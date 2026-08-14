@@ -398,9 +398,10 @@ test("the full paste reflows the input layout (no status-bar overlap)", () => {
   assert.equal(chat.view.h + chat.input.h + chat.todoHeight() + 1, chat.h, "layout rows add up (no overlap into the footer)");
 });
 
-test("the input supports drag-selection and Ctrl+C copy", () => {
+test("the input supports drag-selection and Ctrl+Shift+C copy", () => {
   const copied = [];
-  const input = new Input({ x: 0, y: 0, w: 40, h: 1, multi: true, app: { copyText: (t) => copied.push(t), toast: () => {} } });
+  const toasts = [];
+  const input = new Input({ x: 0, y: 0, w: 40, h: 1, multi: true, app: { copyText: (t) => copied.push(t), toast: (m) => toasts.push(m) } });
   input.setValue("hello world\nsecond line");
   // press at the text start, drag across "hello"
   input.onMouse({ type: "mouse", kind: "press", button: 0, x: strWidth("❯ "), y: 0 });
@@ -408,12 +409,15 @@ test("the input supports drag-selection and Ctrl+C copy", () => {
   assert.deepEqual([input.selStart, input.selEnd], [0, 5], "selection span");
   const screen = new Screen(40, 3);
   input.render(screen); // selection highlight must not throw
-  input.onKey({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: false });
-  assert.deepEqual(copied, ["hello"], "selection copied");
+  input.onKey({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: true });
+  assert.deepEqual(copied, ["hello"], "Ctrl+Shift+C copied the selection");
   assert.equal(input.selStart, null, "selection cleared after copy");
-  // without a selection, Ctrl+C clears the input as before
+  // without a selection, Ctrl+Shift+C just hints
+  input.onKey({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: true });
+  assert.equal(toasts.at(-1), "先用鼠标拖动选中要复制的内容");
+  // plain Ctrl+C keeps its single meaning: clear the input
   input.onKey({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: false });
-  assert.equal(input.value, "", "no selection → clear the input");
+  assert.equal(input.value, "", "Ctrl+C cleared the input");
 });
 
 test("large pastes are two-stage (placeholder then full content, claude-code style)", () => {

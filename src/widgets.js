@@ -596,13 +596,18 @@ export class Input extends Widget {
           switch (ev.key) {
             case "j": if (this.multi) { this.insert("\n"); return true; } return false;
             case "c": {
-              // a drag-selection copies it; otherwise Ctrl+C clears the input
-              if (this.selStart !== null && this.selEnd !== null && this.selEnd > this.selStart) {
-                const text = Array.from(this.value).slice(this.selStart, this.selEnd).join("");
-                this.selStart = this.selEnd = null;
-                this.app?.copyText?.(text);
+              if (ev.shift) {
+                // Ctrl+Shift+C: copy the drag-selection (if any)
+                if (this.selStart !== null && this.selEnd !== null && this.selEnd > this.selStart) {
+                  const text = Array.from(this.value).slice(this.selStart, this.selEnd).join("");
+                  this.selStart = this.selEnd = null;
+                  this.app?.copyText?.(text);
+                } else {
+                  this.app?.toast?.("先用鼠标拖动选中要复制的内容");
+                }
                 return true;
               }
+              // plain Ctrl+C keeps ONE meaning here: clear the input
               this.#touch();
               this.value = "";
               this.cursor = 0;

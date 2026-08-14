@@ -1219,6 +1219,7 @@ export class ControlPanel extends Widget {
       ["[", "上一提问的终点", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); this.app.chat.onKey({ type: "key", name: "char", key: "[", text: "[", ctrl: false, alt: false, shift: false }); }],
       ["]", "下一提问的终点", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); this.app.chat.onKey({ type: "key", name: "char", key: "]", text: "]", ctrl: false, alt: false, shift: false }); }],
       ["Ctrl+L", "输入栏 展开/折叠", () => { this.app.closeOverlay(); this.app.focus(this.app.chat.input); this.app.chat.input.onKey({ type: "key", name: "char", key: "l", text: "l", ctrl: true, alt: false, shift: false }); }],
+      ["Ctrl+Shift+C", "复制输入栏选区", () => { this.app.closeOverlay(); this.app.chat.input.onKey({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: true }); }],
       ["Ctrl+P", "控制面板", () => { this.page = 1; this.sel = 0; this.app.redraw(); }],
       ["Ctrl+M", "切换模型", () => { this.app.overlay = buildModelPicker(this.app); }],
       ["Ctrl+T", "轨迹视图", () => { this.app.closeOverlay(); this.app.setMode("trajectory"); }],
