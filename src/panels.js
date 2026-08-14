@@ -222,6 +222,7 @@ export function buildCommandPalette(app) {
   const w = Math.min(70, app.screen.w - 4), h = Math.min(26, app.screen.h - 4);
   const items = [
     { label: "新建会话", hint: "n", action: () => app.newSession(), keywords: "new session create" },
+    { label: "新建工作区…", action: () => app.addWorkspace(), keywords: "new workspace create directory" },
     { label: "打开会话…", hint: "o", action: () => app.openSessionPicker(), keywords: "open session" },
     { label: "搜索会话", hint: "/", action: () => app.startSearch(), keywords: "search find" },
     { label: "重命名当前会话", action: () => app.renameCurrent(), keywords: "rename title" },

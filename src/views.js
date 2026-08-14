@@ -460,11 +460,19 @@ class SidebarTree extends Widget {
     if (ev.kind === "press" && ev.button === 2) {
       const idx = this.scrollY + (ev.y - this.y - 2);
       const row = this.rows[idx];
-      if (!row) return false;
+      if (!row) {
+        // right-click on empty sidebar space → workspace-level actions
+        this.app.openMenu([
+          { label: "新建工作区…", action: () => this.app.addWorkspace() },
+          { label: "新建会话", action: () => this.app.newSessionIn(null) },
+        ], ev);
+        return true;
+      }
       this.sel = idx;
       if (row.kind === "group") {
         const items = [
           { label: "新建会话", action: () => this.app.newSessionIn(row.group) },
+          { label: "新建工作区…", action: () => this.app.addWorkspace() },
           { label: "折叠全部", action: () => { this.collapseAll(); this.app.redraw(); } },
           { label: "展开全部", action: () => { this.expandAll(); this.app.redraw(); } },
         ];
@@ -2263,7 +2271,10 @@ export class App {
       if (ev.ctrl && ev.key === "m") { this.overlay = buildModelPicker(this); this.redraw(); return; }
       if (ev.name === "f8") { this.rotatePermission(); return; }
       if (ev.name === "f9") { this.showModePicker(); return; }
-      if (ev.ctrl && ev.key === "w") { this.setMode("workspace"); return; }
+      if (ev.ctrl && ev.key === "w") {
+        if (ev.shift) { this.addWorkspace(); return; }
+        this.setMode("workspace"); return;
+      }
       if (ev.ctrl && ev.key === "t") { this.setMode("trajectory"); return; }
       if (ev.ctrl && ev.key === "j") { this.showJobs(); return; }
       if (ev.ctrl && ev.key === "g") { this.showGoal(); return; }
