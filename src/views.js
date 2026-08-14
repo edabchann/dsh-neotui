@@ -3,6 +3,7 @@ import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
 import { truncate, strWidth, bars } from "./text.js";
 import { readFileSync } from "node:fs";
+import { userInfo } from "node:os";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
@@ -14,6 +15,21 @@ import {
 import { T, themeName } from "./theme.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
 const K = new Proxy({}, { get(_k, key) { return T[key]; } });
+
+// ---- User-message prefix ----
+// "edabchann > " style marker on the first line of every message the user
+// sent. Customizable via the DSH_TUI_USER_PREFIX env var; defaults to the
+// OS login username (process.env.USER as a fallback).
+let OS_USERNAME = null;
+function osUsername() {
+  if (OS_USERNAME !== null) return OS_USERNAME;
+  try { OS_USERNAME = userInfo().username; } catch { OS_USERNAME = ""; }
+  return OS_USERNAME;
+}
+export function userPrefix() {
+  const name = process.env.DSH_TUI_USER_PREFIX || osUsername() || process.env.USER || process.env.LOGNAME || "user";
+  return `${name} > `;
+}
 
 // ---- Tool card renderers (host-computed view models) ----
 
@@ -666,14 +682,15 @@ export class ChatView extends Widget {
   }
 
   jumpToNode(idx) {
-    if (idx < 0 || idx >= this.nodes.length) return;
+    if (idx < 0 || idx >= this.nodes.length) return false;
     for (let li = 0; li < this.lineMap.length; li++) {
       if (this.lineMap[li]?.nodeIdx === idx) {
         this.view.scrollY = Math.max(0, li - 2);
         this.app.redraw();
-        return;
+        return true;
       }
     }
+    return false; // node exists but is outside the rendered tail window
   }
 
   queueRebuild() { this.rebuildQueued = true; }
@@ -853,7 +870,7 @@ export class ChatView extends Widget {
     const markImg = (nodeIdx, imgIdx) => lineMap.push({ nodeIdx, imgIdx });
     // render only the tail of very long sessions; earlier nodes load via pagination
     const MAX_NODES = 150;
-    const skipCount = this.nodes.length - MAX_NODES;
+    const skipCount = Math.max(0, this.nodes.length - MAX_NODES);
     const nodes = skipCount > 0 ? this.nodes.slice(skipCount) : this.nodes;
     lines.push([{ t: truncate(this.title || this.sessionId?.slice(0, 8) || "", w - 2), fg: K.DIM }]);
     mark(-1);
@@ -916,9 +933,19 @@ export class ChatView extends Widget {
           const text = node.text ?? "";
           const shown = isExp ? text : text.slice(0, 2000);
           beginCard("USERBG");
-          lines.push([{ t: "▎ ", fg: K.OK }]);
-          mark(realIdx);
-          for (const ln of renderMd(shown, w - 4)) { lines.push([{ t: "  " }, ...ln]); mark(realIdx); }
+          // First line carries the customizable "name > " marker and the
+          // message text starts on that same line (no blank first row).
+          const prefix = userPrefix();
+          const pw = strWidth(prefix);
+          const md = renderMd(shown, Math.max(10, w - 4 - pw));
+          if (md.length === 0) {
+            lines.push([{ t: "  " + prefix, fg: K.OK, bold: true }]);
+            mark(realIdx);
+          } else {
+            lines.push([{ t: "  " + prefix, fg: K.OK, bold: true }, ...md[0]]);
+            mark(realIdx);
+            for (const ln of md.slice(1)) { lines.push([{ t: "  " + " ".repeat(pw) }, ...ln]); mark(realIdx); }
+          }
           if (!isExp && text.length > 2000) lines.push([{ t: "  …", fg: K.FAINT }]);
           if (node.images) {
             for (let ii = 0; ii < node.images.length; ii++) {
@@ -1195,6 +1222,9 @@ export class ChatView extends Widget {
             { label: "复制消息", action: () => this.app.copyNode(info.nodeIdx) },
             { label: "展开 / 折叠", action: () => this.#clickLine(y, ev) },
           ];
+          if (node?.id) {
+            items.push({ label: "转跳轨迹", action: () => this.app.jumpToTrajectoryNode(info.nodeIdx) });
+          }
           if (node?.kind === "assistant" && node.id) {
             const fb = this.app.feedbackMap.get(node.id);
             const cur = fb?.rating === "positive" ? " ✓已好评" : fb?.rating === "negative" ? " ✓已差评" : "";
@@ -1516,6 +1546,38 @@ export class App {
   toggleChatTrajectory() {
     if (!this.currentSession) { this.toast("先打开一个会话"); return; }
     this.setMode(this.mode === "trajectory" ? "chat" : "trajectory");
+  }
+
+  /** Chat → trajectory: open the trajectory panel at the step containing a
+   *  chat node (right-click menu), loading older steps on demand. */
+  async jumpToTrajectoryNode(nodeIdx) {
+    if (!this.currentSession) { this.toast("先打开一个会话"); return; }
+    const node = this.chat.nodes[nodeIdx];
+    if (!node) { this.toast("消息不存在"); return; }
+    if (!this.trajectoryPanel) this.trajectoryPanel = new TrajectoryPanel(this);
+    this.setMode("trajectory"); // also kicks load(currentSession)
+    await this.trajectoryPanel.focusMessage(node.id ?? null);
+  }
+
+  /** Trajectory → chat: switch back to the chat view scrolled at the message
+   *  the step belongs to (right-click menu). */
+  jumpToChatStep(si) {
+    const step = this.trajectoryPanel?.steps?.[si];
+    if (!step) { this.toast("该步骤不可用"); return; }
+    let messageId = null;
+    for (const e of step.events) {
+      const d = e.data ?? {};
+      const id = d.id ?? d.message?.id;
+      if (id) { messageId = id; break; }
+    }
+    if (!messageId) { this.toast("该步骤没有关联消息 ID"); return; }
+    this.setMode("chat");
+    const idx = this.chat.nodes.findIndex((n) => n.id === messageId);
+    if (idx >= 0 && this.chat.jumpToNode(idx)) {
+      this.toast(`已转跳到消息 ${messageId.slice(0, 8)}`);
+    } else {
+      this.toast(idx >= 0 ? "该消息在更早的记录中（PgUp 加载后再试）" : "对应消息不在已加载的对话窗口");
+    }
   }
 
   toggleSidebar() {

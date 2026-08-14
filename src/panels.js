@@ -554,30 +554,37 @@ export class TrajectoryPanel extends Widget {
     this.minSeq = null;
     this.allEvents = [];
     this.sessionId = null;
-    this.view = new ScrollView({ x: this.x, y: this.y, w: this.w, h: this.h, showScrollbar: true, onClick: (y) => this.#clickLine(y) });
+    this.expandedSteps = new Set(); // step identity keys rendered 详细 (expanded)
+    this.flashStep = null;          // step just jumped to (brief highlight)
+    this.flashUntil = 0;
+    this.loadPromise = null;        // dedupes concurrent load(currentSession)
+    this.loadTarget = null;
+    // No onClick: LEFT click on a step does nothing (details live in the
+    // right-click menu and in the per-step 详细/简略 expansion).
+    this.view = new ScrollView({ x: this.x, y: this.y, w: this.w, h: this.h, showScrollbar: true });
     this.stepLines = [];
     this.query = "";
   }
-  #clickLine(lineIdx) {
-    if (this.hasMore && lineIdx === 1) { this.loadOlder(); return true; }
-    const si = this.stepLines[lineIdx];
-    if (si === undefined) return false;
+
+  #eventSummary(e) {
+    const d = e.data ?? {};
+    if (e.type === "user/message") return `❯ ${String(d.content?.[0]?.text ?? "").slice(0, 40)}`;
+    if (e.type === "tool/call") return `⚙ ${d.name ?? "tool"} ${String(d.arguments ?? "").slice(0, 30)}`;
+    if (e.type === "tool/result") return "↳ 结果";
+    if (e.type === "assistant/message") return `◉ ${String(d.message?.content?.find((c) => c.type === "text")?.text ?? "").slice(0, 40)}`;
+    if (e.type === "assistant/chunk") {
+      const ch = d.chunk ?? {};
+      return ch.type === "text-delta" ? String(ch.delta ?? "").slice(0, 40) : `[${ch.blockType ?? ch.type}]`;
+    }
+    return e.type;
+  }
+
+  /** Right-click menu entry: the old event-detail picker for one step. */
+  #showDetail(si) {
     const step = this.steps[si];
-    if (!step) return false;
+    if (!step) return;
     const t0 = step.events[0]?.time, t1 = step.events[step.events.length - 1]?.time;
-    const items = step.events.map((e, i) => {
-      const d = e.data ?? {};
-      let summary = e.type;
-      if (e.type === "user/message") summary = `❯ ${String(d.content?.[0]?.text ?? "").slice(0, 40)}`;
-      else if (e.type === "tool/call") summary = `⚙ ${d.name ?? "tool"} ${String(d.arguments ?? "").slice(0, 30)}`;
-      else if (e.type === "tool/result") summary = "↳ 结果";
-      else if (e.type === "assistant/message") summary = `◉ ${String(d.message?.content?.find((c) => c.type === "text")?.text ?? "").slice(0, 40)}`;
-      else if (e.type === "assistant/chunk") {
-        const ch = d.chunk ?? {};
-        summary = ch.type === "text-delta" ? String(ch.delta ?? "").slice(0, 40) : `[${ch.blockType ?? ch.type}]`;
-      }
-      return { label: truncate(summary, 60), hint: `#${e.seq}`, idx: i, event: e };
-    });
+    const items = step.events.map((e, i) => ({ label: truncate(this.#eventSummary(e), 60), hint: `#${e.seq}`, idx: i, event: e }));
     if (t0 && t1) items.unshift({ label: `⏱ 步骤 ${step.step} · ${step.events.length} 事件 · ${fmtMs(t1 - t0)}`, hint: "", idx: -1, event: null });
     const w = Math.min(78, this.app.screen.w - 8), h = Math.min(22, this.app.screen.h - 4);
     this.app.overlay = new Picker({
@@ -594,7 +601,6 @@ export class TrajectoryPanel extends Widget {
         else if (e.type === "assistant/message") body = String(d.message?.content?.map((c) => c.text ?? "").join("\n") ?? "");
         else body = JSON.stringify(d, null, 2);
         const lines = body.split("\n").slice(0, 40).map((l) => [{ t: truncate(l, w - 6), fg: K.TXT }]);
-        // centered detail popup (never the stale top-left corner)
         const pw = Math.min(80, this.app.screen.w - 4);
         const ph = Math.min(lines.length + 5, 24);
         this.app.overlay = new Popup({
@@ -607,7 +613,64 @@ export class TrajectoryPanel extends Widget {
       },
     });
     this.app.redraw();
-    return true;
+  }
+
+  #toggleStep(si) {
+    const step = this.steps[si];
+    if (!step) return;
+    const key = this.stepKey(step);
+    if (this.expandedSteps.has(key)) this.expandedSteps.delete(key);
+    else this.expandedSteps.add(key);
+    this.buildLines();
+    this.app.redraw();
+  }
+
+  /** Stable identity of a step across loadOlder re-segmentation: the seq of
+   *  its first event (step indexes shift when older steps are prepended). */
+  stepKey(step) { return step.events[0]?.seq ?? `step-${step.step}`; }
+
+  /** Step index whose events carry the given message id (-1 when absent). */
+  indexOfMessage(messageId) {
+    if (!messageId) return -1;
+    for (let si = this.steps.length - 1; si >= 0; si--) {
+      if (this.steps[si].events.some((e) => {
+        const d = e.data ?? {};
+        return (d.id ?? d.message?.id) === messageId;
+      })) return si;
+    }
+    return -1;
+  }
+
+  /** Scroll to a step: auto-expand, highlight, center its line. */
+  jumpToStep(si) {
+    if (si < 0 || si >= this.steps.length) return;
+    this.expandedSteps.add(this.stepKey(this.steps[si]));
+    this.buildLines(si);
+    const li = this.stepLines.indexOf(si);
+    this.view.scrollY = li >= 0 ? Math.max(0, li - 2) : 0;
+    this.flashStep = si;
+    this.flashUntil = Date.now() + 3000;
+    this.app.redraw();
+  }
+
+  /** Chat → trajectory jump target: load the current session's steps (if not
+   *  already), page back until the message's step is loaded, then jump. */
+  async focusMessage(messageId) {
+    if (this.sessionId !== this.app.currentSession || this.steps.length === 0) {
+      await this.load(this.app.currentSession);
+    }
+    let si = this.indexOfMessage(messageId);
+    for (let i = 0; si < 0 && this.hasMore && i < 10; i++) {
+      await this.loadOlder();
+      si = this.indexOfMessage(messageId);
+    }
+    if (si >= 0) {
+      this.jumpToStep(si);
+      this.app.toast(`已定位到 step ${this.steps[si].step}`);
+    } else if (this.steps.length) {
+      this.jumpToStep(this.steps.length - 1);
+      this.app.toast(messageId ? "对应步骤不在已加载窗口" : "消息未关联步骤，已到最新步骤");
+    }
   }
   relayout(x, y, w, h) {
     this.x = x; this.y = y; this.w = w; this.h = h;
@@ -624,6 +687,14 @@ export class TrajectoryPanel extends Widget {
       this.app.redraw();
       return;
     }
+    // Dedupe concurrent loads of the same session (setMode + focusMessage).
+    if (this.loadPromise && this.loadTarget === sessionId) return this.loadPromise;
+    this.loadTarget = sessionId;
+    this.loadPromise = this.#doLoad(sessionId);
+    try { await this.loadPromise; }
+    finally { this.loadPromise = null; this.loadTarget = null; }
+  }
+  async #doLoad(sessionId) {
     this.sessionId = sessionId;
     this.loading = true;
     this.steps = [];
@@ -682,10 +753,10 @@ export class TrajectoryPanel extends Widget {
     if (cur && cur.events.length) steps.push(cur);
     this.steps = steps.slice(-600);
   }
-  buildLines() {
+  buildLines(aroundSi = null) {
     const w = Math.max(40, this.w - 2);
     const lines = [];
-    lines.push([{ t: "轨迹 — 步骤时间轴（每行一个色块，点击查看详情 · r 刷新）", fg: K.ACCENT, bold: true }]);
+    lines.push([{ t: "轨迹 — 步骤时间轴（右键：展开/折叠 · 转跳对话 · 查看详情；r 刷新）", fg: K.ACCENT, bold: true }]);
     if (this.hasMore) lines.push([{ t: "▲ 更早步骤（点击 / PgUp 加载）", fg: K.FAINT }]);
     else lines.push([{ t: "" }]);
     const st = this.stats;
@@ -701,7 +772,14 @@ export class TrajectoryPanel extends Widget {
         return hay.includes(this.query.toLowerCase());
       }))
       : this.steps;
-    for (const step of list.slice(-40).reverse()) {
+    // Render a window of 40 steps (newest at the top). A jump to an older
+    // step centers the window around it so its line actually exists.
+    let windowStart = Math.max(0, list.length - 40);
+    if (!this.query && aroundSi !== null && aroundSi >= 0) {
+      const li = list.indexOf(this.steps[aroundSi]);
+      if (li >= 0) windowStart = Math.max(0, Math.min(li - 8, list.length - 40));
+    }
+    for (const step of list.slice(windowStart, windowStart + 40).reverse()) {
       const si = this.steps.indexOf(step);
       const tools = [...new Set(step.events.filter((e) => e.type === "tool/call").map((e) => e.data?.name))];
       const hasResult = step.events.some((e) => e.type === "tool/result");
@@ -710,12 +788,27 @@ export class TrajectoryPanel extends Widget {
       const dur = t0 && t1 ? fmtMs(t1 - t0) : "—";
       const bg = tools.length ? (hasResult ? T.TOOLOK : T.TOOLBG) : hasReasoning ? T.THINKBG : T.CARD;
       const summary = tools.slice(0, 3).join(",") || (hasReasoning ? "模型推理" : "纯文本");
-      const label = ` step ${String(step.step).padStart(3)}  ${pad(dur, 8)}  ${summary}`;
-      const segs = [{ t: label, fg: K.TXT, bg, bold: true }];
+      const open = this.expandedSteps.has(this.stepKey(step));       // 详细
+      const flash = this.flashStep === si && Date.now() < this.flashUntil;
+      const rowBg = flash ? T.ACCENT : bg;
+      const label = `${open ? "▾" : "▸"} step ${String(step.step).padStart(3)}  ${pad(dur, 8)}  ${summary}  ${open ? "[折叠]" : "[展开]"}`;
+      const segs = [{ t: label, fg: flash ? T.SELFG : K.TXT, bg: rowBg, bold: true }];
       const fill = w - strWidth(label);
-      if (fill > 0) segs.push({ t: " ".repeat(fill), bg });
+      if (fill > 0) segs.push({ t: " ".repeat(fill), bg: rowBg });
       lines.push(segs);
       this.stepLines[lines.length - 1] = si;
+      if (open) {
+        // 详细 mode: the step's events inline under its color block.
+        const evs = step.events.slice(0, 12);
+        for (const e of evs) {
+          lines.push([{ t: `    #${String(e.seq).padStart(4)} ${truncate(this.#eventSummary(e), w - 12)}`, fg: K.DIM, bg }]);
+          this.stepLines[lines.length - 1] = si;
+        }
+        if (step.events.length > evs.length) {
+          lines.push([{ t: `    …共 ${step.events.length} 个事件（右键 → 查看详情）`, fg: K.FAINT, bg }]);
+          this.stepLines[lines.length - 1] = si;
+        }
+      }
     }
     this.view.setLines(lines);
   }
@@ -727,7 +820,40 @@ export class TrajectoryPanel extends Widget {
     }
     this.view.render(screen);
   }
-  onMouse(ev) { return this.view.onMouse(ev); }
+  onMouse(ev) {
+    // RIGHT click on a step: context menu (expand/collapse · jump · detail).
+    if (ev.kind === "press" && ev.button === 2) {
+      const y = ev.y - this.view.y + this.view.scrollY;
+      const si = this.stepLines[y];
+      const step = si !== undefined ? this.steps[si] : null;
+      if (step) {
+        const open = this.expandedSteps.has(this.stepKey(step));
+        this.app.openMenu([
+          { label: open ? "折叠（简略）" : "展开（详细）", action: () => this.#toggleStep(si) },
+          { label: "转跳对话", action: () => this.app.jumpToChatStep(si) },
+          { label: "查看详情", action: () => this.#showDetail(si) },
+        ], ev);
+        return true;
+      }
+      if (this.hasMore && y === 1) {
+        this.app.openMenu([{ label: "加载更早步骤", action: () => this.loadOlder() }], ev);
+        return true;
+      }
+      // swallow right-clicks on non-step rows (header/stats) so they cannot
+      // leak into the chat view's context menu underneath.
+      return this.view.inside(ev.x, ev.y);
+    }
+    // wheel / scrollbar drag keep working
+    if (this.view.onMouse(ev)) return true;
+    // LEFT click on a step: no reaction — but swallow it so it cannot leak
+    // through to the chat view underneath (which shares this rectangle).
+    if (ev.kind === "press" && ev.button === 0 && this.view.inside(ev.x, ev.y)) {
+      const y = ev.y - this.view.y + this.view.scrollY;
+      if (this.hasMore && y === 1) this.loadOlder(); // "▲ 更早步骤" row
+      return true;
+    }
+    return false;
+  }
   onKey(ev) {
     if (ev.type === "text") { this.query += ev.text; this.buildLines(); this.app.redraw(); return true; }
     if (ev.type !== "key") return false;
