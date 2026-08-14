@@ -194,7 +194,6 @@ test("collapsing a long text block keeps the viewport anchored (no view jump)", 
   // flung to unrelated content
   assert.equal(topKey(), "0:0", "viewport stays anchored on the clicked block");
   const topText = chat.lines[chat.view.scrollY].map((g) => g.t).join("");
-  assert.ok(topText.trim() !== "", "viewport top is never a blank separator row");
   assert.ok(!topText.includes("tail-node"), "did not jump past the block");
 });
 
@@ -486,26 +485,37 @@ test("folding the last block at the bottom holds the header position (no 5-line 
   assert.equal(hdr3 - chat.view.scrollY, rowBefore, "no delayed snap on the next rebuild");
 });
 
-test("collapsing by clicking a content line lands the fold trailer at the clicked row", () => {
+test("fixed-height fold: collapsing a block moves NOTHING below it", () => {
   const longText = Array.from({ length: 30 }, (_, i) => `para ${i}`).join("\n\n");
   const { chat } = render([
     { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [{ kind: "text", text: longText }] },
     { kind: "assistant", id: "a2", step: 2, streaming: false, blocks: [{ kind: "text", text: "AFTER" }] },
   ]);
-  // click a CONTENT line deep inside the block (the header is off-screen)
+  // click a CONTENT line deep inside the block
   const clicked = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 20"));
-  chat.view.scrollY = Math.max(0, clicked - 3); // the clicked line 3 rows below the top
-  const rowBefore = clicked - chat.view.scrollY;
-  const y = chat.view.y + rowBefore;
+  chat.view.scrollY = Math.max(0, clicked - 3);
+  const afterIdxBefore = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("AFTER"));
+  const scrollBefore = chat.view.scrollY;
+  const y = chat.view.y + (clicked - chat.view.scrollY);
   chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
   chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
   assert.ok(chat.collapsedBlocks.has("0:0"), "collapsed");
-  // the fold's trailer ("…共 … 字") must sit EXACTLY at the clicked row
-  const trailerIdx = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("…共"));
-  assert.equal(trailerIdx - chat.view.scrollY, rowBefore, "trailer landed at the clicked row");
-  // and the following content stays right below it
-  const afterIdx = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("AFTER"));
-  assert.ok(afterIdx - chat.view.scrollY >= rowBefore + 1 && afterIdx - chat.view.scrollY <= rowBefore + 3, "the next block sits right below the trailer");
+  assert.equal(chat.view.scrollY, scrollBefore, "view did not scroll");
+  const afterIdxAfter = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("AFTER"));
+  assert.equal(afterIdxAfter, afterIdxBefore, "the content below the fold did not move AT ALL");
+  // the block pads its old height: header+preview+trailer+filler == old height
+  const hdr = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 0"));
+  const trailer = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("…共"));
+  assert.ok(trailer > hdr, "trailer after the header");
+  // re-expand: everything below stays too
+  const tr = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("…共"));
+  chat.view.scrollY = Math.max(0, tr - 3);
+  const y2 = chat.view.y + (tr - chat.view.scrollY);
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y: y2 });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y: y2 });
+  assert.ok(!chat.collapsedBlocks.has("0:0"), "re-expanded");
+  const afterIdxAfter2 = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("AFTER"));
+  assert.equal(afterIdxAfter2, afterIdxBefore, "below content still unmoved after re-expand");
 });
 
 test("the stream growing between press and release cannot shift the hit", () => {

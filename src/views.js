@@ -565,6 +565,8 @@ export class ChatView extends Widget {
     this.expanded = new Set();   // node indexes (user-message full text)
     this.expandedTools = new Set();
     this.collapsedBlocks = new Set(); // per-block COLLAPSE (default expanded): `${realIdx}:${bi}`
+    this.blockHeights = new Map();    // collapsed block → its rendered height when collapsed
+                                       // (fixed-height fold: the space below stays put)
     this.thinkMode = "expanded";        // think blocks: expanded by default (t toggles)
     this.bashMode = "expanded";         // tool blocks: expanded | collapsed (b toggles)
     this.todosVisible = true;           // todo block above the input (Shift+T toggles)
@@ -906,28 +908,11 @@ export class ChatView extends Widget {
       this.#clickLog(`toggle mark=${JSON.stringify(info)} kind=${node.kind} blockIdx=${info.blockIdx} preHeaderRow=${preHeaderRow} topKey=${topKey} topOffset=${topOffset}`);
     }
     const reanchor = () => {
-      // COLLAPSING a block by clicking one of its CONTENT lines: the clicked
-      // text itself vanishes, and the content below slides up by the fold
-      // size — the "4-line offset" the user sees. Land the fold's LAST line
-      // (the trailer/summary) exactly at the clicked row so the eye stays
-      // anchored and nothing below visibly shifts.
-      if (collapsing && pressY !== null && pressY !== preHeaderIdx && pressRow !== null && pressRow >= 0) {
-        let lastIdx = -1;
-        for (let i = 0; i < this.lineMap.length; i++) {
-          if (match(this.lineMap[i])) lastIdx = i;
-        }
-        if (lastIdx >= 0) {
-          const sy = lastIdx - pressRow;
-          this.view.scrollY = Math.max(0, sy);
-          if (sy > this.view.maxScroll()) this.view.anchorLock = sy;
-          return;
-        }
-      }
+      // Fixed-height folds keep the buffer size UNCHANGED (the collapsed
+      // block pads its recorded height with ghost rows), so nothing below
+      // the fold can move — the anchor is only a safety net now.
       // primary anchor: the clicked block's header stays at its pre-click
       // viewport row (zero shift) — only when the header was ON-SCREEN.
-      // When the fold removed the tail content below, the anchored position
-      // may exceed maxScroll: hold it via the view's anchorLock instead of
-      // clamping (the clamp is exactly the slide the user sees).
       if (preHeaderRow !== null && preHeaderRow >= 0 && preHeaderIdx >= 0) {
         const h2 = firstNonEmpty(match);
         if (h2 >= 0) {
@@ -951,17 +936,25 @@ export class ChatView extends Widget {
       if (target > this.view.maxScroll()) this.view.anchorLock = target;
     };
     // never park the viewport on a blank separator row — it reads as a
-    // spurious offset right after the click
+    // spurious offset right after the click. Ghost rows of a fixed-height
+    // fold are INTENTIONAL blanks (marked with a blockIdx) — leave them.
     const nudge = () => {
       while (
         this.view.scrollY < this.lineMap.length - 1 &&
-        !(this.lines[this.view.scrollY] ?? []).some((g) => g.t.trim() !== "")
+        !(this.lines[this.view.scrollY] ?? []).some((g) => g.t.trim() !== "") &&
+        (this.lineMap[this.view.scrollY]?.blockIdx ?? null) === null
       ) this.view.scrollY++;
     };
     if (node.kind === "assistant" && info.blockIdx !== null) {
       const b = node.blocks[info.blockIdx];
       if (b && (b.kind === "tool" || b.kind === "reasoning" || b.kind === "other" || b.kind === "text")) {
         const key = `${info.nodeIdx}:${info.blockIdx}`;
+        // fixed-height fold: remember how tall the block is right now so the
+        // collapsed form can pad the SAME height (nothing below moves)
+        let firstM = -1, lastM = -1;
+        for (let i = 0; i < this.lineMap.length; i++) {
+          if (match(this.lineMap[i])) { if (firstM < 0) firstM = i; lastM = i; }
+        }
         if (b.kind === "reasoning") {
           // clean two-state override: expand ⇄ collapse (never a no-op click)
           const open = this.expanded.has(key) || (!this.collapsedBlocks.has(key) && this.thinkMode === "expanded");
@@ -973,6 +966,8 @@ export class ChatView extends Widget {
           if (this.collapsedBlocks.has(key)) this.collapsedBlocks.delete(key);
           else this.collapsedBlocks.add(key);
         }
+        if (collapsing && firstM >= 0) this.blockHeights.set(key, lastM - firstM + 1);
+        else if (!collapsing) this.blockHeights.delete(key);
         this.#rebuild();
         reanchor(); nudge();
         if (process.env.DSH_TUI_DEBUG_CLICK) {
@@ -1116,6 +1111,7 @@ export class ChatView extends Widget {
                 timing = " 已完成";
               }
               const thinkMeta = `${stepTag}（${b.text?.length ?? 0} 字）${timing}`;
+              const blkLines0 = lines.length;
               lines.push([{ t: "💭 思考" + (b.streaming ? "…" : "") + thinkMeta + (open ? " [t 折叠]" : " [t 展开]"), fg: K.FAINT }]);
               mark(realIdx, bi);
               if (open) {
@@ -1127,6 +1123,13 @@ export class ChatView extends Widget {
                   lines.push([{ t: "  " }, ...ln.map((g) => ({ ...g, fg: K.FAINT }))]);
                   mark(realIdx, bi);
                 }
+              }
+              // fixed-height fold: pad the recorded height with ghost rows so
+              // nothing below the block moves
+              if (!open) {
+                const h = this.blockHeights.get(key) ?? 0;
+                const filler = Math.max(0, h - (lines.length - blkLines0));
+                for (let fi = 0; fi < filler; fi++) { lines.push([{ t: "" }]); mark(realIdx, bi); }
               }
               sep();
             } else if (b.kind === "tool") {
@@ -1142,6 +1145,7 @@ export class ChatView extends Widget {
               const glyph = orphan ? "✗" : running ? "⏳" : exitCode !== undefined && exitCode !== 0 ? "✗" : "✓";
               const card = b.view ? renderToolCard(b.view, w, open) : [];
               beginCard(status);
+              const blkLines0 = lines.length;
               let timing = "";
               if (running) {
                 timing = ` 已经过 ${fmtDuration(Date.now() - (b.startedAt ?? Date.now()))}`;
@@ -1165,6 +1169,11 @@ export class ChatView extends Widget {
                   lines.push([{ t: "  " + truncate(summary, w - 6), fg: K.FAINT }]);
                   mark(realIdx, bi);
                 }
+                // fixed-height fold: pad the recorded height with ghost rows so
+                // nothing below the block moves
+                const h = this.blockHeights.get(key) ?? 0;
+                const filler = Math.max(0, h - (lines.length - blkLines0));
+                for (let fi = 0; fi < filler; fi++) { lines.push([{ t: "" }]); mark(realIdx, bi); }
               }
               if (open) {
                 for (const ln of card) { lines.push(ln); mark(realIdx, bi); }
@@ -1187,6 +1196,7 @@ export class ChatView extends Widget {
               sep();
             } else {
               beginCard("CARD");
+              const blkLines0 = lines.length;
               // Text blocks collapse per-block like tool/reasoning blocks:
               // collapsed shows a 3-line preview + trailer, expanded the whole
               // text. Clicking (or the right-click 展开/折叠) toggles it.
@@ -1209,6 +1219,13 @@ export class ChatView extends Widget {
               if (!open && text.length > 0) {
                 lines.push([{ t: `  …共 ${text.length} 字（点击展开）`, fg: K.FAINT }]);
                 mark(realIdx, bi);
+              }
+              // fixed-height fold: pad the recorded height with ghost rows so
+              // nothing below the block moves
+              if (!open) {
+                const h = this.blockHeights.get(key) ?? 0;
+                const filler = Math.max(0, h - (lines.length - blkLines0));
+                for (let fi = 0; fi < filler; fi++) { lines.push([{ t: "" }]); mark(realIdx, bi); }
               }
               sep();
             }
@@ -2271,6 +2288,7 @@ export class App {
     this.chat.cache.clear();
     this.chat.nodes = [];
     this.chat.collapsedBlocks.clear();
+    this.chat.blockHeights.clear();
     this.chat.expanded.clear();
     this.chat.expandedTools.clear();
     this.chat.queueRebuild();
