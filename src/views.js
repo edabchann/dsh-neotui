@@ -594,6 +594,7 @@ export class ChatView extends Widget {
     this.pressY = null;
     this.pressInfo = null;  // hit identity locked at press time
     this.pressCtx = null;
+    this.pressX = null;
     this.selStart = null;
     this.selEnd = null;
     this.stepState = { step: null }; // step/start tracking for the mux merge path
@@ -871,7 +872,7 @@ export class ChatView extends Widget {
    *  shift the hit identity between press and release (the 4-line mystery:
    *  the rendered frame and the hit test were consistent, but the identity
    *  was re-resolved at release against a stream that had moved). */
-  #anchorCtx(info, pressY = null) {
+  #anchorCtx(info, pressY = null, pressX = null) {
     const lineKey = (m) => (m ? `${m.nodeIdx}:${m.blockIdx ?? "n"}` : null);
     const topKey = lineKey(this.lineMap[this.view.scrollY]) ?? null;
     let topFirst = -1;
@@ -893,7 +894,24 @@ export class ChatView extends Widget {
     const preHeaderIdx = info ? firstNonEmpty(match) : -1;
     const preHeaderRow = preHeaderIdx >= 0 ? preHeaderIdx - this.view.scrollY : null;
     const pressRow = pressY !== null && pressY !== undefined && pressY >= 0 ? pressY - this.view.scrollY : null;
-    return { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow, pressY, pressRow };
+    // the segment under the cursor at PRESS time (code-block [复制] hit test):
+    // re-resolving it at release would let a streaming rebuild move the line
+    const pressSeg = pressY !== null && pressY !== undefined && pressY >= 0 ? this.#segAtLine(pressY, pressX) : null;
+    return { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow, pressY, pressRow, pressX, pressSeg };
+  }
+
+  /** The line-segment under a screen x on a rendered line (for the code
+   *  block's [复制] button hit test). */
+  #segAtLine(y, x) {
+    const line = this.lines[y];
+    if (!line || x == null || x < 0) return null;
+    let px = this.view.x;
+    for (const g of line) {
+      const w = strWidth(g.t ?? "");
+      if (x >= px && x < px + w) return g;
+      px += w;
+    }
+    return null;
   }
 
   /** Toggle the block/node under a line-mark, then re-anchor the viewport.
@@ -908,7 +926,18 @@ export class ChatView extends Widget {
     }
     const node = this.nodes[info.nodeIdx];
     if (!node) return false;
-    const { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow, pressY, pressRow } = ctx ?? this.#anchorCtx(info);
+    const { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow, pressY, pressRow, pressX, pressSeg } = ctx ?? this.#anchorCtx(info);
+    // code block [复制] button: copy the raw code, no toggle (hit identity
+    // and segment locked at press time)
+    if (pressSeg?.copyCode) {
+      this.app.copyText(pressSeg.copyCode);
+      this.app.toast("已复制代码块");
+      return true;
+    }
+    // formal text blocks are NOT collapsible: clicking them is a no-op
+    if (node.kind === "assistant" && info.blockIdx !== null && node.blocks[info.blockIdx]?.kind === "text") {
+      return true;
+    }
     let collapsing = false;
     if (process.env.DSH_TUI_DEBUG_CLICK) {
       this.#clickLog(`toggle mark=${JSON.stringify(info)} kind=${node.kind} blockIdx=${info.blockIdx} preHeaderRow=${preHeaderRow} topKey=${topKey} topOffset=${topOffset}`);
@@ -1181,27 +1210,20 @@ export class ChatView extends Widget {
               sep();
             } else {
               beginCard("CARD");
-              // Text blocks collapse per-block like tool/reasoning blocks:
-              // collapsed shows a 3-line preview + trailer, expanded the whole
-              // text. Clicking (or the right-click 展开/折叠) toggles it.
+              // FORMAL text output is NOT collapsible — the user's message
+              // content must stay readable; only think/tool blocks fold.
+              // Code blocks inside render as boxes with a [复制] button.
               const key = `${realIdx}:${bi}`;
-              const open = !this.collapsedBlocks.has(key);
               const text = b.text ?? "";
-              const glyph = open ? "▾" : "▸";
               const mdW = Math.max(10, w - 6 - strWidth(stepTag));
-              const md = open
-                ? renderMd(text, mdW)
-                : renderMd(truncateText(text, 600), mdW).slice(0, 3);
+              const sink = { codeBlocks: [] };
+              const md = renderMd(text, mdW, sink);
               if (md.length > 0) {
-                lines.push([{ t: "  " }, { t: glyph + " ", fg: K.FAINT }, { t: stepTag, fg: K.FAINT }, ...md[0]]);
+                lines.push([{ t: "  " }, { t: stepTag, fg: K.FAINT }, ...md[0]]);
                 mark(realIdx, bi);
                 for (const ln of md.slice(1)) { lines.push([{ t: "  " }, ...ln]); mark(realIdx, bi); }
               } else {
-                lines.push([{ t: "  " + glyph + " " + stepTag, fg: K.FAINT }]);
-                mark(realIdx, bi);
-              }
-              if (!open && text.length > 0) {
-                lines.push([{ t: `  …共 ${text.length} 字（点击展开）`, fg: K.FAINT }]);
+                lines.push([{ t: "  " + stepTag, fg: K.FAINT }]);
                 mark(realIdx, bi);
               }
               sep();
@@ -1365,7 +1387,8 @@ export class ChatView extends Widget {
         // between press and release, so resolving the block at release would
         // toggle a block a few lines away from the one the user saw.
         this.pressInfo = this.lineMap?.[this.pressY] ?? null;
-        this.pressCtx = this.pressInfo ? this.#anchorCtx(this.pressInfo, this.pressY) : null;
+        this.pressX = ev.x;
+        this.pressCtx = this.pressInfo ? this.#anchorCtx(this.pressInfo, this.pressY, ev.x) : null;
         if (process.env.DSH_TUI_DEBUG_CLICK) {
           const t = this.lines[this.pressY]?.map((g) => g.t).join("") ?? "";
           this.#clickLog(`press screenY=${ev.y} screenX=${ev.x} lineIdx=${this.pressY} mark=${JSON.stringify(this.pressInfo)} text="${t.slice(0, 40)}" scrollY=${this.view.scrollY} viewY=${this.view.y} viewH=${this.view.h} assumedH=${this.app.screen?.h} assumedW=${this.app.screen?.w} ttyRows=${process.stdout.rows} ttyCols=${process.stdout.columns} inputY=${this.input.y} inputH=${this.input.h} todoH=${this.todoHeight()} footerH=${this.app.footerHeight?.() ?? "?"}`);
@@ -1407,8 +1430,11 @@ export class ChatView extends Widget {
           const node = this.nodes[info.nodeIdx];
           const items = [
             { label: "复制消息", action: () => this.app.copyNode(info.nodeIdx) },
-            { label: "展开 / 折叠", action: () => this.#toggleAt(info) },
           ];
+          const clickedBlock = node?.kind === "assistant" && info.blockIdx !== null ? node.blocks[info.blockIdx] : null;
+          if (clickedBlock?.kind !== "text") {
+            items.push({ label: "展开 / 折叠", action: () => this.#toggleAt(info) });
+          }
           if (node?.id) {
             items.push({ label: "转跳轨迹", action: () => this.app.jumpToTrajectoryNode(info.nodeIdx) });
           }

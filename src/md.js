@@ -160,7 +160,7 @@ function highlightLine(line, lang) {
 // ---- block renderer ----
 // Returns array of lines; each line = array of segments.
 
-export function renderMd(text, width) {
+export function renderMd(text, width, sink = null) {
   const lines = [];
   const pushLine = (segs = []) => {
     if (segs.length === 0) segs = [SEG(" ")];
@@ -246,10 +246,19 @@ export function renderMd(text, width) {
         const codeLines = codeBuf.length === 0 ? [""] : codeBuf;
         let maxLen = Math.max(...codeLines.map((l) => strWidth(l)), 1);
         const barW = Math.min(hw, maxLen + 2);
-        // a fence WITHOUT a language gets no label — the bare "text" tag next
-        // to the box corner just looks like a rendering artifact
+        // web-style box with a click-to-copy button in the top-right corner;
+        // a fence WITHOUT a language gets no label (the bare "text" tag next
+        // to the corner looked like a rendering artifact)
+        const btn = "[复制]";
+        const btnW = strWidth(btn);
+        const topLen = Math.max(1, barW - btnW - 4);
         const tag = lang && lang !== "text" ? " " + lang : "";
-        lines.push([SEG("┌" + "─".repeat(Math.max(1, barW - 2)) + "┐" + tag, { fg: C.hr })]);
+        if (sink?.codeBlocks) sink.codeBlocks.push({ text: codeBuf.join("\n"), lineIdx: lines.length, lang });
+        lines.push([
+          SEG("┌" + "─".repeat(topLen) + " ", { fg: C.hr }),
+          SEG(btn, { fg: C.link, bold: true, copyCode: codeBuf.join("\n") }),
+          SEG(" ┐" + tag, { fg: C.hr }),
+        ]);
         for (const cl of codeLines) {
           const hls = highlightLine(cl, lang);
           lines.push([SEG("│ ", { fg: C.hr }), ...wrapSegs(hls, hw, { pad: true }).map((l) => l).flatMap((l, k) => (k === 0 ? l : [SEG("  ", { fg: C.hr }), ...l])), SEG(" │", { fg: C.hr })]);
