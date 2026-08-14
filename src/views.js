@@ -1331,6 +1331,10 @@ export class ChatView extends Widget {
         // toggle a block a few lines away from the one the user saw.
         this.pressInfo = this.lineMap?.[this.pressY] ?? null;
         this.pressCtx = this.pressInfo ? this.#anchorCtx(this.pressInfo) : null;
+        if (process.env.DSH_TUI_DEBUG_CLICK) {
+          const t = this.lines[this.pressY]?.map((g) => g.t).join("") ?? "";
+          this.app.log(`[click-dbg] press screenY=${ev.y} lineIdx=${this.pressY} mark=${JSON.stringify(this.pressInfo)} text="${t.slice(0, 40)}" scrollY=${this.view.scrollY}`);
+        }
         return true;
       }
       if (ev.kind === "drag" && ev.button === 0 && this.pressY !== null) {
