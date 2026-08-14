@@ -486,6 +486,28 @@ test("folding the last block at the bottom holds the header position (no 5-line 
   assert.equal(hdr3 - chat.view.scrollY, rowBefore, "no delayed snap on the next rebuild");
 });
 
+test("the stream growing between press and release cannot shift the hit", () => {
+  const longText = Array.from({ length: 40 }, (_, i) => `para ${i}`).join("\n\n");
+  const { chat } = render([
+    { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [{ kind: "text", text: longText }] },
+    { kind: "assistant", id: "a2", step: 2, streaming: false, blocks: [{ kind: "tool", name: "bash", args: "ls", result: "ok", startedAt: 1, endedAt: 2, view: null }] },
+    { kind: "assistant", id: "a3", step: 3, streaming: true, blocks: [{ kind: "text", text: "tail", streaming: true, startedAt: Date.now() }] },
+  ]);
+  chat.view.scrollY = chat.view.maxScroll();
+  const hdr = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("bash"));
+  const y = chat.view.y + (hdr - chat.view.scrollY);
+  // PRESS on the bash header…
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
+  // …the stream grows 4 lines while the button is down…
+  const tail = chat.nodes[2];
+  tail.blocks[0].text = "tail\n\n" + Array.from({ length: 8 }, (_, i) => `grow-${i}`).join("\n\n");
+  chat.queueRebuild();
+  chat.flushRebuild();
+  // …RELEASE: the bash block must toggle, not whatever now sits at that row
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
+  assert.equal(chat.collapsedBlocks.has("1:0"), true, "the block seen at press time toggled");
+});
+
 test("a missed block-end cannot leave a forever-running timer", () => {
   const now = Date.now();
   const { lines } = render([{

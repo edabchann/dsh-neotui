@@ -590,6 +590,8 @@ export class ChatView extends Widget {
     this.cardRanges = [];     // absolute line ranges of card-backed message blocks
     this.welcomeModes = [];   // absolute row y → agent preset id (welcome screen)
     this.pressY = null;
+    this.pressInfo = null;  // hit identity locked at press time
+    this.pressCtx = null;
     this.selStart = null;
     this.selEnd = null;
     this.stepState = { step: null }; // step/start tracking for the mux merge path
@@ -845,20 +847,13 @@ export class ChatView extends Widget {
     return this.#toggleAt(this.lineMap?.[y]);
   }
 
-  /** Toggle the block/node under a line-mark, then re-anchor the viewport.
-   *  `info` must be the mark of the frame the user clicked on. */
-  #toggleAt(info) {
-    if (!info) return false;
-    if (info.imgIdx !== undefined) {
-      const node = this.nodes[info.nodeIdx];
-      const ref = node?.images?.[info.imgIdx];
-      if (ref) { this.app.openImage(ref, { all: node.images, index: info.imgIdx }); return true; }
-    }
-    const node = this.nodes[info.nodeIdx];
-    if (!node) return false;
-    // anchor context captured from the frame the user saw:
-    // - the clicked block's header line + its viewport row (primary anchor)
-    // - the viewport-top line's identity + offset (fallback for deep clicks)
+  /** Anchor context for a click: the clicked block's header line + its
+   *  viewport row (primary anchor) and the viewport-top identity + offset
+   *  (fallback for deep clicks). Captured at PRESS time so the stream cannot
+   *  shift the hit identity between press and release (the 4-line mystery:
+   *  the rendered frame and the hit test were consistent, but the identity
+   *  was re-resolved at release against a stream that had moved). */
+  #anchorCtx(info) {
     const lineKey = (m) => (m ? `${m.nodeIdx}:${m.blockIdx ?? "n"}` : null);
     const topKey = lineKey(this.lineMap[this.view.scrollY]) ?? null;
     let topFirst = -1;
@@ -868,23 +863,39 @@ export class ChatView extends Widget {
       }
     }
     const topOffset = topFirst >= 0 ? this.view.scrollY - topFirst : 0;
-    const match = info.blockIdx !== null
-      ? (m) => m?.nodeIdx === info.nodeIdx && m?.blockIdx === info.blockIdx
-      : (m) => m?.nodeIdx === info.nodeIdx;
+    const match = info?.blockIdx !== null
+      ? (m) => m?.nodeIdx === info?.nodeIdx && m?.blockIdx === info?.blockIdx
+      : (m) => m?.nodeIdx === info?.nodeIdx;
     const firstNonEmpty = (m) => {
       for (let i = 0; i < this.lineMap.length; i++) {
         if (m(this.lineMap[i]) && (this.lines[i] ?? []).some((g) => g.t.trim() !== "")) return i;
       }
       return -1;
     };
-    const preHeaderIdx = firstNonEmpty(match);
+    const preHeaderIdx = info ? firstNonEmpty(match) : -1;
     const preHeaderRow = preHeaderIdx >= 0 ? preHeaderIdx - this.view.scrollY : null;
+    return { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow };
+  }
+
+  /** Toggle the block/node under a line-mark, then re-anchor the viewport.
+   *  `info` must be the mark of the frame the user clicked on; `ctx` its
+   *  press-time anchor context. */
+  #toggleAt(info, ctx = null) {
+    if (!info) return false;
+    if (info.imgIdx !== undefined) {
+      const node = this.nodes[info.nodeIdx];
+      const ref = node?.images?.[info.imgIdx];
+      if (ref) { this.app.openImage(ref, { all: node.images, index: info.imgIdx }); return true; }
+    }
+    const node = this.nodes[info.nodeIdx];
+    if (!node) return false;
+    const { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow } = ctx ?? this.#anchorCtx(info);
     const reanchor = () => {
       // primary anchor: the clicked block's header stays at its pre-click
       // viewport row (zero shift) — only when the header was ON-SCREEN.
       // When the fold removed the tail content below, the anchored position
       // may exceed maxScroll: hold it via the view's anchorLock instead of
-      // clamping (the clamp is exactly the 5–6 line slide the user sees).
+      // clamping (the clamp is exactly the slide the user sees).
       if (preHeaderRow !== null && preHeaderRow >= 0 && preHeaderIdx >= 0) {
         const h2 = firstNonEmpty(match);
         if (h2 >= 0) {
@@ -1315,6 +1326,11 @@ export class ChatView extends Widget {
       if (ev.kind === "wheel-up" && this.view.scrollY === 0 && this.hasMore) { this.loadOlder(); return true; }
       if (ev.kind === "press" && ev.button === 0) {
         this.pressY = ev.y - this.view.y + this.view.scrollY;
+        // LOCK the hit identity at press time: the stream keeps growing
+        // between press and release, so resolving the block at release would
+        // toggle a block a few lines away from the one the user saw.
+        this.pressInfo = this.lineMap?.[this.pressY] ?? null;
+        this.pressCtx = this.pressInfo ? this.#anchorCtx(this.pressInfo) : null;
         return true;
       }
       if (ev.kind === "drag" && ev.button === 0 && this.pressY !== null) {
@@ -1330,6 +1346,7 @@ export class ChatView extends Widget {
         const wasPress = this.pressY;
         this.pressY = null;
         if (this.selStart !== null && this.selEnd !== null) {
+          this.pressInfo = null; this.pressCtx = null;
           const text = this.lines.slice(this.selStart, this.selEnd + 1).map((l) => l.map((g) => g.t).join("")).join("\n");
           const rows = this.selEnd - this.selStart + 1;
           this.selStart = this.selEnd = null;
@@ -1338,7 +1355,9 @@ export class ChatView extends Widget {
           return true;
         }
         this.selStart = this.selEnd = null;
-        this.#clickLine(wasPress, ev);
+        this.#toggleAt(this.pressInfo, this.pressCtx);
+        this.pressInfo = null;
+        this.pressCtx = null;
         return true;
       }
       if (ev.kind === "press" && ev.button === 2) {
