@@ -514,6 +514,23 @@ test("collapsing a block folds the content below up naturally (no ghost gap)", (
   assert.equal(afterIdxAfter2, afterIdxBefore, "re-expand restores the exact position");
 });
 
+test("overflow indicator lines carry marks (lineMap stays aligned)", () => {
+  const result = Array.from({ length: 40 }, (_, i) => `result line ${i}`).join("\n");
+  const { chat } = render([{
+    kind: "assistant", id: "a1", step: 1, streaming: false,
+    blocks: [
+      { kind: "tool", name: "bash", args: "ls", result, startedAt: 1, endedAt: 2, view: null },
+      { kind: "text", text: "AFTER" },
+    ],
+  }]);
+  assert.equal(chat.lines.length, chat.lineMap.length, "every rendered line has a mark");
+  const overflow = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("…共 40 行"));
+  assert.ok(overflow >= 0, "overflow indicator present");
+  assert.deepEqual(chat.lineMap[overflow], { nodeIdx: 0, blockIdx: 0 }, "overflow line carries the tool block's mark");
+  const after = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("AFTER"));
+  assert.deepEqual(chat.lineMap[after], { nodeIdx: 0, blockIdx: 1 }, "the next block's mark is aligned");
+});
+
 test("the stream growing between press and release cannot shift the hit", () => {
   const longText = Array.from({ length: 40 }, (_, i) => `para ${i}`).join("\n\n");
   const { chat } = render([

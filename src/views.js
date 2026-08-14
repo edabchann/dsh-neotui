@@ -1071,7 +1071,7 @@ export class ChatView extends Widget {
             mark(realIdx);
             for (const ln of md.slice(1)) { lines.push([{ t: "  " + " ".repeat(pw) }, ...ln]); mark(realIdx); }
           }
-          if (!isExp && text.length > 2000) lines.push([{ t: "  …", fg: K.FAINT }]);
+          if (!isExp && text.length > 2000) { lines.push([{ t: "  …", fg: K.FAINT }]); mark(realIdx); }
           if (node.images) {
             for (let ii = 0; ii < node.images.length; ii++) {
               const img = node.images[ii];
@@ -1170,7 +1170,7 @@ export class ChatView extends Widget {
                   mark(realIdx, bi);
                   const rl = truncateText(b.result, 4000).split("\n");
                   for (const r of rl.slice(0, 30)) { lines.push([{ t: "  " + truncate(r, w - 4), fg: K.DIM }]); mark(realIdx, bi); }
-                  if (rl.length > 30) lines.push([{ t: `  …共 ${rl.length} 行`, fg: K.FAINT }]);
+                  if (rl.length > 30) { lines.push([{ t: `  …共 ${rl.length} 行`, fg: K.FAINT }]); mark(realIdx, bi); }
                 }
               }
               sep();
@@ -1257,6 +1257,9 @@ export class ChatView extends Widget {
     }
     this.lines = lines;
     this.lineMap = lineMap;
+    if (process.env.DSH_TUI_DEBUG_CLICK && lineMap.length !== lines.length) {
+      this.#clickLog(`INVARIANT BROKEN: lines=${lines.length} lineMap=${lineMap.length}`);
+    }
     this.view.setLines(lines);
   }
 
