@@ -130,8 +130,11 @@ function applyEvent(nodes, event, view, log, state = null) {
         const text = partsToText(d.content ?? d.message?.content);
         const images = partsToImages(d.content ?? d.message?.content);
         const id = d.id ?? null;
-        if (text !== null) nodes.push({ kind: "user", text, images, id, step: st.step });
-        else if (images) nodes.push({ kind: "user", text: "", images, id, step: st.step });
+        // the turn timer starts HERE: the user message carries the turn start
+        // so the 🕐 ticker shows even before the first assistant chunk lands
+        const turnStartAt = st.turnStart ?? event.time ?? Date.now();
+        if (text !== null) nodes.push({ kind: "user", text, images, id, step: st.step, turnStartAt });
+        else if (images) nodes.push({ kind: "user", text: "", images, id, step: st.step, turnStartAt });
         break;
       }
       case "assistant/message": {
@@ -1201,7 +1204,9 @@ export class ChatView extends Widget {
       const ckey = `${realIdx}|${w}|${expKey}|${blockKeys}|${this.thinkMode}|${this.bashMode}|${node.streaming ? "s" : "f"}|${themeName()}|${node.step ?? "-"}|${userPrefix()}|${node.turnMs ?? "-"}`;
       // Streaming nodes re-render every frame: their text grows without any
       // change to the cache key, so caching them freezes the live think/tool/text.
-      const hit = node.streaming ? undefined : this.cache.get(ckey);
+      // The LAST node re-renders too while a turn runs — its ticking 🕐 timer
+      // must not be baked into a cached entry.
+      const hit = (node.streaming || (this.running && realIdx === this.nodes.length - 1)) ? undefined : this.cache.get(ckey);
       if (hit) {
         for (const [rs, re, bg] of hit.cards ?? []) {
           this.cardRanges.push([lines.length + rs, lines.length + re, bg]);
@@ -1262,6 +1267,13 @@ export class ChatView extends Widget {
               lines.push([{ t: "  🖼 " + truncate(img.name ?? img.attachmentId ?? "image", w - 12) + (img.width ? ` (${img.width}×${img.height})` : "") + " — 点击查看", fg: T.PURPLE }]);
               markImg(realIdx, ii);
             }
+          }
+          // the turn timer starts at the QUESTION: while the reply is still
+          // in the request/queue phase (no assistant node yet), the ticker
+          // lives under the user message — web-style deep-dive from t=0.
+          if (this.running && realIdx === this.nodes.length - 1 && node.turnStartAt != null) {
+            lines.push([{ t: `  🕐 本轮进行中…已经过 ${fmtDuration(Date.now() - node.turnStartAt)}`, fg: T.WARN, bold: true }]);
+            mark(realIdx);
           }
           sep();
           break;

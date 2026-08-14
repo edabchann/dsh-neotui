@@ -560,6 +560,9 @@ export class TrajectoryPanel extends Widget {
     this.flashUntil = 0;
     this.loadPromise = null;        // dedupes concurrent load(currentSession)
     this.loadTarget = null;
+    this.liveTickAt = 0;     // ⏱ live timer re-render throttle
+    this.tailFetchAt = 0;    // tail-window auto-refresh throttle
+    this.refreshing = false;
     this.winSeqLo = null;           // visible window = first-event SEQ range; null = follow the tail
     this.winSeqHi = null;
     // LEFT click toggles a step's 详细/简略 expansion (the ▸/▾ triangle).
@@ -977,12 +980,36 @@ export class TrajectoryPanel extends Widget {
       screen.text(this.x + 2, this.y + 1, "加载轨迹…", { fg: K.FAINT });
       return;
     }
-    // the live step's ⏱ timer re-renders once per second while the turn runs
-    if (this.app.chat?.running && this.winSeqLo == null && Date.now() - (this.liveTickAt ?? 0) > 1000) {
-      this.liveTickAt = Date.now();
-      this.buildLines();
+    // the live step's ⏱ timer re-renders once per second while the turn runs,
+    // and the tail window refreshes periodically so a NEW turn's step (and
+    // its timer) appears without pressing r
+    if (this.app.chat?.running && this.winSeqLo == null) {
+      if (Date.now() - (this.liveTickAt ?? 0) > 1000) {
+        this.liveTickAt = Date.now();
+        this.buildLines();
+      }
+      if (!this.refreshing && Date.now() - (this.tailFetchAt ?? 0) > 4000) {
+        this.tailFetchAt = Date.now();
+        this.#refreshTail();
+      }
     }
     this.view.render(screen);
+  }
+  /** Re-fetch the tail window while following the live turn. */
+  async #refreshTail() {
+    if (!this.sessionId) return;
+    this.refreshing = true;
+    try {
+      const h = await this.app.api.call("session.history", { sessionId: this.sessionId, maxMessages: 20 });
+      this.allEvents = h.events;
+      this.minSeq = h.events[0]?.event?.seq ?? this.minSeq;
+      this.hasMore = h.hasMore;
+      this.stats = h.projections?.values?.sessionStats ?? this.stats;
+      this.build();
+      this.buildLines();
+      this.app.redraw();
+    } catch { /* next tick retries */ }
+    this.refreshing = false;
   }
   onMouse(ev) {
     // RIGHT click on a step: context menu (expand/collapse · jump · detail).

@@ -704,6 +704,17 @@ test("INSERT mode exits only via Esc (clicks never switch the mode)", () => {
   assert.equal(app.focused, app.chat, "Esc exits INSERT");
 });
 
+test("the turn timer ticks from the QUESTION (before step 1 exists)", () => {
+  const { chat } = render([
+    { kind: "user", id: "u1", step: 0, streaming: false, text: "hello?", turnStartAt: Date.now() - 30000 },
+  ]);
+  chat.running = true;
+  chat.queueRebuild(); chat.flushRebuild();
+  const text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
+  assert.ok(text.includes("🕐 本轮进行中…已经过"), text);
+  assert.ok(!text.includes("总耗时"), "not finalized yet");
+});
+
 test("finalized think blocks keep their start time and turns carry their total", () => {
   const events = [
     { event: { type: "turn/start", seq: 1, time: 1000, data: {} }, view: null },
