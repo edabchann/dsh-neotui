@@ -1094,10 +1094,9 @@ export class ChatView extends Widget {
         }
         case "assistant": {
           const blocks = node.blocks ?? [];
-          if (node.streaming) {
-            lines.push([{ t: "◌ 生成中…", fg: K.FAINT }]);
-            mark(realIdx);
-          }
+          // No separate "◌ 生成中…" marker line: it vanished at finalization,
+          // snapping the pinned view by 1 line. Streaming state is already
+          // visible via the block "…" suffixes and the live timers.
           if (blocks.length === 0) { lines.push([{ t: "  …", fg: K.FAINT }]); mark(realIdx); break; }
           for (let bi = 0; bi < blocks.length; bi++) {
             const b = blocks[bi];
