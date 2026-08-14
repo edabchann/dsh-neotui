@@ -5,7 +5,7 @@ import { userInfo } from "node:os";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ChatView, App, userPrefix, saveTuiConfig, nodeForEvents } from "../src/views.js";
+import { ChatView, App, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig } from "../src/views.js";
 import { TrajectoryPanel, JobsPanel, SettingsPanel } from "../src/panels.js";
 import { fmtDuration, strWidth } from "../src/text.js";
 import { renderMd } from "../src/md.js";
@@ -1170,8 +1170,34 @@ test("settings panel: TUI 界面 namespace saves userPrefix to the config file",
   p.pendingOps.push({ op: "set", path: ["userPrefix"], value: "newname" });
   await p.save();
   assert.equal(userPrefix(), "newname > ", "config file updated");
-  // switching to a real namespace keeps working
-  p.selectNs(1);
+  // switching to a real namespace keeps working (index 1 = 默认展开/折叠)
+  p.selectNs(2);
   assert.equal(p.currentNs().ns, "test");
   saveTuiConfig({ userPrefix: "" });
+});
+
+test("settings panel: 默认展开/折叠 namespace toggles and applies fold defaults", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  app.api.call = async (m) => (m === "settings.describe"
+    ? { namespaces: [{ ns: "test", applies: "live", revision: 1, value: { a: 1 } }], writable: true }
+    : {});
+  app.chat = { cache: new Map(), queueRebuild() {}, thinkMode: "expanded", bashMode: "collapsed", todosVisible: true, expanded: { clear() {} }, collapsedBlocks: { clear() {} } };
+  const p = new SettingsPanel(app);
+  await p.load();
+  assert.equal(p.namespaces[1].ns, "默认展开/折叠");
+  p.selectNs(1);
+  const rows = p.rows.map((r) => r.path.join("."));
+  assert.deepEqual(rows, ["思考块默认展开", "工具块默认展开", "任务清单默认显示"]);
+  assert.equal(p.rows[0].value, true, "think default expanded");
+  assert.equal(p.rows[1].value, false, "bash default collapsed");
+  // click-style toggle: flip 工具块默认展开 to true and save
+  p.pendingOps.push({ op: "set", path: ["工具块默认展开"], value: true });
+  p.pendingOps.push({ op: "set", path: ["任务清单默认显示"], value: false });
+  await p.save();
+  const cfg = loadTuiConfig();
+  assert.deepEqual(cfg.foldDefaults, { think: true, bash: true, todos: false }, "persisted");
+  assert.equal(app.chat.bashMode, "expanded", "applied live");
+  assert.equal(app.chat.todosVisible, false, "todos default applied live");
+  saveTuiConfig({ foldDefaults: { think: true, bash: false, todos: true } }); // restore
 });

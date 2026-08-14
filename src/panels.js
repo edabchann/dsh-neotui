@@ -10,7 +10,7 @@ import { join, basename, extname } from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 
 import { T, cycleTheme, themeName } from "./theme.js";
-import { loadTuiConfig, saveTuiConfig, userPrefix, userName } from "./config.js";
+import { loadTuiConfig, saveTuiConfig, userPrefix, userName, foldDefaults } from "./config.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
 const K = new Proxy({}, { get(_k, key) { return T[key]; } });
 
@@ -1591,6 +1591,13 @@ export class SettingsPanel extends Widget {
       ns: "TUI 界面", applies: "live", local: true,
       value: { userPrefix: userName() },
     });
+    // 默认展开/折叠: the fold-related defaults as a local sub-panel of
+    // booleans (click to toggle), persisted to the TUI config file.
+    const fd = foldDefaults();
+    this.namespaces.splice(1, 0, {
+      ns: "默认展开/折叠", applies: "live", local: true,
+      value: { 思考块默认展开: fd.think, 工具块默认展开: fd.bash, 任务清单默认显示: fd.todos },
+    });
     this.selectNs(0);
   }
   selectNs(i) {
@@ -1719,6 +1726,27 @@ export class SettingsPanel extends Widget {
     if (ns.local) {
       // TUI-local config: write the config file, apply instantly.
       const v = applyOps(ns.value, this.pendingOps);
+      if (ns.ns === "默认展开/折叠") {
+        const patch = { foldDefaults: { think: !!v.思考块默认展开, bash: !!v.工具块默认展开, todos: !!v.任务清单默认显示 } };
+        if (saveTuiConfig(patch)) {
+          this.pendingOps = [];
+          this.app.toast("已保存展开/折叠默认值（即时生效）");
+          // apply live to the current chat
+          const chat = this.app.chat;
+          if (chat) {
+            chat.thinkMode = v.思考块默认展开 ? "expanded" : "collapsed";
+            chat.bashMode = v.工具块默认展开 ? "expanded" : "collapsed";
+            chat.todosVisible = !!v.任务清单默认显示;
+            chat.expanded.clear();
+            chat.collapsedBlocks.clear();
+            chat.queueRebuild();
+          }
+          await this.load();
+        } else {
+          this.app.toast("保存失败：无法写入 TUI 配置文件");
+        }
+        return;
+      }
       const name = String(v.userPrefix ?? "").trim();
       if (saveTuiConfig({ userPrefix: name })) {
         this.pendingOps = [];

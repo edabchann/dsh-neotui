@@ -5,8 +5,8 @@ import { truncate, strWidth, bars, fmtDuration, fmtClock, fmtDateTime } from "./
 import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
-import { userPrefix, saveTuiConfig, loadTuiConfig, userName } from "./config.js";
-export { userPrefix, saveTuiConfig, loadTuiConfig, userName } from "./config.js";
+import { userPrefix, saveTuiConfig, loadTuiConfig, userName, foldDefaults } from "./config.js";
+export { userPrefix, saveTuiConfig, loadTuiConfig, userName, foldDefaults } from "./config.js";
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
   modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker,
@@ -595,9 +595,10 @@ export class ChatView extends Widget {
     this.expanded = new Set();   // node indexes (user-message full text)
     this.expandedTools = new Set();
     this.collapsedBlocks = new Set(); // per-block COLLAPSE (default expanded): `${realIdx}:${bi}`
-    this.thinkMode = "expanded";        // think blocks: expanded by default (t toggles)
-    this.bashMode = "collapsed";        // tool blocks: collapsed by default (b toggles)
-    this.todosVisible = true;           // todo block above the input (Shift+T toggles)
+    const fd = foldDefaults();
+    this.thinkMode = fd.think ? "expanded" : "collapsed";   // t toggles
+    this.bashMode = fd.bash ? "expanded" : "collapsed";     // b toggles
+    this.todosVisible = fd.todos;                           // Shift+T toggles
     this.todoSeen = false;             // once seen, the todo box keeps its height
     this.running = false;
     this.hasMore = false;

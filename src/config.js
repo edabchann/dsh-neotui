@@ -62,3 +62,14 @@ export function userName() {
 export function userPrefix() {
   return `${userName()} > `;
 }
+
+/** Fold defaults (settings → 默认展开/折叠): think/tool blocks and the
+ *  todo list, with the shipped defaults when nothing is configured. */
+export function foldDefaults() {
+  const fd = loadTuiConfig().foldDefaults ?? {};
+  return {
+    think: fd.think !== false,      // think blocks default expanded
+    bash: fd.bash === true,         // tool blocks default collapsed
+    todos: fd.todos !== false,      // todo list default visible
+  };
+}
