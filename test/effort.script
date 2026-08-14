@@ -1,0 +1,13 @@
+wait 800
+mouse press 0 5 3
+wait 1500
+key m c
+wait 800
+text deepseek-official/deepseek-v4-pro
+key enter
+wait 600
+key escape
+wait 300
+key escape
+wait 200
+quit

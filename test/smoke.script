@@ -1,0 +1,18 @@
+# scripted smoke test: boot against live host, open first non-blank session,
+# scroll, expand a tool card, and dump plain frames.
+wait 800
+# list should be populated; open second item (a real session) via sidebar click
+mouse press 0 5 3
+wait 600
+# scroll the chat down and up (pagination hint visible)
+key down
+key down
+wait 300
+key up
+wait 300
+# focus input, type a message, then check it appears in input (do NOT send)
+key i
+text 你好，TUI
+wait 300
+# quit
+quit

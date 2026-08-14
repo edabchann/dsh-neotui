@@ -1,0 +1,21 @@
+wait 800
+mouse press 0 5 3
+wait 2000
+mouse wheel down 50 10
+mouse wheel down 50 10
+mouse wheel down 50 10
+wait 300
+resize 120 40
+wait 300
+mouse wheel down 50 10
+mouse wheel down 50 10
+wait 300
+resize 80 25
+wait 300
+mouse wheel up 50 5
+mouse wheel up 50 5
+wait 300
+key pgdn
+key pgup
+wait 300
+quit

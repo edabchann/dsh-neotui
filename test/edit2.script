@@ -1,0 +1,11 @@
+wait 800
+mouse press 0 5 3
+wait 1000
+key s c
+wait 1200
+mouse press 0 60 1
+wait 400
+text 2099-01-01.9
+key enter
+wait 400
+quit

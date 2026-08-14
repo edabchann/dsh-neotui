@@ -1,0 +1,17 @@
+wait 800
+mouse press 0 5 3
+wait 1000
+key k c
+wait 1000
+mouse press 0 60 2
+wait 500
+key c
+wait 300
+key escape
+wait 200
+key p c
+wait 400
+text 主题
+key enter
+wait 300
+quit

@@ -1,0 +1,12 @@
+wait 800
+mouse press 0 5 3
+wait 1000
+key g c
+wait 600
+key escape
+wait 200
+key m c
+wait 1500
+key escape
+wait 200
+quit

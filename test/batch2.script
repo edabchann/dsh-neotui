@@ -1,0 +1,23 @@
+wait 800
+mouse press 0 5 3
+wait 1500
+key f c
+wait 600
+text 会话
+wait 300
+key escape
+wait 200
+key t c
+wait 2500
+mouse press 0 40 22
+wait 300
+key escape
+wait 200
+key w c
+wait 1500
+text readme
+wait 300
+key escape
+key escape
+wait 200
+quit

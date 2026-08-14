@@ -1,0 +1,109 @@
+# The dsh-tui-app bundle patch: the terminal surface over the dsh-base layer.
+#
+# --attach mode (coexists with a running web UI): the local host plane is
+# disabled below and these disk-backed rows redirect to a throwaway directory,
+# so the attached process never touches the shared $DSH_HOME storage while the
+# TUI speaks to the already-running host.
+
+# ── attach-mode storage isolation (restating base rows replaces their whole config) ──
+
+- id: session-persistence-jsonl
+  inject: [tuiStartup]
+  config:
+    root: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-tui-attach/sessions' || dshHomePath('sessions'))
+
+- id: settings-file
+  inject: [tuiStartup]
+  config:
+    path: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-tui-attach/settings.yaml' || dshHomePath('settings.yaml'))
+
+- id: credentials-local
+  inject: [tuiStartup]
+  config:
+    path: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-tui-attach/.credentials.yaml' || dshHomePath('.credentials.yaml'))
+
+# The dsh-tui-app bundle patch: the terminal surface over the dsh-base layer.
+# Applied after dsh-base's insert; rows here add the API surface the TUI
+# client speaks (HTTP unary + WS frame streams) plus the two tui rows.
+#
+# The base layer deliberately keeps the agent plane (tools, skills, goal,
+# plan, compaction, subagents) enabled: the TUI is single-session and
+# composes its agent process-wide.
+
+- insert:
+    # Ordinary provider for the parsed TUI flags (--host/--port/--session/--cwd).
+    - id: tui-startup
+      name: 'dsh-tui-app/startup'
+
+    # Plain route-registration carrier; host/port come from the tui-startup
+    # provider. Default port 0 = OS-picked (the TUI reads the real port from
+    # the webServer service in-process; no fixed port is required).
+    - id: webserver
+      name: '@deepseek-ai/dsh-host-webserver'
+      inject: [tuiStartup]
+      config:
+        host: !!js ctx.tuiStartup.host ?? '127.0.0.1'
+        port: !!js ctx.tuiStartup.port ?? 0
+
+    # The API gateway: unary /api/<method>, /api/respond, /api/session.export.
+    - id: api-gateway
+      name: '@deepseek-ai/dsh-host-apiproxy'
+
+    - id: api-remotes
+      name: '@deepseek-ai/dsh-api-remotes'
+
+    # The API gateway requires a directory picker (host-side chooser service).
+    - id: directory-picker
+      name: '@deepseek-ai/dsh-host-directory-picker-auto'
+
+    # Owns both ends of the transport: node half binds the gateway to the
+    # webserver under /api (plus the events.mux/events.host WebSocket
+    # downlinks); the TUI client speaks the same wire protocol.
+    - id: connection
+      name: '@deepseek-ai/dsh-client-connection'
+      inject: [tuiStartup]
+      config:
+        trustedHosts: []
+
+    # Storage domain: the session-projection-cache row requires storageDomain;
+    # same three-row stack the web surface mounts.
+    - id: storage
+      name: '@deepseek-ai/dsh-storage'
+
+    - id: storage-json
+      name: '@deepseek-ai/dsh-storage-json'
+      inject: [tuiStartup]
+      config:
+        root: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-tui-attach/storages' || dshHomePath('storages'))
+
+    - id: storage-domain
+      name: '@deepseek-ai/dsh-storage-domain'
+      config:
+        backend: json
+
+    # Host services the TUI surface calls that the base layer does not mount.
+    - id: workspace
+      name: '@deepseek-ai/dsh-workspace'
+
+    - id: session-log-export
+      name: '@deepseek-ai/dsh-session-log-export'
+
+    - id: session-projection-cache
+      name: '@deepseek-ai/dsh-session-projection-cache'
+      config:
+        writeEveryEvents: 200
+        writeIntervalMs: 5000
+
+    - id: session-stats
+      name: '@deepseek-ai/dsh-session-stats'
+
+    # Read-only projection of current Loader entries (ControlPanel 插件页).
+    - id: plugin-inventory
+      name: '@deepseek-ai/dsh-host-plugin-inventory'
+
+    # The TUI application: waits for the embedded webserver port, then takes
+    # over stdin/stdout (alternate screen, SGR mouse, polling client) and
+    # disposes with the tree.
+    - id: tui-runtime
+      name: 'dsh-tui-app'
+      inject: [tuiStartup]

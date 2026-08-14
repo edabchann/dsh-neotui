@@ -1,0 +1,12 @@
+{
+  "name": "dsh-neotui",
+  "version": "0.0.0",
+  "description": "Neo-TUI: mouse-driven terminal UI client for DeepSeek Harness (B-tier per dsh-tui-design.md)",
+  "type": "module",
+  "bin": { "dsh-tui": "bin/dsh-tui.js" },
+  "scripts": {
+    "start": "node bin/dsh-tui.js",
+    "test": "node test/scripted.mjs"
+  },
+  "license": "MIT"
+}

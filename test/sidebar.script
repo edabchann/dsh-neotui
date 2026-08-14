@@ -1,0 +1,18 @@
+wait 800
+# click the dsh group to collapse it
+mouse press 0 5 2
+wait 300
+# click again to expand
+mouse press 0 5 2
+wait 300
+# click the first session under dsh (y=1) to open it
+mouse press 0 5 3
+wait 1500
+# collapse via right-click menu → 折叠全部
+mouse press 2 5 0
+wait 300
+mouse press 0 10 2
+wait 300
+key escape
+wait 200
+quit

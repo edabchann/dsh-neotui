@@ -1,0 +1,7 @@
+wait 800
+mouse press 0 5 3
+wait 1500
+mouse press 0 32 27
+text hello world
+wait 400
+quit

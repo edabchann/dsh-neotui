@@ -1,0 +1,18 @@
+wait 800
+mouse press 0 5 3
+wait 1500
+key f7
+wait 400
+key tab
+wait 400
+key tab
+wait 800
+key backtab
+wait 400
+key escape
+wait 300
+key backtab
+wait 800
+key backtab
+wait 300
+quit

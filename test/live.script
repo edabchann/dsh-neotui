@@ -1,0 +1,5 @@
+# live streaming test: open the rich session, let mux frames stream in
+wait 800
+mouse press 0 5 3
+wait 6000
+quit

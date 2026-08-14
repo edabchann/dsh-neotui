@@ -1,0 +1,9 @@
+wait 800
+mouse press 0 5 3
+wait 1500
+mouse press 0 32 5
+mouse drag 0 32 9
+wait 300
+mouse release 0 32 9
+wait 400
+quit

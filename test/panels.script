@@ -1,0 +1,33 @@
+# panels test: palette, trajectory, workspace, jobs, goal
+wait 800
+mouse press 0 5 3
+wait 1200
+# command palette
+key p c
+wait 400
+key escape
+wait 200
+# trajectory
+key t c
+wait 3000
+key escape
+wait 200
+# workspace
+key w c
+wait 1500
+# expand first workspace dir via click on tree (first dir row y=1)
+mouse press 0 32 1
+wait 800
+key escape
+wait 200
+# jobs popup
+key j c
+wait 300
+key escape
+wait 200
+# goal popup
+key g c
+wait 300
+key escape
+wait 200
+quit

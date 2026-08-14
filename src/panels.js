@@ -1,0 +1,1464 @@
+// panels.js — Command palette, model picker, workspace browser, trajectory
+// timeline, jobs/goal panels, and the terminal image viewer (kitty graphics
+// protocol with external-viewer / chafa fallbacks).
+import { Widget, ScrollView, Input, Popup } from "./widgets.js";
+import { strWidth, truncate, pad } from "./text.js";
+import { renderMd, C } from "./md.js";
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, basename, extname } from "node:path";
+import { spawn, execFileSync } from "node:child_process";
+
+import { T, cycleTheme, themeName } from "./theme.js";
+// Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
+const K = new Proxy({}, { get(_k, key) { return T[key]; } });
+
+// ---- fuzzy matcher ----
+
+export function fuzzyScore(query, text) {
+  const q = query.toLowerCase();
+  const t = text.toLowerCase();
+  if (!q) return 1;
+  if (t.includes(q)) return 1000 + (1000 - t.indexOf(q)) - t.length / 10;
+  let qi = 0, score = 0, streak = 0, firstHit = true;
+  for (let ti = 0; ti < t.length && qi < q.length; ti++) {
+    if (t[ti] === q[qi]) {
+      score += 10 + streak * 6 + (firstHit ? 5 : 0) + (ti === 0 || /[\s\-_/.]/.test(t[ti - 1]) ? 8 : 0);
+      streak++;
+      qi++;
+      firstHit = false;
+    } else {
+      streak = 0;
+      score -= 0.5;
+    }
+  }
+  return qi === q.length ? score : -1;
+}
+
+// ---- Picker: floating fuzzy selector (mouse + keyboard) ----
+
+export class Picker extends Widget {
+  constructor({ x, y, w, h, title, items, onPick, onCancel, placeholder = "输入以筛选…" }) {
+    super({ x, y, w, h });
+    this.title = title;
+    this.items = items;        // { label, hint?, action, keywords? }
+    this.onPick = onPick;
+    this.onCancel = onCancel;
+    this.placeholder = placeholder;
+    this.query = "";
+    this.sel = 0;
+    this.scroll = 0;
+    this.input = new Input({ x: x + 1, y: y + 1, w: w - 2, h: 1, prompt: "❯ ", placeholder, bg: T.BG2 });
+  }
+  filtered() {
+    const scored = this.items
+      .map((it) => ({ it, s: fuzzyScore(this.query, `${it.label} ${it.hint ?? ""} ${it.keywords ?? ""}`) }))
+      .filter((e) => e.s > 0 || this.query === "")
+      .sort((a, b) => b.s - a.s)
+      .map((e) => e.it);
+    if (this.sel >= scored.length) this.sel = Math.max(0, scored.length - 1);
+    return scored;
+  }
+  render(screen) {
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.BG2 });
+    screen.box(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, { fg: K.ACCENT, bg: T.BG2 }, this.title);
+    this.input.render(screen);
+    const list = this.filtered();
+    const lh = this.h - 3;
+    if (this.sel < this.scroll) this.scroll = this.sel;
+    if (this.sel >= this.scroll + lh) this.scroll = this.sel - lh + 1;
+    for (let i = 0; i < lh; i++) {
+      const idx = this.scroll + i;
+      const it = list[idx];
+      const y = this.y + 2 + i;
+      if (!it) { screen.hline(this.x + 1, this.x + this.w - 2, y, " ", { bg: T.BG2 }); continue; }
+      const sel = idx === this.sel;
+      screen.fillRect(this.x + 1, y, this.x + this.w - 2, y, " ", { bg: sel ? T.MENUSEL : T.BG2 });
+      const hint = it.hint ? "  " + it.hint : "";
+      screen.text(this.x + 2, y, truncate(it.label, this.w - 4 - strWidth(hint)), { fg: sel ? 0xffffff : K.TXT, bg: sel ? T.MENUSEL : T.BG2, attrs: sel ? 1 : 0 });
+      if (it.hint) screen.text(this.x + this.w - 2 - strWidth(hint), y, hint, { fg: K.DIM, bg: sel ? T.MENUSEL : T.BG2 });
+    }
+  }
+  onMouse(ev) {
+    if (ev.kind === "press" && ev.button === 0) {
+      const idx = this.scroll + (ev.y - this.y - 2);
+      const list = this.filtered();
+      if (ev.y === this.y + 1) { this.input.onMouse(ev); return true; }
+      if (idx >= 0 && idx < list.length) { this.onPick?.(list[idx]); return true; }
+      return true;
+    }
+    if (ev.kind === "wheel-up") { this.sel = Math.max(0, this.sel - 1); return true; }
+    if (ev.kind === "wheel-down") { this.sel = Math.min(Math.max(0, this.filtered().length - 1), this.sel + 1); return true; }
+    return true;
+  }
+  onKey(ev) {
+    if (ev.type === "text") { this.query += ev.text; this.sel = 0; return true; }
+    if (ev.type !== "key") return false;
+    switch (ev.name) {
+      case "up": this.sel = Math.max(0, this.sel - 1); return true;
+      case "down": this.sel = Math.min(Math.max(0, this.filtered().length - 1), this.sel + 1); return true;
+      case "enter": { const l = this.filtered(); if (l[this.sel]) { this.onPick?.(l[this.sel]); } return true; }
+      case "escape": this.onCancel?.(); return true;
+      case "backspace": this.query = this.query.slice(0, -1); this.sel = 0; return true;
+      case "char": if (!ev.ctrl) { this.query += ev.text; this.sel = 0; return true; } return false;
+    }
+    return false;
+  }
+}
+
+// ---- Model picker ----
+
+export function buildModelPicker(app) {
+  const w = Math.min(70, app.screen.w - 4), h = Math.min(24, app.screen.h - 4);
+  const selectModel = async (it) => {
+    app.overlay = null; app.redraw();
+    if (!app.currentSession) { app.toast("先打开一个会话"); return; }
+    try {
+      await app.api.call("session.selectModel", { sessionId: app.currentSession, provider: it.provider, model: it.model, ...(it.effort ? { reasoningEffort: it.effort } : {}) });
+      app.updateModel();
+      app.toast(`已切换 ${it.provider}/${it.model}${it.effort ? ` (${it.effort})` : ""}`);
+    } catch (e) { app.toast(`切换失败: ${e.message}`); }
+  };
+  const picker = new Picker({
+    x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2),
+    w, h, title: "选择模型",
+    items: [],
+    onCancel: () => { app.overlay = null; app.redraw(); },
+    onPick: (it) => {
+      const efforts = it.efforts ?? [];
+      if (efforts.length > 0) {
+        // second step: reasoning effort
+        const w2 = Math.min(60, app.screen.w - 4), h2 = Math.min(efforts.length + 4, app.screen.h - 4);
+        app.overlay = new Picker({
+          x: Math.floor((app.screen.w - w2) / 2), y: Math.floor((app.screen.h - h2) / 2),
+          w: w2, h: h2, title: `思考强度 — ${it.model}`,
+          items: efforts.map((e) => ({
+            label: e.name ?? e.id, hint: e.id === it.defaultEffort ? "默认" : (e.description ?? "").slice(0, 28),
+            provider: it.provider, model: it.model, effort: e.id,
+          })),
+          onCancel: () => { app.overlay = picker; app.redraw(); },
+          onPick: (eff) => selectModel(eff),
+        });
+        app.redraw();
+      } else {
+        selectModel(it);
+      }
+    },
+  });
+  app.api.call("llm.models").then(({ groups, failures }) => {
+    const items = [];
+    for (const g of groups) {
+      for (const m of g.models) {
+        items.push({
+          label: `${g.id}/${m.id}`,
+          hint: m.name ?? m.id,
+          provider: g.id, model: m.id,
+          efforts: m.reasoning?.efforts ?? [],
+          defaultEffort: m.reasoning?.defaultEffort,
+          keywords: `${m.description ?? ""} ${g.name}`,
+        });
+      }
+    }
+    picker.items = items;
+    app.redraw();
+  }).catch((e) => app.toast(`模型列表失败: ${e.message}`));
+  return picker;
+}
+
+// ---- Mode (agent preset) & permission pickers ----
+
+export const MODE_NAMES = { standard: "标准模式", code: "PTC 模式", minimal: "极简模式", cordis: "创造模式" };
+export const PERM_NAMES = { "read-only": "只读", "workspace-write": "工作区写入", "danger-full-access": "完全访问" };
+
+export function modeName(id) { return MODE_NAMES[id] ?? id; }
+export function permName(id) { return PERM_NAMES[id] ?? id; }
+
+/** Four-mode selector: the shipped agent presets (standard/code/minimal/cordis). */
+export function buildModePicker(app) {
+  const w = Math.min(66, app.screen.w - 4), h = Math.min(18, app.screen.h - 4);
+  const picker = new Picker({
+    x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2),
+    w, h, title: "模式（Agent 预设）",
+    items: [],
+    onCancel: () => { app.overlay = null; app.redraw(); },
+    onPick: (it) => { app.overlay = null; app.redraw(); app.selectPreset(it.id); },
+  });
+  app.api.call("agentPreset.list").then(({ presets }) => {
+    const cur = app.sessions.find((s) => s.sessionId === app.currentSession)?.agentPreset;
+    picker.items = presets.filter((p) => !p.broken).map((p) => ({
+      label: `${p.id === cur ? "●" : p.isDefault ? "◐" : "○"} ${modeName(p.id)}`,
+      hint: p.id === cur ? "当前" : p.isDefault ? "默认" : p.id,
+      id: p.id,
+      keywords: `${p.id} ${p.description ?? ""}`,
+    }));
+    app.redraw();
+  }).catch((e) => app.toast(`模式列表失败: ${e.message}`));
+  return picker;
+}
+
+/** Three-permission selector: read-only / workspace-write / danger-full-access. */
+export function buildPermissionPicker(app) {
+  const perms = app.projections.permissions;
+  const options = (perms?.options ?? []).filter((o) => o.value !== "custom");
+  const current = perms?.currentValue;
+  const w = Math.min(60, app.screen.w - 4), h = Math.min(options.length + 4, 16);
+  return new Picker({
+    x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2),
+    w, h, title: "权限（沙箱 + 审批）",
+    items: options.map((o) => ({
+      label: `${o.value === current ? "●" : "○"} ${permName(o.value)}`,
+      hint: o.value === current ? "当前" : o.value,
+      value: o.value,
+      keywords: o.value,
+    })),
+    onCancel: () => { app.overlay = null; app.redraw(); },
+    onPick: (it) => { app.overlay = null; app.redraw(); app.switchPermission(it.value); },
+  });
+}
+
+// ---- Command palette ----
+
+export function buildCommandPalette(app) {
+  const w = Math.min(70, app.screen.w - 4), h = Math.min(26, app.screen.h - 4);
+  const items = [
+    { label: "新建会话", hint: "n", action: () => app.newSession(), keywords: "new session create" },
+    { label: "打开会话…", hint: "o", action: () => app.openSessionPicker(), keywords: "open session" },
+    { label: "搜索会话", hint: "/", action: () => app.startSearch(), keywords: "search find" },
+    { label: "重命名当前会话", action: () => app.renameCurrent(), keywords: "rename title" },
+    { label: "切换模型", hint: "m", action: () => { app.overlay = buildModelPicker(app); app.redraw(); }, keywords: "model provider llm" },
+    { label: "模式（Agent 预设）", action: () => app.showModePicker(), keywords: "mode preset standard code minimal cordis" },
+    { label: "权限（沙箱 + 审批）", action: () => app.showPermissionPicker(), keywords: "permission sandbox read-only write full access" },
+    { label: "工作区文件", hint: "w", action: () => app.setMode("workspace"), keywords: "workspace files tree" },
+    { label: "轨迹视图", hint: "t", action: () => app.setMode("trajectory"), keywords: "trajectory timeline trace" },
+    { label: "任务列表", hint: "j", action: () => app.showJobs(), keywords: "jobs tasks" },
+    { label: "目标状态", hint: "g", action: () => app.showGoal(), keywords: "goal objective" },
+    { label: "刷新会话列表", action: () => app.refreshSessions(), keywords: "refresh reload" },
+    { label: "切换主题", action: () => { cycleTheme(); app.toast(`主题: ${themeName()}`); }, keywords: "theme color" },
+    { label: "复制当前会话 ID", action: () => app.copyText(app.currentSession ?? ""), keywords: "copy id" },
+    { label: "退出", hint: "q", action: () => app.stop(), keywords: "quit exit" },
+  ];
+  return new Picker({
+    x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2),
+    w, h, title: "命令", items,
+    onCancel: () => { app.overlay = null; app.redraw(); },
+    onPick: (it) => { app.overlay = null; it.action(); app.redraw(); },
+  });
+}
+
+// ---- Workspace browser ----
+
+export class WorkspacePanel extends Widget {
+  constructor(app) {
+    super({ x: 30, y: 0, w: app.screen.w - 30, h: app.screen.h - 1 });
+    this.app = app;
+    this.workspaces = [];
+    this.tree = [];          // { depth, name, path, isDir, open, children? }
+    this.treeScroll = new ScrollView({ x: this.x + 1, y: this.y + 1, w: Math.floor(this.w / 2), h: this.h - 2, showScrollbar: true });
+    this.preview = new ScrollView({ x: this.x + Math.floor(this.w / 2) + 1, y: this.y + 1, w: this.w - Math.floor(this.w / 2) - 2, h: this.h - 2, showScrollbar: true });
+    this.previewPath = null;
+  }
+  relayout(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    const half = Math.floor(w / 2);
+    this.treeScroll.x = x + 1; this.treeScroll.y = y + 1; this.treeScroll.w = half; this.treeScroll.h = h - 2;
+    this.preview.x = x + half + 1; this.preview.y = y + 1; this.preview.w = w - half - 2; this.preview.h = h - 2;
+  }
+  async load() {
+    this.query = "";
+    this.searchSel = 0;
+    this.searchResults = [];
+    try {
+      const { items } = await this.app.api.call("workspace.list");
+      this.workspaces = items;
+      const tree = [];
+      for (const ws of items) {
+        tree.push({ depth: 0, name: `▣ ${ws.title}`, path: ws.path, isDir: true, open: false, ws: true });
+      }
+      this.tree = tree;
+      this.rebuildTree();
+    } catch (e) {
+      this.app.toast(`工作区加载失败: ${e.message}`);
+      this.app.setMode("chat");
+    }
+  }
+  expand(node) {
+    node.open = !node.open;
+    this.rebuildTree();
+  }
+  rebuildTree() {
+    const out = [];
+    const walk = (nodes) => {
+      for (const n of nodes) {
+        out.push(n);
+        if (n.isDir && n.open && n.children) walk(n.children);
+      }
+    };
+    walk(this.tree);
+    this.treeLines = out.map((n) => {
+      const indent = "  ".repeat(n.depth);
+      const icon = n.isDir ? (n.open ? "▾" : "▸") : "·";
+      const segs = [{ t: `${indent}${icon} ${n.name}`, fg: n.isDir ? K.ACCENT : K.TXT, bold: n.ws }];
+      return segs;
+    });
+    this.treeScroll.setLines(this.treeLines);
+    this.app.redraw();
+  }
+  async fillChildren(node) {
+    try {
+      const entries = readdirSync(node.path, { withFileTypes: true })
+        .filter((d) => !d.name.startsWith(".") && d.name !== "node_modules")
+        .sort((a, b) => (a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1));
+      node.children = entries.map((d) => ({
+        depth: node.depth + 1,
+        name: d.name,
+        path: join(node.path, d.name),
+        isDir: d.isDirectory(),
+        open: false,
+        children: d.isDirectory() ? [] : null,
+      }));
+    } catch { node.children = []; }
+  }
+  onMouse(ev) {
+    if (ev.x >= this.x + 1 && ev.x < this.x + Math.floor(this.w / 2)) {
+      const idx = this.treeScroll.scrollY + (ev.y - this.treeScroll.y);
+      const node = this.treeLinesNode(idx);
+      if (node) {
+        if (ev.kind === "press" && ev.button === 0) {
+          if (node.isDir) {
+            if (!node.open && (!node.children || node.children.length === 0)) { this.fillChildren(node); }
+            this.expand(node);
+          } else if (!node.ws) this.previewFile(node.path);
+          return true;
+        }
+        if (ev.kind === "wheel-up" || ev.kind === "wheel-down") return this.treeScroll.onMouse(ev);
+      }
+      return false;
+    }
+    return this.preview.onMouse(ev);
+  }
+  treeLinesNode(idx) {
+    let i = 0;
+    const find = (nodes) => {
+      for (const n of nodes) {
+        if (i === idx) return n;
+        i++;
+        if (n.isDir && n.open && n.children) {
+          const r = find(n.children);
+          if (r) return r;
+        }
+      }
+      return null;
+    };
+    return find(this.tree);
+  }
+  previewFile(path) {
+    this.previewPath = path;
+    try {
+      const st = statSync(path);
+      if (st.size > 256 * 1024) {
+        this.preview.setLines([[{ t: `文件过大（${Math.round(st.size / 1024)}KB），仅预览前 256KB`, fg: K.WARN }]]);
+        return;
+      }
+      const text = readFileSync(path, "utf8");
+      const lang = extname(path).slice(1);
+      const lines = [];
+      lines.push([{ t: basename(path), fg: K.ACCENT, bold: true, underline: true }]);
+      lines.push([{ t: "" }]);
+      const codeLines = text.split("\n").slice(0, 300);
+      let inFence = false;
+      for (const cl of codeLines) {
+        if (cl.trim().startsWith("```")) { inFence = !inFence; lines.push([{ t: cl, fg: K.FAINT }]); continue; }
+        if (inFence) lines.push([{ t: truncate(cl, this.preview.w - 2), fg: K.DIM, code: true }]);
+        else lines.push([{ t: truncate(cl, this.preview.w - 2), fg: K.TXT }]);
+      }
+      this.preview.setLines(lines);
+      this.app.redraw();
+    } catch (e) {
+      this.preview.setLines([[{ t: `读取失败: ${e.message}`, fg: K.ERR }]]);
+    }
+  }
+  render(screen) {
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", {});
+    const mid = this.x + Math.floor(this.w / 2);
+    screen.put(mid, this.y, "┬", { fg: T.BORDER });
+    screen.vline(mid, this.y + 1, this.y + this.h - 1);
+    screen.text(this.x + 1, this.y, ` 工作区 (${this.workspaces.length}) — 点击目录展开，/ 搜索文件`, { fg: K.DIM });
+    if (this.query) {
+      const results = [];
+      const walk = (nodes) => {
+        for (const n of nodes) {
+          if (!n.ws && !n.isDir && n.name.toLowerCase().includes(this.query.toLowerCase())) results.push(n.path);
+          if (n.children) walk(n.children);
+        }
+      };
+      walk(this.tree);
+      this.searchResults = results;
+      for (let i = 0; i < Math.min(this.h - 2, results.length); i++) {
+        const sel = i === this.searchSel;
+        screen.fillRect(this.x + 1, this.y + 2 + i, mid - 2, this.y + 2 + i, " ", { bg: sel ? K.MENUSEL : -1 });
+        screen.text(this.x + 2, this.y + 2 + i, truncate("⚲ " + basename(results[i]), mid - 6), { fg: sel ? K.BOLD : K.TXT, bg: sel ? K.MENUSEL : -1 });
+      }
+      screen.text(this.x + 1, this.y + this.h - 1, ` 匹配 ${results.length} 个文件 · Esc 退出搜索`, { fg: K.FAINT });
+      return;
+    }
+    this.treeScroll.render(screen);
+    this.preview.render(screen);
+  }
+  onKey(ev) {
+    if (ev.type === "text") { this.query += ev.text; this.searchSel = 0; this.app.redraw(); return true; }
+    if (ev.type !== "key") return false;
+    if (ev.name === "escape") {
+      if (this.query) { this.query = ""; this.app.redraw(); return true; }
+      this.app.setMode("chat");
+      return true;
+    }
+    if (ev.name === "backspace") { this.query = this.query.slice(0, -1); this.app.redraw(); return true; }
+    if (ev.name === "down" && this.query) { this.searchSel = Math.min((this.searchResults?.length ?? 1) - 1, (this.searchSel ?? 0) + 1); this.app.redraw(); return true; }
+    if (ev.name === "up" && this.query) { this.searchSel = Math.max(0, (this.searchSel ?? 0) - 1); this.app.redraw(); return true; }
+    if (ev.name === "enter" && this.query && this.searchResults?.length) { this.previewFile(this.searchResults[this.searchSel ?? 0]); return true; }
+    if (ev.name === "up" || ev.name === "down" || ev.name === "pgup" || ev.name === "pgdn") return this.treeScroll.onKey?.(ev) ?? false;
+    return false;
+  }
+}
+
+// ---- Trajectory view ----
+
+export class TrajectoryPanel extends Widget {
+  constructor(app) {
+    super({ x: 30, y: 1, w: app.screen.w - 30, h: app.screen.h - 2 });
+    this.app = app;
+    this.steps = [];
+    this.stats = null;
+    this.loading = false;
+    this.loadingOlder = false;
+    this.hasMore = false;
+    this.minSeq = null;
+    this.allEvents = [];
+    this.sessionId = null;
+    this.view = new ScrollView({ x: this.x, y: this.y, w: this.w, h: this.h, showScrollbar: true, onClick: (y) => this.#clickLine(y) });
+    this.stepLines = [];
+    this.query = "";
+  }
+  #clickLine(lineIdx) {
+    if (this.hasMore && lineIdx === 1) { this.loadOlder(); return true; }
+    const si = this.stepLines[lineIdx];
+    if (si === undefined) return false;
+    const step = this.steps[si];
+    if (!step) return false;
+    const t0 = step.events[0]?.time, t1 = step.events[step.events.length - 1]?.time;
+    const items = step.events.map((e, i) => {
+      const d = e.data ?? {};
+      let summary = e.type;
+      if (e.type === "user/message") summary = `❯ ${String(d.content?.[0]?.text ?? "").slice(0, 40)}`;
+      else if (e.type === "tool/call") summary = `⚙ ${d.name ?? "tool"} ${String(d.arguments ?? "").slice(0, 30)}`;
+      else if (e.type === "tool/result") summary = "↳ 结果";
+      else if (e.type === "assistant/message") summary = `◉ ${String(d.message?.content?.find((c) => c.type === "text")?.text ?? "").slice(0, 40)}`;
+      else if (e.type === "assistant/chunk") {
+        const ch = d.chunk ?? {};
+        summary = ch.type === "text-delta" ? String(ch.delta ?? "").slice(0, 40) : `[${ch.blockType ?? ch.type}]`;
+      }
+      return { label: truncate(summary, 60), hint: `#${e.seq}`, idx: i, event: e };
+    });
+    if (t0 && t1) items.unshift({ label: `⏱ 步骤 ${step.step} · ${step.events.length} 事件 · ${fmtMs(t1 - t0)}`, hint: "", idx: -1, event: null });
+    const w = Math.min(78, this.app.screen.w - 8), h = Math.min(22, this.app.screen.h - 4);
+    this.app.overlay = new Picker({
+      x: Math.floor((this.app.screen.w - w) / 2), y: Math.floor((this.app.screen.h - h) / 2),
+      w, h, title: "轨迹详情", items,
+      onCancel: () => this.app.closeOverlay(),
+      onPick: (it) => {
+        if (!it.event) { this.app.closeOverlay(); return; }
+        const e = it.event;
+        const d = e.data ?? {};
+        let body = "";
+        if (e.type === "tool/result") body = String(d.message?.content?.[0]?.content?.map((c) => c.text ?? "").join("\n") ?? JSON.stringify(d));
+        else if (e.type === "tool/call") body = String(d.arguments ?? "");
+        else if (e.type === "assistant/message") body = String(d.message?.content?.map((c) => c.text ?? "").join("\n") ?? "");
+        else body = JSON.stringify(d, null, 2);
+        const lines = body.split("\n").slice(0, 40).map((l) => [{ t: truncate(l, w - 6), fg: K.TXT }]);
+        // centered detail popup (never the stale top-left corner)
+        const pw = Math.min(80, this.app.screen.w - 4);
+        const ph = Math.min(lines.length + 5, 24);
+        this.app.overlay = new Popup({
+          x: Math.floor((this.app.screen.w - pw) / 2), y: Math.floor((this.app.screen.h - ph) / 2),
+          w: pw, h: ph, title: `#${e.seq} ${e.type}`,
+          lines: [[{ t: "" }], ...lines], buttons: [{ label: "关闭", action: "close" }],
+          onAction: () => this.app.closeOverlay(),
+        });
+        this.app.redraw();
+      },
+    });
+    this.app.redraw();
+    return true;
+  }
+  relayout(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = h;
+    this.buildLines();
+  }
+  async load(sessionId) {
+    this.sessionId = sessionId;
+    this.loading = true;
+    this.steps = [];
+    this.allEvents = [];
+    this.stats = null;
+    this.hasMore = false;
+    this.minSeq = null;
+    this.app.setStatus("加载轨迹…");
+    try {
+      // One bounded call for the recent steps (maxMessages = model messages =
+      // steps). Instant, and older steps load on demand via PgUp/click.
+      const h = await this.app.api.call("session.history", { sessionId, maxMessages: 40 });
+      this.stats = h.projections?.values?.sessionStats ?? null;
+      this.minSeq = h.events[0]?.event?.seq ?? null;
+      this.hasMore = h.hasMore;
+      this.allEvents = h.events;
+      this.build();
+    } catch (e) { this.app.toast(`轨迹加载失败: ${e.message}`); }
+    this.loading = false;
+    this.app.setStatus("");
+    this.buildLines();
+    this.app.redraw();
+  }
+  async loadOlder() {
+    if (!this.hasMore || this.loadingOlder || this.minSeq == null) return;
+    this.loadingOlder = true;
+    this.app.setStatus("加载更早轨迹…");
+    try {
+      const h = await this.app.api.call("session.history", { sessionId: this.sessionId, beforeSeq: this.minSeq, maxMessages: 40 });
+      if (h.events.length === 0) { this.hasMore = false; }
+      else {
+        this.minSeq = h.events[0]?.event?.seq ?? this.minSeq;
+        this.hasMore = h.hasMore;
+        this.allEvents = [...h.events, ...this.allEvents].sort((a, b) => a.event.seq - b.event.seq);
+        this.build();
+      }
+    } catch (e) { this.app.toast(`加载更早失败: ${e.message}`); }
+    this.loadingOlder = false;
+    this.app.setStatus("");
+    this.buildLines();
+    this.app.redraw();
+  }
+  build() {
+    // Segment on step/start: each model message is one step (the web view's
+    // trajectory node), which is what maxMessages actually pages over.
+    const steps = [];
+    let cur = null;
+    for (const { event } of this.allEvents) {
+      const d = event.data ?? {};
+      if (event.type === "step/start" || event.type === "turn/start") {
+        if (cur && cur.events.length) steps.push(cur);
+        cur = { events: [], step: d.step ?? steps.length + 1, turn: d.turn };
+      }
+      if (cur) cur.events.push(event);
+    }
+    if (cur && cur.events.length) steps.push(cur);
+    this.steps = steps.slice(-600);
+  }
+  buildLines() {
+    const w = Math.max(40, this.w - 2);
+    const lines = [];
+    lines.push([{ t: "轨迹 — 步骤时间轴（每行一个色块，点击查看详情）", fg: K.ACCENT, bold: true }]);
+    if (this.hasMore) lines.push([{ t: "▲ 更早步骤（点击 / PgUp 加载）", fg: K.FAINT }]);
+    else lines.push([{ t: "" }]);
+    const st = this.stats;
+    if (st) {
+      lines.push([{ t: `回合 ${st.turns} · 步骤 ${st.steps} · LLM ${fmtMs(st.llmMs)} · 工具 ${fmtMs(st.toolMs)}`, fg: K.DIM }]);
+    }
+    lines.push([{ t: `步骤（已加载 ${this.steps.length}${this.hasMore ? "+" : ""}）：`, fg: K.DIM, underline: true }]);
+    this.stepLines = [];
+    const list = this.query
+      ? this.steps.filter((t) => t.events.some((e) => {
+        const d = e.data ?? {};
+        const hay = `${e.type} ${d.name ?? ""} ${typeof d.content === "string" ? d.content : ""}`.toLowerCase();
+        return hay.includes(this.query.toLowerCase());
+      }))
+      : this.steps;
+    for (const step of list.slice(-40).reverse()) {
+      const si = this.steps.indexOf(step);
+      const tools = [...new Set(step.events.filter((e) => e.type === "tool/call").map((e) => e.data?.name))];
+      const hasResult = step.events.some((e) => e.type === "tool/result");
+      const hasReasoning = step.events.some((e) => e.type === "assistant/chunk" && e.data?.chunk?.blockType === "reasoning");
+      const t0 = step.events[0]?.time, t1 = step.events[step.events.length - 1]?.time;
+      const dur = t0 && t1 ? fmtMs(t1 - t0) : "—";
+      const bg = tools.length ? (hasResult ? T.TOOLOK : T.TOOLBG) : hasReasoning ? T.THINKBG : T.CARD;
+      const summary = tools.slice(0, 3).join(",") || (hasReasoning ? "模型推理" : "纯文本");
+      const label = ` step ${String(step.step).padStart(3)}  ${pad(dur, 8)}  ${summary}`;
+      const segs = [{ t: label, fg: K.TXT, bg, bold: true }];
+      const fill = w - strWidth(label);
+      if (fill > 0) segs.push({ t: " ".repeat(fill), bg });
+      lines.push(segs);
+      this.stepLines[lines.length - 1] = si;
+    }
+    this.view.setLines(lines);
+  }
+  render(screen) {
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", {});
+    if (this.loading && this.steps.length === 0) {
+      screen.text(this.x + 2, this.y + 1, "加载轨迹…", { fg: K.FAINT });
+      return;
+    }
+    this.view.render(screen);
+  }
+  onMouse(ev) { return this.view.onMouse(ev); }
+  onKey(ev) {
+    if (ev.type === "text") { this.query += ev.text; this.buildLines(); this.app.redraw(); return true; }
+    if (ev.type !== "key") return false;
+    if (ev.name === "escape") {
+      if (this.query) { this.query = ""; this.buildLines(); this.app.redraw(); return true; }
+      this.app.setMode("chat");
+      return true;
+    }
+    if (ev.name === "backspace") { this.query = this.query.slice(0, -1); this.buildLines(); this.app.redraw(); return true; }
+    if (ev.name === "pgup") { if (this.view.scrollY === 0 && this.hasMore) { this.loadOlder(); return true; } return this.view.scroll(-this.view.h); }
+    if (ev.name === "pgdn" || ev.name === "up" || ev.name === "down") return this.view.onKey(ev);
+    return false;
+  }
+}
+
+function fmtMs(ms) {
+  if (ms == null || isNaN(ms)) return "—";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${(ms / 60000).toFixed(1)}m`;
+}
+
+// ---- Terminal image viewer (kitty graphics / external viewer / chafa) ----
+
+export function kittyCapable(env = process.env) {
+  if (env.KITTY_WINDOW_ID || env.TERM_PROGRAM === "WezTerm" || env.TERM_PROGRAM === "foot" || env.TERM === "xterm-kitty") return true;
+  if (env.DSH_TUI_NO_KITTY) return false;
+  return false;
+}
+
+export class ImagePopup extends Popup {
+  constructor({ app, ref, sessionId, refs = null, index = 0 }) {
+    const w = Math.min(80, app.screen.w - 4), h = Math.min(24, app.screen.h - 4);
+    super({
+      x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2),
+      w, h, title: `🖼 ${truncate(ref?.name ?? "image", 50)}`,
+      lines: [[{ t: "加载中…", fg: K.DIM }]],
+      buttons: [
+        { label: "打开查看器", action: "viewer" },
+        { label: "关闭", action: "close" },
+      ],
+      onAction: (btn) => {
+        if (btn.action === "close" || btn.action === "__cancel__") app.closeOverlay();
+        else if (btn.action === "viewer") this.openExternal();
+      },
+    });
+    this.app = app;
+    this.refs = (refs && refs.length > 0) ? refs : [ref];
+    this.index = Math.min(index, this.refs.length - 1);
+    this.ref = this.refs[this.index];
+    this.sessionId = sessionId;
+    this.data = null;
+    this.imageKey = "";
+    this.load();
+  }
+  #show(idx) {
+    this.index = (idx + this.refs.length) % this.refs.length;
+    this.ref = this.refs[this.index];
+    this.data = null;
+    this.chafaTmp = null;
+    this.lines = [[{ t: "加载中…", fg: K.DIM }]];
+    this.app.redraw();
+    this.load();
+  }
+  galleryTitle() {
+    const nm = this.ref?.name ?? "image";
+    const dims = this.ref?.width ? ` · ${this.ref.width}×${this.ref.height}` : "";
+    return `🖼 ${truncate(nm, 40)}${this.refs.length > 1 ? ` (${this.index + 1}/${this.refs.length})` : ""}${dims}`;
+  }
+  onKey(ev) {
+    if (ev.type === "key" && ev.name === "left" && this.refs.length > 1) { this.#show(this.index - 1); return true; }
+    if (ev.type === "key" && ev.name === "right" && this.refs.length > 1) { this.#show(this.index + 1); return true; }
+    return super.onKey(ev);
+  }
+  async load() {
+    try {
+      if (!this.sessionId || !this.ref?.attachmentId) throw new Error("无附件引用");
+      const res = await this.app.api.call("session.attachment", { sessionId: this.sessionId, attachmentId: this.ref.attachmentId });
+      this.data = Buffer.from(res.data ?? "", "base64");
+      this.title = this.galleryTitle();
+      this.lines = [[{ t: `${res.attachment.mediaType} · ${res.attachment.width}×${res.attachment.height} · ${Math.round(this.data.length / 1024)}KB`, fg: K.DIM }]];
+      if (this.refs.length > 1) this.lines.push([{ t: "←/→ 切换图片", fg: K.FAINT }]);
+      this.renderImage();
+    } catch (e) {
+      this.lines = [[{ t: `加载失败: ${e.message}`, fg: K.ERR }]];
+    }
+    this.app.redraw();
+  }
+  renderImage() {
+    if (kittyCapable()) {
+      this.kittyLines = 0;
+      this.kittyCols = 0;
+      // mark: kitty transmission happens in App after frame render (raster overlay)
+      this.imageKey = `${this.data.length}:${Date.now()}`;
+      this.app.toast("kitty 图形协议显示");
+      return;
+    }
+    // non-kitty: try chafa for an in-terminal preview
+    if (this.tryChafa()) return;
+    this.lines = [
+      [{ t: "终端不支持图形协议；使用「打开查看器」按钮，或安装 chafa 获得字符预览", fg: K.DIM }],
+    ];
+  }
+  tryChafa() {
+    try {
+      const tmp = join(tmpdir(), `dsh-tui-${Date.now()}.${extname(this.ref?.name ?? "img") || "png"}`);
+      writeFileSync(tmp, this.data);
+      const out = spawnSyncSafe("chafa", ["--format", "symbols", "--size", `${Math.min(70, this.w - 6)}x${Math.max(4, this.h - 6)}`, tmp], 4000);
+      if (out) {
+        this.lines = out.split("\n").map((l) => [{ t: truncate(l, this.w - 4), fg: K.TXT }]);
+        this.chafaTmp = tmp;
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+  openExternal() {
+    try {
+      const ext = extname(this.ref?.name ?? "img") || ".png";
+      const tmp = join(tmpdir(), `dsh-tui-${Date.now()}${ext}`);
+      writeFileSync(tmp, this.data ?? Buffer.alloc(0));
+      const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+      const args = process.platform === "win32" ? ["/c", "start", "", tmp] : [tmp];
+      spawn(cmd, args, { detached: true, stdio: "ignore" }).unref();
+      this.app.toast(`已在查看器中打开: ${tmp}`);
+    } catch (e) {
+      this.app.toast(`打开失败: ${e.message}`);
+    }
+  }
+  kittyTransmit() {
+    // kitty graphics protocol: transmit + place. Returns ANSI or "".
+    if (!this.data || !kittyCapable()) return "";
+    const w = Math.min(70, this.w - 4), h = Math.max(4, this.h - 5);
+    const b64 = this.data.toString("base64");
+    const chunks = [];
+    for (let i = 0; i < b64.length; i += 4096) chunks.push(b64.slice(i, i + 4096));
+    const payload = chunks.map((c, i) => `\x1b_Ga=${i === 0 ? "T" : "f"},m=${i === chunks.length - 1 ? 0 : 1};${c}\x1b\\`).join("");
+    // place at popup position with column/row fit
+    const place = `\x1b_Ga=p,s=${w},v=${h},c=${w},r=${h},q=2;${this.imageKey}\x1b\\`;
+    return payload + place;
+  }
+}
+
+function spawnSyncSafe(cmd, args, timeoutMs) {
+  try {
+    return execFileSync(cmd, args, { timeout: timeoutMs, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch { return null; }
+}
+
+// ---- ControlPanel: leader panel (快捷键 / 命令 / 设置，Tab 翻页；设置内 Shift+Tab 次级翻页) ----
+
+const DEFAULT_COMMANDS = [
+  { name: "compact", description: "Compact older conversation history", input: { hint: "" } },
+  { name: "export", description: "Download this Session log as a ZIP archive", input: { hint: "" } },
+  { name: "feedback", description: "record feedback about this session", input: { hint: "<text>" } },
+  { name: "goal", description: "set or view the goal for a long-running task", input: { hint: "[<objective>|clear|edit <objective>|pause|resume]" } },
+  { name: "permission", description: "Switch the permission preset (sandbox mode + approval policy)", input: { hint: "<preset>" } },
+  { name: "plan", description: "Enter or leave plan mode", input: { hint: "[off|message]" } },
+];
+
+export class ControlPanel extends Widget {
+  constructor(app, { startPage = 0 } = {}) {
+    const w = Math.min(74, app.screen.w - 4);
+    const h = Math.min(24, app.screen.h - 4);
+    super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h });
+    this.app = app;
+    this.pages = ["快捷键", "命令", "设置"];
+    this.page = startPage;
+    this.subPages = ["常规", "插件"];
+    this.subPage = 0;
+    this.sel = 0;
+    this.commands = DEFAULT_COMMANDS;
+    this.plugins = null;
+    this.pluginError = null;
+    this.loadCommands();
+    this.loadPlugins();
+  }
+  async loadCommands() {
+    try {
+      const agentId = this.app.currentSession;
+      if (agentId) {
+        const cmds = await this.app.api.rpcCall("commands/list", { agentId });
+        if (Array.isArray(cmds) && cmds.length) this.commands = cmds;
+      }
+    } catch {}
+    this.app.redraw();
+  }
+  async loadPlugins() {
+    try {
+      const res = await this.app.api.rpcCall("pluginInventory/list", {});
+      this.plugins = res.entries ?? [];
+    } catch (e) { this.pluginError = e.message; }
+    this.app.redraw();
+  }
+  shortcutItems() {
+    return [
+      ["t", "思考块 展开/折叠", () => this.app.chat.onKey({ type: "key", name: "char", key: "t", text: "t", ctrl: false, alt: false, shift: false })],
+      ["b", "工具块 展开/折叠", () => this.app.chat.onKey({ type: "key", name: "char", key: "b", text: "b", ctrl: false, alt: false, shift: false })],
+      ["i", "进入输入", () => this.app.focus(this.app.chat.input)],
+      ["Esc", "退出输入", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); }],
+      ["/", "搜索会话", () => { this.app.closeOverlay(); this.app.startSearch(); }],
+      ["n", "新建会话", () => this.app.newSession()],
+      ["g g", "滚动到顶", () => { this.app.closeOverlay(); this.app.chat.view.scrollY = 0; }],
+      ["G", "滚动到底", () => { this.app.closeOverlay(); this.app.chat.view.scrollY = this.app.chat.view.maxScroll(); }],
+      ["Ctrl+P", "控制面板", () => { this.page = 1; this.sel = 0; this.app.redraw(); }],
+      ["Ctrl+M", "切换模型", () => { this.app.overlay = buildModelPicker(this.app); }],
+      ["Ctrl+T", "轨迹视图", () => { this.app.closeOverlay(); this.app.setMode("trajectory"); }],
+      ["Shift+Tab", "主页 对话/轨迹 切换", () => { this.app.closeOverlay(); this.app.toggleChatTrajectory(); }],
+      ["Ctrl+W", "工作区", () => { this.app.closeOverlay(); this.app.setMode("workspace"); }],
+      ["Ctrl+S", "设置", () => { this.app.closeOverlay(); this.app.setMode("settings"); }],
+      ["Ctrl+A", "子代理", () => { this.app.closeOverlay(); this.app.setMode("subagent"); }],
+      ["Ctrl+K", "技能", () => { this.app.closeOverlay(); this.app.setMode("skills"); }],
+      ["Ctrl+G", "目标", () => this.app.showGoal()],
+      ["Ctrl+J", "任务", () => this.app.showJobs()],
+      ["Ctrl+B", "侧栏 显示/隐藏", () => this.app.toggleSidebar()],
+      ["Ctrl+Q", "退出", () => this.app.stop()],
+    ];
+  }
+  items() {
+    if (this.page === 0) return this.shortcutItems();
+    if (this.page === 1) {
+      return this.commands.map((c) => [
+        `/${c.name}${c.input?.hint ? " " + c.input.hint : ""}`,
+        c.description,
+        () => {
+          this.app.closeOverlay();
+          this.app.focus(this.app.chat.input);
+          this.app.chat.input.setValue(`/${c.name} `);
+          this.app.redraw();
+        },
+      ]);
+    }
+    // 设置 page with sub-pages
+    if (this.subPage === 0) {
+      return [
+        ["模型管理（含思考强度）", "切换模型并选择思考强度", () => { this.app.overlay = buildModelPicker(this.app); }],
+        ["模式（Agent 预设）", "标准 / PTC / 极简 / 创造", () => { this.app.overlay = buildModePicker(this.app); this.app.redraw(); }],
+        ["权限（沙箱 + 审批）", "只读 / 工作区写入 / 完全访问", () => { this.app.overlay = buildPermissionPicker(this.app); this.app.redraw(); }],
+        ["完整设置（JSON 编辑器）", "所有命名空间的原始值", () => { this.app.closeOverlay(); this.app.setMode("settings"); }],
+        ["切换主题", "dark / light / gruvbox", () => { cycleTheme(); this.app.toast(`主题: ${themeName()}`); }],
+        ["侧栏显示/隐藏", "nvim 式整体收起", () => this.app.toggleSidebar()],
+        ["导出当前会话日志", "下载 ZIP", () => { const sess = this.app.sessions.find((x) => x.sessionId === this.app.currentSession); if (sess) { this.app.closeOverlay(); this.app.exportSession(sess); } }],
+        ["复制会话 ID", "", () => this.app.copyText(this.app.currentSession ?? "")],
+      ];
+    }
+    if (this.plugins) {
+      return this.plugins.map((pl) => [`${pl.enabled ? "●" : "○"} ${pl.moduleName}`, pl.fiberPhase ?? "", null]);
+    }
+    return [[this.pluginError ?? "插件清单加载中…", "", null]];
+  }
+  render(screen) {
+    const s = screen;
+    s.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.PANEL });
+    s.box(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, { fg: T.ACCENT, bg: T.PANEL }, " 控制面板");
+    let tx = this.x + 2;
+    this.pages.forEach((name, i) => {
+      const sel = i === this.page;
+      s.text(tx, this.y, ` ${name} `, { fg: sel ? T.SELFG : T.DIM, bg: sel ? T.ACCENT : -1, attrs: sel ? 1 : 0 });
+      tx += strWidth(` ${name} `);
+    });
+    // sub-page tabs when on 设置
+    if (this.page === 2) {
+      let sx = this.x + 2 + strWidth(" 快捷键   命令   设置 ");
+      this.subPages.forEach((name, i) => {
+        const sel = i === this.subPage;
+        s.text(sx, this.y, ` ${name} `, { fg: sel ? T.BOLD : T.FAINT, bg: sel ? T.MENUSEL : -1, attrs: sel ? 1 : 0 });
+        sx += strWidth(` ${name} `);
+      });
+      s.text(this.x + this.w - 24, this.y, "Shift+Tab 次级", { fg: T.FAINT });
+    } else {
+      s.text(this.x + this.w - 12, this.y, "Tab 翻页", { fg: T.FAINT });
+    }
+    const items = this.items();
+    if (this.sel >= items.length) this.sel = Math.max(0, items.length - 1);
+    for (let i = 0; i < Math.min(this.h - 3, items.length); i++) {
+      const it = items[i];
+      const sel = i === this.sel;
+      s.fillRect(this.x + 1, this.y + 2 + i, this.x + this.w - 2, this.y + 2 + i, " ", { bg: sel ? T.MENUSEL : T.PANEL });
+      const label = it[0];
+      s.text(this.x + 2, this.y + 2 + i, truncate(label, this.w - 34), { fg: sel ? T.BOLD : (this.page === 0 ? T.ACCENT : T.TXT), bg: sel ? T.MENUSEL : T.PANEL, attrs: sel ? 1 : 0 });
+      if (it[1]) s.text(this.x + this.w - 30, this.y + 2 + i, truncate(it[1], 28), { fg: T.FAINT, bg: sel ? T.MENUSEL : T.PANEL });
+    }
+    s.text(this.x + 2, this.y + this.h - 1, "↑↓ 选择 · Enter 执行 · Esc 关闭", { fg: T.FAINT });
+  }
+  onKey(ev) {
+    if (ev.type !== "key") return false;
+    if (ev.name === "escape") { this.app.closeOverlay(); return true; }
+    if (ev.name === "tab") {
+      this.page = (this.page + 1) % this.pages.length;
+      this.sel = 0;
+      this.app.redraw();
+      return true;
+    }
+    if (ev.name === "backtab") {
+      if (this.page === 2) {
+        this.subPage = (this.subPage + 1) % this.subPages.length;
+        this.sel = 0;
+        this.app.redraw();
+      } else {
+        this.page = (this.page + this.pages.length - 1) % this.pages.length;
+        this.sel = 0;
+        this.app.redraw();
+      }
+      return true;
+    }
+    if (ev.name === "pgup" || ev.name === "left") { this.sel = 0; this.app.redraw(); return true; }
+    if (ev.name === "pgdn" || ev.name === "right") { this.sel = this.items().length - 1; this.app.redraw(); return true; }
+    if (ev.name === "up") { this.sel = Math.max(0, this.sel - 1); this.app.redraw(); return true; }
+    if (ev.name === "down") { this.sel = Math.min(this.items().length - 1, this.sel + 1); this.app.redraw(); return true; }
+    if (ev.name === "enter") {
+      const it = this.items()[this.sel];
+      if (it && it[2]) { it[2](); this.app.redraw(); }
+      return true;
+    }
+    return false;
+  }
+  onMouse(ev) {
+    if (ev.kind === "press" && ev.button === 0) {
+      if (ev.y === this.y) {
+        // top page tabs
+        let tx = this.x + 2;
+        for (let i = 0; i < this.pages.length; i++) {
+          const wTab = strWidth(` ${this.pages[i]} `);
+          if (ev.x >= tx && ev.x < tx + wTab) { this.page = i; this.sel = 0; this.app.redraw(); return true; }
+          tx += wTab;
+        }
+        // sub-page tabs (on 设置)
+        if (this.page === 2) {
+          let sx = this.x + 2 + strWidth(" 快捷键   命令   设置 ");
+          for (let i = 0; i < this.subPages.length; i++) {
+            const wTab = strWidth(` ${this.subPages[i]} `);
+            if (ev.x >= sx && ev.x < sx + wTab) { this.subPage = i; this.sel = 0; this.app.redraw(); return true; }
+            sx += wTab;
+          }
+        }
+        return true;
+      }
+      const idx = ev.y - this.y - 2;
+      const items = this.items();
+      if (idx >= 0 && idx < items.length && idx < this.h - 3) {
+        this.sel = idx;
+        const it = items[idx];
+        if (it && it[2]) { it[2](); this.app.redraw(); }
+        else this.app.redraw();
+        return true;
+      }
+    }
+    if (ev.kind === "wheel-up") { this.sel = Math.max(0, this.sel - 1); this.app.redraw(); return true; }
+    if (ev.kind === "wheel-down") { this.sel = Math.min(this.items().length - 1, this.sel + 1); this.app.redraw(); return true; }
+    return true;
+  }
+}
+
+// ---- Jobs & goal popups ----
+
+export function buildJobsPopup(app) {
+  const jobs = app.jobs ?? [];
+  const lines = jobs.length === 0
+    ? [[{ t: "（当前没有任务帧）", fg: K.FAINT }]]
+    : jobs.map((j) => {
+      const icon = j.status === "running" ? "⚙" : j.status === "completed" ? "✓" : j.status === "failed" ? "✗" : "·";
+      const color = j.status === "running" ? K.WARN : j.status === "completed" ? K.OK : j.status === "failed" ? K.ERR : K.DIM;
+      return [{ t: ` ${icon} ${truncate(j.kind, 14)}`, fg: color, bold: true }, { t: ` ${truncate(j.label, 44)}`, fg: K.TXT }, { t: ` ${j.status}`, fg: K.DIM }];
+    });
+  return new Popup({
+    x: 6, y: 3, w: Math.min(80, app.screen.w - 12), h: Math.min(jobs.length + 4, 20), title: "任务",
+    lines: [[{ t: "" }], ...lines],
+    buttons: [{ label: "关闭", action: "close" }],
+    onAction: () => app.closeOverlay(),
+  });
+}
+
+export function buildGoalPopup(app) {
+  const goal = app.goalData?.goal ?? app.goalData;
+  const todos = app.todos ?? [];
+  const lines = [];
+  if (!goal) lines.push([{ t: "（当前会话没有目标）", fg: K.FAINT }]);
+  else {
+    lines.push([{ t: ` 目标: ${goal.objective ?? goal}`, fg: K.TXT }]);
+    if (goal.phase) lines.push([{ t: ` 阶段: ${goal.phase}`, fg: K.DIM }]);
+    if (goal.id) lines.push([{ t: ` id: ${goal.id}`, fg: K.FAINT }]);
+  }
+  if (todos.length) {
+    lines.push([{ t: "" }, { t: " 任务清单:", fg: K.ACCENT, bold: true }]);
+    for (const t of todos.slice(0, 16)) {
+      const icon = t.status === "completed" ? "✓" : t.status === "in_progress" ? "◉" : "○";
+      const color = t.status === "completed" ? K.OK : t.status === "in_progress" ? K.WARN : K.DIM;
+      lines.push([{ t: `  ${icon} ${truncate(t.content, 60)}`, fg: color }]);
+    }
+    if (todos.length > 16) lines.push([{ t: `  …共 ${todos.length} 项`, fg: K.FAINT }]);
+  }
+  return new Popup({
+    x: 6, y: 3, w: Math.min(80, app.screen.w - 12), h: Math.min(lines.length + 5, 24), title: "目标",
+    lines: [[{ t: "" }], ...lines],
+    buttons: [{ label: "关闭", action: "close" }],
+    onAction: () => app.closeOverlay(),
+  });
+}
+
+// ---- Settings panel (generic JSON-tree editor over settings.describe/mutate) ----
+
+const TYPE_COLORS = new Proxy({}, {
+  get(_t, key) {
+    const map = { string: "STRING", number: "NUMBER", boolean: "LINK", object: "DIM", array: "DIM", null: "FAINT" };
+    return T[map[key] ?? key];
+  },
+});
+
+export class SettingsPanel extends Widget {
+  constructor(app) {
+    super({ x: 30, y: 0, w: app.screen.w - 30, h: app.screen.h - 1 });
+    this.app = app;
+    this.namespaces = [];
+    this.nsIdx = 0;
+    this.rows = [];            // { path: string[], value, type, display }
+    this.pendingOps = [];
+    this.editing = false;
+    this.editPath = null;
+    this.secrets = new Set();
+    const listW = 26;
+    this.nsList = new ScrollView({ x: this.x + 1, y: this.y + 1, w: listW, h: this.h - 2, showScrollbar: true });
+    this.tree = new ScrollView({ x: this.x + listW + 1, y: this.y + 1, w: this.w - listW - 2, h: this.h - 3, showScrollbar: true });
+    this.input = new Input({ x: this.x + listW + 1, y: this.y + this.h - 2, w: this.w - listW - 2, h: 1, prompt: "值: ", placeholder: "输入新值，Enter 暂存，Esc 取消" });
+  }
+  relayout(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    const listW = 26;
+    this.nsList.x = x + 1; this.nsList.y = y + 1; this.nsList.w = listW; this.nsList.h = h - 2;
+    this.tree.x = x + listW + 1; this.tree.y = y + 1; this.tree.w = w - listW - 2; this.tree.h = h - 3;
+    this.input.x = x + listW + 1; this.input.y = y + h - 2; this.input.w = w - listW - 2;
+  }
+  async load() {
+    try {
+      const d = await this.app.api.call("settings.describe");
+      this.namespaces = d.namespaces ?? [];
+      this.writable = d.writable;
+      this.selectNs(0);
+    } catch (e) {
+      this.app.toast(`设置加载失败: ${e.message}`);
+      this.app.setMode("chat");
+    }
+  }
+  selectNs(i) {
+    this.nsIdx = Math.max(0, Math.min(this.namespaces.length - 1, i));
+    this.pendingOps = [];
+    this.editing = false;
+    const ns = this.namespaces[this.nsIdx];
+    this.secrets = new Set((ns.secrets ?? []).map((s) => JSON.stringify(s.path ?? [])));
+    this.rebuildRows();
+    const items = this.namespaces.map((n) => ({
+      text: n.ns,
+      sub: n.applies === "live" ? "live" : "重启生效",
+      badge: n.applies === "live" ? "" : "↻",
+      data: n,
+    }));
+    this.nsList.setLines(items.map((it) => it.lines ?? this.nsRow(it)));
+    this.nsItems = items;
+    this.app.redraw();
+  }
+  nsRow(it) {
+    return [{ t: `${it.badge ? it.badge + " " : ""}${truncate(it.text, 20)}`, fg: 0xd4d8dd, bold: false }, { t: " " + it.sub, fg: 0x8b939e }];
+  }
+  rebuildRows() {
+    const ns = this.namespaces[this.nsIdx];
+    if (!ns) { this.rows = []; this.tree.setLines([]); return; }
+    const value = applyOps(ns.value, this.pendingOps);
+    const rows = [];
+    flattenJson(value, [], rows);
+    this.rows = rows;
+    this.tree.setLines(rows.map((r) => this.rowLine(r)));
+  }
+  rowLine(r) {
+    const p = r.path.join(".");
+    const vt = typeof r.value;
+    let v;
+    if (r.value === null) v = "null";
+    else if (vt === "object") v = Array.isArray(r.value) ? `[${Object.keys(r.value).length}]` : `{${Object.keys(r.value).length}}`;
+    else v = String(r.value);
+    if (this.secrets.has(JSON.stringify(r.path))) v = "•••••";
+    const segs = [{ t: p, fg: K.TXT }];
+    if (!(vt === "object" && r.value !== null)) segs.push({ t: " = ", fg: K.FAINT }, { t: v, fg: TYPE_COLORS[vt] ?? K.TXT, bold: vt !== "string" });
+    return segs;
+  }
+  currentNs() { return this.namespaces[this.nsIdx]; }
+  render(screen) {
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", {});
+    const mid = this.x + 26;
+    screen.vline(mid, this.y, this.y + this.h - 1, "│", { fg: T.BORDER });
+    screen.text(this.x + 1, this.y, " 设置 — 点击值编辑，Ctrl+S 保存，Esc 返回", { fg: K.DIM });
+    this.nsList.render(screen);
+    const ns = this.currentNs();
+    if (ns) {
+      screen.text(this.x + 28, this.y, ` ${ns.ns}  rev${ns.revision}  ${this.writable === false ? "(只读)" : ""}`, { fg: K.ACCENT, bold: true });
+      const pend = this.pendingOps.length ? `  ⚠ ${this.pendingOps.length} 项待保存` : "";
+      if (pend) screen.text(this.x + 28 + strWidth(` ${ns.ns}  rev${ns.revision}  `), this.y, pend, { fg: K.WARN });
+    }
+    this.tree.render(screen);
+    if (this.editing) {
+      screen.hline(this.x + 27, this.x + this.w - 1, this.y + this.h - 3, "─", { fg: 0x3a424c });
+      screen.text(this.x + 28, this.y + this.h - 3, `编辑 ${this.editPath.join(".")}`, { fg: K.WARN, bold: true });
+      this.input.render(screen);
+    }
+  }
+  onMouse(ev) {
+    if (ev.x < this.x + 26) {
+      if (ev.kind === "press" && ev.button === 0) {
+        const idx = ev.y - this.nsList.y + this.nsList.scrollY;
+        if (idx >= 0 && idx < this.namespaces.length) { this.selectNs(idx); return true; }
+      }
+      return this.nsList.onMouse(ev);
+    }
+    if (this.editing && this.input.inside(ev.x, ev.y)) return this.input.onMouse(ev);
+    if (ev.kind === "press" && ev.button === 0) {
+      const idx = this.tree.scrollY + (ev.y - this.tree.y);
+      const row = this.rows[idx];
+      if (row) {
+        if (typeof row.value === "boolean") {
+          this.pendingOps.push({ op: "set", path: row.path, value: !row.value });
+          this.rebuildRows();
+          return true;
+        }
+        if (typeof row.value === "string" || typeof row.value === "number" || row.value === null) {
+          this.editPath = row.path;
+          this.editing = true;
+          this.input.setValue(row.value === null ? "" : String(row.value), { select: row.value !== null });
+          return true;
+        }
+        return false;
+      }
+    }
+    return false;
+  }
+  onKey(ev) {
+    if (this.editing) {
+      if (ev.type === "key" && ev.name === "escape") { this.editing = false; this.rebuildRows(); return true; }
+      if (ev.type === "key" && ev.name === "enter") {
+        const typed = this.input.value;
+        this.pendingOps.push({ op: "set", path: this.editPath, value: parseScalar(typed) });
+        this.editing = false;
+        this.input.setValue("");
+        this.rebuildRows();
+        return true;
+      }
+      const handled = this.input.onKey(ev);
+      if (handled) this.app.redraw();
+      return true;
+    }
+    if (ev.type !== "key") return false;
+    if (ev.name === "escape") { this.app.setMode("chat"); return true; }
+    if (ev.ctrl && ev.key === "s") { this.save(); return true; }
+    if (ev.name === "up" || ev.name === "down" || ev.name === "pgup" || ev.name === "pgdn") return this.tree.scroll(ev.name === "up" || ev.name === "pgup" ? -3 : 3);
+    if (ev.name === "enter") {
+      const idx = this.tree.scrollY;
+      const row = this.rows[idx];
+      if (row && (typeof row.value === "string" || typeof row.value === "number")) {
+        this.editPath = row.path; this.editing = true; this.input.setValue(String(row.value), { select: true });
+        return true;
+      }
+    }
+    return false;
+  }
+  async save() {
+    const ns = this.currentNs();
+    if (!ns || this.pendingOps.length === 0) { this.app.toast("没有待保存的修改"); return; }
+    try {
+      await this.app.api.call("settings.mutate", { ns: ns.ns, ops: this.pendingOps, expectedRevision: ns.revision });
+      this.pendingOps = [];
+      this.app.toast(`已保存 ${ns.ns}`);
+      await this.load();
+    } catch (e) { this.app.toast(`保存失败: ${e.message}`); }
+  }
+}
+
+function flattenJson(value, path, out, depth = 0) {
+  if (depth === 0 && path.length === 0 && value !== null && typeof value === "object") {
+    for (const k of Object.keys(value)) flattenJson(value[k], [k], out, 1);
+    return;
+  }
+  if (depth > 6) { out.push({ path, value: value === null ? null : String(value).slice(0, 80), type: typeof value }); return; }
+  if (value !== null && typeof value === "object") {
+    out.push({ path, value, type: Array.isArray(value) ? "array" : "object" });
+    for (const k of Object.keys(value)) {
+      flattenJson(value[k], [...path, k], out, depth + 1);
+    }
+  } else {
+    out.push({ path, value, type: value === null ? "null" : typeof value });
+  }
+}
+
+function applyOps(base, ops) {
+  const value = JSON.parse(JSON.stringify(base ?? {}));
+  for (const op of ops) {
+    if (op.op === "set") {
+      let cur = value;
+      for (let i = 0; i < op.path.length - 1; i++) {
+        cur[op.path[i]] ??= {};
+        cur = cur[op.path[i]];
+      }
+      cur[op.path[op.path.length - 1]] = op.value;
+    } else if (op.op === "unset") {
+      let cur = value;
+      for (let i = 0; i < op.path.length - 1; i++) {
+        if (typeof cur[op.path[i]] !== "object" || cur[op.path[i]] === null) break;
+        cur = cur[op.path[i]];
+      }
+      delete cur[op.path[op.path.length - 1]];
+    }
+  }
+  return value;
+}
+
+function parseScalar(s) {
+  const t = s.trim();
+  if (t === "true") return true;
+  if (t === "false") return false;
+  if (t === "null" || t === "") return null;
+  if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
+  return s;
+}
+
+// ---- Subagent panel ----
+
+export class SubagentPanel extends Widget {
+  constructor(app) {
+    super({ x: 30, y: 0, w: app.screen.w - 30, h: app.screen.h - 1 });
+    this.app = app;
+    this.parentId = null;
+    this.entries = [];
+    this.selIdx = 0;
+    this.log = [];
+    const listW = 30;
+    this.list = new ScrollView({ x: this.x + 1, y: this.y + 1, w: listW, h: this.h - 3, showScrollbar: true });
+    this.view = new ScrollView({ x: this.x + listW + 1, y: this.y + 1, w: this.w - listW - 2, h: this.h - 3, showScrollbar: true, autoScroll: true });
+    this.input = new Input({ x: this.x + listW + 1, y: this.y + this.h - 2, w: this.w - listW - 2, h: 1, placeholder: "给选中子代理发消息…（continuable）", onEnter: (v) => this.send(v) });
+  }
+  relayout(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    const listW = 30;
+    this.list.x = x + 1; this.list.y = y + 1; this.list.w = listW; this.list.h = h - 3;
+    this.view.x = x + listW + 1; this.view.y = y + 1; this.view.w = w - listW - 2; this.view.h = h - 3;
+    this.input.x = x + listW + 1; this.input.y = y + h - 2; this.input.w = w - listW - 2;
+  }
+  async load(parentId) {
+    this.parentId = parentId;
+    try {
+      const res = await this.app.api.call("subagent.list", { parentSessionId: parentId });
+      this.entries = res.entries ?? [];
+      this.parentAvailable = res.parentAvailable;
+    } catch (e) {
+      this.entries = [];
+      this.app.toast(`子代理列表失败: ${e.message}`);
+    }
+    this.selIdx = 0;
+    this.#rebuildList();
+    await this.selectChild(0);
+  }
+  #rebuildList() {
+    const lines = this.entries.length === 0
+      ? [[{ t: "（当前会话没有子代理）", fg: K.FAINT }], [{ t: "子代理由 agent 的 subagent 工具创建", fg: K.FAINT }]]
+      : this.entries.map((e) => [
+        { t: `${e.activity === "running" ? "●" : "○"} `, fg: e.activity === "running" ? K.OK : K.FAINT },
+        { t: truncate(e.label ?? e.id.slice(0, 8), 22), fg: K.TXT, bold: true },
+        { t: " " + e.mode, fg: K.DIM },
+      ]);
+    this.list.setLines(lines);
+  }
+  async selectChild(i) {
+    if (i < 0 || i >= this.entries.length) { this.view.setLines([[{ t: "选择左侧子代理查看历史", fg: K.FAINT }]]); this.selIdx = Math.max(0, i); return; }
+    this.selIdx = i;
+    const child = this.entries[i];
+    this.view.setLines([[{ t: `加载 ${child.id.slice(0, 8)} 历史…`, fg: K.DIM }]]);
+    try {
+      const h = await this.app.api.call("subagent.history", {
+        parentSessionId: this.parentId,
+        childSessionId: child.id,
+        mode: child.mode,
+        maxMessages: 100,
+      });
+      const lines = [[{ t: `${child.label ?? child.id} — ${h.events.length} 事件`, fg: K.ACCENT, bold: true }], [{ t: "" }]];
+      for (const { event } of h.events.slice(-200)) {
+        const d = event.data ?? {};
+        let summary = "";
+        switch (event.type) {
+          case "user/message": summary = "❯ " + String(partsText(d.content)).slice(0, 90); break;
+          case "assistant/message": summary = "◉ " + String(partsText(d.message?.content)).slice(0, 90); break;
+          case "assistant/chunk": {
+            const ch = d.chunk ?? {};
+            if (ch.type === "text-delta") summary = "▸ " + String(ch.delta ?? "").slice(0, 90);
+            else if (ch.type === "block-start") summary = `▸ [${ch.blockType}]`;
+            else summary = "▸ …";
+            break;
+          }
+          case "tool/call": summary = `⚙ ${d.name ?? "tool"} ${String(d.arguments ?? "").slice(0, 60)}`; break;
+          case "tool/result": summary = "↳ 结果 " + String(partsText(d.message?.content)).slice(0, 60); break;
+          case "step/start": summary = `— step ${d.step ?? ""}`; break;
+          case "step/end": summary = "— step end"; break;
+          default: summary = event.type;
+        }
+        lines.push([{ t: `#${event.seq}`, fg: K.FAINT }, { t: "  " + truncate(summary, this.view.w - 14), fg: K.TXT }]);
+      }
+      this.view.setLines(lines);
+    } catch (e) {
+      this.view.setLines([[{ t: `历史加载失败: ${e.message}`, fg: K.ERR }]]);
+    }
+    this.app.redraw();
+  }
+  async send(text) {
+    const child = this.entries[this.selIdx];
+    if (!child) { this.app.toast("先选择子代理"); return; }
+    try {
+      await this.app.api.call("subagent.prompt", {
+        parentSessionId: this.parentId,
+        childSessionId: child.id,
+        mode: "continuable",
+        content: [{ type: "text", text }],
+        clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      });
+      this.app.toast(`已发送给 ${child.id.slice(0, 8)}`);
+    } catch (e) { this.app.toast(`发送失败: ${e.message}`); }
+  }
+  async interrupt() {
+    const child = this.entries[this.selIdx];
+    if (!child) return;
+    try {
+      await this.app.api.call("subagent.interrupt", { parentSessionId: this.parentId, childSessionId: child.id, mode: "continuable" });
+      this.app.toast("已请求中断");
+      this.load(this.parentId);
+    } catch (e) { this.app.toast(`中断失败: ${e.message}`); }
+  }
+  render(screen) {
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", {});
+    const mid = this.x + 30;
+    screen.vline(mid, this.y, this.y + this.h - 1, "│", { fg: T.BORDER });
+    screen.text(this.x + 1, this.y, " 子代理 — 点击选择，x 中断，Esc 返回", { fg: K.DIM });
+    this.list.render(screen);
+    this.view.render(screen);
+    screen.hline(this.x + 31, this.x + this.w - 1, this.y + this.h - 2, "─", { fg: 0x3a424c });
+    this.input.render(screen);
+  }
+  onMouse(ev) {
+    if (ev.x < this.x + 30) {
+      if (ev.kind === "press" && ev.button === 0) {
+        const idx = ev.y - this.list.y + this.list.scrollY;
+        if (idx >= 0 && idx < this.entries.length) { this.selectChild(idx); return true; }
+      }
+      return this.list.onMouse(ev);
+    }
+    if (this.input.inside(ev.x, ev.y)) return this.input.onMouse(ev);
+    return this.view.onMouse(ev);
+  }
+  onKey(ev) {
+    if (ev.type === "text") { this.input.insert(ev.text); this.app.redraw(); return true; }
+    if (ev.type !== "key") return false;
+    if (ev.name === "escape") { this.app.setMode("chat"); return true; }
+    if (ev.name === "char" && ev.key === "x" && !ev.ctrl) { this.interrupt(); return true; }
+    if (ev.name === "char" && ev.key === "r" && !ev.ctrl) { this.selectChild(this.selIdx); return true; }
+    if (ev.name === "up" || ev.name === "down") {
+      if (this.entries.length === 0) return false;
+      const next = this.selIdx + (ev.name === "up" ? -1 : 1);
+      if (next >= 0 && next < this.entries.length) { this.selectChild(next); }
+      return true;
+    }
+    if (this.input.onKey(ev)) { this.app.redraw(); return true; }
+    return false;
+  }
+}
+
+function partsText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const texts = [];
+  const walk = (arr) => {
+    for (const p of arr) {
+      if (!p || typeof p !== "object") continue;
+      if (p.type === "text" && typeof p.text === "string") texts.push(p.text);
+      else if (Array.isArray(p.content)) walk(p.content);
+    }
+  };
+  walk(content);
+  return texts.join(" ");
+}
+
+// ---- Skills panel ----
+
+export class SkillsPanel extends Widget {
+  constructor(app) {
+    super({ x: 30, y: 0, w: app.screen.w - 30, h: app.screen.h - 1 });
+    this.app = app;
+    this.skills = [];
+    this.selIdx = 0;
+    this.list = new ScrollView({ x: this.x + 1, y: this.y + 1, w: 30, h: this.h - 2, showScrollbar: true });
+    this.detail = new ScrollView({ x: this.x + 32, y: this.y + 1, w: this.w - 33, h: this.h - 2, showScrollbar: true });
+  }
+  relayout(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.list.x = x + 1; this.list.y = y + 1; this.list.w = 30; this.list.h = h - 2;
+    this.detail.x = x + 32; this.detail.y = y + 1; this.detail.w = w - 33; this.detail.h = h - 2;
+  }
+  async load() {
+    try {
+      const r = await this.app.api.call("skill.list", { sessionId: this.app.currentSession });
+      this.skills = r.skills ?? [];
+    } catch (e) {
+      this.skills = [];
+      this.app.toast(`技能加载失败: ${e.message}`);
+    }
+    this.select(0);
+  }
+  select(i) {
+    this.selIdx = Math.max(0, Math.min(this.skills.length - 1, i));
+    this.list.setLines(this.skills.map((k) => [
+      { t: k.modelInvocable ? "⚡" : "  ", fg: k.modelInvocable ? K.WARN : K.FAINT },
+      { t: " " + truncate(k.name, 26), fg: K.TXT, bold: true },
+    ]));
+    const k = this.skills[this.selIdx];
+    if (!k) { this.detail.setLines([[{ t: "（本会话没有可用技能）", fg: K.FAINT }]]); this.app.redraw(); return; }
+    const lines = [];
+    lines.push([{ t: k.name, fg: K.ACCENT, bold: true, underline: true }]);
+    if (k.modelInvocable) lines.push([{ t: "⚡ 模型可主动调用", fg: K.WARN }]);
+    lines.push([{ t: "" }]);
+    for (const ln of renderMd(k.description ?? "", this.detail.w - 2)) lines.push(ln);
+    if (k.whenToUse) {
+      lines.push([{ t: "" }, { t: "何时使用:", fg: K.DIM, underline: true }]);
+      for (const ln of renderMd(k.whenToUse, this.detail.w - 2)) lines.push(ln);
+    }
+    lines.push([{ t: "" }, { t: "按 c 复制技能名 · Esc 返回", fg: K.FAINT }]);
+    this.detail.setLines(lines);
+    this.app.redraw();
+  }
+  render(screen) {
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", {});
+    screen.vline(this.x + 31, this.y, this.y + this.h - 1, "│", { fg: K.BORDER });
+    screen.text(this.x + 1, this.y, ` 技能 (${this.skills.length}) — 点击查看详情`, { fg: K.DIM });
+    this.list.render(screen);
+    this.detail.render(screen);
+  }
+  onMouse(ev) {
+    if (ev.x < this.x + 31) {
+      if (ev.kind === "press" && ev.button === 0) {
+        const idx = ev.y - this.list.y + this.list.scrollY;
+        if (idx >= 0 && idx < this.skills.length) { this.select(idx); return true; }
+      }
+      return this.list.onMouse(ev);
+    }
+    return this.detail.onMouse(ev);
+  }
+  onKey(ev) {
+    if (ev.type !== "key") return false;
+    if (ev.name === "escape") { this.app.setMode("chat"); return true; }
+    if (ev.name === "up" || ev.name === "down") {
+      if (this.skills.length === 0) return false;
+      const next = this.selIdx + (ev.name === "up" ? -1 : 1);
+      if (next >= 0 && next < this.skills.length) this.select(next);
+      return true;
+    }
+    if (ev.name === "char" && ev.key === "c" && !ev.ctrl && this.skills[this.selIdx]) {
+      this.app.copyText(this.skills[this.selIdx].name);
+      return true;
+    }
+    return false;
+  }
+}
