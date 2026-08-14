@@ -11,7 +11,7 @@ import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
   modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker,
   ImagePopup, kittyCapable, buildGoalPopup, SettingsPanel, SubagentPanel,
-  SkillsPanel, ControlPanel, JobsPanel, fmtMs,
+  SkillsPanel, ControlPanel, JobsPanel, ModelPanel, fmtMs,
 } from "./panels.js";
 
 import { T, themeName, cycleTheme } from "./theme.js";
@@ -1946,6 +1946,7 @@ export class App {
     this.workspacePanel = null;
     this.trajectoryPanel = null;
     this.settingsPanel = null;
+    this.modelPanel = null;
     this.subagentPanel = null;
     this.skillsPanel = null;
 
@@ -1973,7 +1974,7 @@ export class App {
     this.sidebar.x = 0; this.sidebar.y = 0; this.sidebar.w = this.sidebarWidth; this.sidebar.h = this.screen.h - 1;
     this.searchInput.w = this.sidebarWidth;
     this.chat.resize(x, 1, w, mainH);
-    for (const p of [this.workspacePanel, this.trajectoryPanel, this.settingsPanel, this.subagentPanel, this.skillsPanel]) {
+    for (const p of [this.workspacePanel, this.trajectoryPanel, this.settingsPanel, this.modelPanel, this.subagentPanel, this.skillsPanel]) {
       if (p?.relayout) p.relayout(x, 1, w, mainH);
     }
     this.status.y = this.screen.h - footerH;
@@ -2516,6 +2517,9 @@ export class App {
     } else if (mode === "settings") {
       if (!this.settingsPanel) this.settingsPanel = new SettingsPanel(this);
       this.settingsPanel.load();
+    } else if (mode === "models") {
+      if (!this.modelPanel) this.modelPanel = new ModelPanel(this);
+      this.modelPanel.load();
     } else if (mode === "subagent") {
       if (!this.currentSession) { this.toast("先打开一个会话"); this.mode = "chat"; this.redraw(); return; }
       if (!this.subagentPanel) this.subagentPanel = new SubagentPanel(this);
@@ -2534,6 +2538,7 @@ export class App {
       case "workspace": return this.workspacePanel;
       case "trajectory": return this.trajectoryPanel;
       case "settings": return this.settingsPanel;
+      case "models": return this.modelPanel;
       case "subagent": return this.subagentPanel;
       case "skills": return this.skillsPanel;
       default: return null;
@@ -2578,7 +2583,7 @@ export class App {
     this.closeOverlay();
     this.menu = null;
     this.popup = null;
-    for (const p of [this.workspacePanel, this.trajectoryPanel, this.settingsPanel, this.subagentPanel, this.skillsPanel]) {
+    for (const p of [this.workspacePanel, this.trajectoryPanel, this.settingsPanel, this.modelPanel, this.subagentPanel, this.skillsPanel]) {
       if (p?.dispose) { try { p.dispose(); } catch {} }
     }
     this.workspacePanel = this.trajectoryPanel = this.settingsPanel = this.subagentPanel = this.skillsPanel = null;
@@ -2754,7 +2759,7 @@ export class App {
   }
 
   #panelLabel(mode) {
-    return { workspace: "工作区", settings: "设置", skills: "技能", subagent: "子代理" }[mode] ?? null;
+    return { workspace: "工作区", settings: "设置", models: "模型供应商", skills: "技能", subagent: "子代理" }[mode] ?? null;
   }
 
   #renderTabBar(s) {
@@ -2784,7 +2789,7 @@ export class App {
       const seg = ` ${label} `;
       if (px >= tx && px < tx + strWidth(seg)) {
         if (id === this.mode && panelLabel && id !== "chat" && id !== "trajectory") { /* click active panel tab: stay */ return true; }
-        this.setMode(id === "chat" || id === "trajectory" ? id : "chat");
+        this.setMode(id === "chat" || id === "trajectory" || this.#panelLabel(id) ? id : "chat");
         return true;
       }
       tx += strWidth(seg);

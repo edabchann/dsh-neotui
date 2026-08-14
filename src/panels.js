@@ -111,6 +111,11 @@ export class Picker extends Widget {
 
 export function buildModelPicker(app) {
   const w = Math.min(70, app.screen.w - 4), h = Math.min(24, app.screen.h - 4);
+  const manageProviders = {
+    label: "⚙ 管理供应商…（填表式）", hint: "M",
+    provider: null, model: null,
+    action: () => { app.overlay = null; app.setMode("models"); },
+  };
   const selectModel = async (it) => {
     app.overlay = null; app.redraw();
     if (!app.currentSession) { app.toast("先打开一个会话"); return; }
@@ -126,6 +131,7 @@ export function buildModelPicker(app) {
     items: [],
     onCancel: () => { app.overlay = null; app.redraw(); },
     onPick: (it) => {
+      if (it === manageProviders) { manageProviders.action(); return; }
       const efforts = it.efforts ?? [];
       if (efforts.length > 0) {
         // second step: reasoning effort
@@ -160,7 +166,7 @@ export function buildModelPicker(app) {
         });
       }
     }
-    picker.items = items;
+    picker.items = [manageProviders, ...items];
     app.redraw();
   }).catch((e) => app.toast(`模型列表失败: ${e.message}`));
   return picker;
@@ -1634,6 +1640,11 @@ export class SettingsPanel extends Widget {
       ns: "默认展开/折叠", applies: "live", local: true,
       value: { 思考块默认展开: fd.think, 工具块默认展开: fd.bash, 任务清单默认显示: fd.todos },
     });
+    // the model provider manager opens its own big form buffer (CC Switch 式)
+    this.namespaces.splice(2, 0, {
+      ns: "模型供应商…（填表式）", applies: "live", local: true, modelsEntry: true,
+      value: {},
+    });
     this.selectNs(0);
   }
   selectNs(i) {
@@ -1641,6 +1652,7 @@ export class SettingsPanel extends Widget {
     this.pendingOps = [];
     this.editing = false;
     const ns = this.namespaces[this.nsIdx];
+    if (ns.modelsEntry) { this.app.setMode("models"); return; }
     this.secrets = new Set((ns.secrets ?? []).map((s) => JSON.stringify(s.path ?? [])));
     this.rebuildRows();
     const items = this.namespaces.map((n) => ({
@@ -1801,6 +1813,425 @@ export class SettingsPanel extends Widget {
       this.app.toast(`已保存 ${ns.ns}`);
       await this.load();
     } catch (e) { this.app.toast(`保存失败: ${e.message}`); }
+  }
+}
+
+// ---- Model provider management (CC Switch-style big form buffer) ----
+
+const MODEL_APIS = ["openai-completions", "anthropic-messages", "google-genai"];
+
+export class ModelPanel extends Widget {
+  constructor(app) {
+    super({ x: 30, y: 0, w: app.screen.w - 30, h: app.screen.h - 1 });
+    this.app = app;
+    this.providers = {};   // route → profile (mirror of settings llm-pi-ai.providers)
+    this.revision = 0;
+    this.loaded = false;
+    this.routes = [];
+    this.sel = 0;          // list cursor (routes.length = the ＋ 添加供应商 row)
+    this.mode = "list";    // list | form
+    this.formIdx = 0;      // form item cursor
+    this.formItems = [];   // {kind:"field"|"model"|"button", ...}
+    this.modelsSel = -1;   // selected model row (shows its subfields)
+    this.editing = null;   // { label, commit } while the inline editor is open
+    this.scanMode = false;
+    this.scanItems = [];
+    this.scanSel = new Set();
+    this.scanCursor = 0;
+    this.scanning = false;
+    const listW = 26;
+    this.listView = new ScrollView({ x: this.x + 1, y: this.y + 1, w: listW, h: this.h - 2, showScrollbar: true });
+    this.formView = new ScrollView({ x: this.x + listW + 1, y: this.y + 1, w: this.w - listW - 2, h: this.h - 3, showScrollbar: true });
+    this.input = new Input({ x: this.x + listW + 1, y: this.y + this.h - 2, w: this.w - listW - 2, h: 1, prompt: "值: ", placeholder: "Enter 提交 · Esc 取消" });
+  }
+  relayout(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    const listW = 26;
+    this.listView.x = x + 1; this.listView.y = y + 1; this.listView.w = listW; this.listView.h = h - 2;
+    this.formView.x = x + listW + 1; this.formView.y = y + 1; this.formView.w = w - listW - 2; this.formView.h = h - 3;
+    this.input.x = x + listW + 1; this.input.y = y + h - 2; this.input.w = w - listW - 2;
+  }
+  async load() {
+    try {
+      const d = await this.app.api.call("settings.describe");
+      const ns = (d.namespaces ?? []).find((n) => n.ns === "llm-pi-ai");
+      this.providers = { ...(ns?.value?.providers ?? {}) };
+      this.revision = ns?.revision ?? 0;
+      this.routes = Object.keys(this.providers);
+    } catch (e) { this.app.toast(`模型配置加载失败: ${e.message}`); }
+    this.loaded = true;
+    this.modelsSel = -1;
+    this.#rebuild();
+    this.app.redraw();
+  }
+  #route() { return this.routes[this.sel] ?? null; }
+  #profile(route) { return route == null ? null : this.providers[route] ?? {}; }
+  #formRows() {
+    const route = this.#route();
+    if (route == null) return [];
+    const p = this.#profile(route);
+    const items = [];
+    items.push({ kind: "field", key: "route", label: "路由名", value: route, editable: !(route in this.providers && this.routes.includes(route)) });
+    items.push({ kind: "field", key: "displayName", label: "显示名", value: p.displayName ?? "" });
+    items.push({ kind: "field", key: "api", label: "协议 api", value: p.api ?? "openai-completions", cycle: MODEL_APIS });
+    items.push({ kind: "field", key: "baseURL", label: "baseURL", value: p.baseURL ?? "" });
+    items.push({ kind: "field", key: "apiKeyEnv", label: "apiKeyEnv", value: p.apiKeyEnv ?? "", note: "环境变量名（密钥不落盘）" });
+    const models = p.models ?? [];
+    for (let mi = 0; mi < models.length; mi++) {
+      const m = models[mi];
+      items.push({ kind: "model", idx: mi, id: m.id ?? "", name: m.name ?? "", ctx: m.contextWindow ?? null, max: m.maxTokens ?? null });
+      if (this.modelsSel === mi) {
+        items.push({ kind: "field", key: `model.${mi}.id`, label: "  模型 id", value: m.id ?? "" });
+        items.push({ kind: "field", key: `model.${mi}.name`, label: "  模型名", value: m.name ?? "" });
+        items.push({ kind: "field", key: `model.${mi}.contextWindow`, label: "  上下文窗口", value: m.contextWindow ?? "", numeric: true });
+        items.push({ kind: "field", key: `model.${mi}.maxTokens`, label: "  最大输出", value: m.maxTokens ?? "", numeric: true });
+      }
+    }
+    items.push({ kind: "button", label: "＋ 添加模型", action: () => this.#addModel() });
+    items.push({ kind: "button", label: "🗑 删除选中模型", action: () => this.#deleteModel() });
+    items.push({ kind: "button", label: "🔄 自动扫描模型（读 /models 端点）", action: () => this.#scan() });
+    items.push({ kind: "button", label: "◉ 设为当前会话模型（选中模型）", action: () => this.#setDefaultModel() });
+    items.push({ kind: "button", label: "💾 保存配置", action: () => this.#save() });
+    items.push({ kind: "button", label: "🗑 删除供应商", action: () => this.#deleteProvider() });
+    return items;
+  }
+  #rebuild() {
+    // left list
+    const listLines = [];
+    for (let i = 0; i < this.routes.length; i++) {
+      const r = this.routes[i];
+      const p = this.providers[r] ?? {};
+      const sel = i === this.sel && this.mode === "list";
+      listLines.push([{ t: ` ${sel ? "▸" : " "} ${truncate(p.displayName || r, 18)}`, fg: sel ? T.SELFG : T.TXT, bg: sel ? T.MENUSEL : T.BG2, bold: sel }]);
+    }
+    const addSel = this.sel === this.routes.length && this.mode === "list";
+    listLines.push([{ t: ` ${addSel ? "▸" : " "} ＋ 添加供应商`, fg: addSel ? T.SELFG : T.ACCENT, bg: addSel ? T.MENUSEL : T.BG2, bold: true }]);
+    this.listView.setLines(listLines);
+    // right form
+    const route = this.#route();
+    const formLines = [];
+    if (route == null) {
+      formLines.push([{ t: "  选择左侧供应商,或“＋ 添加供应商”新建(CC Switch 式填表)", fg: K.FAINT }]);
+      this.formItems = [];
+    } else if (this.scanMode) {
+      formLines.push([{ t: `  扫描 ${truncate(this.#profile(route).baseURL ?? "", 44)} — 空格勾选,Enter 添加,↑/↓ 移动`, fg: K.ACCENT, bold: true }]);
+      if (this.scanning) formLines.push([{ t: "  扫描中…", fg: K.WARN }]);
+      for (let i = 0; i < this.scanItems.length; i++) {
+        const m = this.scanItems[i];
+        const on = this.scanSel.has(m.id);
+        const cur = i === this.scanCursor;
+        formLines.push([{ t: `  ${cur ? "▸" : " "} [${on ? "x" : " "}] ${truncate(m.id, this.formView.w - 10)}`, fg: on ? K.OK : cur ? T.TXT : K.DIM, bg: cur ? T.MENUSEL : T.BG2 }]);
+      }
+      formLines.push([{ t: "  Enter 添加选中 · Esc 取消扫描", fg: K.FAINT }]);
+      this.formItems = [];
+    } else {
+      this.formItems = this.#formRows();
+      const w = Math.max(30, this.formView.w - 4);
+      for (let i = 0; i < this.formItems.length; i++) {
+        const it = this.formItems[i];
+        const cur = this.mode === "form" && i === this.formIdx;
+        let t;
+        if (it.kind === "field") {
+          const v = it.value === "" || it.value == null ? "（空）" : String(it.value);
+          t = ` ${cur ? "▸" : " "} ${it.label}: ${truncate(v, w - strWidth(it.label) - 6)}${it.note ? `  [${it.note}]` : ""}`;
+        } else if (it.kind === "model") {
+          const extras = [it.ctx != null ? `ctx ${it.ctx}` : "", it.max != null ? `max ${it.max}` : ""].filter(Boolean).join(" ");
+          t = ` ${cur ? "▸" : " "} 模型 ${truncate(it.id || "（未命名）", 24)}  ${truncate(it.name || "", 20)}  ${truncate(extras, 24)}`;
+        } else {
+          t = ` ${cur ? "▸" : " "} ${it.label}`;
+        }
+        formLines.push([{ t: truncate(t, w), fg: cur ? T.SELFG : T.TXT, bg: cur ? T.MENUSEL : T.BG2 }]);
+      }
+      formLines.push([{ t: "  Enter 编辑/执行 · ← 回列表 · Esc 退出面板", fg: K.FAINT }]);
+    }
+    this.formView.setLines(formLines);
+  }
+  render(screen) {
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", {});
+    const mid = this.x + 26;
+    screen.vline(mid, this.y, this.y + this.h - 1, "│", { fg: T.BORDER });
+    screen.text(this.x + 1, this.y, " 模型供应商 — CC Switch 式", { fg: K.DIM });
+    this.listView.render(screen);
+    this.formView.render(screen);
+    if (this.editing) {
+      screen.text(this.x + 28, this.y + this.h - 3, `编辑 ${this.editing.label}`, { fg: K.WARN, bold: true });
+      this.input.render(screen);
+    }
+  }
+  #startEdit(label, value, commit) {
+    this.editing = { label, commit };
+    this.input.setValue(value ?? "", { select: true });
+    this.app.redraw();
+  }
+  #commitEdit() {
+    if (!this.editing) return;
+    const { label, commit } = this.editing;
+    this.editing = null;
+    commit(this.input.value);
+    this.#rebuild();
+    this.app.redraw();
+  }
+  #activateItem() {
+    if (this.mode === "list") {
+      if (this.sel === this.routes.length) {
+        // ＋ 添加供应商
+        let name = "新供应商", i = 2;
+        while (this.providers[name] !== undefined) name = `新供应商${i++}`;
+        this.providers[name] = { displayName: "", api: "openai-completions", baseURL: "", apiKeyEnv: "", models: [] };
+        this.routes = Object.keys(this.providers);
+        this.sel = this.routes.indexOf(name);
+        this.mode = "form";
+        this.formIdx = 0;
+        this.#rebuild();
+        this.app.redraw();
+        return;
+      }
+      this.mode = "form";
+      this.formIdx = 0;
+      this.modelsSel = -1;
+      this.#rebuild();
+      this.app.redraw();
+      return;
+    }
+    // form
+    const it = this.formItems[this.formIdx];
+    if (!it) return;
+    const route = this.#route();
+    const p = this.#profile(route);
+    if (it.kind === "field") {
+      if (it.cycle) {
+        // cycle through the allowed api values
+        const next = it.cycle[(it.cycle.indexOf(it.value) + 1) % it.cycle.length];
+        p[it.key] = next;
+        this.#rebuild();
+        this.app.redraw();
+        return;
+      }
+      this.#startEdit(it.label, it.value, (text) => {
+        if (it.key === "route") {
+          // renaming the route key
+          const t = text.trim() || route;
+          if (t !== route && this.providers[t] !== undefined) { this.app.toast(`路由 ${t} 已存在`); return; }
+          if (t !== route) {
+            this.providers[t] = this.providers[route];
+            delete this.providers[route];
+            this.routes = Object.keys(this.providers);
+            this.sel = this.routes.indexOf(t);
+          }
+        } else if (it.numeric) {
+          const n = text.trim() === "" ? undefined : Number(text);
+          if (n !== undefined && !isFinite(n)) { this.app.toast("请输入数字"); return; }
+          const [, mi, field] = it.key.split(".");
+          p.models[Number(mi)][field] = n;
+        } else if (it.key.startsWith("model.")) {
+          const [, mi, field] = it.key.split(".");
+          p.models[Number(mi)][field] = text;
+        } else {
+          p[it.key] = text;
+        }
+      });
+      return;
+    }
+    if (it.kind === "model") {
+      this.modelsSel = this.modelsSel === it.idx ? -1 : it.idx;
+      this.#rebuild();
+      this.app.redraw();
+      return;
+    }
+    if (it.kind === "button") {
+      it.action();
+      this.app.redraw();
+      return;
+    }
+  }
+  #addModel() {
+    const route = this.#route();
+    if (!route) return;
+    const p = this.#profile(route);
+    p.models ??= [];
+    p.models.push({ id: "", name: "" });
+    this.modelsSel = p.models.length - 1;
+    this.#rebuild();
+    this.app.redraw();
+  }
+  #deleteModel() {
+    const route = this.#route();
+    if (!route || this.modelsSel < 0) { this.app.toast("先选中一个模型"); return; }
+    this.#profile(route).models.splice(this.modelsSel, 1);
+    this.modelsSel = -1;
+    this.#rebuild();
+    this.app.redraw();
+  }
+  async #setDefaultModel() {
+    const route = this.#route();
+    if (!route) return;
+    const p = this.#profile(route);
+    const m = p.models?.[this.modelsSel];
+    if (!m?.id) { this.app.toast("先选中一个模型"); return; }
+    if (!this.app.currentSession) { this.app.toast("先打开一个会话"); return; }
+    try {
+      await this.app.api.call("session.selectModel", { sessionId: this.app.currentSession, provider: route, model: m.id });
+      this.app.updateModel();
+      this.app.toast(`已切换 ${route}/${m.id}`);
+    } catch (e) { this.app.toast(`切换失败: ${e.message}`); }
+  }
+  async #save() {
+    try {
+      const res = await this.app.api.call("settings.mutate", {
+        ns: "llm-pi-ai",
+        ops: [{ op: "set", path: ["providers"], value: this.providers }],
+        expectedRevision: this.revision,
+      });
+      this.revision = res?.revision ?? this.revision;
+      this.app.toast(`已保存 ${Object.keys(this.providers).length} 个供应商`);
+    } catch (e) { this.app.toast(`保存失败: ${e.message}`); }
+  }
+  async #deleteProvider() {
+    const route = this.#route();
+    if (!route) return;
+    delete this.providers[route];
+    this.routes = Object.keys(this.providers);
+    this.sel = Math.min(this.sel, this.routes.length - 1);
+    this.modelsSel = -1;
+    await this.#save();
+    this.#rebuild();
+    this.app.redraw();
+  }
+  async #scan() {
+    const route = this.#route();
+    if (!route) return;
+    const p = this.#profile(route);
+    const base = String(p.baseURL ?? "").replace(/\/+$/, "");
+    if (!base) { this.app.toast("先填写 baseURL"); return; }
+    this.scanning = true;
+    this.scanMode = true;
+    this.scanItems = [];
+    this.scanCursor = 0;
+    this.#rebuild();
+    this.app.redraw();
+    const key = p.apiKeyEnv ? process.env[p.apiKeyEnv] : null;
+    const headers = key ? { Authorization: `Bearer ${key}` } : {};
+    const tryFetch = async (dispatcher) => {
+      const res = await fetch(`${base}/models`, { headers, dispatcher });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    };
+    try {
+      let body;
+      try { body = await tryFetch(undefined); }
+      catch (e0) {
+        // self-signed gateways: retry with TLS verification disabled
+        try {
+          const { Agent } = await import("undici");
+          body = await tryFetch(new Agent({ connect: { rejectUnauthorized: false } }));
+        } catch { throw e0; }
+      }
+      const list = Array.isArray(body?.data) ? body.data : Array.isArray(body?.models) ? body.models : [];
+      const seen = new Set();
+      const items = [];
+      for (const e of list) {
+        if (!e || typeof e !== "object") continue;
+        const id = String(e.id ?? e.name ?? "").trim();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        items.push({ id, name: e.name ?? e.id ?? id });
+      }
+      this.scanItems = items;
+      this.scanSel = new Set(items.map((m) => m.id));
+      if (items.length === 0) this.app.toast("扫描完成:未发现模型");
+      else this.app.toast(`发现 ${items.length} 个模型,空格勾选,Enter 添加`);
+    } catch (e) {
+      this.app.toast(`扫描失败: ${e.message}`);
+      this.scanMode = false;
+    }
+    this.scanning = false;
+    this.#rebuild();
+    this.app.redraw();
+  }
+  #scanCommit() {
+    const route = this.#route();
+    if (!route) return;
+    const p = this.#profile(route);
+    p.models ??= [];
+    const existing = new Set(p.models.map((m) => m.id));
+    let added = 0;
+    for (const m of this.scanItems) {
+      if (!this.scanSel.has(m.id) || existing.has(m.id)) continue;
+      p.models.push({ id: m.id, name: m.name });
+      added++;
+    }
+    this.scanMode = false;
+    this.app.toast(`已添加 ${added} 个模型（保存后生效）`);
+    this.#rebuild();
+    this.app.redraw();
+  }
+  onKey(ev) {
+    if (ev.type !== "key") return false;
+    if (this.editing) {
+      if (ev.name === "escape") { this.editing = null; this.#rebuild(); return true; }
+      if (ev.name === "enter") { this.#commitEdit(); return true; }
+      const handled = this.input.onKey(ev);
+      if (handled) this.app.redraw();
+      return true;
+    }
+    if (this.scanMode) {
+      if (ev.name === "escape") { this.scanMode = false; this.#rebuild(); return true; }
+      if (ev.name === "up") { this.scanCursor = Math.max(0, this.scanCursor - 1); this.app.redraw(); return true; }
+      if (ev.name === "down") { this.scanCursor = Math.min(this.scanItems.length - 1, this.scanCursor + 1); this.app.redraw(); return true; }
+      if (ev.name === "char" && ev.key === " " && !ev.ctrl) {
+        const m = this.scanItems[this.scanCursor];
+        if (m) { if (this.scanSel.has(m.id)) this.scanSel.delete(m.id); else this.scanSel.add(m.id); }
+        this.app.redraw();
+        return true;
+      }
+      if (ev.name === "enter") { this.#scanCommit(); return true; }
+      return false;
+    }
+    if (ev.name === "escape") { this.editing = null; return false; } // App falls back to chat mode
+    if (ev.name === "left" || (ev.name === "char" && ev.key === "h" && !ev.ctrl)) { this.mode = "list"; this.#rebuild(); return true; }
+    if (ev.name === "right" || (ev.name === "char" && ev.key === "l" && !ev.ctrl) || ev.name === "tab") {
+      if (this.#route() != null) { this.mode = "form"; this.#rebuild(); }
+      return true;
+    }
+    if (ev.name === "up" || (ev.name === "char" && ev.key === "k" && !ev.ctrl)) {
+      if (this.mode === "list") this.sel = Math.max(0, this.sel - 1);
+      else { this.formIdx = Math.max(0, this.formIdx - 1); this.#rebuild(); }
+      this.app.redraw();
+      return true;
+    }
+    if (ev.name === "down" || (ev.name === "char" && ev.key === "j" && !ev.ctrl)) {
+      if (this.mode === "list") this.sel = Math.min(this.routes.length, this.sel + 1);
+      else { this.formIdx = Math.min(Math.max(0, this.formItems.length - 1), this.formIdx + 1); this.#rebuild(); }
+      this.app.redraw();
+      return true;
+    }
+    if (ev.name === "enter") { this.#activateItem(); return true; }
+    return false;
+  }
+  onMouse(ev) {
+    if (ev.kind === "wheel-up") { this.formView.scroll(-3); return true; }
+    if (ev.kind === "wheel-down") { this.formView.scroll(3); return true; }
+    if (ev.kind !== "press" || ev.button !== 0) return false;
+    if (this.editing && this.input.inside(ev.x, ev.y)) return this.input.onMouse(ev);
+    if (ev.x < this.x + 26) {
+      const idx = ev.y - this.listView.y + this.listView.scrollY;
+      if (idx >= 0 && idx <= this.routes.length) { this.sel = idx; this.mode = "list"; this.#rebuild(); this.app.redraw(); return true; }
+      return false;
+    }
+    if (this.scanMode) {
+      const idx = ev.y - this.formView.y + this.formView.scrollY - 1;
+      if (idx >= 0 && idx < this.scanItems.length) {
+        this.scanCursor = idx;
+        const m = this.scanItems[idx];
+        if (this.scanSel.has(m.id)) this.scanSel.delete(m.id); else this.scanSel.add(m.id);
+        this.app.redraw();
+        return true;
+      }
+      return false;
+    }
+    const idx = ev.y - this.formView.y + this.formView.scrollY;
+    if (idx >= 0 && idx < this.formItems.length) { this.formIdx = idx; this.mode = "form"; this.#activateItem(); return true; }
+    return false;
   }
 }
 

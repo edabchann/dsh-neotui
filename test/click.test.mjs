@@ -6,7 +6,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatView, App, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig } from "../src/views.js";
-import { TrajectoryPanel, JobsPanel, SettingsPanel } from "../src/panels.js";
+import { TrajectoryPanel, JobsPanel, SettingsPanel, ModelPanel } from "../src/panels.js";
 import { fmtDuration, strWidth } from "../src/text.js";
 import { renderMd } from "../src/md.js";
 import { Input } from "../src/widgets.js";
@@ -715,6 +715,63 @@ test("the turn timer ticks from the QUESTION (before step 1 exists)", () => {
   assert.ok(!text.includes("总耗时"), "not finalized yet");
 });
 
+test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (m, p) => {
+    calls.push([m, p]);
+    if (m === "settings.describe") return {
+      namespaces: [{ ns: "llm-pi-ai", applies: "live", revision: 3, value: { providers: { ucas: { displayName: "UCAS", api: "openai-completions", baseURL: "https://x/v1", apiKeyEnv: "UCAS_API_KEY", models: [{ id: "gpt-5.6-terra", name: "GPT-5.6 Terra" }] } } } }],
+      writable: true,
+    };
+    if (m === "settings.mutate") return { revision: 4 };
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  assert.deepEqual(panel.routes, ["ucas"]);
+  // ＋ 添加供应商 creates a draft and opens the form
+  panel.sel = panel.routes.length;
+  panel.mode = "list";
+  panel.onKey({ type: "key", name: "enter" });
+  assert.ok(panel.routes.includes("新供应商"), "draft route created");
+  assert.equal(panel.mode, "form");
+  const fieldIdx = (label) => panel.formItems.findIndex((it) => it.kind === "field" && it.label === label);
+  // edit displayName and baseURL through the inline editor
+  for (const [label, value] of [["显示名", "My GW"], ["baseURL", "https://gw/v1"]]) {
+    panel.formIdx = fieldIdx(label);
+    panel.onKey({ type: "key", name: "enter" });
+    panel.input.setValue(value);
+    panel.onKey({ type: "key", name: "enter" });
+  }
+  assert.equal(panel.providers["新供应商"].displayName, "My GW");
+  assert.equal(panel.providers["新供应商"].baseURL, "https://gw/v1");
+  // save persists via settings.mutate
+  panel.formIdx = panel.formItems.findIndex((it) => it.kind === "button" && it.label.includes("保存配置"));
+  panel.onKey({ type: "key", name: "enter" });
+  const mutate = calls.find(([m]) => m === "settings.mutate");
+  assert.ok(mutate, "settings.mutate called");
+  assert.equal(mutate[1].ns, "llm-pi-ai");
+  assert.equal(mutate[1].expectedRevision, 3);
+  assert.equal(mutate[1].ops[0].value["新供应商"].displayName, "My GW");
+  // the auto-scan reads the /models endpoint and adds the picked models
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ data: [{ id: "m1" }, { id: "m2" }] }) });
+  try {
+    panel.formIdx = panel.formItems.findIndex((it) => it.kind === "button" && it.label.includes("自动扫描"));
+    panel.onKey({ type: "key", name: "enter" });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(panel.scanMode, true, "scan mode entered");
+    assert.deepEqual(panel.scanItems.map((m) => m.id), ["m1", "m2"]);
+    panel.onKey({ type: "key", name: "enter" }); // add the selected scan results
+    const ids = (panel.providers["新供应商"].models ?? []).map((m) => m.id);
+    assert.deepEqual(ids, ["m1", "m2"], "scanned models added");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test("finalized think blocks keep their start time and turns carry their total", () => {
   const events = [
     { event: { type: "turn/start", seq: 1, time: 1000, data: {} }, view: null },
@@ -1257,8 +1314,8 @@ test("settings panel: TUI 界面 namespace saves userPrefix to the config file",
   p.pendingOps.push({ op: "set", path: ["userPrefix"], value: "newname" });
   await p.save();
   assert.equal(userPrefix(), "newname > ", "config file updated");
-  // switching to a real namespace keeps working (index 1 = 默认展开/折叠)
-  p.selectNs(2);
+  // switching to a real namespace keeps working (indexes 1/2 = 默认展开/折叠, 模型供应商…)
+  p.selectNs(3);
   assert.equal(p.currentNs().ns, "test");
   saveTuiConfig({ userPrefix: "" });
 });
