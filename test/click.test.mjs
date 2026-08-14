@@ -778,6 +778,25 @@ test("footer jobs row is a single 后台任务 summary", () => {
   assert.equal(app.status.rows.length, 3, "footer has exactly one jobs row");
 });
 
+test("the todo box freezes its height once todos appear (no idle reflow)", () => {
+  const app = headlessApp();
+  const chat = app.chat;
+  assert.equal(chat.todoHeight(), 0, "empty before any todos");
+  app.projections.todos = [{ content: "a", status: "in_progress" }];
+  assert.equal(chat.todoHeight(), 7, "fixed max once seen");
+  app.projections.todos = [
+    { content: "a", status: "completed" },
+    { content: "b", status: "in_progress" },
+    { content: "c", status: "in_progress" },
+  ];
+  assert.equal(chat.todoHeight(), 7, "still 7 while the list changes");
+  app.projections.todos = [];
+  assert.equal(chat.todoHeight(), 7, "box reserved even when the list empties");
+  chat.todosVisible = false;
+  assert.equal(chat.todoHeight(), 0, "Shift+T collapse still hides it");
+  assert.equal(app.footerHeight(), 3, "footer always 3 rows (no job-driven reflow)");
+});
+
 test("footer jobs row says 没有任务正在后台运行 when none run", () => {
   const app = headlessApp();
   app.jobs = [{ status: "completed", kind: "goal", label: "done" }];

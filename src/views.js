@@ -570,6 +570,7 @@ export class ChatView extends Widget {
     this.thinkMode = "expanded";        // think blocks: expanded by default (t toggles)
     this.bashMode = "expanded";         // tool blocks: expanded | collapsed (b toggles)
     this.todosVisible = true;           // todo block above the input (Shift+T toggles)
+    this.todoSeen = false;             // once seen, the todo box keeps its height
     this.running = false;
     this.hasMore = false;
     this.loadingOlder = false;
@@ -717,11 +718,16 @@ export class ChatView extends Widget {
     }
   }
 
-  /** Height of the collapsible todo block (0 when empty or collapsed). */
+  /** Height of the collapsible todo block. FROZEN at the max (1 header + 6
+   *  items) once the session has ever shown todos: the harness updates the
+   *  list in the background while the user reads, and a height that tracks
+   *  the count reflows the whole layout every time (the idle 2-line shifts). */
   todoHeight() {
     const todos = this.app.todos;
-    if (!this.todosVisible || !todos || todos.length === 0) return 0;
-    return Math.min(todos.length, 6) + 1; // 1 header row + up to 6 todos
+    if (!this.todosVisible) return 0;
+    if (!todos || todos.length === 0) return this.todoSeen ? 7 : 0;
+    this.todoSeen = true;
+    return 7; // fixed max height — short lists just show fewer rows
   }
 
   inputChanged() {
@@ -1719,7 +1725,9 @@ export class App {
   }
 
   footerHeight() {
-    return 2 + (this.jobs?.length ? 1 : 0);
+    // Constant 3 rows: the jobs summary row is always present, so jobs
+    // arriving/completing in the background never reflow the layout.
+    return 3;
   }
 
   layout() {
@@ -2859,11 +2867,13 @@ export class App {
       if (stats.ttftMs) row1.right.push({ t: ` 首响${Math.round(stats.ttftMs / stats.ttftSteps)}ms `, fg: T.FAINT, bg: T.STATUSBG });
     }
     rows.push(row1);
-    // ── row 2: background jobs — one summary line, never per-job noise ──
-    if (this.jobs?.length) {
-      const running = this.jobs.filter((j) => j.status === "running").length;
-      const done = this.jobs.filter((j) => j.status === "completed").length;
-      const failed = this.jobs.filter((j) => j.status === "failed").length;
+    // ── row 2: background jobs — one summary line, always present so its
+    //    appearance/disappearance never reflows the layout ──
+    {
+      const jobs = this.jobs ?? [];
+      const running = jobs.filter((j) => j.status === "running").length;
+      const done = jobs.filter((j) => j.status === "completed").length;
+      const failed = jobs.filter((j) => j.status === "failed").length;
       const row2 = { left: [], right: [] };
       row2.left.push({
         t: ` ${running > 0 ? `${running} 个任务正在后台运行` : "没有任务正在后台运行"} `,
