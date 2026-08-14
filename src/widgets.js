@@ -28,6 +28,7 @@ export class ScrollView extends Widget {
     this.lines = [];       // array of arrays of segs: {t, fg, bg, bold, italic, underline, strike, code, link}
     this.scrollY = 0;
     this.anchorLock = null; // click anchor held beyond maxScroll (fold at the tail)
+    this.follow = opts.follow ?? true; // auto-follow the tail while pinned
     this.autoScroll = opts.autoScroll ?? false;
     this.onClick = opts.onClick ?? null;    // (y, ev) => bool
     this.onWheel = null;                    // optional custom wheel handler
@@ -35,7 +36,7 @@ export class ScrollView extends Widget {
     this.title = opts.title ?? "";
   }
   setLines(lines, { keep = false } = {}) {
-    const atBottom = this.autoScroll && this.scrollY + this.h >= this.lines.length - 1 || (keep && this.scrollY + this.h >= this.lines.length);
+    const atBottom = this.autoScroll && this.follow && this.scrollY + this.h >= this.lines.length - 1 || (keep && this.scrollY + this.h >= this.lines.length);
     this.lines = lines;
     if (this.anchorLock != null) {
       // A click fold removed the tail content: hold the exact anchored
@@ -52,6 +53,7 @@ export class ScrollView extends Widget {
     const before = this.scrollY;
     this.anchorLock = null; // explicit scroll releases the click anchor
     this.scrollY = Math.max(0, Math.min(this.maxScroll(), this.scrollY + dy));
+    this.follow = this.scrollY >= this.maxScroll(); // reaching the bottom re-follows
     return this.scrollY !== before;
   }
   render(screen) {
@@ -123,6 +125,7 @@ export class ScrollView extends Widget {
   }
   #scrubTo(ey) {
     this.anchorLock = null; // scrubbing releases the click anchor
+    this.follow = this.scrollY >= this.maxScroll();
     const trackH = Math.max(1, this.h - 2);
     const total = Math.max(1, this.lines.length);
     const thumbH = Math.max(1, Math.floor(this.h * this.h / total));

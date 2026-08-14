@@ -2,7 +2,7 @@
 import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
 import { truncate, strWidth, bars, fmtDuration } from "./text.js";
-import { readFileSync, appendFileSync } from "node:fs";
+import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
 import { userPrefix, saveTuiConfig, loadTuiConfig, userName } from "./config.js";
@@ -702,7 +702,7 @@ export class ChatView extends Widget {
     if (idx < 0 || idx >= this.nodes.length) return false;
     for (let li = 0; li < this.lineMap.length; li++) {
       if (this.lineMap[li]?.nodeIdx === idx) {
-        this.view.anchorLock = null; this.view.scrollY = Math.max(0, li - 2);
+        this.view.anchorLock = null; this.view.follow = false; this.view.scrollY = Math.max(0, li - 2);
         this.app.redraw();
         return true;
       }
@@ -782,6 +782,7 @@ export class ChatView extends Widget {
     // Jump to the LIVE tail (the newest content) on open — the view would
     // otherwise sit at the top showing the oldest turns.
     this.view.anchorLock = null; this.view.scrollY = this.view.maxScroll();
+    this.view.follow = true;
   }
 
   async loadOlder() {
@@ -853,6 +854,7 @@ export class ChatView extends Widget {
   #clickLog(msg) {
     try {
       const dir = process.env.DSH_HOME ?? join(process.env.HOME ?? ".", ".dsh");
+      mkdirSync(dir, { recursive: true });
       appendFileSync(join(dir, "tui-click-debug.log"), `${new Date().toISOString()} ${msg}\n`);
     } catch {}
   }
@@ -951,6 +953,8 @@ export class ChatView extends Widget {
         (this.lineMap[this.view.scrollY]?.blockIdx ?? null) === null
       ) this.view.scrollY++;
     };
+    // interacting with a block = reading mode: stop following the stream
+    this.view.follow = false;
     if (node.kind === "assistant" && info.blockIdx !== null) {
       const b = node.blocks[info.blockIdx];
       if (b && (b.kind === "tool" || b.kind === "reasoning" || b.kind === "other" || b.kind === "text")) {
@@ -1471,12 +1475,12 @@ export class ChatView extends Widget {
       case "pgdn": return this.view.scroll(this.view.h);
     }
     if (ev.name === "char" && ev.key === "g" && !ev.ctrl && !ev.shift) {
-      if (this.gKey) { this.gKey = false; this.view.anchorLock = null; this.view.scrollY = 0; return true; }
+      if (this.gKey) { this.gKey = false; this.view.anchorLock = null; this.view.follow = false; this.view.scrollY = 0; return true; }
       this.gKey = true;
       this.app.toast("再按 g 回顶");
       return true;
     }
-    if (ev.name === "char" && ev.key === "g" && ev.shift) { this.view.anchorLock = null; this.view.scrollY = this.view.maxScroll(); return true; }
+    if (ev.name === "char" && ev.key === "g" && ev.shift) { this.view.anchorLock = null; this.view.follow = true; this.view.scrollY = this.view.maxScroll(); return true; }
     if (ev.name === "escape" && this.app.searchQuery) { this.app.searchQuery = null; this.queueRebuild(); return true; }
     if (ev.name === "escape" && this.selStart !== null) { this.selStart = this.selEnd = null; this.app.redraw(); return true; }
     if (ev.name === "char" && ev.key === "i" && !ev.ctrl) { this.app.focus(this.input); return true; }
@@ -2867,6 +2871,14 @@ export class App {
       if (stats.ttftMs) row1.right.push({ t: ` 首响${Math.round(stats.ttftMs / stats.ttftSteps)}ms `, fg: T.FAINT, bg: T.STATUSBG });
     }
     rows.push(row1);
+    // frozen-view indicator: N lines of new content arrived below
+    {
+      const c = this.chat;
+      const below = c.lines.length - 1 - (c.view.scrollY + c.view.h);
+      if (!c.view.follow && below > 0) {
+        row1.left.push({ t: ` ↓${below} 条新内容 · G 跟随 `, fg: T.SELFG, bg: T.ACCENT, bold: true });
+      }
+    }
     // ── row 2: background jobs — one summary line, always present so its
     //    appearance/disappearance never reflows the layout ──
     {

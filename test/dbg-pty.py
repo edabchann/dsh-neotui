@@ -12,7 +12,7 @@ ROWS, COLS = 44, 118
 pid, fd = pty.fork()
 if pid == 0:
     os.chdir("/home/edabchann/dsh/tui")
-    env = dict(os.environ, TERM="xterm-256color", DSH_TUI_NO_KITTY="1")
+    env = dict(os.environ, TERM="xterm-256color", DSH_TUI_NO_KITTY="1", DSH_TUI_DEBUG_CLICK="1", DSH_HOME="/tmp/dsh-tui-dbghome")
     os.execvpe("node", ["node", "bin/dsh-tui.js", "--attach", "http://127.0.0.1:3080"], env)
 
 def set_size(rows, cols):
@@ -101,17 +101,31 @@ hdr_y, hdr_text = find_header()
 print("click target: row", hdr_y, repr(hdr_text))
 if hdr_y is None:
     print("no tool header found"); os.kill(pid, signal.SIGKILL); sys.exit(0)
-os.write(fd, f"\x1b[<0;40;{hdr_y + 1}M".encode())
-drain(0.4)
-os.write(fd, f"\x1b[<0;40;{hdr_y + 1}m".encode())
-drain(1.5)
-collapsed_at = -1
-for y in range(ROWS):
-    r = grid.row(y)
-    if re.search(r"▸\s+\S", r) and "展" in r:
-        collapsed_at = y
-        break
-print("after click: collapsed header at row", collapsed_at, "| offset =", collapsed_at - hdr_y, "rows")
+# click several positions: the header row and rows ABOVE/BELOW it, measuring
+# which block visually sits at the clicked row vs which one toggles
+def visible_header_rows():
+    rows = []
+    for y in range(ROWS):
+        r = grid.row(y)
+        if "[b " in r and ("折" in r or "展" in r):
+            rows.append(y)
+    return rows
+hdr_rows = visible_header_rows()
+print("tool headers at rows:", hdr_rows)
+for off in [0, 2, -2]:
+    ty = hdr_y + off
+    if ty < 0: continue
+    os.write(fd, f"\x1b[<0;40;{ty + 1}M".encode())
+    drain(0.3)
+    os.write(fd, f"\x1b[<0;40;{ty + 1}m".encode())
+    drain(1.2)
+    try:
+        log = open("/tmp/dsh-tui-dbghome/tui-click-debug.log").read().strip().split("\n")
+        print(f"clicked row {ty}:")
+        for line in log[-3:]:
+            print("   ", line[11:140])
+    except Exception as e:
+        print(f"clicked row {ty}: log unreadable {e}")
 # also: click the trailer of a collapsed TEXT block and measure the expansion
 def find_trailer():
     for y in range(ROWS):

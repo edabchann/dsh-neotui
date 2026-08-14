@@ -518,6 +518,33 @@ test("fixed-height fold: collapsing a block moves NOTHING below it", () => {
   assert.equal(afterIdxAfter2, afterIdxBefore, "below content still unmoved after re-expand");
 });
 
+test("scrolling up freezes the follow; G re-follows; footer shows the new-content badge", () => {
+  const app = headlessApp();
+  const c = app.chat;
+  c.nodes = [
+    toolNode(),
+    { kind: "assistant", id: "a2", step: 2, streaming: true, blocks: [{ kind: "text", text: Array.from({ length: 40 }, (_, i) => `para ${i}`).join("\n\n"), streaming: true, startedAt: Date.now() }] },
+  ];
+  c.resize(0, 1, 100, 30);
+  c.view.scrollY = c.view.maxScroll();
+  c.view.follow = true;
+  assert.ok(c.view.maxScroll() > 0, "buffer is scrollable");
+  c.view.scroll(-2);
+  assert.equal(c.view.follow, false, "scrolling up freezes the follow");
+  const sy = c.view.scrollY;
+  const tail = c.nodes[1];
+  tail.blocks[0].text += "\n\n" + Array.from({ length: 10 }, (_, i) => `grow-${i}`).join("\n\n");
+  c.queueRebuild(); c.flushRebuild();
+  assert.equal(c.view.scrollY, sy, "frozen view does not snap to the new tail");
+  app.renderFrame();
+  const row1 = app.status.rows[1];
+  const text = [...(row1?.left ?? []), ...(row1?.right ?? [])].map((x) => x.t).join(" ");
+  assert.ok(text.includes("条新内容"), `badge shown: ${text}`);
+  c.onKey({ type: "key", name: "char", key: "g", text: "g", ctrl: false, alt: false, shift: true });
+  assert.equal(c.view.follow, true, "G re-follows");
+  assert.equal(c.view.scrollY, c.view.maxScroll());
+});
+
 test("the stream growing between press and release cannot shift the hit", () => {
   const longText = Array.from({ length: 40 }, (_, i) => `para ${i}`).join("\n\n");
   const { chat } = render([
