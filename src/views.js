@@ -2376,7 +2376,7 @@ export class App {
   renderFrame() {
     this.chat.flushRebuild();
     const s = this.screen;
-    s.clear(T.BG);
+    s.clear(-1, T.BG);
     this.#renderTabBar(s);
     if (this.sidebarVisible) {
       if (this.searchActive) {

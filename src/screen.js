@@ -53,7 +53,13 @@ export class Screen {
     const cell = this.cells[y][x];
     const wide = wcwidth(ch.codePointAt(0)) === 2;
     if (wide && x + 1 >= this.w) ch = " "; // clip wide char at the right edge (terminal wrap corruption)
-    cell.ch = ch; cell.fg = fg; cell.bg = bg; cell.attrs = attrs; cell.link = link;
+    cell.ch = ch; cell.fg = fg;
+    // bg -1 = transparent: KEEP the cell's existing background (the layer
+    // underneath) instead of resetting it to the terminal default — this is
+    // what used to leave "unexplained dark blocks" wherever widgets drew
+    // text/fills without an explicit background.
+    if (bg !== -1) cell.bg = bg;
+    cell.attrs = attrs; cell.link = link;
     cell.wide = wide && x + 1 < this.w;
     if (cell.wide) {
       const cont = this.cells[y][x + 1];
@@ -62,7 +68,7 @@ export class Screen {
         const next = this.cells[y][x + 2];
         next.ch = " "; next.wide = false; next.link = "";
       }
-      cont.ch = ""; cont.fg = fg; cont.bg = bg; cont.attrs = attrs; cont.link = link; cont.wide = false;
+      cont.ch = ""; cont.fg = fg; cont.bg = cell.bg; cont.attrs = attrs; cont.link = link; cont.wide = false;
     }
   }
 
