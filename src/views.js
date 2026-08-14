@@ -111,12 +111,12 @@ function diffText(oldText, newText, width) {
 
 // ---- Chat node model ----
 
-function nodeForEvents(events, log) {
-  const nodes = [];
+/** Apply ONE event onto a mutable nodes array (shared by full-window
+ *  derivation and the incremental mux merge — the two paths must agree). */
+function applyEvent(nodes, event, view, log) {
   const cur = () => nodes[nodes.length - 1];
-  for (const { event, view } of events) {
-    const d = event.data ?? {};
-    switch (event.type) {
+  const d = event.data ?? {};
+  switch (event.type) {
       case "user/message": {
         const text = partsToText(d.content ?? d.message?.content);
         const images = partsToImages(d.content ?? d.message?.content);
@@ -238,7 +238,12 @@ function nodeForEvents(events, log) {
         }
       }
     }
-  }
+}
+
+/** Re-derive the whole node list from a complete event window (open/poll). */
+function nodeForEvents(events, log) {
+  const nodes = [];
+  for (const { event, view } of events) applyEvent(nodes, event, view, log);
   return nodes;
 }
 
@@ -557,23 +562,13 @@ export class ChatView extends Widget {
   }
 
   /** Queue a rebuild; flushed on the next frame render (throttles streaming). */
-  /** Merge freshly arrived events (mux frames or poll results) into the tail. */
+  /** Merge freshly arrived events (mux frames) into the tail INCREMENTALLY —
+   *  each event mutates this.nodes directly via the same applyEvent the
+   *  full-window re-derivation uses, so a lone reasoning-delta appends to the
+   *  existing block instead of wiping it (the old "shows then deleted" bug). */
   mergeEvents(entries) {
-    const nodes = nodeForEvents(entries, this.app.log);
-    if (nodes.length === 0) return;
-    const last = nodes[nodes.length - 1];
-    const mine = this.nodes[this.nodes.length - 1];
-    // Only merge into the ACTIVE streaming node; a newly started turn is pushed
-    // as its own node (merging into a finalized turn would overwrite it).
-    if (last.kind === "assistant" && mine && mine.kind === "assistant" && mine.streaming) {
-      mine.blocks = last.blocks;
-      mine.images = last.images ?? mine.images;
-      mine.id = last.id ?? mine.id;
-      mine.streaming = last.streaming;
-      mine.finalized = false;
-    } else {
-      this.nodes.push(...nodes);
-      this.expanded.add(this.nodes.length - 1);
+    for (const { event, view } of entries) {
+      applyEvent(this.nodes, event, view, this.app.log);
     }
     this.running = this.nodes.some((n) => n.kind === "assistant" && n.streaming);
     this.queueRebuild();
@@ -737,6 +732,9 @@ export class ChatView extends Widget {
       this.nodes = [{ kind: "system", text: `加载失败: ${e.message}` }];
     }
     this.#rebuild();
+    // Jump to the LIVE tail (the newest content) on open — the view would
+    // otherwise sit at the top showing the oldest turns.
+    this.view.scrollY = this.view.maxScroll();
   }
 
   async loadOlder() {
