@@ -874,6 +874,12 @@ export class ChatView extends Widget {
         if (first < 0) return;
         const target = Math.min(first + topOffset, last);
         this.view.scrollY = Math.max(0, Math.min(target, this.view.maxScroll()));
+        // never park the viewport on a blank separator row — it reads as a
+        // spurious offset right after the click
+        while (
+          this.view.scrollY < this.lineMap.length - 1 &&
+          !(this.lines[this.view.scrollY] ?? []).some((g) => g.t.trim() !== "")
+        ) this.view.scrollY++;
       };
       if (node?.kind === "assistant" && info.blockIdx !== null) {
         const b = node.blocks[info.blockIdx];
@@ -1016,12 +1022,16 @@ export class ChatView extends Widget {
               const open = manuallyExpanded || (!manuallyCollapsed && this.thinkMode === "expanded");
               beginCard("THINKBG");
               // Live blocks tick (已经过…); finished blocks freeze at their
-              // total (已完成,耗时…). No timestamps → no bogus timer shown.
+              // total (已完成,耗时…). Snapshot-derived blocks may lack a
+              // per-block start (the history projection has no block-start):
+              // show a plain 已完成 then — never a bogus ticking timer.
               let timing = "";
               if (b.streaming) {
                 timing = ` 已经过 ${fmtDuration(Date.now() - (b.startedAt ?? Date.now()))}`;
               } else if (b.startedAt !== undefined && b.endedAt !== undefined) {
                 timing = ` 已完成,耗时 ${fmtDuration(b.endedAt - b.startedAt)}`;
+              } else if (b.endedAt !== undefined) {
+                timing = " 已完成";
               }
               const thinkMeta = `${stepTag}（${b.text?.length ?? 0} 字）${timing}`;
               lines.push([{ t: "💭 思考" + (b.streaming ? "…" : "") + thinkMeta + (open ? " [t 折叠]" : " [t 展开]"), fg: K.FAINT }]);
@@ -1041,16 +1051,23 @@ export class ChatView extends Widget {
               const key = `${realIdx}:${bi}`;
               const open = this.bashMode !== "collapsed" && !this.collapsedBlocks.has(key);
               const exitCode = b.view?.view?.exitCode;
-              const status = b.result == null && !b.done ? "TOOLBG" : exitCode !== undefined && exitCode !== 0 ? "TOOLERR" : "TOOLOK";
-              const glyph = b.result == null && !b.done ? "⏳" : exitCode !== undefined && exitCode !== 0 ? "✗" : "✓";
+              // A tool only TICKS while its turn is live. A finalized turn
+              // whose result never matched (orphan) must freeze at 无结果 —
+              // otherwise the timer runs forever ("timing chaos").
+              const running = b.result == null && !b.done && node.streaming;
+              const orphan = b.result == null && !b.done && !node.streaming;
+              const status = orphan ? "TOOLERR" : running ? "TOOLBG" : exitCode !== undefined && exitCode !== 0 ? "TOOLERR" : "TOOLOK";
+              const glyph = orphan ? "✗" : running ? "⏳" : exitCode !== undefined && exitCode !== 0 ? "✗" : "✓";
               const card = b.view ? renderToolCard(b.view, w, open) : [];
               beginCard(status);
               let timing = "";
-              if (b.result == null && !b.done) {
+              if (running) {
                 timing = ` 已经过 ${fmtDuration(Date.now() - (b.startedAt ?? Date.now()))}`;
               } else if (b.startedAt !== undefined && b.endedAt !== undefined) {
                 const failed = exitCode !== undefined && exitCode !== 0;
                 timing = ` ${failed ? "失败" : "已完成"},耗时 ${fmtDuration(b.endedAt - b.startedAt)}`;
+              } else if (orphan) {
+                timing = " 无结果";
               }
               lines.push([
                 { t: open ? "▾ " : "▸ ", fg: K.ACCENT },

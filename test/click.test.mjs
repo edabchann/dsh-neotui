@@ -194,30 +194,40 @@ test("collapsing a long text block keeps the viewport anchored (no view jump)", 
   // flung to unrelated content
   assert.equal(topKey(), "0:0", "viewport stays anchored on the clicked block");
   const topText = chat.lines[chat.view.scrollY].map((g) => g.t).join("");
+  assert.ok(topText.trim() !== "", "viewport top is never a blank separator row");
   assert.ok(!topText.includes("tail-node"), "did not jump past the block");
 });
 
 test("clicking a block header keeps the viewport EXACTLY still (zero offset)", () => {
   const longText = Array.from({ length: 40 }, (_, i) => `para ${i}`).join("\n\n");
+  const tail = Array.from({ length: 40 }, (_, i) => ({
+    kind: "assistant", id: `t${i}`, step: 3 + i, streaming: false,
+    blocks: [{ kind: "text", text: `tail-${i}` }],
+  }));
   const { chat } = render([
     { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [{ kind: "text", text: longText }] },
-    { kind: "assistant", id: "a2", step: 2, streaming: false, blocks: [{ kind: "text", text: "AFTER" }] },
+    { kind: "assistant", id: "a2", step: 2, streaming: false, blocks: [{ kind: "text", text: "AFTER-NODE" }] },
+    ...tail,
   ]);
-  const headerIdx = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 0"));
-  chat.view.scrollY = Math.max(0, headerIdx - 3); // header 3 rows below the top
+  // click the SECOND node's header while a non-empty line of the first node
+  // sits at the viewport top (and scrollY stays within maxScroll)
+  const headerIdx = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("AFTER-NODE"));
+  chat.view.scrollY = Math.max(0, Math.min(headerIdx - 3, chat.view.maxScroll()));
+  const topBefore = chat.lines[chat.view.scrollY].map((g) => g.t).join("");
+  assert.ok(topBefore.trim() !== "", "top line is real content");
   const scrollBefore = chat.view.scrollY;
   const y = chat.view.y + (headerIdx - chat.view.scrollY);
   chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
   chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
-  assert.ok(chat.collapsedBlocks.has("0:0"), "collapsed");
+  assert.ok(chat.collapsedBlocks.has("1:0"), "collapsed");
   assert.equal(chat.view.scrollY, scrollBefore, "scrollY unchanged when clicking the header");
   // and re-expanding the header keeps it still too
-  const hdr2 = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 0"));
+  const hdr2 = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("AFTER-NODE"));
   const scrollBefore2 = chat.view.scrollY;
   const y2 = chat.view.y + (hdr2 - chat.view.scrollY);
   chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y: y2 });
   chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y: y2 });
-  assert.ok(!chat.collapsedBlocks.has("0:0"), "re-expanded");
+  assert.ok(!chat.collapsedBlocks.has("1:0"), "re-expanded");
   assert.equal(chat.view.scrollY, scrollBefore2, "scrollY unchanged when re-expanding the header");
 });
 
@@ -383,6 +393,31 @@ test("streaming blocks tick with 已经过", () => {
   const text = lines.join("\n");
   assert.ok(/💭 思考… \(step 7\)（1 字） 已经过 \d+秒/.test(text), `live think ticks: ${text.split("\n").find((l) => l.includes("💭"))}`);
   assert.ok(/已经过 \d+秒/.test(text.split("\n").find((l) => l.includes("bash")) ?? ""), "running tool ticks");
+});
+
+test("a finalized tool block without a result freezes at 无结果 (no forever timer)", () => {
+  const now = Date.now();
+  const { lines } = render([{
+    kind: "assistant", id: "a7", step: 4, streaming: false,
+    blocks: [{ kind: "tool", name: "bash", args: "ls", result: null, startedAt: now - 300000, view: null }],
+  }]);
+  const text = lines.join("\n");
+  const tool = text.split("\n").find((l) => l.includes("bash"));
+  assert.ok(tool.includes("✗"), `orphan tool shows ✗: ${tool}`);
+  assert.ok(tool.includes("无结果"), `orphan tool shows 无结果: ${tool}`);
+  assert.ok(!tool.includes("已经过"), `orphan tool does NOT tick: ${tool}`);
+});
+
+test("a finished snapshot think block without a start time shows plain 已完成", () => {
+  const now = Date.now();
+  const { lines } = render([{
+    kind: "assistant", id: "a8", step: 5, streaming: false,
+    blocks: [{ kind: "reasoning", text: "snapshot thinking", streaming: false, endedAt: now - 1000 }],
+  }]);
+  const think = lines.find((l) => l.includes("💭"));
+  assert.ok(think.includes("已完成"), `snapshot think shows 已完成: ${think}`);
+  assert.ok(!think.includes("已经过"), "no live timer");
+  assert.ok(!think.includes("耗时"), "no fabricated duration");
 });
 
 test("a missed block-end cannot leave a forever-running timer", () => {
