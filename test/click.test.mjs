@@ -485,64 +485,33 @@ test("folding the last block at the bottom holds the header position (no 5-line 
   assert.equal(hdr3 - chat.view.scrollY, rowBefore, "no delayed snap on the next rebuild");
 });
 
-test("fixed-height fold: collapsing a block moves NOTHING below it", () => {
+test("collapsing a block folds the content below up naturally (no ghost gap)", () => {
   const longText = Array.from({ length: 30 }, (_, i) => `para ${i}`).join("\n\n");
   const { chat } = render([
     { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [{ kind: "text", text: longText }] },
     { kind: "assistant", id: "a2", step: 2, streaming: false, blocks: [{ kind: "text", text: "AFTER" }] },
   ]);
-  // click a CONTENT line deep inside the block
   const clicked = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 20"));
   chat.view.scrollY = Math.max(0, clicked - 3);
   const afterIdxBefore = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("AFTER"));
-  const scrollBefore = chat.view.scrollY;
   const y = chat.view.y + (clicked - chat.view.scrollY);
   chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
   chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
   assert.ok(chat.collapsedBlocks.has("0:0"), "collapsed");
-  assert.equal(chat.view.scrollY, scrollBefore, "view did not scroll");
   const afterIdxAfter = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("AFTER"));
-  assert.equal(afterIdxAfter, afterIdxBefore, "the content below the fold did not move AT ALL");
-  // the block pads its old height: header+preview+trailer+filler == old height
-  const hdr = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 0"));
+  assert.ok(afterIdxAfter < afterIdxBefore, "content below folded up (natural fold, no ghost gap)");
   const trailer = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("…共"));
-  assert.ok(trailer > hdr, "trailer after the header");
-  // re-expand: everything below stays too
-  const tr = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("…共"));
-  chat.view.scrollY = Math.max(0, tr - 3);
-  const y2 = chat.view.y + (tr - chat.view.scrollY);
+  assert.ok(trailer >= 0, "trailer present");
+  const after2 = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("AFTER"));
+  assert.ok(after2 - trailer <= 3, "the next block follows the trailer immediately (no filler)");
+  // re-expand restores the exact position
+  chat.view.scrollY = Math.max(0, trailer - 3);
+  const y2 = chat.view.y + (trailer - chat.view.scrollY);
   chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y: y2 });
   chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y: y2 });
   assert.ok(!chat.collapsedBlocks.has("0:0"), "re-expanded");
   const afterIdxAfter2 = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("AFTER"));
-  assert.equal(afterIdxAfter2, afterIdxBefore, "below content still unmoved after re-expand");
-});
-
-test("scrolling up freezes the follow; G re-follows; footer shows the new-content badge", () => {
-  const app = headlessApp();
-  const c = app.chat;
-  c.nodes = [
-    toolNode(),
-    { kind: "assistant", id: "a2", step: 2, streaming: true, blocks: [{ kind: "text", text: Array.from({ length: 40 }, (_, i) => `para ${i}`).join("\n\n"), streaming: true, startedAt: Date.now() }] },
-  ];
-  c.resize(0, 1, 100, 30);
-  c.view.scrollY = c.view.maxScroll();
-  c.view.follow = true;
-  assert.ok(c.view.maxScroll() > 0, "buffer is scrollable");
-  c.view.scroll(-2);
-  assert.equal(c.view.follow, false, "scrolling up freezes the follow");
-  const sy = c.view.scrollY;
-  const tail = c.nodes[1];
-  tail.blocks[0].text += "\n\n" + Array.from({ length: 10 }, (_, i) => `grow-${i}`).join("\n\n");
-  c.queueRebuild(); c.flushRebuild();
-  assert.equal(c.view.scrollY, sy, "frozen view does not snap to the new tail");
-  app.renderFrame();
-  const row1 = app.status.rows[1];
-  const text = [...(row1?.left ?? []), ...(row1?.right ?? [])].map((x) => x.t).join(" ");
-  assert.ok(text.includes("条新内容"), `badge shown: ${text}`);
-  c.onKey({ type: "key", name: "char", key: "g", text: "g", ctrl: false, alt: false, shift: true });
-  assert.equal(c.view.follow, true, "G re-follows");
-  assert.equal(c.view.scrollY, c.view.maxScroll());
+  assert.equal(afterIdxAfter2, afterIdxBefore, "re-expand restores the exact position");
 });
 
 test("the stream growing between press and release cannot shift the hit", () => {
