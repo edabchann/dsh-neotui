@@ -950,10 +950,13 @@ export class TrajectoryPanel extends Widget {
       lines.push(segs);
       this.stepLines[lines.length - 1] = si;
       if (open) {
-        // 详细 mode: the step's events inline under its color block.
+        // 详细 mode: the step's events inline under its color block, each
+        // with its deep-dive elapsed time since the step started (web-style).
+        const t0 = step.events[0]?.time;
         const evs = step.events.slice(0, 12);
         for (const e of evs) {
-          lines.push([{ t: `    #${String(e.seq).padStart(4)} ${truncate(this.#eventSummary(e), w - 12)}`, fg: K.DIM, bg }]);
+          const dt = t0 != null && e.time != null ? ` +${fmtMs(e.time - t0)}` : "";
+          lines.push([{ t: `    #${String(e.seq).padStart(4)}${dt} ${truncate(this.#eventSummary(e), w - 12 - strWidth(dt))}`, fg: K.DIM, bg }]);
           this.stepLines[lines.length - 1] = si;
         }
         if (step.events.length > evs.length) {

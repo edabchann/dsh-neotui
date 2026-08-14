@@ -1,7 +1,7 @@
 // views.js — App composition: session list + chat timeline + approvals + status.
 import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
-import { truncate, strWidth, bars, fmtDuration } from "./text.js";
+import { truncate, strWidth, bars, fmtDuration, fmtClock, fmtDateTime } from "./text.js";
 import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
@@ -147,12 +147,17 @@ function applyEvent(nodes, event, view, log, state = null) {
           else blocks.push({ kind: "other", text: JSON.stringify(p).slice(0, 500) });
         }
         // Finalization stamps: endedAt marks when the message completed. The
-        // block start time is left untouched so syncTail's inheritStarts can
-        // carry the ORIGINAL block start across re-derivations.
+        // final message REPLACES the chunk-built blocks, so carry their start
+        // times by position (same rule as syncTail's inheritStarts) —
+        // otherwise every reloaded think block loses 耗时 after completion.
+        const last = cur();
+        const prevBlocks = last && last.kind === "assistant" ? last.blocks ?? [] : [];
         for (const b of blocks) b.endedAt = event.time ?? Date.now();
+        for (let bi = 0; bi < blocks.length; bi++) {
+          if (blocks[bi].startedAt === undefined && prevBlocks[bi]?.startedAt !== undefined) blocks[bi].startedAt = prevBlocks[bi].startedAt;
+        }
         const images = partsToImages(d.message?.content);
         const id = d.message?.id ?? null;
-        const last = cur();
         if (last && last.kind === "assistant" && last.streaming !== false) {
           last.blocks = blocks;
           last.images = images ?? last.images;
@@ -224,11 +229,36 @@ function applyEvent(nodes, event, view, log, state = null) {
         const callId = d.message?.source?.callId;
         const text = partsToText(d.message?.content);
         const node = nodes.findLast((nd) => nd.kind === "assistant" && nd.blocks.some((b) => b.kind === "tool" && b.callId === callId));
-        const block = node?.blocks.find((b) => b.kind === "tool" && b.callId === callId);
+        let block = node?.blocks.find((b) => b.kind === "tool" && b.callId === callId);
+        if (!block) {
+          // the callId did not match (missed tool/call in the loaded window):
+          // attach to the most recent tool block still awaiting a result —
+          // otherwise a SUCCESSFUL bash renders as a red "无结果" failure
+          outer:
+          for (let ni = nodes.length - 1; ni >= 0; ni--) {
+            const nd = nodes[ni];
+            if (nd.kind !== "assistant") continue;
+            for (const b of nd.blocks ?? []) {
+              if (b.kind === "tool" && b.result == null) { block = b; break outer; }
+            }
+          }
+        }
         if (block) {
           block.result = text ?? JSON.stringify(d).slice(0, 400);
           block.endedAt = event.time ?? Date.now();
         }
+        break;
+      }
+      case "turn/start": {
+        st.turnStart = event.time ?? Date.now();
+        break;
+      }
+      case "turn/end": {
+        const node = cur();
+        if (node?.kind === "assistant" && st.turnStart !== undefined) {
+          node.turnMs = Math.max(0, (event.time ?? Date.now()) - st.turnStart);
+        }
+        st.turnStart = null;
         break;
       }
       case "step/end": {
@@ -254,7 +284,7 @@ function applyEvent(nodes, event, view, log, state = null) {
       }
       default: {
         // known benign control events: silently ignored
-        const KNOWN = new Set(["turn/start", "turn/end", "todo/write",
+        const KNOWN = new Set(["todo/write",
           "agent/inbox/spliced", "request/header", "request/context", "permission/preset",
           "sandbox/mode", "approval/policy", "session/title-llm-request", "command/done", "command/failed"]);
         if (!KNOWN.has(event.type) && !SEEN_TYPES.has(event.type)) {
@@ -266,7 +296,7 @@ function applyEvent(nodes, event, view, log, state = null) {
 }
 
 /** Re-derive the whole node list from a complete event window (open/poll). */
-function nodeForEvents(events, log) {
+export function nodeForEvents(events, log) {
   const nodes = [];
   const state = { step: null };
   for (const { event, view } of events) applyEvent(nodes, event, view, log, state);
@@ -573,6 +603,7 @@ export class ChatView extends Widget {
     this.hasMore = false;
     this.loadingOlder = false;
     this.minSeq = null;
+    this.earliestTime = null;  // earliest loaded event time ≈ session start
     this.view = new ScrollView({
       x: this.x, y: this.y, w: this.w, h: this.h - 2,
       autoScroll: true, title: "",
@@ -633,10 +664,22 @@ export class ChatView extends Widget {
 
   /** Idempotently re-derive the tail node(s) from the complete last message.
    *  Dedup by message id so already-loaded nodes are updated, never duplicated. */
+  /** Track the earliest event time ever loaded — the session's start time
+   *  (converges to the true start as older pages load). */
+  #noteEarliest(events) {
+    let t = Infinity;
+    for (const e of events ?? []) {
+      const et = e?.event?.time;
+      if (typeof et === "number" && et < t) t = et;
+    }
+    if (t !== Infinity && (this.earliestTime == null || t < this.earliestTime)) this.earliestTime = t;
+  }
+
   syncTail(events) {
     const maxSeq = events[events.length - 1]?.event?.seq ?? 0;
     if (maxSeq <= (this.lastSyncedSeq ?? -1)) return;
     this.lastSyncedSeq = maxSeq;
+    this.#noteEarliest(events);
     const nodes = nodeForEvents(events, this.app.log);
     const lastAssistant = [...nodes].reverse().find((n) => n.kind === "assistant");
     if (!lastAssistant) {
@@ -771,6 +814,7 @@ export class ChatView extends Widget {
       this.lastSyncedSeq = -1;
       this.pollSlow = false;
       this.hasMore = hist.hasMore;
+      this.#noteEarliest(hist.events);
       this.nodes = nodeForEvents(hist.events, this.app.log);
       this.title = hist.projections?.values?.title ?? this.title;
       if (hist.projections?.values) {
@@ -797,6 +841,7 @@ export class ChatView extends Widget {
         const before = this.lines.length;
         this.minSeq = hist.events[0]?.event?.seq ?? this.minSeq;
         this.hasMore = hist.hasMore;
+        this.#noteEarliest(hist.events);
         const more = nodeForEvents(hist.events, this.app.log);
         this.nodes = [...more, ...this.nodes];
       }
@@ -1138,7 +1183,7 @@ export class ChatView extends Widget {
           return ".";
         }).join("")
         : "";
-      const ckey = `${realIdx}|${w}|${expKey}|${blockKeys}|${this.thinkMode}|${this.bashMode}|${node.streaming ? "s" : "f"}|${themeName()}|${node.step ?? "-"}|${userPrefix()}`;
+      const ckey = `${realIdx}|${w}|${expKey}|${blockKeys}|${this.thinkMode}|${this.bashMode}|${node.streaming ? "s" : "f"}|${themeName()}|${node.step ?? "-"}|${userPrefix()}|${node.turnMs ?? "-"}`;
       // Streaming nodes re-render every frame: their text grows without any
       // change to the cache key, so caching them freezes the live think/tool/text.
       const hit = node.streaming ? undefined : this.cache.get(ckey);
@@ -1256,23 +1301,25 @@ export class ChatView extends Widget {
               // otherwise the timer runs forever ("timing chaos").
               const running = b.result == null && !b.done && node.streaming;
               const orphan = b.result == null && !b.done && !node.streaming;
-              const status = orphan ? "TOOLERR" : running ? "TOOLBG" : exitCode !== undefined && exitCode !== 0 ? "TOOLERR" : "TOOLOK";
-              const glyph = orphan ? "✗" : running ? "⏳" : exitCode !== undefined && exitCode !== 0 ? "✗" : "✓";
+              // An orphan (result never matched) is NOT a failure — it renders
+              // neutral (◌, TOOLBG), never the red ✗ of a failed exit code.
+              const failed = !orphan && exitCode !== undefined && exitCode !== 0;
+              const status = running ? "TOOLBG" : failed ? "TOOLERR" : "TOOLOK";
+              const glyph = running ? "⏳" : failed ? "✗" : orphan ? "◌" : "✓";
               const card = b.view ? renderToolCard(b.view, w, open) : [];
               beginCard(status);
               let timing = "";
               if (running) {
                 timing = ` 已经过 ${fmtDuration(Date.now() - (b.startedAt ?? Date.now()))}`;
               } else if (b.startedAt !== undefined && b.endedAt !== undefined) {
-                const failed = exitCode !== undefined && exitCode !== 0;
-                timing = ` ${failed ? "失败" : "已完成"},耗时 ${fmtDuration(b.endedAt - b.startedAt)}`;
+                timing = ` ${failed ? "失败" : orphan ? "无结果" : "已完成"},耗时 ${fmtDuration(b.endedAt - b.startedAt)}`;
               } else if (orphan) {
                 timing = " 无结果";
               }
               lines.push([
                 { t: open ? "▾ " : "▸ ", fg: K.ACCENT },
                 { t: ` ${b.name ?? "tool"}`, fg: K.TXT, bold: true },
-                { t: ` ${glyph}`, fg: status === "TOOLOK" ? K.OK : status === "TOOLERR" ? K.ERR : K.WARN },
+                { t: ` ${glyph}`, fg: failed ? K.ERR : status === "TOOLOK" ? K.OK : K.WARN },
                 { t: stepTag + timing, fg: K.DIM },
                 { t: open ? " [b 折叠]" : " [b 展开]", fg: K.FAINT },
               ]);
@@ -1347,6 +1394,11 @@ export class ChatView extends Widget {
               markImg(realIdx, ii);
               sep();
             }
+          }
+          // the turn's FINAL reply carries the whole turn duration
+          if (node.turnMs != null) {
+            lines.push([{ t: `  🕐 本轮回答总耗时 ${fmtDuration(node.turnMs)}`, fg: T.WARN, bold: true }]);
+            mark(realIdx);
           }
           break;
         }
@@ -1810,6 +1862,7 @@ export class App {
     this.jobs = [];
     this.jobsBySession = new Map(); // sessionId → latest session/jobs snapshot
     this.ctrlCUntil = null;         // NORMAL-mode double-Ctrl+C exit window
+    this.lastSec = 0;               // status-bar clock second pulse
     this.focused = null;
     this.provider = "";
     this.model = "";
@@ -2990,6 +3043,9 @@ export class App {
           this.renderFrame();
         }
         if (this.toastMsg && Date.now() > this.toastUntil) { this.toastMsg = null; this.dirty = true; }
+        // the status-bar clock ticks once per second
+        const sec = Math.floor(Date.now() / 1000);
+        if (sec !== this.lastSec) { this.lastSec = sec; this.dirty = true; }
       } catch (e) {
         this.log("render error (kept running):", e);
         // stderr is invisible under the alt screen — record the stack where
@@ -3056,6 +3112,16 @@ export class App {
     if (this.sidebarVisible) row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });
     else row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });
     if (cur?.running) row0.left.push({ t: " ●运行 ", fg: T.OK, bg: T.STATUSBG });
+    // session elapsed/start: effective time (model+tool work, not wall clock)
+    // right after the session name; start = the earliest event time loaded
+    {
+      const stats = this.projections.sessionStats ?? cur?.projections?.values?.sessionStats;
+      const startMs = this.chat?.earliestTime;
+      const parts = [];
+      if (stats && stats.llmMs != null) parts.push(`有效 ${fmtDuration(stats.llmMs + (stats.toolMs ?? 0))}`);
+      if (startMs != null) parts.push(`开始 ${fmtDateTime(startMs)}`);
+      if (parts.length) row0.left.push({ t: ` ${parts.join(" · ")} `, fg: T.DIM, bg: T.STATUSBG });
+    }
     if (this.goalText) row0.right.push({ t: " 🎯" + truncate(this.goalText, 22) + " ", fg: T.SELFG, bg: T.WARN, bold: true });
     const plan = this.projections.plan;
     if (plan?.active || plan?.pending) row0.right.push({ t: plan.active ? " ✎计划中 " : " ✎计划待审 ", fg: T.SELFG, bg: T.ACCENT2 });
@@ -3095,6 +3161,8 @@ export class App {
     // full working directory
     const cwd = this.currentSession ? (this.sessions.find((x) => x.sessionId === this.currentSession)?.cwd) : process.cwd();
     if (cwd) row1.left.push({ t: ` ${cwd} `, fg: T.FAINT, bg: T.STATUSBG });
+    // live clock after the working directory (ticks once per second)
+    row1.left.push({ t: ` ${fmtClock(Date.now())} `, fg: T.DIM, bg: T.STATUSBG });
     const stats = this.projections.sessionStats;
     if (stats) {
       if (stats.steps) row1.right.push({ t: ` ⚙${stats.steps}步 `, fg: T.FAINT, bg: T.STATUSBG });

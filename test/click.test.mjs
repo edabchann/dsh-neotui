@@ -5,7 +5,7 @@ import { userInfo } from "node:os";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ChatView, App, userPrefix, saveTuiConfig } from "../src/views.js";
+import { ChatView, App, userPrefix, saveTuiConfig, nodeForEvents } from "../src/views.js";
 import { TrajectoryPanel, JobsPanel, SettingsPanel } from "../src/panels.js";
 import { fmtDuration, strWidth } from "../src/text.js";
 import { renderMd } from "../src/md.js";
@@ -628,6 +628,54 @@ test("the footer hints Ctrl+Space between the mode badge and the permission badg
   assert.ok(ni >= 0 && ci > ni && bi > ci, `hint sits between mode and permission badges: ${text.slice(0, 60)}`);
 });
 
+test("finalized think blocks keep their start time and turns carry their total", () => {
+  const events = [
+    { event: { type: "turn/start", seq: 1, time: 1000, data: {} }, view: null },
+    { event: { type: "assistant/chunk", seq: 2, time: 2000, data: { chunk: { type: "block-start", blockType: "reasoning", index: 0 } } }, view: null },
+    { event: { type: "assistant/chunk", seq: 3, time: 3000, data: { chunk: { type: "reasoning-delta", index: 0, text: "thinking" } } }, view: null },
+    { event: { type: "assistant/message", seq: 4, time: 9000, data: { message: { content: [{ type: "reasoning", text: "thinking" }] } } }, view: null },
+    { event: { type: "turn/end", seq: 5, time: 9000, data: {} }, view: null },
+  ];
+  const nodes = nodeForEvents(events, () => {});
+  const b = nodes[0].blocks[0];
+  assert.equal(b.startedAt, 2000, "start inherited from the chunk block at finalization");
+  assert.equal(b.endedAt, 9000, "finalization stamped the end");
+  assert.equal(nodes[0].turnMs, 8000, "turn duration attached to the final reply");
+  const { chat } = render(nodes);
+  const text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
+  assert.ok(text.includes("已完成,耗时 7秒"), text);
+  assert.ok(text.includes("🕐 本轮回答总耗时 8秒"), "turn trailer rendered");
+});
+
+test("a tool result with a mismatched callId still lands via the fallback", () => {
+  const events = [
+    { event: { type: "assistant/chunk", seq: 1, time: 1000, data: { chunk: { type: "block-start", blockType: "tool-call", index: 0 } } }, view: null },
+    { event: { type: "assistant/message", seq: 2, time: 3000, data: { message: { content: [{ type: "tool-call", id: "call-1", name: "bash", arguments: "ls" }] } } }, view: null },
+    { event: { type: "tool/call", seq: 3, time: 3000, data: { callId: "call-1", name: "bash", arguments: "ls" } }, view: null },
+    { event: { type: "tool/result", seq: 4, time: 6000, data: { message: { source: { callId: "DIFFERENT" }, content: [{ type: "text", text: "res" }] } } }, view: null },
+  ];
+  const nodes = nodeForEvents(events, () => {});
+  const withResult = nodes.flatMap((n) => n.blocks).find((b) => b.kind === "tool" && b.result != null);
+  assert.ok(withResult, "the result attached to a tool block despite the callId mismatch");
+  assert.equal(withResult.result, "res");
+  const { chat } = render(nodes);
+  const text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
+  assert.ok(text.includes("已完成,耗时 3秒"), `timing shown (${text.slice(0, 200)})`);
+  assert.ok(!text.includes("失败"), "no false failure label");
+});
+
+test("footer shows effective session time, start time, and a live clock", () => {
+  const app = headlessApp();
+  app.projections.sessionStats = { llmMs: 3600000, toolMs: 1200000 };
+  app.chat.earliestTime = new Date(2026, 0, 1, 8, 30).getTime();
+  app.renderFrame();
+  const text0 = [...(app.status.rows[0]?.left ?? []), ...(app.status.rows[0]?.right ?? [])].map((s) => s.t).join(" ");
+  assert.ok(text0.includes("有效 1小时20分00秒"), text0);
+  assert.ok(text0.includes("开始 01-01 08:30"), text0);
+  const text1 = [...(app.status.rows[1]?.left ?? []), ...(app.status.rows[1]?.right ?? [])].map((s) => s.t).join(" ");
+  assert.ok(/\d{2}:\d{2}:\d{2}/.test(text1), `live clock present: ${text1.slice(0, 80)}`);
+});
+
 test("ESC interrupts a running turn with ONE press, from insert or normal", async () => {
   const app = headlessApp();
   const calls = [];
@@ -885,10 +933,12 @@ test("trajectory: right click opens 展开/转跳/详情 menu; toggle expands �
   toggle.action();
   assert.equal(panel.expandedSteps.size, 1);
   assert.ok(panel.expandedSteps.has(panel.stepKey(panel.steps[0])));
-  // 详细 mode: detail rows appear under the step header
+  // 详细 mode: detail rows appear under the step header, each with its
+  // deep-dive elapsed time (+Xs since the step started)
   const header = panel.view.lines.map((l) => l.map((g) => g.t).join("")).find((l) => l.includes("step   1"));
   assert.ok(header.includes("▾"), "header shows ▾ when expanded");
   assert.ok(panel.view.lines.some((l) => l.some((g) => g.t.includes("⚙ bash"))), "tool event listed inline");
+  assert.ok(panel.view.lines.some((l) => l.some((g) => /\+[0-9.]+(s|ms)/.test(g.t))), "deep-dive elapsed shown per event");
   // second click collapses back to 简略
   panel.onMouse({ type: "mouse", kind: "press", button: 2, x: panel.view.x + 2, y: panel.view.y + li });
   const fold = app.lastMenu.items.find((i) => i.label === "折叠（简略）");

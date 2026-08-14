@@ -64,6 +64,20 @@ export function fmtDuration(ms) {
   return `${sec}秒`;
 }
 
+/** Local wall-clock "HH:MM:SS" (status-bar live clock). */
+export function fmtClock(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/** Local wall-clock "MM-DD HH:MM" (session start time). */
+export function fmtDateTime(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 export function hexRgb(hex) {
   const m = /^#?([0-9a-f]{6})$/i.exec(String(hex).trim());
   if (!m) return null;
