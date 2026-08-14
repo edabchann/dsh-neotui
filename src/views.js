@@ -849,22 +849,31 @@ export class ChatView extends Widget {
       }
       const node = this.nodes[info.nodeIdx];
       // Expand/collapse changes the line count ABOVE the viewport, which would
-      // leave scrollY pointing at unrelated content (the "chaotic" jump).
-      // Anchor: after the rebuild, scroll so the clicked block's first line
-      // sits at the top of the viewport. This applies ALWAYS — even at the
-      // bottom: the tail-follow snap would otherwise fling the clicked header
-      // out of view when a folded block re-expands.
-      const reanchor = (match) => {
-        let fallback = -1;
+      // leave scrollY pointing at unrelated content. Anchor: remember the
+      // viewport-top line's identity AND its offset within that block, then
+      // restore the same position after the rebuild — the view does not move
+      // at all when the top line survives (e.g. clicking a block header), and
+      // lands on the fold's last line when the top line itself was collapsed.
+      const lineKey = (m) => (m ? `${m.nodeIdx}:${m.blockIdx ?? "n"}` : null);
+      const topKey = lineKey(this.lineMap[this.view.scrollY]);
+      let topFirst = -1;
+      if (topKey !== null) {
         for (let i = 0; i < this.lineMap.length; i++) {
-          if (!match(this.lineMap[i])) continue;
-          if ((this.lines[i] ?? []).some((g) => g.t.trim() !== "")) {
-            this.view.scrollY = Math.max(0, Math.min(i, this.view.maxScroll()));
-            return;
-          }
-          if (fallback < 0) fallback = i;
+          if (lineKey(this.lineMap[i]) === topKey) { topFirst = i; break; }
         }
-        if (fallback >= 0) this.view.scrollY = Math.max(0, Math.min(fallback, this.view.maxScroll()));
+      }
+      const topOffset = topFirst >= 0 ? this.view.scrollY - topFirst : 0;
+      const reanchor = () => {
+        if (topKey === null || topFirst < 0) return;
+        let first = -1, last = -1;
+        for (let i = 0; i < this.lineMap.length; i++) {
+          if (lineKey(this.lineMap[i]) !== topKey) continue;
+          if (first < 0) first = i;
+          last = i;
+        }
+        if (first < 0) return;
+        const target = Math.min(first + topOffset, last);
+        this.view.scrollY = Math.max(0, Math.min(target, this.view.maxScroll()));
       };
       if (node?.kind === "assistant" && info.blockIdx !== null) {
         const b = node.blocks[info.blockIdx];
@@ -880,7 +889,7 @@ export class ChatView extends Widget {
             else this.collapsedBlocks.add(key);
           }
           this.#rebuild();
-          reanchor((m) => m?.nodeIdx === info.nodeIdx && m?.blockIdx === info.blockIdx);
+          reanchor();
           return true;
         }
       }
@@ -888,7 +897,7 @@ export class ChatView extends Widget {
         if (this.expanded.has(info.nodeIdx)) this.expanded.delete(info.nodeIdx);
         else this.expanded.add(info.nodeIdx);
         this.#rebuild();
-        reanchor((m) => m?.nodeIdx === info.nodeIdx);
+        reanchor();
         return true;
       }
     }

@@ -155,8 +155,13 @@ test("re-expanding a folded block at the bottom keeps the header in view", () =>
   const hdr = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 0"));
   clickLine(hdr);
   assert.ok(!chat.collapsedBlocks.has("0:0"), "re-expanded");
+  const hdrIdx2 = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 0"));
+  assert.ok(
+    hdrIdx2 >= chat.view.scrollY && hdrIdx2 < chat.view.scrollY + chat.view.h,
+    `expanded header remains in the viewport (hdr ${hdrIdx2}, scrollY ${chat.view.scrollY}, h ${chat.view.h})`,
+  );
   const topText = chat.lines[chat.view.scrollY].map((g) => g.t).join("");
-  assert.ok(topText.includes("▾"), `expanded header anchored at the viewport top (got: ${JSON.stringify(topText.slice(0, 40))})`);
+  assert.ok(!topText.includes("para 39"), "did not snap to the bottom of the expanded text");
 });
 
 test("collapsing a long text block keeps the viewport anchored (no view jump)", () => {
@@ -185,12 +190,35 @@ test("collapsing a long text block keeps the viewport anchored (no view jump)", 
   chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y: clickY });
   chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y: clickY });
   assert.ok(chat.collapsedBlocks.has("0:0"), "collapsed");
-  // the viewport must stay on the SAME block (its header now) — not flung to
-  // unrelated content
+  // the viewport must stay on the SAME block (its fold trailer now) — not
+  // flung to unrelated content
   assert.equal(topKey(), "0:0", "viewport stays anchored on the clicked block");
   const topText = chat.lines[chat.view.scrollY].map((g) => g.t).join("");
-  assert.ok(topText.includes("▸"), "block header (collapsed glyph) at the top");
   assert.ok(!topText.includes("tail-node"), "did not jump past the block");
+});
+
+test("clicking a block header keeps the viewport EXACTLY still (zero offset)", () => {
+  const longText = Array.from({ length: 40 }, (_, i) => `para ${i}`).join("\n\n");
+  const { chat } = render([
+    { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [{ kind: "text", text: longText }] },
+    { kind: "assistant", id: "a2", step: 2, streaming: false, blocks: [{ kind: "text", text: "AFTER" }] },
+  ]);
+  const headerIdx = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 0"));
+  chat.view.scrollY = Math.max(0, headerIdx - 3); // header 3 rows below the top
+  const scrollBefore = chat.view.scrollY;
+  const y = chat.view.y + (headerIdx - chat.view.scrollY);
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
+  assert.ok(chat.collapsedBlocks.has("0:0"), "collapsed");
+  assert.equal(chat.view.scrollY, scrollBefore, "scrollY unchanged when clicking the header");
+  // and re-expanding the header keeps it still too
+  const hdr2 = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 0"));
+  const scrollBefore2 = chat.view.scrollY;
+  const y2 = chat.view.y + (hdr2 - chat.view.scrollY);
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y: y2 });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y: y2 });
+  assert.ok(!chat.collapsedBlocks.has("0:0"), "re-expanded");
+  assert.equal(chat.view.scrollY, scrollBefore2, "scrollY unchanged when re-expanding the header");
 });
 
 test("expanded think renders the WHOLE reasoning, collapsed only a preview", () => {
