@@ -446,16 +446,19 @@ test("a queued streaming rebuild inside the click does not shift the view", () =
   assert.equal(topAfter, topBefore, "viewport top unchanged despite the streaming flush inside the click");
 });
 
-test("/reload in the input restarts the app instead of sending", async () => {
+test("/reload and /restart are intercepted, never sent to the session", async () => {
   const app = fakeApp();
-  let reloaded = false;
-  app.reloadApp = async () => { reloaded = true; };
+  let reloaded = false, restarted = false;
+  app.softReload = async () => { reloaded = true; };
+  app.restartApp = async () => { restarted = true; };
   let sent = null;
   app.api.call = async (m, p) => { sent = { m, p }; return {}; };
   const chat = new ChatView({ app, x: 0, y: 1, w: 80, h: 24 });
   chat.sessionId = "sess-1";
   chat.send("/reload");
-  assert.equal(reloaded, true, "/reload triggers the restart");
+  assert.equal(reloaded, true, "/reload triggers the in-place reload");
+  chat.send("/restart");
+  assert.equal(restarted, true, "/restart triggers the process restart");
   assert.equal(sent, null, "nothing sent to the session");
   chat.send("/compact");
   assert.equal(sent?.m, "session.prompt", "other slash commands still send");

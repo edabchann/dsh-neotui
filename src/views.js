@@ -817,7 +817,8 @@ export class ChatView extends Widget {
   send(text) {
     if (!this.sessionId) return;
     const trimmed = text.trim();
-    if (trimmed === "/reload") { this.app.reloadApp(); return; }
+    if (trimmed === "/reload") { this.app.softReload(); return; }
+    if (trimmed === "/restart") { this.app.restartApp(); return; }
     if (!trimmed) return;
     const { parts, images, errors } = buildPromptParts(trimmed, {
       readFile: (p) => {
@@ -2194,17 +2195,49 @@ export class App {
   showModePicker() { this.overlay = buildModePicker(this); this.redraw(); }
   showPermissionPicker() { this.overlay = buildPermissionPicker(this); this.redraw(); }
 
-  /** /reload: restart the TUI process in the same terminal so a freshly
-   *  published build (the profile symlinks the repo) takes effect without
-   *  quitting and re-running `dsh` by hand. */
-  async reloadApp() {
-    this.toast("正在重启 TUI…");
+  /** /reload: in-place soft reload — fresh session list, fresh chat history,
+   *  panels rebuilt, screen re-rendered. No process churn, no terminal
+   *  handoff (the old process-restart approach leaked mouse bytes into the
+   *  boot of the new instance). */
+  async softReload() {
+    this.closeOverlay();
+    this.menu = null;
+    this.popup = null;
+    for (const p of [this.workspacePanel, this.trajectoryPanel, this.settingsPanel, this.subagentPanel, this.skillsPanel]) {
+      if (p?.dispose) { try { p.dispose(); } catch {} }
+    }
+    this.workspacePanel = this.trajectoryPanel = this.settingsPanel = this.subagentPanel = this.skillsPanel = null;
+    this.chat.cache.clear();
+    this.chat.nodes = [];
+    this.chat.collapsedBlocks.clear();
+    this.chat.expanded.clear();
+    this.chat.expandedTools.clear();
+    this.chat.queueRebuild();
+    this.chat.view.anchorLock = null;
+    this.mode = "chat";
+    this.focus(this.chat);
+    this.toast("正在重新加载…");
+    await this.refreshSessions();
+    if (this.currentSession) await this.openSession(this.currentSession);
+    else await this.newSessionIn(null);
+    this.layout();
+    this.redraw();
+    this.toast("已重新加载会话与界面");
+  }
+
+  /** /restart: restart the TUI process in the same terminal so a freshly
+   *  published build (the profile symlinks the repo) takes effect. The new
+   *  instance starts one second after this process restores the terminal —
+   *  no stray mouse/keyboard bytes leak into its boot. */
+  async restartApp() {
+    this.toast("正在重启 TUI（加载新版本代码）…");
     this.redraw();
     await new Promise((r) => setTimeout(r, 250));
     try { this.term?.stop?.(); } catch {}
     try {
       const { spawn } = await import("node:child_process");
-      const child = spawn(process.argv[0], process.argv.slice(1), { detached: true, stdio: "inherit" });
+      const argv = process.argv.slice(1);
+      const child = spawn("sh", ["-c", 'sleep 1; exec "$@"', "sh", ...argv], { detached: true, stdio: "inherit" });
       child.unref();
     } catch (e) {
       this.toast(`重启失败: ${e.message}（请手动重启）`);
