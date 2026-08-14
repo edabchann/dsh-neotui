@@ -10,14 +10,29 @@ dsh plugin --profile dsh-neotui add dsh-neotui-app   # 装 bundle，自动加入
 dsh --profile dsh-neotui                   # 启动
 ```
 
-## 运行
+## 本地开发（从源码跑）
+
+克隆后先自链核心包（app bundle 通过包名 `dsh-neotui` 引核心，Node 会从真实路径向上找 `node_modules`）：
 
 ```bash
-dsh --profile dsh-neotui                   # 本地开发 profile（~/.dsh/profiles/dsh-neotui，软链到本仓库）
-dsh --profile dsh-neotui --session <id>    # 启动即打开某会话
-dsh --profile dsh-neotui --cwd ~/work      # 新建会话的默认目录
-dsh --profile dsh-neotui --port 3981       # 内嵌 API 指定端口（默认 0 = 系统分配）
-dsh --profile dsh-neotui --attach 3080     # 共存调试：连已运行的 web 宿主（存储自动隔离，不碰 $DSH_HOME）
+ln -sfn .. node_modules/dsh-neotui        # 仓库根自链，让 app/src 能 import "dsh-neotui"
+```
+
+然后把 profile 的两条软链指到本仓库（`~/.dsh/profiles/node_modules/`）：
+
+```bash
+ln -sfn "$(pwd)"        ~/.dsh/profiles/node_modules/dsh-neotui
+ln -sfn "$(pwd)/app"    ~/.dsh/profiles/node_modules/dsh-neotui-app
+```
+
+启动（本地开发 profile `~/.dsh/profiles/dsh-neotui`）：
+
+```bash
+dsh --profile dsh-neotui
+dsh --profile dsh-neotui --session <id>
+dsh --profile dsh-neotui --cwd ~/work
+dsh --profile dsh-neotui --port 3981
+dsh --profile dsh-neotui --attach 3080     # 共存调试：连已运行的 web 宿主（存储隔离，不碰 $DSH_HOME）
 
 node bin/dsh-tui.js                        # 纯客户端模式：连接已运行的 web 宿主（默认 3080）
 node bin/dsh-tui.js --base http://host:port
