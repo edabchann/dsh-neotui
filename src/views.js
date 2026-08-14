@@ -2951,6 +2951,15 @@ export class App {
         if (this.toastMsg && Date.now() > this.toastUntil) { this.toastMsg = null; this.dirty = true; }
       } catch (e) {
         this.log("render error (kept running):", e);
+        // stderr is invisible under the alt screen — record the stack where
+        // it can be read, then flush whatever composed before the throw so
+        // the terminal never sits frozen on the previous frame.
+        try {
+          const dir = process.env.DSH_HOME ?? join(process.env.HOME ?? ".", ".dsh");
+          mkdirSync(dir, { recursive: true });
+          appendFileSync(join(dir, "tui-error.log"), `${new Date().toISOString()} ${e?.stack ?? e}\n`);
+        } catch {}
+        try { this.term?.output?.write?.(this.screen.render()); } catch {}
         this.dirty = true;
       }
       this.timer = setTimeout(tick, 33);

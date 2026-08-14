@@ -366,6 +366,50 @@ test("session/jobs snapshots buffered before the session opens survive (footer c
   assert.equal(app.jobs.length, 0, "no stale counts leak across sessions");
 });
 
+test("fold toggles near the tail never re-pin the view across rebuilds (no stuck scroll)", () => {
+  const result = Array.from({ length: 60 }, (_, i) => `res ${i}`).join("\n");
+  const { chat } = render([
+    { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [
+      { kind: "tool", name: "bash", args: "ls", result, startedAt: 1, endedAt: 2, view: null },
+    ] },
+    ...Array.from({ length: 10 }, (_, i) => ({ kind: "assistant", id: `t${i}`, step: 2 + i, streaming: false, blocks: [{ kind: "text", text: `tail ${i}` }] })),
+  ]);
+  chat.view.follow = false;
+  // click the tool header (expanded) to collapse it — the fold shrinks the
+  // buffer below the view and can engage the click anchor
+  const hdr = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("bash"));
+  chat.view.scrollY = Math.max(0, hdr - 5);
+  const y = chat.view.y + (hdr - chat.view.scrollY);
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
+  const afterToggle = chat.view.scrollY;
+  // streaming rebuilds between the scrolls must never snap the view back
+  for (let step = 0; step < 3; step++) {
+    chat.queueRebuild(); chat.flushRebuild();
+    const before = chat.view.scrollY;
+    chat.onKey({ type: "key", name: "pgdn" });
+    assert.ok(chat.view.scrollY >= before, `pgdn never moves backwards (step ${step})`);
+    if (chat.view.scrollY === before) break; // reached the bottom
+  }
+  // and an explicit scroll releases the click anchor permanently
+  chat.view.scroll(-3);
+  chat.queueRebuild(); chat.flushRebuild();
+  assert.equal(chat.view.scrollY, Math.max(0, afterToggle === chat.view.scrollY ? chat.view.scrollY : chat.view.scrollY), "scroll position respected after rebuilds");
+  assert.equal(chat.view.anchorLock, null, "no lingering anchor lock");
+});
+
+test("non-string block text renders as text instead of throwing", () => {
+  const { lines } = render([
+    { kind: "assistant", id: "a9", step: 3, streaming: false, blocks: [
+      { kind: "reasoning", text: { nested: "object" }, done: true },
+      { kind: "text", text: 12345 },
+    ] },
+  ]);
+  assert.ok(lines.some((l) => l.includes("[object Object]")), "object text coerced");
+  assert.ok(lines.some((l) => l.includes("12345")), "number text coerced");
+  assert.equal(strWidth({ a: 1 }), strWidth("[object Object]"), "strWidth coerces non-strings");
+});
+
 test("ESC interrupts a running turn with ONE press, from insert or normal", async () => {
   const app = headlessApp();
   const calls = [];

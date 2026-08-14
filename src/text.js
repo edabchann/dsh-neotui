@@ -26,6 +26,7 @@ export function wcwidth(cp) {
 }
 
 export function strWidth(s) {
+  if (typeof s !== "string") s = String(s ?? "");
   let w = 0;
   for (const ch of s) w += wcwidth(ch.codePointAt(0));
   return w;

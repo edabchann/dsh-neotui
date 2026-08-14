@@ -161,6 +161,9 @@ function highlightLine(line, lang) {
 // Returns array of lines; each line = array of segments.
 
 export function renderMd(text, width, sink = null, opts = {}) {
+  // defensive: snapshot-derived blocks can carry non-string text; a `.replace`
+  // on an object would throw mid-frame and freeze the whole terminal
+  if (typeof text !== "string") text = String(text ?? "");
   const hardBreaks = !!opts.hardBreaks;
   const lines = [];
   const pushLine = (segs = []) => {
