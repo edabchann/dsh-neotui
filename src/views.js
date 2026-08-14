@@ -850,7 +850,7 @@ export class ChatView extends Widget {
       const node = this.nodes[info.nodeIdx];
       if (node?.kind === "assistant" && info.blockIdx !== null) {
         const b = node.blocks[info.blockIdx];
-        if (b && (b.kind === "tool" || b.kind === "reasoning" || b.kind === "other")) {
+        if (b && (b.kind === "tool" || b.kind === "reasoning" || b.kind === "other" || b.kind === "text")) {
           const key = `${info.nodeIdx}:${info.blockIdx}`;
           if (b.kind === "reasoning") {
             // clean two-state override: expand ⇄ collapse (never a no-op click)
@@ -891,7 +891,6 @@ export class ChatView extends Widget {
     if (this.hasMore) { lines.push([{ t: "▲ 更早的记录", fg: K.FAINT }]); mark(-1); }
     if (skipCount > 0) { lines.push([{ t: `… 更早 ${skipCount} 条记录（PgUp 加载）`, fg: K.FAINT }]); mark(-1); }
 
-    const MAX_TEXT = 4000;
     for (let ni = 0; ni < nodes.length; ni++) {
       const node = nodes[ni];
       const realIdx = ni + skipCount;
@@ -999,7 +998,8 @@ export class ChatView extends Widget {
               lines.push([{ t: "💭 思考" + (b.streaming ? "…" : "") + thinkMeta + (open ? " [t 折叠]" : " [t 展开]"), fg: K.FAINT }]);
               mark(realIdx, bi);
               if (open) {
-                for (const ln of renderMd(truncateText(b.text, MAX_TEXT), w - 4)) { lines.push([{ t: "  " }, ...ln]); mark(realIdx, bi); }
+                // Expanded = the WHOLE reasoning (no hidden remainder).
+                for (const ln of renderMd(b.text ?? "", w - 4)) { lines.push([{ t: "  " }, ...ln]); mark(realIdx, bi); }
               } else {
                 // collapsed: three-line preview
                 for (const ln of renderMd(truncateText(b.text, 400), w - 4).slice(0, 3)) {
@@ -1059,18 +1059,27 @@ export class ChatView extends Widget {
               sep();
             } else {
               beginCard("CARD");
+              // Text blocks collapse per-block like tool/reasoning blocks:
+              // collapsed shows a 3-line preview + trailer, expanded the whole
+              // text. Clicking (or the right-click 展开/折叠) toggles it.
+              const key = `${realIdx}:${bi}`;
+              const open = !this.collapsedBlocks.has(key);
               const text = b.text ?? "";
-              const md = renderMd(text, w - 4 - strWidth(stepTag));
+              const glyph = open ? "▾" : "▸";
+              const mdW = Math.max(10, w - 6 - strWidth(stepTag));
+              const md = open
+                ? renderMd(text, mdW)
+                : renderMd(truncateText(text, 600), mdW).slice(0, 3);
               if (md.length > 0) {
-                lines.push([{ t: "  " }, { t: stepTag, fg: K.FAINT }, ...md[0]]);
-                mark(realIdx);
-                for (const ln of md.slice(1)) { lines.push([{ t: "  " }, ...ln]); mark(realIdx); }
-                // Label the block's LAST line with its blockIdx IN PLACE. A
-                // pushed mark without a line would desync lineMap from lines
-                // and shift every later click mapping (the off-by-one bug).
-                lineMap[lineMap.length - 1] = { nodeIdx: realIdx, blockIdx: bi };
+                lines.push([{ t: "  " }, { t: glyph + " ", fg: K.FAINT }, { t: stepTag, fg: K.FAINT }, ...md[0]]);
+                mark(realIdx, bi);
+                for (const ln of md.slice(1)) { lines.push([{ t: "  " }, ...ln]); mark(realIdx, bi); }
               } else {
-                lines.push([{ t: "  " + stepTag, fg: K.FAINT }]);
+                lines.push([{ t: "  " + glyph + " " + stepTag, fg: K.FAINT }]);
+                mark(realIdx, bi);
+              }
+              if (!open && text.length > 0) {
+                lines.push([{ t: `  …共 ${text.length} 字（点击展开）`, fg: K.FAINT }]);
                 mark(realIdx, bi);
               }
               sep();
@@ -1298,13 +1307,13 @@ export class ChatView extends Widget {
       case "pgup": if (this.view.scrollY === 0) { this.loadOlder(); return true; } return this.view.scroll(-this.view.h);
       case "pgdn": return this.view.scroll(this.view.h);
     }
-    if (ev.name === "char" && ev.key === "g" && !ev.ctrl) {
+    if (ev.name === "char" && ev.key === "g" && !ev.ctrl && !ev.shift) {
       if (this.gKey) { this.gKey = false; this.view.scrollY = 0; return true; }
       this.gKey = true;
       this.app.toast("再按 g 回顶");
       return true;
     }
-    if (ev.name === "char" && ev.key === "G") { this.view.scrollY = this.view.maxScroll(); return true; }
+    if (ev.name === "char" && ev.key === "g" && ev.shift) { this.view.scrollY = this.view.maxScroll(); return true; }
     if (ev.name === "escape" && this.app.searchQuery) { this.app.searchQuery = null; this.queueRebuild(); return true; }
     if (ev.name === "escape" && this.selStart !== null) { this.selStart = this.selEnd = null; this.app.redraw(); return true; }
     if (ev.name === "char" && ev.key === "i" && !ev.ctrl) { this.app.focus(this.input); return true; }
@@ -1891,18 +1900,26 @@ export class App {
   async loadFeedback() {
     if (!this.currentSession) return;
     try {
-      const res = await this.api.rpcCall("messageFeedback/list", { sessionId: this.currentSession });
+      const res = await this.api.rpcCall("messageFeedback/list", { request: { sessionId: this.currentSession } });
       this.feedbackMap = new Map();
-      for (const item of res.items ?? []) this.feedbackMap.set(item.messageId, item);
+      for (const item of res?.value?.items ?? res?.items ?? []) this.feedbackMap.set(item.messageId, item);
     } catch { this.feedbackMap = new Map(); }
   }
 
   async feedback(messageId, rating) {
     const existing = this.feedbackMap?.get(messageId);
     try {
-      const item = await this.api.rpcCall("messageFeedback/put", {
-        sessionId: this.currentSession, messageId, rating, ifVersion: existing?.version ?? null,
+      const res = await this.api.rpcCall("messageFeedback/put", {
+        request: {
+          sessionId: this.currentSession, messageId, rating,
+          ifVersion: existing?.version ?? null,
+        },
       });
+      if (res?.ok === false) {
+        this.toast(`反馈失败: ${res.error?.code ?? res.error?.message ?? "unknown"}`);
+        return;
+      }
+      const item = res?.value ?? res;
       this.feedbackMap = this.feedbackMap ?? new Map();
       this.feedbackMap.set(messageId, item);
       this.toast(rating === "positive" ? "已记录 👍" : "已记录 👎");
@@ -1913,7 +1930,13 @@ export class App {
     const existing = this.feedbackMap?.get(messageId);
     if (!existing) return;
     try {
-      await this.api.rpcCall("messageFeedback/delete", { sessionId: this.currentSession, messageId, ifVersion: existing.version });
+      const res = await this.api.rpcCall("messageFeedback/delete", {
+        request: { sessionId: this.currentSession, messageId, ifVersion: existing.version },
+      });
+      if (res?.ok === false) {
+        this.toast(`删除反馈失败: ${res.error?.code ?? res.error?.message ?? "unknown"}`);
+        return;
+      }
       this.feedbackMap.delete(messageId);
       this.toast("已删除反馈");
     } catch (e) { this.toast(`删除反馈失败: ${e.message}`); }
@@ -2290,16 +2313,29 @@ export class App {
     }
     if (this.menu) {
       const before = this.menu;
-      if (ev.type === "key") this.menu.onKey(ev);
-      else if (ev.type === "mouse") {
-        if (ev.kind === "press" && ev.button === 0 && !this.menu.inside(ev.x, ev.y)) { this.menu = null; this.swallowRelease = true; }
-        else {
+      if (ev.type === "key") { this.menu.onKey(ev); this.redraw(); return; }
+      if (ev.type === "mouse") {
+        if (ev.kind === "press" && ev.button === 0 && !this.menu.inside(ev.x, ev.y)) {
+          this.menu = null; this.swallowRelease = true; this.redraw(); return;
+        }
+        if (ev.kind === "press" && ev.button === 2) {
+          if (this.menu.inside(ev.x, ev.y)) { this.redraw(); return; } // right-click on the menu itself: keep it open
+          // OS-style: a right-click anywhere else closes the current menu and
+          // the SAME press falls through to open a fresh menu at the new spot.
+          this.menu = null;
+          this.swallowRelease = true;
+          this.redraw();
+          // fall through to the normal mouse routing below
+        } else {
           this.menu.onMouse(ev);
           if (ev.kind === "press" && this.menu !== before) this.swallowRelease = true;
+          this.redraw();
+          return;
         }
+      } else {
+        this.redraw();
+        return;
       }
-      this.redraw();
-      return;
     }
     if (this.overlay) {
       const before = this.overlay;
@@ -2443,7 +2479,14 @@ export class App {
         return;
       }
       if (ev.text.length === 1) {
-        const asKey = { type: "key", name: "char", key: ev.text, text: ev.text, ctrl: false, alt: false, shift: false };
+        // Legacy terminals deliver Shift+letter as the UPPERCASE char with no
+        // modifier info — recover the shift flag from the case so Shift+T
+        // (todo fold) and G (scroll bottom) work everywhere.
+        const asKey = {
+          type: "key", name: "char",
+          key: ev.text.toLowerCase(), text: ev.text,
+          ctrl: false, alt: false, shift: ev.text !== ev.text.toLowerCase(),
+        };
         if (this.chat.onKey(asKey)) { this.redraw(); return; }
         if (this.focused && this.focused !== this.chat.input && this.focused.onKey(asKey)) { this.redraw(); return; }
         this.toast("按 i 进入输入");

@@ -96,16 +96,106 @@ test("right-click menu 展开/折叠 on reasoning block toggles", () => {
   assert.equal(chat.collapsedBlocks.has(key), true, "reasoning block collapsed");
 });
 
-test("right-click menu 展开/折叠 on text block toggles node expansion", () => {
+test("right-click menu 展开/折叠 on text block collapses the block", () => {
   const { app, chat, lines } = render([toolNode()]);
   const y = lines.findIndex((l) => l.includes("hello world"));
   assert.ok(y >= 0);
   chat.onMouse({ type: "mouse", kind: "press", button: 2, x: 2, y: y + 1 });
   const toggle = app.lastMenu.items.find((i) => i.label === "展开 / 折叠");
   assert.ok(toggle);
-  const before = chat.expanded.has(0);
+  assert.equal(chat.collapsedBlocks.has("0:2"), false);
   toggle.action();
-  assert.notEqual(chat.expanded.has(0), before, "node expansion toggled");
+  assert.equal(chat.collapsedBlocks.has("0:2"), true, "text block collapsed");
+  const text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
+  assert.ok(text.includes("…共 11 字（点击展开）"), "trailer visible");
+  assert.ok(text.split("\n").find((l) => l.includes("hello")).includes("▸"), "collapsed glyph");
+  toggle.action();
+  assert.equal(chat.collapsedBlocks.has("0:2"), false, "re-expanded");
+});
+
+test("text block left-click collapses to a 3-line preview + trailer, click restores", () => {
+  const text = "line one\n\nline two\n\nline three\n\nline four";
+  const { chat, lines } = render([{ kind: "assistant", id: "a10", step: 3, streaming: false, blocks: [{ kind: "text", text }] }]);
+  const y = lines.findIndex((l) => l.includes("line one"));
+  assert.ok(y >= 0);
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y: y + 1 });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y: y + 1 });
+  assert.ok(chat.collapsedBlocks.has("0:0"), "text block collapsed by left click");
+  let text2 = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
+  assert.ok(text2.includes("…共"), "trailer visible");
+  assert.ok(!text2.includes("line four"), "tail hidden when collapsed");
+  const y2 = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("line one"));
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y: y2 + 1 });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y: y2 + 1 });
+  assert.ok(!chat.collapsedBlocks.has("0:0"), "re-expanded");
+  text2 = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
+  assert.ok(text2.includes("line four"), "full text back");
+});
+
+test("expanded think renders the WHOLE reasoning, collapsed only a preview", () => {
+  const long = "开头\n\n" + "A".repeat(4000) + "ENDMARKER";
+  const { chat, lines } = render([{
+    kind: "assistant", id: "a9", step: 5, streaming: false,
+    blocks: [{ kind: "reasoning", text: long, streaming: false, startedAt: 1, endedAt: 2 }],
+  }]);
+  let text = lines.join("\n");
+  assert.ok(text.includes("ENDMARKER"), "tail rendered when expanded");
+  chat.onKey({ type: "key", name: "char", key: "t", text: "t", ctrl: false, alt: false, shift: false });
+  chat.flushRebuild();
+  text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
+  assert.ok(!text.includes("ENDMARKER"), "tail hidden when collapsed");
+  assert.ok(chat.lines.filter((l) => l.some((g) => g.t.includes("A"))).length <= 3, "3-line preview");
+});
+
+test("Shift+T (legacy uppercase text) toggles the todo block", () => {
+  const app = headlessApp();
+  app.projections.todos = [{ content: "todo 1", status: "in_progress" }];
+  const chat = app.chat;
+  assert.equal(chat.todosVisible, true);
+  app.onEvent({ type: "text", text: "T" }); // legacy terminal: Shift+T arrives as "T"
+  assert.equal(chat.todosVisible, false, "Shift+T folded the todo block");
+  app.onEvent({ type: "text", text: "T" });
+  assert.equal(chat.todosVisible, true, "Shift+T re-expanded");
+});
+
+test("feedback sends the typert {request:…} envelope", async () => {
+  const app = headlessApp();
+  app.currentSession = "sess-1";
+  let captured = null;
+  app.api.rpcCall = async (m, p) => { captured = { m, p }; return { ok: true, value: { messageId: "m1", rating: "positive", version: 2 } }; };
+  await app.feedback("m1", "positive");
+  assert.deepEqual(captured, {
+    m: "messageFeedback/put",
+    p: { request: { sessionId: "sess-1", messageId: "m1", rating: "positive", ifVersion: null } },
+  });
+  assert.equal(app.feedbackMap.get("m1")?.version, 2);
+  // logical failure surfaces as a toast, not a crash
+  app.api.rpcCall = async () => ({ ok: false, error: { code: "target-not-found" } });
+  await app.feedback("m2", "negative");
+  assert.ok(app.toastMsg?.includes("target-not-found"), app.toastMsg);
+});
+
+test("right-click elsewhere closes the menu and opens a fresh one", () => {
+  const app = headlessApp();
+  app.chat.nodes = [toolNode()];
+  app.chat.resize(0, 1, 100, 25);
+  app.renderFrame();
+  const c = app.chat;
+  const lineOf = (needle) => c.lines.findIndex((l) => l.map((g) => g.t).join("").includes(needle));
+  const toolY = lineOf("bash");
+  const helloY = lineOf("hello world");
+  assert.ok(toolY >= 0 && helloY >= 0);
+  const press = (x, y, button) => {
+    app.onEvent({ type: "mouse", kind: "press", button, x, y, ctrl: false, shift: false, alt: false, motion: false });
+    app.onEvent({ type: "mouse", kind: "release", button, x, y, ctrl: false, shift: false, alt: false, motion: false });
+  };
+  press(40, c.view.y + toolY, 2);
+  assert.ok(app.menu, "first menu open");
+  const firstY = app.menu.y;
+  // right-click a different line → menu replaced at the new position
+  press(40, c.view.y + helloY, 2);
+  assert.ok(app.menu, "menu still open");
+  assert.notEqual(app.menu.y, firstY, "menu moved to the new position");
 });
 
 test("right-click menu offers 转跳轨迹 for nodes with a message id", () => {
