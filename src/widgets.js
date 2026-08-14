@@ -336,7 +336,6 @@ export class Input extends Widget {
     if (!this.multi) {
       // single-line: horizontal scroll (search/rename/picker inputs)
       screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y, " ", { bg: this.bg });
-      screen.hline(this.x, this.x + this.w - 1, this.y, "─", { fg: this.border, bg: this.bg });
       const promptW = strWidth(this.prompt);
       const inner = Math.max(0, this.w - promptW - 2);
       screen.text(this.x, this.y, this.prompt, { fg: T.ACCENT, bg: this.bg });
@@ -358,7 +357,6 @@ export class Input extends Widget {
     const rows = this.#visualRows();
     const h = Math.min(this.maxLines, rows.length);
     screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + h - 1, " ", { bg: this.bg });
-    screen.hline(this.x, this.x + this.w - 1, this.y, "─", { fg: this.border, bg: this.bg });
     if (this.value === "" && this.placeholder) {
       screen.text(this.x, this.y, this.prompt, { fg: T.ACCENT, bg: this.bg });
       screen.text(this.x + strWidth(this.prompt), this.y, truncate(this.placeholder, this.w - strWidth(this.prompt) - 2), { fg: T.FAINT, bg: this.bg });

@@ -541,7 +541,7 @@ export class ChatView extends Widget {
     this.input = new Input({
       x: this.x, y: this.y + this.h - 2, w: this.w, h: 1,
       multi: true, maxLines: 6,
-      bg: T.BG2, border: T.BORDER2,
+      bg: T.PANEL,
       placeholder: "输入消息…（Ctrl+J 换行，Enter 发送）",
       onEnter: (v) => this.send(v),
       onChange: () => this.inputChanged(),
@@ -1094,7 +1094,6 @@ export class ChatView extends Widget {
     const isBlank = this.app.sessions.find((s) => s.sessionId === this.sessionId)?.blank ?? false;
     if (this.nodes.length === 0 && isBlank) {
       this.#renderWelcome(screen);
-      screen.hline(this.x, this.x + this.w - 1, this.input.y - 1, "─", { fg: T.BORDER2 });
       this.input.render(screen);
       return;
     }
@@ -1120,7 +1119,6 @@ export class ChatView extends Widget {
       }
     }
     this.#renderTodos(screen);
-    screen.hline(this.x, this.x + this.w - 1, this.input.y - 1, "─", { fg: T.BORDER2 });
     this.input.render(screen);
   }
 
