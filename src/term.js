@@ -30,6 +30,7 @@ export class Term {
     this.onResize = onResize ?? (() => {});
     this.kitty = kitty;
     this.kittyActive = false;  // set when the terminal answers the CSI ? u query
+    this.escTimer = null;      // pending lone-ESC fallback (split-sequence safety)
     this.decoder = new StringDecoder("utf8");
     this.buf = "";
     this.started = false;
@@ -81,6 +82,24 @@ export class Term {
 
   #emit(ev) { this.onEvent(ev); }
 
+  /** A lone ESC waits briefly for the rest of its sequence; if nothing
+   *  arrives it becomes the standalone Escape key. */
+  #armEscFallback() {
+    if (this.escTimer) return;
+    this.escTimer = setTimeout(() => {
+      this.escTimer = null;
+      if (this.buf === "\x1b") {
+        this.buf = "";
+        this.#emit({ type: "key", name: "escape", ctrl: false, alt: false, shift: false });
+      } else {
+        this.#parse(); // more bytes arrived: re-parse the pending ESC
+      }
+    }, 30);
+  }
+  #clearEscFallback() {
+    if (this.escTimer) { clearTimeout(this.escTimer); this.escTimer = null; }
+  }
+
   #feed(s) {
     if (!s) return;
     this.buf += s;
@@ -95,34 +114,38 @@ export class Term {
       if (ch === "\x1b") {
         // escape sequence
         const next = buf[i + 1];
+        if (next !== undefined) this.#clearEscFallback();
         if (next === "[") {
           const r = this.#parseCsi(buf, i + 2);
-          if (r === null) { i = buf.length; break; } // incomplete
+          if (r === null) break; // incomplete: retain the sequence head
           i = r.next;
         } else if (next === "O") {
           const fin = buf[i + 2];
-          if (fin === undefined) { i = buf.length; break; }
+          if (fin === undefined) break; // incomplete: retain
           const name = KEY_NAMES[fin];
           if (name) this.#emit({ type: "key", name, ctrl: false, alt: false, shift: false });
           i += 3;
         } else if (next === "]") {
           // OSC: skip to BEL or ST
           let j = i + 2;
+          let terminated = false;
           while (j < buf.length) {
-            if (buf[j] === "\x07") { j++; break; }
-            if (buf[j] === "\x1b" && buf[j + 1] === "\\") { j += 2; break; }
+            if (buf[j] === "\x07") { terminated = true; j++; break; }
+            if (buf[j] === "\x1b" && buf[j + 1] === "\\") { terminated = true; j += 2; break; }
             j++;
           }
-          if (j > buf.length && buf[buf.length - 1] !== "\x07") { i = buf.length; break; }
+          if (!terminated) break; // incomplete OSC: retain the head
           i = j;
         } else if (next === "P" || next === "X" || next === "^" || next === "_") {
           // DCS / SOS / PM / APC: skip to ST (or BEL)
           let j = i + 2;
+          let terminated = false;
           while (j < buf.length) {
-            if (buf[j] === "\x07") { j++; break; }
-            if (buf[j] === "\x1b" && buf[j + 1] === "\\") { j += 2; break; }
+            if (buf[j] === "\x07") { terminated = true; j++; break; }
+            if (buf[j] === "\x1b" && buf[j + 1] === "\\") { terminated = true; j += 2; break; }
             j++;
           }
+          if (!terminated) break; // incomplete: retain the head
           i = j;
         } else if (next !== undefined) {
           // ESC + char = alt key
@@ -131,11 +154,14 @@ export class Term {
           else this.#emit({ type: "key", name: "char", key: next.toLowerCase(), text: next, ctrl: false, alt: true, shift: false });
           i += 2;
         } else {
-          // Lone ESC at end of buffer = the standalone Escape key. Terminals
-          // deliver escape sequences atomically, so a bare \x1b is never the
-          // head of a sequence that will arrive in a later chunk.
-          this.#emit({ type: "key", name: "escape", ctrl: false, alt: false, shift: false });
-          i++;
+          // Lone ESC at the end of the buffer. A pty does NOT deliver escape
+          // sequences atomically: during a restart-handoff burst a mouse
+          // report can split across chunks, and emitting "escape key" here
+          // turned the remainder into input text (raw SGR bytes sent to the
+          // session). Hold the ESC and re-parse on the next chunk; only treat
+          // it as the Escape key if nothing follows within a short window.
+          this.#armEscFallback();
+          break; // retain the lone ESC
         }
       } else if (ch === "\r") {
         this.#emit({ type: "key", name: "enter", ctrl: false, alt: false, shift: false });

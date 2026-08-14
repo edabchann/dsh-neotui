@@ -1410,13 +1410,19 @@ export class JobsPanel extends Popup {
     // Expanded = EVERYTHING: every field, full values — long commands wrap
     // across lines instead of being truncated (the web clips them; we don't).
     // `label` carries the full command, so it is shown here too (the header
-    // row keeps only a 36-column preview of it).
+    // row keeps only a 36-column preview of it). Epoch timestamps render as
+    // Beijing time, not raw millisecond integers.
     const names = { label: "命令", detail: "结果", startedAt: "开始于", finishedAt: "结束于" };
+    const fmtBeijing = (ms) => {
+      if (typeof ms !== "number" || !isFinite(ms)) return String(ms ?? "");
+      return new Date(ms).toLocaleString("sv-SE", { timeZone: "Asia/Shanghai", hour12: false }).replace("T", " ") + "（北京时间）";
+    };
     const lines = [];
     const budget = Math.max(20, this.w - 10);
     for (const [k, v] of Object.entries(j)) {
       if (["status", "kind"].includes(k)) continue;
-      const s = v !== null && typeof v === "object" ? JSON.stringify(v) : String(v ?? "");
+      let s = v !== null && typeof v === "object" ? JSON.stringify(v) : String(v ?? "");
+      if (k === "startedAt" || k === "finishedAt") s = fmtBeijing(v);
       if (s === "") continue;
       const key = names[k] ?? k;
       let rest = s;

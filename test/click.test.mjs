@@ -429,17 +429,62 @@ test("Ctrl+L expands/collapses the input past the 6-line cap", () => {
   assert.ok(input.height() <= 6, "back to the 6-line cap");
 });
 
+test("a mouse report split across chunks never becomes input text", async () => {
+  const { PassThrough } = await import("node:stream");
+  const { Term } = await import("../src/term.js");
+  const output = { write: () => true };
+  const events = [];
+  const term = new Term({ input: new PassThrough(), output, onEvent: (e) => events.push(e) });
+  term.start();
+  term.input.write("\x1b");        // lone ESC first — the restart-handoff split
+  term.input.write("[<0;11;6M");  // the rest of the SGR press arrives separately
+  await new Promise((r) => setTimeout(r, 70));
+  assert.deepEqual(events, [{ type: "mouse", kind: "press", button: 0, x: 10, y: 5, ctrl: false, shift: false, alt: false, motion: false }], "parsed as one mouse event, not text");
+  // a genuinely lone ESC still becomes the escape key after the window
+  const events2 = [];
+  const term2 = new Term({ input: new PassThrough(), output, onEvent: (e) => events2.push(e) });
+  term2.start();
+  term2.input.write("\x1b");
+  await new Promise((r) => setTimeout(r, 80));
+  assert.deepEqual(events2, [{ type: "key", name: "escape", ctrl: false, alt: false, shift: false }], "lone ESC still emits escape");
+  term.stop(); term2.stop();
+});
+
+test("Ctrl+C clears the input in insert mode and double-press exits in normal mode", () => {
+  const app = headlessApp();
+  // insert mode: Ctrl+C clears the input bar
+  app.focus(app.chat.input);
+  app.chat.input.setValue("garbage");
+  app.onEvent({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: false });
+  assert.equal(app.chat.input.value, "", "Ctrl+C cleared the input");
+  // normal mode: first press warns, second exits within the toast window
+  let stopped = 0;
+  app.stop = () => { stopped++; };
+  app.focus(app.chat);
+  app.onEvent({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: false });
+  assert.equal(stopped, 0, "first press does not exit");
+  assert.ok(String(app.toastMsg ?? "").includes("退出"), String(app.toastMsg));
+  app.onEvent({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: false });
+  assert.equal(stopped, 1, "second press exits");
+  // after the window passes, a press warns again instead of exiting
+  app.ctrlCUntil = Date.now() - 1000;
+  app.onEvent({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: false });
+  assert.equal(stopped, 1, "expired window does not exit");
+});
+
 test("JobsPanel expanded detail shows the FULL command via wrapping + scrolling", () => {
   const app = fakeApp();
   app.screen = { w: 100, h: 30 };
   const longCmd = "bash -c 'echo " + Array.from({ length: 40 }, (_, i) => `arg-${i}`).join(" ") + "'";
   // the real frame shape: the full command lives in `label`
-  app.jobs = [{ status: "completed", kind: "bash", label: longCmd }];
+  app.jobs = [{ status: "completed", kind: "bash", label: longCmd, startedAt: Date.now() - 3600000, finishedAt: Date.now() }];
   const panel = new JobsPanel(app);
   panel.expanded.add(0);
   panel.rebuild();
   const text = panel.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
   assert.ok(text.includes("命令:"), "label shown under 命令");
+  assert.ok(/20\d\d-\d\d-\d\d \d\d:\d\d:\d\d（北京时间）/.test(text), `timestamps in Beijing time: ${text.slice(0, 300)}`);
+  assert.ok(!/17\d{12}/.test(text), "no raw epoch millisecond integers");
   // the full command is present across the wrapped lines (strip the wrap
   // indents so the continuation chunks join contiguously)
   const detail = panel.lines.slice(2).map((l) => l.map((g) => g.t).join("").replace(/^\s+/, "")).join("");

@@ -97,8 +97,8 @@ console.log("term.js decoder tests:");
   check("alt+x", events[0], { type: "key", name: "char", key: "x", text: "x", ctrl: false, alt: true, shift: false });
 }
 {
-  const { events } = harness("\x1b");
-  check("bare ESC = escape key", events[0], { type: "key", name: "escape", ctrl: false, alt: false, shift: false });
+  const { events } = harness("\x1b[200~paste me\x1b[201~");
+  check("bracketed paste passes text", events[0], { type: "text", text: "paste me" });
 }
 {
   const { events } = harness("\x1b[200~paste me\x1b[201~");
@@ -162,5 +162,31 @@ console.log("term.js decoder tests:");
   check("split UTF-8 second chunk", events[1], { type: "text", text: "好" });
 }
 
-console.log(`\n${pass} passed, ${fail} failed`);
-process.exit(fail > 0 ? 1 : 0);
+// Split-sequence checks need the real event loop (timers cannot fire while
+// the synchronous harness above is still on the stack), so they run as an
+// async tail: a lone ESC waits for the rest of its sequence, and an SGR
+// mouse report whose ESC arrived in a separate chunk is reassembled instead
+// of leaking into input text (the /restart-handoff leak).
+setTimeout(() => {
+  {
+    const { events } = harness("\x1b");
+    setTimeout(() => {
+      check("bare ESC = escape key", events[0], { type: "key", name: "escape", ctrl: false, alt: false, shift: false });
+      {
+        const input = new PassThrough();
+        const output = { write: () => true };
+        const events = [];
+        const term = new Term({ input, output, onEvent: (e) => events.push(e) });
+        term.start();
+        input.write("\x1b");
+        input.write("[<0;11;6M");
+        setTimeout(() => {
+          check("split SGR mouse reassembled", events[0], { type: "mouse", kind: "press", button: 0, x: 10, y: 5, ctrl: false, shift: false, alt: false, motion: false });
+          term.stop();
+          console.log(`\n${pass} passed, ${fail} failed`);
+          process.exit(fail > 0 ? 1 : 0);
+        }, 70);
+      }
+    }, 70);
+  }
+}, 0);

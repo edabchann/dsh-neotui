@@ -1809,6 +1809,7 @@ export class App {
     this.toastUntil = 0;
     this.jobs = [];
     this.jobsBySession = new Map(); // sessionId → latest session/jobs snapshot
+    this.ctrlCUntil = null;         // NORMAL-mode double-Ctrl+C exit window
     this.focused = null;
     this.provider = "";
     this.model = "";
@@ -2849,6 +2850,17 @@ export class App {
         return;
       }
       if (ev.ctrl && ev.key === "q") { this.stop(); return; }
+      if (ev.ctrl && ev.key === "c") {
+        // NORMAL-mode Ctrl+C: two presses within the toast window exit the
+        // process; the first press just warns (insert mode owns Ctrl+C for
+        // clearing the input).
+        if (this.focused === this.chat?.input) return false;
+        const now = Date.now();
+        if (this.ctrlCUntil != null && now < this.ctrlCUntil) { this.stop(); return; }
+        this.ctrlCUntil = now + 3000;
+        this.toast("再按一次 Ctrl+C 退出 TUI");
+        return;
+      }
       if (ev.ctrl && ev.key === "n") { this.focus(this.chat); this.redraw(); return; }
       if (ev.ctrl && ev.key === "b") { this.toggleSidebar(); return; }
       if (ev.ctrl && ev.key === "p") { this.overlay = new ControlPanel(this, { startPage: 1 }); this.redraw(); return; }

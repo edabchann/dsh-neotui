@@ -499,6 +499,7 @@ export class Input extends Widget {
         if (ev.ctrl) {
           switch (ev.key) {
             case "j": if (this.multi) { this.insert("\n"); return true; } return false;
+            case "c": this.#touch(); this.value = ""; this.cursor = 0; this.selectAll = false; this.onChange?.(); this.app?.toast?.("已清空输入栏"); return true;
             case "u": this.#touch(); this.value = this.#cps().slice(this.cursor).join(""); this.cursor = 0; this.onChange?.(); return true;
             case "k": this.#touch(); this.value = this.#cps().slice(0, this.cursor).join(""); this.onChange?.(); return true;
             case "l": {
