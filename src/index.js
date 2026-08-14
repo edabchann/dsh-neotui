@@ -44,6 +44,9 @@ export function launchTui(opts = {}) {
       app.run();
     } catch (e) {
       log("fatal:", e);
+      // the profile's ctx.logger may swallow output once the TUI owns the
+      // terminal — always surface the fatal on stderr too
+      try { console.error("[dsh-tui] fatal:", e?.message ?? e); } catch {}
       term.stop();
       process.exit(1);
     }

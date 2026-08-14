@@ -5,8 +5,11 @@ import { launchTui } from "dsh-neotui";
 
 /** Stable Cordis plugin name. */
 export const name = "tui-runtime";
-/** The webserver row binds after activation; poll its synchronous port getter. */
-export const inject = ["tuiStartup"];
+/** The webserver row binds after activation; DECLARING it as an injection
+ *  guarantees it is active before this plugin's apply runs (a bare ctx.get
+ *  could race the sibling row's activation — the standalone boot's failure:
+ *  "no embedded webserver and no --attach target"). */
+export const inject = ["tuiStartup", "webServer"];
 
 function waitForPort(webServer, { timeoutMs = 10000, intervalMs = 25 } = {}) {
   return new Promise((resolve, reject) => {
@@ -33,7 +36,7 @@ export function apply(ctx) {
     resume: startup.session,
     getBase: async () => {
       if (startup.attach) return normalizeAttach(startup.attach);
-      const webServer = ctx.get("webServer");
+      const webServer = ctx.webServer;
       if (webServer === undefined) throw new Error("tui-runtime: no embedded webserver and no --attach target");
       return `http://127.0.0.1:${await waitForPort(webServer)}`;
     },
