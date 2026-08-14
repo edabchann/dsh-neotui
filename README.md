@@ -2,16 +2,24 @@
 
 DeepSeek Harness 的终端客户端（B 档范围，按 `../dsh-tui-design.md`）。纯 Node 标准库，零依赖。
 
+## 安装（推荐：从 npm 装成 profile）
+
+```bash
+npm i -g pnpm                              # 首次需要 pnpm（dsh plugin 通过它安装）
+dsh plugin --profile dsh-neotui add dsh-neotui-app   # 装 bundle，自动加入 profile 层栈
+dsh --profile dsh-neotui                   # 启动
+```
+
 ## 运行
 
 ```bash
-npx dsh --profile ntui                       # 自带宿主：TUI + 内嵌 API（推荐，已装到 ~/.dsh/profiles/ntui）
-npx dsh --profile ntui --session <id>        # 启动即打开某会话
-npx dsh --profile ntui --cwd ~/work          # 新建会话的默认目录
-npx dsh --profile ntui --port 3981           # 内嵌 API 指定端口（默认 0 = 系统分配）
-npx dsh --profile ntui --attach 3080          # 共存调试：连已运行的 web 宿主（存储自动隔离，不碰 $DSH_HOME）
+dsh --profile ntui                         # 本地开发 profile（~/.dsh/profiles/ntui，软链到本仓库）
+dsh --profile ntui --session <id>          # 启动即打开某会话
+dsh --profile ntui --cwd ~/work            # 新建会话的默认目录
+dsh --profile ntui --port 3981             # 内嵌 API 指定端口（默认 0 = 系统分配）
+dsh --profile ntui --attach 3080           # 共存调试：连已运行的 web 宿主（存储自动隔离，不碰 $DSH_HOME）
 
-node bin/dsh-tui.js                     # 纯客户端模式：连接已运行的 web 宿主（默认 3080）
+node bin/dsh-tui.js                        # 纯客户端模式：连接已运行的 web 宿主（默认 3080）
 node bin/dsh-tui.js --base http://host:port
 ```
 
