@@ -332,6 +332,11 @@ test("the sidebar divider drags to resize the session pane", () => {
   assert.equal(app.sidebarWidth, 42, "width followed the drag");
   assert.equal(app.chat.x, 42, "chat moved with the divider");
   assert.equal(app.sidebar.w, 42, "sidebar resized");
+  // the 对话/轨迹 tab bar starts at the new divider column (wide glyphs are
+  // padded in the plain buffer, so compare the glyph's column)
+  app.renderFrame();
+  const row0 = app.screen.toPlain().split("\n")[0] ?? "";
+  assert.equal(row0.indexOf("对", 40), app.sidebarWidth + 1, `tab bar moved with the divider: ${row0.slice(40, 52)}`);
   // clamp bounds
   app.onEvent({ type: "mouse", kind: "drag", button: 0, x: 4, y: 5, ctrl: false, shift: false, alt: false, motion: true });
   assert.equal(app.sidebarWidth, 14, "clamped to the minimum");

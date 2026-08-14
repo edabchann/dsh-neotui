@@ -2607,7 +2607,7 @@ export class App {
   }
 
   #renderTabBar(s) {
-    const x = this.sidebarVisible ? 30 : 0;
+    const x = this.sidebarVisible ? this.sidebarWidth : 0;
     const w = this.screen.w - x;
     s.fillRect(x, 0, x + w - 1, 0, " ", { bg: T.PANEL });
     const tabs = [...this.#modeTabs()];
@@ -2624,7 +2624,7 @@ export class App {
   }
 
   #clickTab(px) {
-    const x = this.sidebarVisible ? 30 : 0;
+    const x = this.sidebarVisible ? this.sidebarWidth : 0;
     const tabs = [...this.#modeTabs()];
     const panelLabel = this.#panelLabel(this.mode);
     if (panelLabel) tabs.push([this.mode, panelLabel]);
