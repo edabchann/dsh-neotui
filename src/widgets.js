@@ -510,12 +510,23 @@ export class Popup extends Widget {
     this.btnIdx = 0;
     this.onAction = opts.onAction ?? null;
     this.fg = opts.fg;
+    // opt-in vertical scrolling: content longer than the box scrolls with
+    // PgUp/PgDn/up/down/wheel instead of being clipped away
+    this.scrollable = opts.scrollable ?? false;
+    this.scrollY = 0;
+  }
+  contentRows() {
+    // rows between the border and the buttons row
+    return this.h - 2 - (this.buttons.length ? 1 : 0);
+  }
+  maxScroll() {
+    return Math.max(0, this.lines.length - this.contentRows());
   }
   render(screen) {
     screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.BG2 });
     screen.box(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, { fg: this.fg ?? 0x67b7ff, bg: T.BG2 }, this.title);
     let ly = this.y + 1;
-    for (const line of this.lines) {
+    const draw = (line) => {
       if (Array.isArray(line)) {
         // styled line: array of segments
         let px = this.x + 2;
@@ -532,6 +543,23 @@ export class Popup extends Widget {
         screen.text(this.x + 2, ly, truncate(String(line), this.w - 4), { fg: T.TXT, bg: T.BG2 });
       }
       ly++;
+    };
+    if (this.scrollable) {
+      const avail = this.contentRows();
+      this.scrollY = Math.max(0, Math.min(this.scrollY, this.maxScroll()));
+      const start = this.scrollY;
+      for (let i = 0; i < avail; i++) {
+        const line = this.lines[start + i];
+        if (line === undefined) break;
+        draw(line);
+      }
+      if (this.maxScroll() > 0) {
+        // "↑N" / "↓N" overflow indicators on the border row
+        if (this.scrollY > 0) screen.text(this.x + this.w - 6, this.y, ` ↑${this.scrollY}`, { fg: T.ACCENT, bg: T.BG2 });
+        if (this.scrollY < this.maxScroll()) screen.text(this.x + this.w - 8, this.y + this.h - 1, ` ↓${this.maxScroll() - this.scrollY}`, { fg: T.ACCENT, bg: T.BG2 });
+      }
+    } else {
+      for (const line of this.lines) draw(line);
     }
     // buttons on last row
     if (this.buttons.length) {
@@ -550,6 +578,10 @@ export class Popup extends Widget {
     }
   }
   onMouse(ev) {
+    if (this.scrollable) {
+      if (ev.kind === "wheel-up") { this.scrollY = Math.max(0, this.scrollY - 3); return true; }
+      if (ev.kind === "wheel-down") { this.scrollY = Math.min(this.maxScroll(), this.scrollY + 3); return true; }
+    }
     if (ev.kind === "press" && ev.button === 0 && this.buttons.length) {
       let bx = this.x + 2;
       const by = this.y + this.h - 2;
@@ -566,6 +598,10 @@ export class Popup extends Widget {
   }
   onKey(ev) {
     if (ev.type !== "key") return false;
+    if (this.scrollable) {
+      if (ev.name === "pgup") { this.scrollY = Math.max(0, this.scrollY - this.contentRows()); return true; }
+      if (ev.name === "pgdn") { this.scrollY = Math.min(this.maxScroll(), this.scrollY + this.contentRows()); return true; }
+    }
     if (ev.name === "escape") { this.onAction?.({ label: "__cancel__", action: "__cancel__" }, -1); return true; }
     if (ev.name === "tab") { this.btnIdx = (this.btnIdx + 1) % Math.max(1, this.buttons.length); return true; }
     if (ev.name === "left") { this.btnIdx = Math.max(0, this.btnIdx - 1); return true; }

@@ -1386,6 +1386,7 @@ export class JobsPanel extends Popup {
       title: "后台任务（Ctrl+J 查看详情）", lines: [],
       buttons: [{ label: "关闭(q)", action: "close" }],
       onAction: () => app.closeOverlay(),
+      scrollable: true, // expanded details scroll instead of being clipped
     });
     this.app = app;
     this.jobs = jobs;
@@ -1394,19 +1395,40 @@ export class JobsPanel extends Popup {
     this.rowOf = [];           // rendered line → job index (-1 = chrome/detail)
     this.rebuild();
   }
+  /** Width-aware character cut (no ellipsis — continuation chunks follow). */
+  static #cutWidth(s, w) {
+    let out = "", cw = 0;
+    for (const ch of s) {
+      const c = strWidth(ch);
+      if (cw + c > w) break;
+      out += ch; cw += c;
+    }
+    return out;
+  }
   #detailLines(j) {
+    // Expanded = EVERYTHING: every field, full values — long commands wrap
+    // across lines instead of being truncated (the web clips them; we don't).
     const lines = [];
+    const budget = Math.max(20, this.w - 10);
     for (const [k, v] of Object.entries(j)) {
       if (["status", "kind", "label"].includes(k)) continue;
       const s = v !== null && typeof v === "object" ? JSON.stringify(v) : String(v ?? "");
       if (s === "") continue;
-      lines.push([{ t: `      ${k}: ${truncate(s, this.w - 14)}`, fg: K.DIM }]);
-      if (lines.length > 8) break;
+      let rest = s;
+      let first = true;
+      while (rest.length > 0 || first) {
+        const head = first ? `${k}: ` : "     ";
+        const take = JobsPanel.#cutWidth(rest, budget - strWidth(head));
+        lines.push([{ t: `      ${head}${take}`, fg: K.DIM }]);
+        rest = rest.slice(take.length);
+        first = false;
+        if (lines.length > 200) break; // pathological safety, never reached in practice
+      }
     }
     return lines;
   }
   rebuild() {
-    let lines = [[{ t: "  这些任务在后台运行,不阻塞会话 — Enter/→/l 展开,←/h 折叠,q 关闭", fg: K.DIM }]];
+    let lines = [[{ t: "  这些任务在后台运行,不阻塞会话 — Enter/→/l 展开,←/h 折叠,PgUp/PgDn 滚动,q 关闭", fg: K.DIM }]];
     const rowOf = [-1];
     const jobs = this.jobs;
     if (jobs.length === 0) {
@@ -1427,11 +1449,19 @@ export class JobsPanel extends Popup {
       rowOf.push(i);
       if (open) for (const fl of this.#detailLines(j)) { lines.push(fl); rowOf.push(-1); }
     }
-    if (lines.length > this.h - 3) {
-      lines = [...lines.slice(0, this.h - 4), [{ t: `  …共 ${jobs.length} 个任务`, fg: K.FAINT }]];
-    }
+    // keep the full content — the panel scrolls now (no more hard clip)
     this.lines = lines;
     this.rowOf = rowOf;
+    this.#ensureVisible();
+  }
+  /** Keep the selected job row inside the scrollable viewport. */
+  #ensureVisible() {
+    const avail = this.contentRows();
+    const row = this.rowOf.findIndex((r) => r === this.sel);
+    if (row < 0) return;
+    if (row < this.scrollY) this.scrollY = row;
+    else if (row >= this.scrollY + avail) this.scrollY = row - avail + 1;
+    this.scrollY = Math.max(0, Math.min(this.scrollY, this.maxScroll()));
   }
   #toggle(i) {
     if (this.expanded.has(i)) this.expanded.delete(i);
@@ -1459,7 +1489,7 @@ export class JobsPanel extends Popup {
     return super.onKey(ev);
   }
   onMouse(ev) {
-    if (super.onMouse(ev)) return true; // buttons
+    if (super.onMouse(ev)) return true; // buttons + wheel scrolling
     if (ev.kind === "press" && ev.button === 0) {
       const i = ev.y - this.y - 1;
       const jIdx = this.rowOf[i];

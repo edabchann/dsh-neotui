@@ -366,6 +366,31 @@ test("session/jobs snapshots buffered before the session opens survive (footer c
   assert.equal(app.jobs.length, 0, "no stale counts leak across sessions");
 });
 
+test("JobsPanel expanded detail shows the FULL command via wrapping + scrolling", () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const longCmd = "bash -c 'echo " + Array.from({ length: 40 }, (_, i) => `arg-${i}`).join(" ") + "'";
+  app.jobs = [{ status: "completed", kind: "bash", label: "long job", args: longCmd }];
+  const panel = new JobsPanel(app);
+  panel.expanded.add(0);
+  panel.rebuild();
+  const text = panel.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
+  assert.ok(text.includes(longCmd.slice(0, 40)), "command head present");
+  // the full command is present across the wrapped lines (strip the wrap
+  // indents so the continuation chunks join contiguously)
+  const detail = panel.lines.slice(2).map((l) => l.map((g) => g.t).join("").replace(/^\s+/, "")).join("");
+  assert.ok(detail.includes(longCmd.slice(-40)), "command TAIL present (never truncated away)");
+  // the panel scrolls through the wrapped detail
+  const before = panel.scrollY;
+  panel.onKey({ type: "key", name: "pgdn" });
+  assert.ok(panel.scrollY > before, "pgdn scrolls the detail window");
+  panel.onKey({ type: "key", name: "pgup" });
+  assert.equal(panel.scrollY, before, "pgup scrolls back");
+  // wheel scrolling reaches the very end of the content
+  panel.onMouse({ type: "mouse", kind: "wheel-down", button: 4, x: 10, y: 10, ctrl: false, shift: false, alt: false, motion: false });
+  assert.equal(panel.scrollY, panel.maxScroll(), "wheel reaches the end");
+});
+
 test("fold toggles near the tail never re-pin the view across rebuilds (no stuck scroll)", () => {
   const result = Array.from({ length: 60 }, (_, i) => `res ${i}`).join("\n");
   const { chat } = render([
