@@ -53,6 +53,16 @@ export function pad(s, w, align = "left") {
   return align === "right" ? sp + s : s + sp;
 }
 
+/** Chinese-unit duration: 12秒 / 3分05秒 / 1小时02分03秒. */
+export function fmtDuration(ms) {
+  if (ms == null || isNaN(ms) || ms < 0) return "—";
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h > 0) return `${h}小时${String(m).padStart(2, "0")}分${String(sec).padStart(2, "0")}秒`;
+  if (m > 0) return `${m}分${String(sec).padStart(2, "0")}秒`;
+  return `${sec}秒`;
+}
+
 export function hexRgb(hex) {
   const m = /^#?([0-9a-f]{6})$/i.exec(String(hex).trim());
   if (!m) return null;

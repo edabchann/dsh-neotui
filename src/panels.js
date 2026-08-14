@@ -10,6 +10,7 @@ import { join, basename, extname } from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 
 import { T, cycleTheme, themeName } from "./theme.js";
+import { loadTuiConfig, saveTuiConfig, userPrefix, userName } from "./config.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
 const K = new Proxy({}, { get(_k, key) { return T[key]; } });
 
@@ -555,15 +556,30 @@ export class TrajectoryPanel extends Widget {
     this.allEvents = [];
     this.sessionId = null;
     this.expandedSteps = new Set(); // step identity keys rendered 详细 (expanded)
-    this.flashStep = null;          // step just jumped to (brief highlight)
+    this.flashStep = null;          // step NUMBER just jumped to (brief highlight)
     this.flashUntil = 0;
     this.loadPromise = null;        // dedupes concurrent load(currentSession)
     this.loadTarget = null;
-    // No onClick: LEFT click on a step does nothing (details live in the
-    // right-click menu and in the per-step 详细/简略 expansion).
-    this.view = new ScrollView({ x: this.x, y: this.y, w: this.w, h: this.h, showScrollbar: true });
+    this.winLo = null;              // visible step-number window [winLo, winHi]; null = follow the tail
+    this.winHi = null;
+    // LEFT click toggles a step's 详细/简略 expansion (the ▸/▾ triangle).
+    this.view = new ScrollView({ x: this.x, y: this.y, w: this.w, h: this.h, showScrollbar: true, onClick: (y) => this.#clickLine(y) });
     this.stepLines = [];
     this.query = "";
+  }
+
+  /** Total step count from the session stats (falls back to the newest loaded). */
+  totalSteps() {
+    return this.stats?.steps ?? (this.steps[this.steps.length - 1]?.step ?? this.steps.length);
+  }
+
+  /** LEFT click: toggle the step under the cursor; the "▲ 更早步骤" row loads
+   *  one more window-width upward. */
+  #clickLine(y) {
+    if (this.hasMore && y === 1) { this.extendUp(); return true; }
+    const si = this.stepLines[y];
+    if (si !== undefined) { this.#toggleStep(si); return true; }
+    return false;
   }
 
   #eventSummary(e) {
@@ -619,9 +635,17 @@ export class TrajectoryPanel extends Widget {
     const step = this.steps[si];
     if (!step) return;
     const key = this.stepKey(step);
+    // Anchor: keep the step header at its current viewport row across the
+    // expand/collapse layout change (rows are added/removed BELOW it).
+    const headerLine = this.stepLines.indexOf(si);
+    const topRow = headerLine >= 0 ? headerLine - this.view.scrollY : null;
     if (this.expandedSteps.has(key)) this.expandedSteps.delete(key);
     else this.expandedSteps.add(key);
     this.buildLines();
+    if (topRow !== null) {
+      const li2 = this.stepLines.indexOf(si);
+      if (li2 >= 0) this.view.scrollY = Math.max(0, Math.min(li2 - topRow, this.view.maxScroll()));
+    }
     this.app.redraw();
   }
 
@@ -641,15 +665,98 @@ export class TrajectoryPanel extends Widget {
     return -1;
   }
 
-  /** Scroll to a step: auto-expand, highlight, center its line. */
-  jumpToStep(si) {
+  /** Load older pages until step `loStep` is covered (or the session's first
+   *  step is reached). Used by jumps and Home — many pages when going far. */
+  async ensureLoaded(loStep, maxPages = 80) {
+    for (let i = 0; i < maxPages; i++) {
+      if (!this.hasMore) break;
+      if (this.steps.length && this.steps[0].step <= loStep) break;
+      this.app.setStatus(`加载更早轨迹…（当前最早 step ${this.steps[0]?.step ?? "?"}）`);
+      await this.loadOlder();
+    }
+    this.app.setStatus("");
+  }
+
+  /** Set the visible step-number window and re-render. */
+  setWindow(lo, hi) {
+    this.winLo = lo;
+    this.winHi = hi;
+    this.buildLines();
+  }
+
+  /** Step number at the top of the viewport (for anchoring after growth). */
+  #topVisibleStep() {
+    const si = this.stepLines[this.view.scrollY];
+    return si !== undefined ? this.steps[si]?.step : null;
+  }
+
+  /** Scroll so the given step number sits at the top of the viewport. */
+  #anchorScroll(stepNum) {
+    const li = this.stepLines.findIndex((si) => this.steps[si]?.step === stepNum);
+    if (li >= 0) this.view.scrollY = Math.max(0, li);
+  }
+
+  /** Scroll to a step: open a ±20 window around it (loading older pages on
+   *  demand), auto-expand and highlight the step. */
+  async jumpToStep(si) {
     if (si < 0 || si >= this.steps.length) return;
+    const S = this.steps[si].step;
     this.expandedSteps.add(this.stepKey(this.steps[si]));
-    this.buildLines(si);
-    const li = this.stepLines.indexOf(si);
-    this.view.scrollY = li >= 0 ? Math.max(0, li - 2) : 0;
-    this.flashStep = si;
+    this.flashStep = S;
     this.flashUntil = Date.now() + 3000;
+    await this.ensureLoaded(Math.max(1, S - 20));
+    // ensureLoaded re-segments → re-find the step index by its number
+    const si2 = this.steps.findIndex((s) => s.step === S);
+    this.setWindow(Math.max(1, S - 20), Math.min(this.totalSteps(), S + 20));
+    const li = si2 >= 0 ? this.stepLines.indexOf(si2) : -1;
+    this.view.scrollY = li >= 0 ? Math.max(0, li - 2) : 0;
+    this.app.redraw();
+  }
+
+  /** PgUp: extend the window 10 steps upward (loading older if needed),
+   *  keeping the view anchored on the step that was at the top. */
+  async extendUp() {
+    const N = this.totalSteps();
+    if (this.winLo == null) { this.winLo = Math.max(1, N - 19); this.winHi = N; }
+    if (this.winLo <= 1 && this.steps.length && this.steps[0].step <= 1) {
+      this.app.toast("已到最早步骤");
+      return;
+    }
+    const anchor = this.#topVisibleStep() ?? this.winLo;
+    this.winLo = Math.max(1, this.winLo - 10);
+    if (!this.steps.length || this.steps[0].step > this.winLo) await this.ensureLoaded(this.winLo);
+    this.buildLines();
+    this.#anchorScroll(anchor);
+    this.app.redraw();
+  }
+
+  /** PgDn: extend the window 10 steps downward (the newer steps are already
+   *  loaded — the tail is always kept). */
+  extendDown() {
+    const N = this.totalSteps();
+    if (this.winLo == null) { this.winLo = Math.max(1, N - 19); this.winHi = N; }
+    if (this.winHi >= N) { this.app.toast("已到最新步骤"); return; }
+    this.winHi = Math.min(N, this.winHi + 10);
+    this.buildLines();
+    this.app.redraw();
+  }
+
+  /** Home: jump to the very first steps (loading all the way back). */
+  async gotoHome() {
+    await this.ensureLoaded(1);
+    this.setWindow(1, 20);
+    const li = this.stepLines.findIndex((si) => this.steps[si]?.step === 1);
+    this.view.scrollY = li >= 0 ? li : 0;
+    this.app.toast("已跳到最早步骤（step 1–20）");
+    this.app.redraw();
+  }
+
+  /** End: jump to the newest steps. */
+  gotoEnd() {
+    const N = this.totalSteps();
+    this.setWindow(Math.max(1, N - 19), N);
+    this.view.scrollY = this.view.maxScroll();
+    this.app.toast(`已跳到最新步骤（step ${Math.max(1, N - 19)}–${N}）`);
     this.app.redraw();
   }
 
@@ -664,11 +771,17 @@ export class TrajectoryPanel extends Widget {
       await this.loadOlder();
       si = this.indexOfMessage(messageId);
     }
+    if (si < 0 && messageId) {
+      // still not found — the message is far back; scan everything (bounded)
+      await this.ensureLoaded(1, 60);
+      si = this.indexOfMessage(messageId);
+    }
     if (si >= 0) {
-      this.jumpToStep(si);
-      this.app.toast(`已定位到 step ${this.steps[si].step}`);
+      const S = this.steps[si].step;
+      await this.jumpToStep(si);
+      this.app.toast(`已定位到 step ${S}`);
     } else if (this.steps.length) {
-      this.jumpToStep(this.steps.length - 1);
+      await this.jumpToStep(this.steps.length - 1);
       this.app.toast(messageId ? "对应步骤不在已加载窗口" : "消息未关联步骤，已到最新步骤");
     }
   }
@@ -751,19 +864,24 @@ export class TrajectoryPanel extends Widget {
       if (cur) cur.events.push(event);
     }
     if (cur && cur.events.length) steps.push(cur);
-    this.steps = steps.slice(-600);
+    // Keep every loaded step: Home/End navigation pages across the whole
+    // session, so older steps must survive until `r` re-fetches fresh.
+    this.steps = steps;
   }
-  buildLines(aroundSi = null) {
+  buildLines() {
     const w = Math.max(40, this.w - 2);
+    const N = this.totalSteps();
+    const lo = this.winLo ?? Math.max(1, N - 19);
+    const hi = this.winHi ?? N;
     const lines = [];
-    lines.push([{ t: "轨迹 — 步骤时间轴（右键：展开/折叠 · 转跳对话 · 查看详情；r 刷新）", fg: K.ACCENT, bold: true }]);
-    if (this.hasMore) lines.push([{ t: "▲ 更早步骤（点击 / PgUp 加载）", fg: K.FAINT }]);
+    lines.push([{ t: "轨迹 — 步骤时间轴（左键展开/折叠 · PgUp/PgDn 上下加载 · Home/End 首尾 · Ctrl+E 转跳 · r 刷新）", fg: K.ACCENT, bold: true }]);
+    if (this.hasMore) lines.push([{ t: "▲ 更早步骤（点击 / PgUp 向上加载 10 步）", fg: K.FAINT }]);
     else lines.push([{ t: "" }]);
     const st = this.stats;
     if (st) {
       lines.push([{ t: `回合 ${st.turns} · 步骤 ${st.steps} · LLM ${fmtMs(st.llmMs)} · 工具 ${fmtMs(st.toolMs)}`, fg: K.DIM }]);
     }
-    lines.push([{ t: `步骤（已加载 ${this.steps.length}${this.hasMore ? "+" : ""}）：`, fg: K.DIM, underline: true }]);
+    lines.push([{ t: `窗口 step ${lo}–${hi} · 共 ${N} 步${this.winLo == null ? "（跟随最新）" : ""}：`, fg: K.DIM, underline: true }]);
     this.stepLines = [];
     const list = this.query
       ? this.steps.filter((t) => t.events.some((e) => {
@@ -771,15 +889,8 @@ export class TrajectoryPanel extends Widget {
         const hay = `${e.type} ${d.name ?? ""} ${typeof d.content === "string" ? d.content : ""}`.toLowerCase();
         return hay.includes(this.query.toLowerCase());
       }))
-      : this.steps;
-    // Render a window of 40 steps (newest at the top). A jump to an older
-    // step centers the window around it so its line actually exists.
-    let windowStart = Math.max(0, list.length - 40);
-    if (!this.query && aroundSi !== null && aroundSi >= 0) {
-      const li = list.indexOf(this.steps[aroundSi]);
-      if (li >= 0) windowStart = Math.max(0, Math.min(li - 8, list.length - 40));
-    }
-    for (const step of list.slice(windowStart, windowStart + 40).reverse()) {
+      : this.steps.filter((s) => s.step >= lo && s.step <= hi);
+    for (const step of list.reverse()) {
       const si = this.steps.indexOf(step);
       const tools = [...new Set(step.events.filter((e) => e.type === "tool/call").map((e) => e.data?.name))];
       const hasResult = step.events.some((e) => e.type === "tool/result");
@@ -789,7 +900,7 @@ export class TrajectoryPanel extends Widget {
       const bg = tools.length ? (hasResult ? T.TOOLOK : T.TOOLBG) : hasReasoning ? T.THINKBG : T.CARD;
       const summary = tools.slice(0, 3).join(",") || (hasReasoning ? "模型推理" : "纯文本");
       const open = this.expandedSteps.has(this.stepKey(step));       // 详细
-      const flash = this.flashStep === si && Date.now() < this.flashUntil;
+      const flash = this.flashStep === step.step && Date.now() < this.flashUntil;
       const rowBg = flash ? T.ACCENT : bg;
       const label = `${open ? "▾" : "▸"} step ${String(step.step).padStart(3)}  ${pad(dur, 8)}  ${summary}  ${open ? "[折叠]" : "[展开]"}`;
       const segs = [{ t: label, fg: flash ? T.SELFG : K.TXT, bg: rowBg, bold: true }];
@@ -843,15 +954,11 @@ export class TrajectoryPanel extends Widget {
       // leak into the chat view's context menu underneath.
       return this.view.inside(ev.x, ev.y);
     }
-    // wheel / scrollbar drag keep working
+    // wheel / scrollbar / LEFT-click toggle keep working (view.onClick)
     if (this.view.onMouse(ev)) return true;
-    // LEFT click on a step: no reaction — but swallow it so it cannot leak
-    // through to the chat view underneath (which shares this rectangle).
-    if (ev.kind === "press" && ev.button === 0 && this.view.inside(ev.x, ev.y)) {
-      const y = ev.y - this.view.y + this.view.scrollY;
-      if (this.hasMore && y === 1) this.loadOlder(); // "▲ 更早步骤" row
-      return true;
-    }
+    // swallow left-clicks on non-step rows (header/stats) so they cannot
+    // leak through to the chat view underneath (which shares this rectangle).
+    if (ev.kind === "press" && ev.button === 0 && this.view.inside(ev.x, ev.y)) return true;
     return false;
   }
   onKey(ev) {
@@ -863,14 +970,22 @@ export class TrajectoryPanel extends Widget {
       return true;
     }
     if (ev.name === "backspace") { this.query = this.query.slice(0, -1); this.buildLines(); this.app.redraw(); return true; }
-    if (ev.name === "char" && ev.key === "r" && !ev.ctrl) { this.steps = []; this.load(this.sessionId); return true; }
-    if (ev.name === "pgup") { if (this.view.scrollY === 0 && this.hasMore) { this.loadOlder(); return true; } return this.view.scroll(-this.view.h); }
-    if (ev.name === "pgdn" || ev.name === "up" || ev.name === "down") return this.view.onKey(ev);
+    if (ev.name === "char" && ev.key === "r" && !ev.ctrl) {
+      this.winLo = this.winHi = null;
+      this.steps = [];
+      this.load(this.sessionId);
+      return true;
+    }
+    if (ev.name === "pgup") { this.extendUp(); return true; }
+    if (ev.name === "pgdn") { this.extendDown(); return true; }
+    if (ev.name === "home") { this.gotoHome(); return true; }
+    if (ev.name === "end") { this.gotoEnd(); return true; }
+    if (ev.name === "up" || ev.name === "down") return this.view.onKey(ev);
     return false;
   }
 }
 
-function fmtMs(ms) {
+export function fmtMs(ms) {
   if (ms == null || isNaN(ms)) return "—";
   if (ms < 1000) return `${Math.round(ms)}ms`;
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
@@ -1069,7 +1184,8 @@ export class ControlPanel extends Widget {
       ["Ctrl+A", "子代理", () => { this.app.closeOverlay(); this.app.setMode("subagent"); }],
       ["Ctrl+K", "技能", () => { this.app.closeOverlay(); this.app.setMode("skills"); }],
       ["Ctrl+G", "目标", () => this.app.showGoal()],
-      ["Ctrl+J", "任务", () => this.app.showJobs()],
+      ["Ctrl+J", "后台任务", () => this.app.showJobs()],
+      ["Ctrl+E", "步骤转跳（fzf 式）", () => this.app.quickJumpStep()],
       ["Ctrl+B", "侧栏 显示/隐藏", () => this.app.toggleSidebar()],
       ["Ctrl+Q", "退出", () => this.app.stop()],
     ];
@@ -1217,21 +1333,98 @@ export class ControlPanel extends Widget {
 
 // ---- Jobs & goal popups ----
 
-export function buildJobsPopup(app) {
-  const jobs = app.jobs ?? [];
-  const lines = jobs.length === 0
-    ? [[{ t: "（当前没有任务帧）", fg: K.FAINT }]]
-    : jobs.map((j) => {
+/** Background-job list (Ctrl+J) with per-job expand/collapse: Enter/→/l 展开,
+ *  ←/h 折叠, ↑↓/j k 选择, q/Esc 关闭, click toggles too. */
+export class JobsPanel extends Popup {
+  constructor(app) {
+    const jobs = app.jobs ?? [];
+    super({
+      x: 5, y: 3, w: Math.min(84, app.screen.w - 8), h: Math.min(Math.max(jobs.length + 5, 7), 24),
+      title: "后台任务（Ctrl+J 查看详情）", lines: [],
+      buttons: [{ label: "关闭(q)", action: "close" }],
+      onAction: () => app.closeOverlay(),
+    });
+    this.app = app;
+    this.jobs = jobs;
+    this.expanded = new Set(); // job indexes rendered expanded
+    this.sel = 0;
+    this.rowOf = [];           // rendered line → job index (-1 = chrome/detail)
+    this.rebuild();
+  }
+  #detailLines(j) {
+    const lines = [];
+    for (const [k, v] of Object.entries(j)) {
+      if (["status", "kind", "label"].includes(k)) continue;
+      const s = v !== null && typeof v === "object" ? JSON.stringify(v) : String(v ?? "");
+      if (s === "") continue;
+      lines.push([{ t: `      ${k}: ${truncate(s, this.w - 14)}`, fg: K.DIM }]);
+      if (lines.length > 8) break;
+    }
+    return lines;
+  }
+  rebuild() {
+    let lines = [[{ t: "  这些任务在后台运行,不阻塞会话 — Enter/→/l 展开,←/h 折叠,q 关闭", fg: K.DIM }]];
+    const rowOf = [-1];
+    const jobs = this.jobs;
+    if (jobs.length === 0) {
+      lines.push([{ t: "  （当前没有任务帧）", fg: K.FAINT }]);
+      rowOf.push(-1);
+    }
+    for (let i = 0; i < jobs.length; i++) {
+      const j = jobs[i];
       const icon = j.status === "running" ? "⚙" : j.status === "completed" ? "✓" : j.status === "failed" ? "✗" : "·";
       const color = j.status === "running" ? K.WARN : j.status === "completed" ? K.OK : j.status === "failed" ? K.ERR : K.DIM;
-      return [{ t: ` ${icon} ${truncate(j.kind, 14)}`, fg: color, bold: true }, { t: ` ${truncate(j.label, 44)}`, fg: K.TXT }, { t: ` ${j.status}`, fg: K.DIM }];
-    });
-  return new Popup({
-    x: 6, y: 3, w: Math.min(80, app.screen.w - 12), h: Math.min(jobs.length + 4, 20), title: "任务",
-    lines: [[{ t: "" }], ...lines],
-    buttons: [{ label: "关闭", action: "close" }],
-    onAction: () => app.closeOverlay(),
-  });
+      const open = this.expanded.has(i);
+      const bg = i === this.sel ? T.MENUSEL : T.BG2;
+      lines.push([
+        { t: ` ${open ? "▾" : "▸"} ${icon} ${truncate(j.kind, 14)}`, fg: color, bold: true, bg },
+        { t: ` ${truncate(j.label, 36)}`, fg: K.TXT, bg },
+        { t: ` ${j.status}`, fg: K.DIM, bg },
+      ]);
+      rowOf.push(i);
+      if (open) for (const fl of this.#detailLines(j)) { lines.push(fl); rowOf.push(-1); }
+    }
+    if (lines.length > this.h - 3) {
+      lines = [...lines.slice(0, this.h - 4), [{ t: `  …共 ${jobs.length} 个任务`, fg: K.FAINT }]];
+    }
+    this.lines = lines;
+    this.rowOf = rowOf;
+  }
+  #toggle(i) {
+    if (this.expanded.has(i)) this.expanded.delete(i);
+    else this.expanded.add(i);
+    this.rebuild();
+    this.app.redraw();
+  }
+  onKey(ev) {
+    if (ev.type === "key") {
+      if (ev.name === "escape" || (ev.name === "char" && ev.key === "q" && !ev.ctrl)) { this.app.closeOverlay(); return true; }
+      if (this.jobs.length === 0) return super.onKey(ev);
+      if (ev.name === "up" || (ev.name === "char" && ev.key === "k" && !ev.ctrl)) {
+        this.sel = Math.max(0, this.sel - 1); this.rebuild(); return true;
+      }
+      if (ev.name === "down" || (ev.name === "char" && ev.key === "j" && !ev.ctrl)) {
+        this.sel = Math.min(this.jobs.length - 1, this.sel + 1); this.rebuild(); return true;
+      }
+      if (ev.name === "right" || ev.name === "enter" || (ev.name === "char" && ev.key === "l" && !ev.ctrl)) {
+        if (this.jobs[this.sel]) { this.expanded.add(this.sel); this.rebuild(); } return true;
+      }
+      if (ev.name === "left" || (ev.name === "char" && ev.key === "h" && !ev.ctrl)) {
+        this.expanded.delete(this.sel); this.rebuild(); return true;
+      }
+    }
+    return super.onKey(ev);
+  }
+  onMouse(ev) {
+    if (super.onMouse(ev)) return true; // buttons
+    if (ev.kind === "press" && ev.button === 0) {
+      const i = ev.y - this.y - 1;
+      const jIdx = this.rowOf[i];
+      if (jIdx >= 0) { this.sel = jIdx; this.#toggle(jIdx); return true; }
+      return true;
+    }
+    return false;
+  }
 }
 
 export function buildGoalPopup(app) {
@@ -1298,11 +1491,19 @@ export class SettingsPanel extends Widget {
       const d = await this.app.api.call("settings.describe");
       this.namespaces = d.namespaces ?? [];
       this.writable = d.writable;
-      this.selectNs(0);
     } catch (e) {
       this.app.toast(`设置加载失败: ${e.message}`);
       this.app.setMode("chat");
+      return;
     }
+    // TUI-local settings ride the same tree editor, but persist to the TUI
+    // config file instead of the host settings (settings.mutate knows nothing
+    // about them). userPrefix = the chat's "edabchann > " display name.
+    this.namespaces.unshift({
+      ns: "TUI 界面", applies: "live", local: true,
+      value: { userPrefix: userName() },
+    });
+    this.selectNs(0);
   }
   selectNs(i) {
     this.nsIdx = Math.max(0, Math.min(this.namespaces.length - 1, i));
@@ -1354,9 +1555,10 @@ export class SettingsPanel extends Widget {
     this.nsList.render(screen);
     const ns = this.currentNs();
     if (ns) {
-      screen.text(this.x + 28, this.y, ` ${ns.ns}  rev${ns.revision}  ${this.writable === false ? "(只读)" : ""}`, { fg: K.ACCENT, bold: true });
+      const revTag = ns.local ? "" : ` rev${ns.revision}`;
+      screen.text(this.x + 28, this.y, ` ${ns.ns}${revTag}  ${this.writable === false && !ns.local ? "(只读)" : ""}`, { fg: K.ACCENT, bold: true });
       const pend = this.pendingOps.length ? `  ⚠ ${this.pendingOps.length} 项待保存` : "";
-      if (pend) screen.text(this.x + 28 + strWidth(` ${ns.ns}  rev${ns.revision}  `), this.y, pend, { fg: K.WARN });
+      if (pend) screen.text(this.x + 28 + strWidth(` ${ns.ns}${revTag}  `), this.y, pend, { fg: K.WARN });
     }
     this.tree.render(screen);
     if (this.editing) {
@@ -1426,6 +1628,21 @@ export class SettingsPanel extends Widget {
   async save() {
     const ns = this.currentNs();
     if (!ns || this.pendingOps.length === 0) { this.app.toast("没有待保存的修改"); return; }
+    if (ns.local) {
+      // TUI-local config: write the config file, apply instantly.
+      const v = applyOps(ns.value, this.pendingOps);
+      const name = String(v.userPrefix ?? "").trim();
+      if (saveTuiConfig({ userPrefix: name })) {
+        this.pendingOps = [];
+        this.app.toast(name ? `已保存显示名 “${name}”（即时生效）` : "已清除自定义显示名（回到系统用户名）");
+        this.app.chat.cache.clear();
+        this.app.chat.queueRebuild();
+        await this.load();
+      } else {
+        this.app.toast("保存失败：无法写入 TUI 配置文件");
+      }
+      return;
+    }
     try {
       await this.app.api.call("settings.mutate", { ns: ns.ns, ops: this.pendingOps, expectedRevision: ns.revision });
       this.pendingOps = [];

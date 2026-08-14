@@ -1,35 +1,21 @@
 // views.js — App composition: session list + chat timeline + approvals + status.
 import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
-import { truncate, strWidth, bars } from "./text.js";
+import { truncate, strWidth, bars, fmtDuration } from "./text.js";
 import { readFileSync } from "node:fs";
-import { userInfo } from "node:os";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
+import { userPrefix, saveTuiConfig, loadTuiConfig, userName } from "./config.js";
+export { userPrefix, saveTuiConfig, loadTuiConfig, userName } from "./config.js";
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
   modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker,
-  ImagePopup, kittyCapable, buildJobsPopup, buildGoalPopup, SettingsPanel, SubagentPanel,
-  SkillsPanel, ControlPanel,
+  ImagePopup, kittyCapable, buildGoalPopup, SettingsPanel, SubagentPanel,
+  SkillsPanel, ControlPanel, JobsPanel, fmtMs,
 } from "./panels.js";
 
 import { T, themeName } from "./theme.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
 const K = new Proxy({}, { get(_k, key) { return T[key]; } });
-
-// ---- User-message prefix ----
-// "edabchann > " style marker on the first line of every message the user
-// sent. Customizable via the DSH_TUI_USER_PREFIX env var; defaults to the
-// OS login username (process.env.USER as a fallback).
-let OS_USERNAME = null;
-function osUsername() {
-  if (OS_USERNAME !== null) return OS_USERNAME;
-  try { OS_USERNAME = userInfo().username; } catch { OS_USERNAME = ""; }
-  return OS_USERNAME;
-}
-export function userPrefix() {
-  const name = process.env.DSH_TUI_USER_PREFIX || osUsername() || process.env.USER || process.env.LOGNAME || "user";
-  return `${name} > `;
-}
 
 // ---- Tool card renderers (host-computed view models) ----
 
@@ -128,17 +114,23 @@ function diffText(oldText, newText, width) {
 // ---- Chat node model ----
 
 /** Apply ONE event onto a mutable nodes array (shared by full-window
- *  derivation and the incremental mux merge — the two paths must agree). */
-function applyEvent(nodes, event, view, log) {
+ *  derivation and the incremental mux merge — the two paths must agree).
+ *  `state` carries the current step number across calls ({ step: number }). */
+function applyEvent(nodes, event, view, log, state = null) {
+  const st = state ?? { step: null };
   const cur = () => nodes[nodes.length - 1];
   const d = event.data ?? {};
   switch (event.type) {
+      case "step/start": {
+        st.step = d.step ?? (st.step ?? 0) + 1;
+        break;
+      }
       case "user/message": {
         const text = partsToText(d.content ?? d.message?.content);
         const images = partsToImages(d.content ?? d.message?.content);
         const id = d.id ?? null;
-        if (text !== null) nodes.push({ kind: "user", text, images, id });
-        else if (images) nodes.push({ kind: "user", text: "", images, id });
+        if (text !== null) nodes.push({ kind: "user", text, images, id, step: st.step });
+        else if (images) nodes.push({ kind: "user", text: "", images, id, step: st.step });
         break;
       }
       case "assistant/message": {
@@ -153,6 +145,10 @@ function applyEvent(nodes, event, view, log) {
           else if (p.type === "tool-call") { /* handled by tool/call event */ }
           else blocks.push({ kind: "other", text: JSON.stringify(p).slice(0, 500) });
         }
+        // Finalization stamps: endedAt marks when the message completed. The
+        // block start time is left untouched so syncTail's inheritStarts can
+        // carry the ORIGINAL block start across re-derivations.
+        for (const b of blocks) b.endedAt = event.time ?? Date.now();
         const images = partsToImages(d.message?.content);
         const id = d.message?.id ?? null;
         const last = cur();
@@ -162,7 +158,7 @@ function applyEvent(nodes, event, view, log) {
           last.id = id ?? last.id;
           last.streaming = false;
         } else {
-          nodes.push({ kind: "assistant", blocks, images, id, streaming: false });
+          nodes.push({ kind: "assistant", blocks, images, id, streaming: false, step: st.step });
         }
         break;
       }
@@ -170,7 +166,7 @@ function applyEvent(nodes, event, view, log) {
         const ch = d.chunk ?? {};
         let node = cur();
         if (!node || node.kind !== "assistant" || node.finalized) {
-          node = { kind: "assistant", blocks: [], streaming: true, finalized: false };
+          node = { kind: "assistant", blocks: [], streaming: true, finalized: false, step: st.step };
           nodes.push(node);
         }
         node.streaming = true;
@@ -192,7 +188,7 @@ function applyEvent(nodes, event, view, log) {
           }
         } else if (ch.type === "block-end") {
           const b = node.blocks[ch.index ?? 0];
-          if (b) b.streaming = false;
+          if (b) { b.streaming = false; b.endedAt = event.time ?? b.endedAt; }
         }
         break;
       }
@@ -212,14 +208,15 @@ function applyEvent(nodes, event, view, log) {
           if (d.arguments !== undefined) block.args = d.arguments;
           if (view?.view !== undefined) block.view = view.view;
           block.result = null;
+          if (block.startedAt === undefined) block.startedAt = event.time ?? Date.now();
           break;
         }
         let node = cur();
         if (!node || node.kind !== "assistant") {
-          node = { kind: "assistant", blocks: [], streaming: true, finalized: false };
+          node = { kind: "assistant", blocks: [], streaming: true, finalized: false, step: st.step };
           nodes.push(node);
         }
-        node.blocks.push({ kind: "tool", name: d.name, args: d.arguments, callId, view: view?.view, result: null });
+        node.blocks.push({ kind: "tool", name: d.name, args: d.arguments, callId, view: view?.view, result: null, startedAt: event.time ?? Date.now() });
         break;
       }
       case "tool/result": {
@@ -227,12 +224,23 @@ function applyEvent(nodes, event, view, log) {
         const text = partsToText(d.message?.content);
         const node = nodes.findLast((nd) => nd.kind === "assistant" && nd.blocks.some((b) => b.kind === "tool" && b.callId === callId));
         const block = node?.blocks.find((b) => b.kind === "tool" && b.callId === callId);
-        if (block) block.result = text ?? JSON.stringify(d).slice(0, 400);
+        if (block) {
+          block.result = text ?? JSON.stringify(d).slice(0, 400);
+          block.endedAt = event.time ?? Date.now();
+        }
         break;
       }
       case "step/end": {
         const node = cur();
-        if (node && node.kind === "assistant") { node.streaming = false; node.finalized = true; }
+        if (node && node.kind === "assistant") {
+          node.streaming = false;
+          node.finalized = true;
+          // a missed block-end must not leave a forever-running timer
+          for (const b of node.blocks ?? []) {
+            b.streaming = false;
+            if (b.endedAt === undefined) b.endedAt = event.time ?? Date.now();
+          }
+        }
         break;
       }
       case "session/title": {
@@ -245,7 +253,7 @@ function applyEvent(nodes, event, view, log) {
       }
       default: {
         // known benign control events: silently ignored
-        const KNOWN = new Set(["turn/start", "turn/end", "step/start", "step/end", "todo/write",
+        const KNOWN = new Set(["turn/start", "turn/end", "todo/write",
           "agent/inbox/spliced", "request/header", "request/context", "permission/preset",
           "sandbox/mode", "approval/policy", "session/title-llm-request", "command/done", "command/failed"]);
         if (!KNOWN.has(event.type) && !SEEN_TYPES.has(event.type)) {
@@ -259,7 +267,8 @@ function applyEvent(nodes, event, view, log) {
 /** Re-derive the whole node list from a complete event window (open/poll). */
 function nodeForEvents(events, log) {
   const nodes = [];
-  for (const { event, view } of events) applyEvent(nodes, event, view, log);
+  const state = { step: null };
+  for (const { event, view } of events) applyEvent(nodes, event, view, log, state);
   return nodes;
 }
 
@@ -583,6 +592,7 @@ export class ChatView extends Widget {
     this.pressY = null;
     this.selStart = null;
     this.selEnd = null;
+    this.stepState = { step: null }; // step/start tracking for the mux merge path
   }
 
   /** Queue a rebuild; flushed on the next frame render (throttles streaming). */
@@ -592,7 +602,7 @@ export class ChatView extends Widget {
    *  existing block instead of wiping it (the old "shows then deleted" bug). */
   mergeEvents(entries) {
     for (const { event, view } of entries) {
-      applyEvent(this.nodes, event, view, this.app.log);
+      applyEvent(this.nodes, event, view, this.app.log, this.stepState);
     }
     this.running = this.nodes.some((n) => n.kind === "assistant" && n.streaming);
     this.queueRebuild();
@@ -682,6 +692,7 @@ export class ChatView extends Widget {
   }
 
   jumpToNode(idx) {
+    this.flushRebuild(); // lineMap must reflect the current nodes array
     if (idx < 0 || idx >= this.nodes.length) return false;
     for (let li = 0; li < this.lineMap.length; li++) {
       if (this.lineMap[li]?.nodeIdx === idx) {
@@ -825,6 +836,9 @@ export class ChatView extends Widget {
   }
 
   #clickLine(y, ev) {
+    // A queued (deferred) rebuild would leave lineMap one frame behind the
+    // nodes array; flush first so the click maps to the CURRENT node/block.
+    this.flushRebuild();
     // map rendered line back to node via cached line→node map
     const info = this.lineMap?.[y];
     if (info) {
@@ -891,7 +905,7 @@ export class ChatView extends Widget {
           return ".";
         }).join("")
         : "";
-      const ckey = `${realIdx}|${w}|${expKey}|${blockKeys}|${this.thinkMode}|${this.bashMode}|${node.streaming ? "s" : "f"}|${themeName()}`;
+      const ckey = `${realIdx}|${w}|${expKey}|${blockKeys}|${this.thinkMode}|${this.bashMode}|${node.streaming ? "s" : "f"}|${themeName()}|${node.step ?? "-"}|${userPrefix()}`;
       // Streaming nodes re-render every frame: their text grows without any
       // change to the cache key, so caching them freezes the live think/tool/text.
       const hit = node.streaming ? undefined : this.cache.get(ckey);
@@ -966,15 +980,22 @@ export class ChatView extends Widget {
           if (blocks.length === 0) { lines.push([{ t: "  …", fg: K.FAINT }]); mark(realIdx); break; }
           for (let bi = 0; bi < blocks.length; bi++) {
             const b = blocks[bi];
+            const stepTag = node.step != null ? ` (step ${node.step})` : "";
             if (b.kind === "reasoning") {
               const key = `${realIdx}:${bi}`;
               const manuallyCollapsed = this.collapsedBlocks.has(key);
               const manuallyExpanded = this.expanded.has(key);
               const open = manuallyExpanded || (!manuallyCollapsed && this.thinkMode === "expanded");
               beginCard("THINKBG");
-              const thinkMeta = b.streaming
-                ? ` · ${fmtElapsed(Date.now() - (b.startedAt ?? Date.now()))}`
-                : `（${b.text?.length ?? 0} 字）`;
+              // Live blocks tick (已经过…); finished blocks freeze at their
+              // total (已完成,耗时…). No timestamps → no bogus timer shown.
+              let timing = "";
+              if (b.streaming) {
+                timing = ` 已经过 ${fmtDuration(Date.now() - (b.startedAt ?? Date.now()))}`;
+              } else if (b.startedAt !== undefined && b.endedAt !== undefined) {
+                timing = ` 已完成,耗时 ${fmtDuration(b.endedAt - b.startedAt)}`;
+              }
+              const thinkMeta = `${stepTag}（${b.text?.length ?? 0} 字）${timing}`;
               lines.push([{ t: "💭 思考" + (b.streaming ? "…" : "") + thinkMeta + (open ? " [t 折叠]" : " [t 展开]"), fg: K.FAINT }]);
               mark(realIdx, bi);
               if (open) {
@@ -995,10 +1016,18 @@ export class ChatView extends Widget {
               const glyph = b.result == null && !b.done ? "⏳" : exitCode !== undefined && exitCode !== 0 ? "✗" : "✓";
               const card = b.view ? renderToolCard(b.view, w, open) : [];
               beginCard(status);
+              let timing = "";
+              if (b.result == null && !b.done) {
+                timing = ` 已经过 ${fmtDuration(Date.now() - (b.startedAt ?? Date.now()))}`;
+              } else if (b.startedAt !== undefined && b.endedAt !== undefined) {
+                const failed = exitCode !== undefined && exitCode !== 0;
+                timing = ` ${failed ? "失败" : "已完成"},耗时 ${fmtDuration(b.endedAt - b.startedAt)}`;
+              }
               lines.push([
                 { t: open ? "▾ " : "▸ ", fg: K.ACCENT },
                 { t: ` ${b.name ?? "tool"}`, fg: K.TXT, bold: true },
                 { t: ` ${glyph}`, fg: status === "TOOLOK" ? K.OK : status === "TOOLERR" ? K.ERR : K.WARN },
+                { t: stepTag + timing, fg: K.DIM },
                 { t: open ? " [b 折叠]" : " [b 展开]", fg: K.FAINT },
               ]);
               mark(realIdx, bi);
@@ -1025,14 +1054,25 @@ export class ChatView extends Widget {
               sep();
             } else if (b.kind === "other") {
               beginCard("THINKBG");
-              lines.push([{ t: "  " + truncate(b.text, w - 4), fg: K.DIM }]);
+              lines.push([{ t: "  " + stepTag + truncate(b.text, w - 4 - strWidth(stepTag)), fg: K.DIM }]);
               mark(realIdx, bi);
               sep();
             } else {
               beginCard("CARD");
               const text = b.text ?? "";
-              for (const ln of renderMd(text, w - 4)) { lines.push([{ t: "  " }, ...ln]); mark(realIdx); }
-              mark(realIdx, bi);
+              const md = renderMd(text, w - 4 - strWidth(stepTag));
+              if (md.length > 0) {
+                lines.push([{ t: "  " }, { t: stepTag, fg: K.FAINT }, ...md[0]]);
+                mark(realIdx);
+                for (const ln of md.slice(1)) { lines.push([{ t: "  " }, ...ln]); mark(realIdx); }
+                // Label the block's LAST line with its blockIdx IN PLACE. A
+                // pushed mark without a line would desync lineMap from lines
+                // and shift every later click mapping (the off-by-one bug).
+                lineMap[lineMap.length - 1] = { nodeIdx: realIdx, blockIdx: bi };
+              } else {
+                lines.push([{ t: "  " + stepTag, fg: K.FAINT }]);
+                mark(realIdx, bi);
+              }
               sep();
             }
           }
@@ -1214,6 +1254,7 @@ export class ChatView extends Widget {
         return true;
       }
       if (ev.kind === "press" && ev.button === 2) {
+        this.flushRebuild(); // keep lineMap current with the nodes array
         const y = ev.y - this.view.y + this.view.scrollY;
         const info = this.lineMap?.[y];
         if (info) {
@@ -1315,13 +1356,6 @@ function toolSummary(b) {
   }
   if (b.view?.view?.title) return b.view.view.title;
   return null;
-}
-
-function fmtElapsed(ms) {
-  if (ms == null || isNaN(ms) || ms < 0) return "0.0s";
-  if (ms < 1000) return `${(ms / 1000).toFixed(1)}s`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(0)}s`;
-  return `${Math.floor(ms / 60000)}m${Math.floor((ms % 60000) / 1000)}s`;
 }
 
 function fmtTokens(n) {
@@ -2054,10 +2088,50 @@ export class App {
     else this.toast("先打开一个会话");
   }
 
-  showJobs() { this.overlay = buildJobsPopup(this); this.redraw(); }
+  showJobs() { this.overlay = new JobsPanel(this); this.redraw(); }
   showGoal() { this.overlay = buildGoalPopup(this); this.redraw(); }
   showModePicker() { this.overlay = buildModePicker(this); this.redraw(); }
   showPermissionPicker() { this.overlay = buildPermissionPicker(this); this.redraw(); }
+
+  /** Ctrl+E: fzf-style quick jump to a step — type to fuzzy-filter the step
+   *  list, Enter opens the trajectory window around the picked step. */
+  async quickJumpStep() {
+    if (!this.currentSession) { this.toast("先打开一个会话"); return; }
+    if (!this.trajectoryPanel) this.trajectoryPanel = new TrajectoryPanel(this);
+    const tp = this.trajectoryPanel;
+    if (tp.sessionId !== this.currentSession || tp.steps.length === 0) {
+      this.setStatus("加载步骤列表…");
+      await tp.load(this.currentSession);
+      this.setStatus("");
+    }
+    const total = tp.stats?.steps ?? (tp.steps[tp.steps.length - 1]?.step ?? tp.steps.length);
+    const items = [...tp.steps].reverse().map((st) => {
+      const si = tp.steps.indexOf(st);
+      const tools = [...new Set(st.events.filter((e) => e.type === "tool/call").map((e) => e.data?.name))];
+      const t0 = st.events[0]?.time, t1 = st.events[st.events.length - 1]?.time;
+      const dur = t0 && t1 ? fmtMs(t1 - t0) : "—";
+      const userMsg = st.events.find((e) => e.type === "user/message")?.data?.content?.[0]?.text ?? "";
+      return {
+        label: `step ${st.step}  ${dur}  ${tools.slice(0, 3).join(",") || "纯文本"}  ${truncate(String(userMsg), 24)}`,
+        hint: `${st.events.length} 事件`,
+        keywords: `step ${st.step} ${tools.join(" ")} ${userMsg}`,
+        stepIdx: si,
+      };
+    });
+    const w = Math.min(76, this.screen.w - 8), h = Math.min(20, this.screen.h - 4);
+    this.overlay = new Picker({
+      x: Math.floor((this.screen.w - w) / 2), y: Math.floor((this.screen.h - h) / 2),
+      w, h, title: `步骤转跳（step 1–${total} · Ctrl+E）— 输入过滤,回车定位`,
+      items,
+      onCancel: () => this.closeOverlay(),
+      onPick: (it) => {
+        this.closeOverlay();
+        this.setMode("trajectory");
+        this.trajectoryPanel.jumpToStep(it.stepIdx);
+      },
+    });
+    this.redraw();
+  }
 
   /** Select one of the four agent presets (modes). */
   async selectPreset(id) {
@@ -2338,6 +2412,7 @@ export class App {
         this.setMode("workspace"); return;
       }
       if (ev.ctrl && ev.key === "t") { this.setMode("trajectory"); return; }
+      if (ev.ctrl && ev.key === "e") { this.quickJumpStep(); return; }
       if (ev.ctrl && ev.key === "j") { this.showJobs(); return; }
       if (ev.ctrl && ev.key === "g") { this.showGoal(); return; }
       if (ev.ctrl && ev.key === "f") { this.findInConversation(); return; }
@@ -2532,16 +2607,18 @@ export class App {
       if (stats.ttftMs) row1.right.push({ t: ` 首响${Math.round(stats.ttftMs / stats.ttftSteps)}ms `, fg: T.FAINT, bg: T.STATUSBG });
     }
     rows.push(row1);
-    // ── row 2: jobs (only when present) ──
+    // ── row 2: background jobs — one summary line, never per-job noise ──
     if (this.jobs?.length) {
-      const running = this.jobs.filter((j) => j.status === "running");
+      const running = this.jobs.filter((j) => j.status === "running").length;
+      const done = this.jobs.filter((j) => j.status === "completed").length;
+      const failed = this.jobs.filter((j) => j.status === "failed").length;
       const row2 = { left: [], right: [] };
-      for (const j of this.jobs.slice(0, 4)) {
-        const icon = j.status === "running" ? "⚙" : j.status === "completed" ? "✓" : j.status === "failed" ? "✗" : "·";
-        const fg = j.status === "running" ? T.WARN : j.status === "completed" ? T.OK : j.status === "failed" ? T.ERR : T.DIM;
-        row2.left.push({ t: ` ${icon} ${truncate(j.label ?? j.kind, 22)} `, fg, bg: T.STATUSBG });
-      }
-      if (running.length) row2.right.push({ t: ` ${running.length} 运行中 `, fg: T.WARN, bg: T.STATUSBG });
+      row2.left.push({
+        t: ` ${running > 0 ? `${running} 个任务正在后台运行` : "没有任务正在后台运行"} `,
+        fg: running > 0 ? T.WARN : T.FAINT, bg: T.STATUSBG,
+      });
+      row2.left.push({ t: ` ${done}已完成${failed > 0 ? ` ${failed}失败` : ""} `, fg: done > 0 ? T.OK : T.FAINT, bg: T.STATUSBG });
+      row2.right.push({ t: " Ctrl+J 查看详情 ", fg: T.DIM, bg: T.STATUSBG });
       rows.push(row2);
     }
     this.status.rows = rows;

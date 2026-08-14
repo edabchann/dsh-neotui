@@ -91,6 +91,7 @@ async function main() {
   const userIdx = app.chat.nodes.findIndex((n) => n.kind === "user");
   check("chat loaded with nodes", app.chat.nodes.length > 0, `${app.chat.nodes.length} nodes, userIdx=${userIdx}`);
   if (userIdx >= 0) {
+    app.renderFrame(); // flush any queued rebuild so lineMap is current
     // first NON-empty line marked with the user node = the prefix line
     const li = app.chat.lineMap.findIndex((m, i) => m?.nodeIdx === userIdx && rowText(app.chat.lines[i]).trim() !== "");
     if (li >= 0) {
@@ -104,6 +105,7 @@ async function main() {
 
   // ---- chat right-click expand/collapse on a tool block ----
   const c = app.chat;
+  app.renderFrame(); // flush so lines/lineMap match nodes
   const toolLi = c.lines.findIndex((l) => /\[b 折叠\]|\[b 展开\]/.test(rowText(l)) && c.lineMap[l]?.blockIdx !== null);
   check("tool block header in rendered lines", toolLi >= 0, `line ${toolLi}`);
   if (toolLi >= 0) {
@@ -117,21 +119,25 @@ async function main() {
     if (m) {
       const mx = menuX(lines, m.y);
       check("menu has 转跳轨迹", /转\s*跳\s*轨\s*迹/.test(lines[m.y + 2] ?? ""));
+      const before = new Set(c.collapsedBlocks);
       left(mx + 3, m.y + 1); // 展开 / 折叠
       await sleep(400);
-      check("block collapsed after menu toggle", c.collapsedBlocks.has(key));
+      app.renderFrame();
+      check("block collapsed after menu toggle", c.collapsedBlocks.has(key) && !before.has(key));
       // toggle back
       right(40, viewY);
       lines = grid();
       m = findRowRx(lines, /复\s*制\s*消\s*息/);
       left(menuX(lines, m.y) + 3, m.y + 1);
       await sleep(400);
+      app.renderFrame();
       check("block re-expanded after second toggle", !c.collapsedBlocks.has(key));
     }
   }
 
   // ---- chat -> trajectory jump ----
   const c2 = app.chat;
+  app.renderFrame();
   const toolLi2 = c2.lines.findIndex((l) => /\[b 折叠\]|\[b 展开\]/.test(rowText(l)) && c2.lineMap[l]?.blockIdx !== null);
   if (toolLi2 >= 0) {
     const viewY = showChatLine(toolLi2);
@@ -140,44 +146,62 @@ async function main() {
     const m = findRowRx(lines, /复\s*制\s*消\s*息/);
     if (m) {
       left(menuX(lines, m.y) + 3, m.y + 2); // 转跳轨迹
-      await waitFor(() => app.mode === "trajectory" && app.trajectoryPanel?.steps?.length > 0, 30000, 400);
+      await waitFor(() => app.mode === "trajectory" && app.trajectoryPanel?.steps?.length > 0 && app.trajectoryPanel.winLo != null, 30000, 400);
       await sleep(1500);
       lines = grid();
       check("switched to trajectory mode", app.mode === "trajectory");
-      const exp = findRowRx(lines, /▾\s*step/);
+      // the jump's async ensureLoaded may page for a while — retry the frame
+      let exp = findRowRx(lines, /▾\s*step/);
+      for (let i = 0; i < 12 && !exp; i++) {
+        await sleep(500);
+        lines = grid();
+        exp = findRowRx(lines, /▾\s*step/);
+      }
       check("jumped step auto-expanded (▾)", exp !== null);
       check("expanded step shows inline events", lines.some((l) => /#\s*\d+/.test(l)));
 
       const step = exp ?? findRowRx(lines, /▸\s*step/);
       if (step) {
-        // left click on a step: no reaction
-        const before = lines[step.y];
+        // left click toggles the step's 详细/简略 (the ▸/▾ triangle)
+        const expandedBefore = app.trajectoryPanel.expandedSteps.size;
         left(step.x + 2, step.y);
         lines = grid();
-        check("left click on step changes nothing (no popup)", lines[step.y] === before && !lines.some((l) => /轨\s*迹\s*详\s*情/.test(l)));
+        const expandedAfter = app.trajectoryPanel.expandedSteps.size;
+        check("left click toggles step expansion", expandedBefore > 0 && expandedAfter === 0, `${expandedBefore} → ${expandedAfter}`);
+        check("no popup opened by left click", !lines.some((l) => /轨\s*迹\s*详\s*情/.test(l)));
+        const collapsedRow = findRowRx(lines, /▸\s*step/);
+        check("collapsed ▸ glyph visible after toggle", collapsedRow !== null);
 
-        // right-click step menu: 折叠（简略）→ toggle → 展开（详细）
-        right(step.x + 2, step.y);
+        // right-click menu: step is now collapsed → 展开（详细）→ 折叠（简略）cycle
+        const target = collapsedRow ?? step;
+        right(target.x + 2, target.y);
         lines = grid();
-        let s = findRowRx(lines, /折\s*叠\s*（\s*简\s*略\s*）/);
-        check("step menu shows 折叠（简略）", s !== null);
+        let s = findRowRx(lines, /展\s*开\s*（\s*详\s*细\s*）/);
+        check("step menu shows 展开（详细）", s !== null);
         if (s) {
           left(menuX(lines, s.y) + 3, s.y);
           lines = grid();
-          check("step collapsed (▸)", findRowRx(lines, /▸\s*step/) !== null);
-          right(step.x + 2, step.y);
+          check("step expanded via menu", findRowRx(lines, /▾\s*step/) !== null);
+          right(target.x + 2, target.y);
           lines = grid();
-          s = findRowRx(lines, /展\s*开\s*（\s*详\s*细\s*）/);
-          check("step menu shows 展开（详细）", s !== null);
+          s = findRowRx(lines, /折\s*叠\s*（\s*简\s*略\s*）/);
+          check("step menu shows 折叠（简略）", s !== null);
           if (s) {
             left(menuX(lines, s.y) + 3, s.y);
             lines = grid();
-            check("step re-expanded via menu", findRowRx(lines, /▾\s*step/) !== null);
+            check("step collapsed via menu", findRowRx(lines, /▸\s*step/) !== null);
+            // re-expand so the final frame is in 详细 mode again
+            right(target.x + 2, target.y);
+            lines = grid();
+            s = findRowRx(lines, /展\s*开\s*（\s*详\s*细\s*）/);
+            if (s) { left(menuX(lines, s.y) + 3, s.y); lines = grid(); }
           }
         }
 
-        // trajectory -> chat jump
-        right(step.x + 2, step.y);
+        // trajectory -> chat jump (re-find a step row; layout shifted by toggles)
+        lines = grid();
+        const anyStep = findRowRx(lines, /▾\s*step/) ?? findRowRx(lines, /▸\s*step/) ?? target;
+        right(anyStep.x + 2, anyStep.y);
         lines = grid();
         const j = findRowRx(lines, /转\s*跳\s*对\s*话/);
         check("step menu has 转跳对话", j !== null);
@@ -189,6 +213,43 @@ async function main() {
         }
       }
     }
+  }
+
+  // ---- footer jobs summary + Ctrl+J 后台任务 panel ----
+  await waitFor(() => app.jobs?.length > 0, 10000, 500);
+  if (app.jobs?.length) {
+    lines = grid();
+    const footer = lines.slice(-4).join(" ");
+    check("footer shows 后台任务 summary", /(没有任务正在后台运行|\d+ 个任务正在后台运行)/.test(footer), footer.trim().slice(-80));
+    check("footer hint Ctrl+J 查看详情", footer.includes("Ctrl+J"));
+    app.onEvent({ type: "key", name: "char", key: "j", text: "j", ctrl: true, alt: false, shift: false });
+    lines = grid();
+    check("Ctrl+J opens 后台任务 panel", app.overlay?.constructor?.name === "JobsPanel");
+    check("jobs panel titled 后台任务", lines.some((l) => l.includes("后台任务")));
+    if (app.overlay?.constructor?.name === "JobsPanel") {
+      app.onEvent({ type: "key", name: "enter" });
+      await sleep(300);
+      check("Enter expands a job detail", app.overlay.expanded?.size > 0);
+      app.onEvent({ type: "key", name: "char", key: "h", text: "h", ctrl: false, alt: false, shift: false });
+      await sleep(300);
+      check("h collapses the job detail", app.overlay.expanded?.size === 0);
+      app.onEvent({ type: "key", name: "escape" });
+      await sleep(200);
+    }
+  }
+
+  // ---- Ctrl+E fzf-style step jump ----
+  app.onEvent({ type: "key", name: "char", key: "e", text: "e", ctrl: true, alt: false, shift: false });
+  await waitFor(() => app.overlay?.constructor?.name === "Picker", 10000, 300);
+  check("Ctrl+E opens the step jump picker", app.overlay?.constructor?.name === "Picker");
+  if (app.overlay?.constructor?.name === "Picker") {
+    check("picker titled 步骤转跳", String(app.overlay.title ?? "").includes("步骤转跳"));
+    check("picker lists steps", app.overlay.items.length > 0, `${app.overlay.items.length} items`);
+    const it = app.overlay.filtered()[0];
+    app.overlay.onPick?.(it);
+    await waitFor(() => app.mode === "trajectory" && app.trajectoryPanel?.winLo != null, 10000, 300);
+    await sleep(800);
+    check("picker pick jumps to a trajectory window", app.mode === "trajectory" && app.trajectoryPanel?.winLo != null);
   }
 
   console.log(`\nsummary: ${results.filter(([, ok]) => ok).length}/${results.length} passed`);

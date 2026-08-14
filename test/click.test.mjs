@@ -2,13 +2,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { userInfo } from "node:os";
-import { ChatView, userPrefix } from "../src/views.js";
-import { TrajectoryPanel } from "../src/panels.js";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ChatView, App, userPrefix, saveTuiConfig } from "../src/views.js";
+import { TrajectoryPanel, JobsPanel, SettingsPanel } from "../src/panels.js";
+import { fmtDuration } from "../src/text.js";
+import { Screen } from "../src/screen.js";
+
+// isolate TUI config writes from the real ~/.dsh/tui-config.json
+process.env.DSH_HOME = mkdtempSync(join(tmpdir(), "tui-test-"));
 
 function fakeApp() {
   const app = {
-    log: () => {}, toast: () => {}, redraw: () => {}, setStatus: () => {},
+    log: () => {}, toast: (msg) => { app.toastMsg = msg; }, redraw: () => {},
+    setStatus: (msg) => { app.statusMsg = msg; },
     setJobs: () => {}, layout: () => {}, copyText: () => {}, copyNode: () => {},
+    closeOverlay: () => { app.overlay = null; },
     feedbackMap: new Map(), feedback: () => {}, deleteFeedback: () => {},
     openImage: () => {}, openMenu: (items, ev) => { app.lastMenu = { items, ev }; },
     todos: [], searchQuery: "", projections: {},
@@ -137,6 +147,79 @@ test("user prefix is customizable via DSH_TUI_USER_PREFIX", () => {
   }
 });
 
+test("user prefix persists via the TUI config file (settings panel path)", () => {
+  assert.ok(saveTuiConfig({ userPrefix: "tester99" }), "config saved");
+  try {
+    assert.equal(userPrefix(), "tester99 > ");
+    process.env.DSH_TUI_USER_PREFIX = "envname";
+    assert.equal(userPrefix(), "tester99 > ", "config file wins over env");
+  } finally {
+    delete process.env.DSH_TUI_USER_PREFIX;
+    saveTuiConfig({ userPrefix: "" });
+  }
+  assert.equal(userPrefix(), `${userInfo().username} > `, "falls back to OS username");
+});
+
+// ---- block timing + step numbers ----
+
+test("fmtDuration uses Chinese h/m/s units", () => {
+  assert.equal(fmtDuration(0), "0秒");
+  assert.equal(fmtDuration(12000), "12秒");
+  assert.equal(fmtDuration(185000), "3分05秒");
+  assert.equal(fmtDuration(3723000), "1小时02分03秒");
+  assert.equal(fmtDuration(null), "—");
+  assert.equal(fmtDuration(-5), "—");
+});
+
+test("finished blocks freeze at 已完成,耗时 with the step number", () => {
+  const now = Date.now();
+  const { lines } = render([{
+    kind: "assistant", id: "a1", step: 123, streaming: false,
+    blocks: [
+      { kind: "reasoning", text: "thinking", streaming: false, startedAt: now - 125000, endedAt: now },
+      { kind: "tool", name: "bash", args: "ls", result: "ok", startedAt: now - 65000, endedAt: now, view: null },
+      { kind: "text", text: "hello", streaming: false },
+    ],
+  }]);
+  const text = lines.join("\n");
+  const think = text.split("\n").find((l) => l.includes("💭"));
+  assert.ok(think.includes("(step 123)"), `think header has step number: ${think}`);
+  assert.ok(think.includes("已完成,耗时 2分05秒"), `think shows frozen duration: ${think}`);
+  const tool = text.split("\n").find((l) => l.includes("bash"));
+  assert.ok(tool.includes("(step 123)"), `tool header has step number: ${tool}`);
+  assert.ok(tool.includes("已完成,耗时 1分05秒"), `tool shows frozen duration: ${tool}`);
+  const hello = text.split("\n").find((l) => l.includes("hello"));
+  assert.ok(hello.includes("(step 123)"), `text block carries the step tag: ${hello}`);
+});
+
+test("streaming blocks tick with 已经过", () => {
+  const now = Date.now();
+  const { lines } = render([{
+    kind: "assistant", id: "a2", step: 7, streaming: true,
+    blocks: [
+      { kind: "reasoning", text: "x", streaming: true, startedAt: now - 3000 },
+      { kind: "tool", name: "bash", args: "ls", result: null, startedAt: now - 2000, view: null },
+    ],
+  }]);
+  const text = lines.join("\n");
+  assert.ok(/💭 思考… \(step 7\)（1 字） 已经过 \d+秒/.test(text), `live think ticks: ${text.split("\n").find((l) => l.includes("💭"))}`);
+  assert.ok(/已经过 \d+秒/.test(text.split("\n").find((l) => l.includes("bash")) ?? ""), "running tool ticks");
+});
+
+test("a missed block-end cannot leave a forever-running timer", () => {
+  const now = Date.now();
+  const { lines } = render([{
+    kind: "assistant", id: "a3", step: 9, streaming: false,
+    // no block-end arrived: streaming stayed true, endedAt set at step/end
+    blocks: [
+      { kind: "reasoning", text: "x", streaming: false, startedAt: now - 90000, endedAt: now - 30000 },
+    ],
+  }]);
+  const think = lines.find((l) => l.includes("💭"));
+  assert.ok(think.includes("已完成,耗时 1分00秒"), `frozen, not ticking: ${think}`);
+  assert.ok(!think.includes("已经过"), "no live timer after completion");
+});
+
 // ---- trajectory panel: left-click no-op, right-click menu, 详细/简略 ----
 
 const sampleEvents = [
@@ -168,14 +251,21 @@ async function traj() {
 
 const stepLine = (panel, n) => panel.view.lines.findIndex((l) => l.some((g) => g.t.includes(`step ${String(n).padStart(3)}`)));
 
-test("trajectory: left click on a step does nothing", async () => {
+test("trajectory: left click toggles a step's 详细/简略 expansion", async () => {
   const { app, panel } = await traj();
   const li = stepLine(panel, 1);
   assert.ok(li >= 0);
+  assert.equal(panel.expandedSteps.size, 0);
   const handled = panel.onMouse({ type: "mouse", kind: "press", button: 0, x: panel.view.x + 2, y: panel.view.y + li });
-  assert.equal(handled, true, "left click swallowed");
+  assert.equal(handled, true, "left click handled");
   assert.equal(app.lastMenu, undefined, "no menu opened");
   assert.equal(app.overlay, undefined, "no detail popup opened");
+  assert.equal(panel.expandedSteps.size, 1, "step expanded by left click");
+  assert.ok(panel.expandedSteps.has(panel.stepKey(panel.steps[0])));
+  // second left click collapses
+  const li2 = stepLine(panel, 1);
+  panel.onMouse({ type: "mouse", kind: "press", button: 0, x: panel.view.x + 2, y: panel.view.y + li2 });
+  assert.equal(panel.expandedSteps.size, 0, "step collapsed by second left click");
 });
 
 test("trajectory: right click opens 展开/转跳/详情 menu; toggle expands 详细", async () => {
@@ -197,7 +287,7 @@ test("trajectory: right click opens 展开/转跳/详情 menu; toggle expands �
   assert.ok(header.includes("▾"), "header shows ▾ when expanded");
   assert.ok(panel.view.lines.some((l) => l.some((g) => g.t.includes("⚙ bash"))), "tool event listed inline");
   // second click collapses back to 简略
-  panel.onMouse({ type: "mouse", kind: "press", button: 2, x: 2, y: panel.view.y + li });
+  panel.onMouse({ type: "mouse", kind: "press", button: 2, x: panel.view.x + 2, y: panel.view.y + li });
   const fold = app.lastMenu.items.find((i) => i.label === "折叠（简略）");
   assert.ok(fold, "menu now offers 折叠（简略）");
   fold.action();
@@ -212,4 +302,191 @@ test("trajectory: indexOfMessage / focusMessage locate the right step", async ()
   assert.equal(panel.indexOfMessage("nope"), -1);
   await panel.focusMessage("msg-u2");
   assert.ok(panel.expandedSteps.has(panel.stepKey(panel.steps[1])), "target step auto-expanded");
+});
+
+// ---- windowed navigation: PgUp/PgDn/Home/End + jump windows ----
+
+/** Synthetic session: `stepsTotal` steps × 6 events, paginated by the fake
+ *  history call (maxMessages counts steps, beforeSeq pages backward). */
+function makeHistory(stepsTotal) {
+  const events = [];
+  let seq = 1;
+  for (let s = 1; s <= stepsTotal; s++) {
+    const t0 = s * 1000;
+    const push = (type, data, t = t0) => events.push({ event: { type, seq: seq++, time: t, data } });
+    push("step/start", { step: s });
+    push("user/message", { id: `u${s}`, content: [{ type: "text", text: `问 ${s}` }] }, t0 + 10);
+    push("tool/call", { callId: `c${s}`, name: s % 2 ? "bash" : "read", arguments: "x" }, t0 + 20);
+    push("tool/result", { message: { source: { callId: `c${s}` }, content: [{ type: "text", text: "ok" }] } }, t0 + 50);
+    push("assistant/message", { message: { id: `a${s}`, content: [{ type: "text", text: `答 ${s}` }] } }, t0 + 80);
+    push("step/end", {}, t0 + 90);
+  }
+  return ({ beforeSeq, maxMessages }) => {
+    const span = maxMessages * 6;
+    let end = events.length;
+    if (beforeSeq != null) {
+      end = events.findIndex((e) => e.event.seq >= beforeSeq);
+      if (end === -1) end = 0;
+    }
+    const start = Math.max(0, end - span);
+    return {
+      events: events.slice(start, end),
+      hasMore: start > 0,
+      projections: { values: { sessionStats: { steps: stepsTotal, turns: stepsTotal } } },
+    };
+  };
+}
+
+async function trajWindow(stepsTotal) {
+  const app = fakeApp();
+  app.screen = { w: 120, h: 40 };
+  app.currentSession = "sess-1";
+  app.setMode = () => {};
+  app.closeOverlay = () => { app.overlay = null; };
+  app.openMenu = (items, ev) => { app.lastMenu = { items, ev }; };
+  app.api.call = async (m, p) => (m === "session.history" ? makeHistory(stepsTotal)(p) : {});
+  app.chat = { nodes: [], jumpToNode: () => true };
+  const panel = new TrajectoryPanel(app);
+  panel.relayout(30, 1, 90, 38);
+  await panel.load("sess-1");
+  return { app, panel };
+}
+
+test("trajectory window: initial tail window + PgUp/PgDn/Home/End", async () => {
+  const { app, panel } = await trajWindow(60);
+  assert.equal(panel.steps.length, 20, "initial page = 20 steps");
+  assert.equal(panel.winLo, null, "starts in tail-follow mode");
+  assert.equal(panel.winHi, null);
+
+  // jump to step 50 (loaded) → window [30, 60]; loading older pages as needed
+  const si = panel.steps.findIndex((s) => s.step === 50);
+  assert.ok(si >= 0, "step 50 in the initial page");
+  await panel.jumpToStep(si);
+  assert.equal(panel.winLo, 30);
+  assert.equal(panel.winHi, 60);
+  assert.ok(panel.steps[0].step <= 30, "older pages loaded down to window edge");
+
+  // PgDn at the newest edge is a no-op with a toast
+  panel.extendDown();
+  assert.equal(panel.winHi, 60);
+  assert.ok(app.toastMsg?.includes("最新"), "toast says already at newest");
+
+  // PgUp extends the window up by 10 each time
+  await panel.extendUp();
+  assert.equal(panel.winLo, 20);
+  await panel.extendUp();
+  assert.equal(panel.winLo, 10);
+  await panel.extendUp();
+  assert.equal(panel.winLo, 1);
+
+  // PgUp at the very start is a no-op
+  await panel.extendUp();
+  assert.equal(panel.winLo, 1);
+  assert.ok(app.toastMsg?.includes("最早"), "toast says already at earliest");
+
+  // Home → step 1–20 window, End → newest 20
+  await panel.gotoHome();
+  assert.equal(panel.winLo, 1);
+  assert.equal(panel.winHi, 20);
+  panel.gotoEnd();
+  assert.equal(panel.winLo, 41);
+  assert.equal(panel.winHi, 60);
+});
+
+test("trajectory window: PgUp from tail-follow switches to a manual window", async () => {
+  const { panel } = await trajWindow(40);
+  await panel.extendUp();
+  assert.equal(panel.winLo, 11);
+  assert.equal(panel.winHi, 40);
+});
+
+// ---- jobs: footer summary + JobsPanel expand/collapse ----
+
+function headlessApp() {
+  const screen = new Screen(100, 30);
+  const term = { output: { chunks: [], write: (s) => { term.output.chunks.push(s); } } };
+  const app = new App({
+    screen, term,
+    api: { call: async () => ({ items: [] }), connectMux: () => {}, connectHost: () => {} },
+    log: () => {},
+  });
+  return app;
+}
+
+test("footer jobs row is a single 后台任务 summary", () => {
+  const app = headlessApp();
+  app.jobs = [
+    { status: "running", kind: "goal", label: "goal round 1" },
+    { status: "running", kind: "subagent", label: "child" },
+    { status: "completed", kind: "goal", label: "done" },
+    { status: "failed", kind: "goal", label: "boom" },
+  ];
+  app.renderFrame();
+  const row2 = app.status.rows[2];
+  const text = [...(row2?.left ?? []), ...(row2?.right ?? [])].map((s) => s.t).join(" ");
+  assert.ok(text.includes("2 个任务正在后台运行"), text);
+  assert.ok(text.includes("1已完成 1失败"), text);
+  assert.ok(text.includes("Ctrl+J 查看详情"), text);
+  // no per-job noise rows
+  assert.equal(app.status.rows.length, 3, "footer has exactly one jobs row");
+});
+
+test("footer jobs row says 没有任务正在后台运行 when none run", () => {
+  const app = headlessApp();
+  app.jobs = [{ status: "completed", kind: "goal", label: "done" }];
+  app.renderFrame();
+  const text = [...(app.status.rows[2]?.left ?? []), ...(app.status.rows[2]?.right ?? [])].map((s) => s.t).join(" ");
+  assert.ok(text.includes("没有任务正在后台运行"), text);
+  assert.ok(text.includes("1已完成"), text);
+});
+
+test("JobsPanel: title, Enter/→ expand, ←/h collapse, q close", () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  app.jobs = [
+    { status: "running", kind: "goal", label: "round 1", detail: { step: 3 } },
+    { status: "completed", kind: "subagent", label: "child done" },
+  ];
+  const panel = new JobsPanel(app);
+  assert.ok(panel.title.includes("后台任务"), panel.title);
+  assert.equal(panel.expanded.size, 0);
+  assert.equal(panel.lines.filter((l) => l.some((g) => g.t.includes("detail:"))).length, 0, "detail hidden before expand");
+  // Enter expands the selected job
+  panel.onKey({ type: "key", name: "enter" });
+  assert.equal(panel.expanded.size, 1);
+  assert.ok(panel.lines.some((l) => l.some((g) => g.t.includes("detail:"))), "detail row visible");
+  // j moves down, h collapses the second... move down then collapse
+  panel.onKey({ type: "key", name: "char", key: "j", text: "j", ctrl: false, alt: false, shift: false });
+  assert.equal(panel.sel, 1);
+  panel.onKey({ type: "key", name: "char", key: "h", text: "h", ctrl: false, alt: false, shift: false });
+  assert.equal(panel.expanded.size, 1, "h collapsed the unexpanded second job (no-op)");
+  panel.onKey({ type: "key", name: "char", key: "k", text: "k", ctrl: false, alt: false, shift: false });
+  panel.onKey({ type: "key", name: "char", key: "h", text: "h", ctrl: false, alt: false, shift: false });
+  assert.equal(panel.expanded.size, 0, "h collapsed the expanded first job");
+  // q closes
+  panel.onKey({ type: "key", name: "char", key: "q", text: "q", ctrl: false, alt: false, shift: false });
+  assert.equal(app.overlay, null, "q closed the overlay");
+});
+
+// ---- settings panel: TUI 界面 namespace persists userPrefix ----
+
+test("settings panel: TUI 界面 namespace saves userPrefix to the config file", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  app.api.call = async (m) => (m === "settings.describe"
+    ? { namespaces: [{ ns: "test", applies: "live", revision: 1, value: { a: 1 } }], writable: true }
+    : {});
+  app.chat = { cache: new Map(), queueRebuild() {} };
+  const p = new SettingsPanel(app);
+  await p.load();
+  assert.equal(p.namespaces[0].ns, "TUI 界面");
+  assert.equal(p.namespaces[0].local, true);
+  assert.equal(p.rows.find((r) => r.path.join(".") === "userPrefix")?.value, userInfo().username);
+  p.pendingOps.push({ op: "set", path: ["userPrefix"], value: "newname" });
+  await p.save();
+  assert.equal(userPrefix(), "newname > ", "config file updated");
+  // switching to a real namespace keeps working
+  p.selectNs(1);
+  assert.equal(p.currentNs().ns, "test");
+  saveTuiConfig({ userPrefix: "" });
 });
