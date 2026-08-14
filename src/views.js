@@ -2,7 +2,8 @@
 import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
 import { truncate, strWidth, bars, fmtDuration } from "./text.js";
-import { readFileSync } from "node:fs";
+import { readFileSync, appendFileSync } from "node:fs";
+import { join } from "node:path";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
 import { userPrefix, saveTuiConfig, loadTuiConfig, userName } from "./config.js";
 export { userPrefix, saveTuiConfig, loadTuiConfig, userName } from "./config.js";
@@ -839,6 +840,15 @@ export class ChatView extends Widget {
     }).catch((e) => this.app.toast(`发送失败: ${e.message}`));
   }
 
+  /** File-based click diagnostics (DSH_TUI_DEBUG_CLICK=1): stderr lines are
+   *  painted over by the next frame, so the trace goes to a log file. */
+  #clickLog(msg) {
+    try {
+      const dir = process.env.DSH_HOME ?? join(process.env.HOME ?? ".", ".dsh");
+      appendFileSync(join(dir, "tui-click-debug.log"), `${new Date().toISOString()} ${msg}\n`);
+    } catch {}
+  }
+
   #clickLine(y, ev) {
     // NO flush here: the click maps against the exact frame the user saw.
     // Flushing would re-derive the streaming tail (the chunk-stream and the
@@ -890,6 +900,9 @@ export class ChatView extends Widget {
     const node = this.nodes[info.nodeIdx];
     if (!node) return false;
     const { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow } = ctx ?? this.#anchorCtx(info);
+    if (process.env.DSH_TUI_DEBUG_CLICK) {
+      this.#clickLog(`toggle mark=${JSON.stringify(info)} kind=${node.kind} blockIdx=${info.blockIdx} preHeaderRow=${preHeaderRow} topKey=${topKey} topOffset=${topOffset}`);
+    }
     const reanchor = () => {
       // primary anchor: the clicked block's header stays at its pre-click
       // viewport row (zero shift) — only when the header was ON-SCREEN.
@@ -941,6 +954,10 @@ export class ChatView extends Widget {
         }
         this.#rebuild();
         reanchor(); nudge();
+        if (process.env.DSH_TUI_DEBUG_CLICK) {
+          const t = this.lines[this.view.scrollY]?.map((g) => g.t).join("") ?? "";
+          this.#clickLog(`after scrollY=${this.view.scrollY} topKey="${topKey}" topText="${t.slice(0, 40)}"`);
+        }
         return true;
       }
     }
@@ -1333,7 +1350,7 @@ export class ChatView extends Widget {
         this.pressCtx = this.pressInfo ? this.#anchorCtx(this.pressInfo) : null;
         if (process.env.DSH_TUI_DEBUG_CLICK) {
           const t = this.lines[this.pressY]?.map((g) => g.t).join("") ?? "";
-          this.app.log(`[click-dbg] press screenY=${ev.y} lineIdx=${this.pressY} mark=${JSON.stringify(this.pressInfo)} text="${t.slice(0, 40)}" scrollY=${this.view.scrollY}`);
+          this.#clickLog(`press screenY=${ev.y} screenX=${ev.x} lineIdx=${this.pressY} mark=${JSON.stringify(this.pressInfo)} text="${t.slice(0, 40)}" scrollY=${this.view.scrollY} viewY=${this.view.y} viewH=${this.view.h}`);
         }
         return true;
       }
