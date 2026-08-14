@@ -258,6 +258,8 @@ export class Input extends Widget {
     this.app = opts.app ?? null;
     this.pendingPaste = null;          // large-paste stage 1: held-back clipboard text
     this.pasteMark = null;             // code-point span of the immutable "[已复制…]" token
+    this.selStart = null;              // drag-selection [start, end) code-point span
+    this.selEnd = null;
     this.onChange = opts.onChange ?? null;
     this.allowEmptyEnter = opts.allowEmptyEnter ?? false;
     this.history = [];
@@ -333,12 +335,13 @@ export class Input extends Widget {
       this.#touch();
     }
     this.#edit(at, at, text);
-    this.onChange?.();
   }
   /** EVERY edit goes through here so the immutable paste token behaves as
    *  one unit: deleting any part of it removes it whole, typing inside it
-   *  replaces it, edits elsewhere just shift it. */
+   *  replaces it, edits elsewhere just shift it. Always notifies onChange —
+   *  the second-paste swap must reflow the layout just like typing. */
   #edit(from, to, text = "") {
+    this.selStart = this.selEnd = null; // edits consume the selection
     const cps = this.#cps();
     const t = Array.from(text);
     const m = this.pasteMark;
@@ -351,6 +354,7 @@ export class Input extends Widget {
       this.pasteMark = null;
       this.pendingPaste = null;
       this.value = cps.join("");
+      this.onChange?.();
       return;
     }
     if (m && to <= m.start) {
@@ -360,6 +364,7 @@ export class Input extends Widget {
     cps.splice(from, to - from, ...t);
     this.cursor = from + t.length;
     this.value = cps.join("");
+    this.onChange?.();
   }
   #deleteAt(idx) {
     this.#edit(idx, idx + 1);
@@ -419,6 +424,21 @@ export class Input extends Widget {
         screen.text(this.x + 1, y, r.text, { fg: this.fg, bg: this.bg });
       }
     }
+    // drag-selection highlight: invert the selected columns per wrapped row
+    if (this.selStart !== null && this.selEnd !== null && this.selEnd > this.selStart) {
+      for (let ri = start; ri < Math.min(rows.length, start + h); ri++) {
+        const r = rows[ri];
+        const lo = Math.max(r.start, this.selStart);
+        const hi = Math.min(r.end, this.selEnd);
+        if (lo >= hi) continue;
+        const rowY = this.y + (ri - start);
+        const text = Array.from(r.text);
+        const preW = strWidth(text.slice(0, lo - r.start).join(""));
+        const selW = strWidth(text.slice(lo - r.start, hi - r.start).join(""));
+        const x0 = this.x + (ri === 0 ? strWidth(this.prompt) : 1) + preW;
+        screen.invertRect(x0, rowY, Math.min(this.x + this.w - 1, x0 + Math.max(0, selW - 1)), rowY);
+      }
+    }
     // Native terminal caret (blinking bar) is positioned by the app after the
     // frame; store the cell it should occupy (the char at the cursor index).
     const curY = this.y + (curRow - start);
@@ -446,6 +466,33 @@ export class Input extends Widget {
         this.cursor = idx;
         this.#snapCursor();
       }
+      // press anchors a drag-selection at the cursor
+      this.selStart = this.cursor;
+      this.selEnd = this.cursor;
+      return true;
+    }
+    if ((ev.kind === "drag" || ev.kind === "release") && ev.button === 0 && this.selStart !== null) {
+      // extend the selection with the pointer (clamped to the text)
+      if (this.multi) {
+        const h = this.height();
+        const start = this.scrollY ?? 0;
+        const row = start + Math.max(0, Math.min(h - 1, ev.y - this.y));
+        const rx = ev.x - this.x - (row === 0 ? strWidth(this.prompt) : 1);
+        this.cursor = this.#indexAtVisual(row, Math.max(0, rx));
+      } else {
+        const rx = ev.x - this.x - strWidth(this.prompt);
+        let w = 0, idx = 0;
+        for (const ch of Array.from(this.value)) {
+          const cw = strWidth(ch);
+          if (rx < w + cw / 2) break;
+          w += cw;
+          idx++;
+        }
+        this.cursor = idx;
+      }
+      this.#snapCursor();
+      this.selEnd = this.cursor;
+      if (this.selEnd < this.selStart) { const t = this.selStart; this.selStart = this.selEnd; this.selEnd = t; }
       return true;
     }
     return false;
@@ -500,26 +547,29 @@ export class Input extends Widget {
     if (ev.type !== "key") return false;
     switch (ev.name) {
       case "backspace":
-        if (this.cursor > 0) { this.#edit(this.cursor - 1, this.cursor); this.onChange?.(); }
+        if (this.cursor > 0) this.#edit(this.cursor - 1, this.cursor);
         return true;
       case "delete":
-        if (this.cursor < this.#cps().length) { this.#edit(this.cursor, this.cursor + 1); this.onChange?.(); }
+        if (this.cursor < this.#cps().length) this.#edit(this.cursor, this.cursor + 1);
         return true;
-      case "left": this.selectAll = false; this.cursor = Math.max(0, this.cursor - 1); this.#snapCursor(-1); return true;
-      case "right": this.selectAll = false; this.cursor = Math.min(this.#cps().length, this.cursor + 1); this.#snapCursor(1); return true;
+      case "left": this.selectAll = false; this.selStart = this.selEnd = null; this.cursor = Math.max(0, this.cursor - 1); this.#snapCursor(-1); return true;
+      case "right": this.selectAll = false; this.selStart = this.selEnd = null; this.cursor = Math.min(this.#cps().length, this.cursor + 1); this.#snapCursor(1); return true;
       case "home": {
+        this.selStart = this.selEnd = null;
         if (this.multi) { const rows = this.#visualRows(); const { row } = this.#cursorVisual(); this.cursor = rows[row].start; }
         else this.cursor = 0;
         this.#snapCursor();
         return true;
       }
       case "end": {
+        this.selStart = this.selEnd = null;
         if (this.multi) { const rows = this.#visualRows(); const { row } = this.#cursorVisual(); this.cursor = rows[row].end; }
         else this.cursor = this.#cps().length;
         this.#snapCursor();
         return true;
       }
       case "up":
+        this.selStart = this.selEnd = null;
         if (this.multi) {
           const rows = this.#visualRows();
           const { row, col } = this.#cursorVisual();
@@ -530,6 +580,7 @@ export class Input extends Widget {
         }
         return true;
       case "down":
+        this.selStart = this.selEnd = null;
         if (this.multi) {
           const rows = this.#visualRows();
           const { row, col } = this.#cursorVisual();
@@ -544,9 +595,24 @@ export class Input extends Widget {
         if (ev.ctrl) {
           switch (ev.key) {
             case "j": if (this.multi) { this.insert("\n"); return true; } return false;
-            case "c": this.#touch(); this.value = ""; this.cursor = 0; this.selectAll = false; this.onChange?.(); this.app?.toast?.("已清空输入栏"); return true;
-            case "u": this.#edit(0, this.cursor); this.onChange?.(); return true;
-            case "k": this.#edit(this.cursor, this.#cps().length); this.onChange?.(); return true;
+            case "c": {
+              // a drag-selection copies it; otherwise Ctrl+C clears the input
+              if (this.selStart !== null && this.selEnd !== null && this.selEnd > this.selStart) {
+                const text = Array.from(this.value).slice(this.selStart, this.selEnd).join("");
+                this.selStart = this.selEnd = null;
+                this.app?.copyText?.(text);
+                return true;
+              }
+              this.#touch();
+              this.value = "";
+              this.cursor = 0;
+              this.selectAll = false;
+              this.onChange?.();
+              this.app?.toast?.("已清空输入栏");
+              return true;
+            }
+            case "u": this.#edit(0, this.cursor); return true;
+            case "k": this.#edit(this.cursor, this.#cps().length); return true;
             case "l": {
               // expand/collapse the input: expanded drops the 6-line cap and
               // lets the editor fill the window above the input

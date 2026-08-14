@@ -1824,6 +1824,7 @@ export class App {
     this.sidebarVisible = true; // Ctrl+B hides the whole session pane (nvim-style)
     this.sidebarWidth = 30;     // draggable divider: the session pane's column width
     this.draggingDivider = false;
+    this.inputDrag = false;     // mouse drag-selection inside the input is active
     this.feedbackMap = new Map(); // messageId → {rating, version}
     this.searchQuery = null;      // active find-in-conversation term (highlight)
     this.findQuery = null;        // term being typed in the find picker
@@ -2768,6 +2769,13 @@ export class App {
       // unhandled keys fall through to global shortcuts
     }
     if (ev.type === "mouse") {
+      // input drag-selection: the gesture continues across motion events
+      // even when the pointer leaves the input area
+      if (ev.kind === "release" && ev.button === 0 && this.inputDrag) {
+        this.inputDrag = false;
+        if (this.chat.input.onMouse(ev)) this.redraw();
+        return;
+      }
       // Draggable sidebar divider: press on the boundary column (±1) starts a
       // resize; drag events (motion flag) update the width live.
       const divX = this.sidebarVisible ? this.sidebarWidth : -1;
@@ -2788,6 +2796,10 @@ export class App {
       // Pure mouse motion must never change focus/mode (vim-style: INSERT is
       // keyboard-only). It reaches just the already-focused widget (drag select).
       if (ev.motion) {
+        if (this.inputDrag) {
+          if (this.chat.input.onMouse(ev)) this.redraw();
+          return;
+        }
         if (this.focused?.onMouse?.(ev)) this.redraw();
         return;
       }
@@ -2795,9 +2807,15 @@ export class App {
         this.focus(this.sidebar);
         if (this.sidebar.onMouse(ev)) this.redraw();
       } else if (this.chat.input.inside(ev.x, ev.y)) {
-        // Clicking the input only positions the cursor while already in INSERT
-        // mode; it never enters INSERT on its own (i / Esc control the mode).
-        if (this.focused === this.chat.input) {
+        // mouse SELECTION in the input works regardless of mode; typing stays
+        // gated behind i / Esc (vim-style)
+        if (ev.kind === "press" && ev.button === 0) {
+          this.inputDrag = true;
+          if (this.chat.input.onMouse(ev)) this.redraw();
+        } else if (ev.kind === "release" && ev.button === 0) {
+          this.inputDrag = false;
+          if (this.chat.input.onMouse(ev)) this.redraw();
+        } else if (this.focused === this.chat.input) {
           if (this.chat.input.onMouse(ev)) this.redraw();
         } else if (ev.kind === "press") {
           this.toast("按 i 进入输入（vim 式）");

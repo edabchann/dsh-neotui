@@ -389,6 +389,33 @@ test("a /restart handoff resumes the session instead of minting a new one", asyn
   }
 });
 
+test("the full paste reflows the input layout (no status-bar overlap)", () => {
+  const { chat } = render([]);
+  const big = Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n");
+  chat.input.onKey({ type: "text", text: big });  // stage 1 placeholder
+  chat.input.onKey({ type: "text", text: big });  // stage 2 full content
+  assert.equal(chat.input.h, 6, "input grew to the 6-line cap");
+  assert.equal(chat.view.h + chat.input.h + chat.todoHeight() + 1, chat.h, "layout rows add up (no overlap into the footer)");
+});
+
+test("the input supports drag-selection and Ctrl+C copy", () => {
+  const copied = [];
+  const input = new Input({ x: 0, y: 0, w: 40, h: 1, multi: true, app: { copyText: (t) => copied.push(t), toast: () => {} } });
+  input.setValue("hello world\nsecond line");
+  // press at the text start, drag across "hello"
+  input.onMouse({ type: "mouse", kind: "press", button: 0, x: strWidth("❯ "), y: 0 });
+  input.onMouse({ type: "mouse", kind: "drag", button: 0, x: strWidth("❯ ") + 5, y: 0, ctrl: false, shift: false, alt: false, motion: true });
+  assert.deepEqual([input.selStart, input.selEnd], [0, 5], "selection span");
+  const screen = new Screen(40, 3);
+  input.render(screen); // selection highlight must not throw
+  input.onKey({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: false });
+  assert.deepEqual(copied, ["hello"], "selection copied");
+  assert.equal(input.selStart, null, "selection cleared after copy");
+  // without a selection, Ctrl+C clears the input as before
+  input.onKey({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: false });
+  assert.equal(input.value, "", "no selection → clear the input");
+});
+
 test("large pastes are two-stage (placeholder then full content, claude-code style)", () => {
   const toasts = [];
   const input = new Input({ x: 0, y: 0, w: 60, h: 1, multi: true, app: { toast: (m) => toasts.push(m) } });
