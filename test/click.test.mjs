@@ -393,26 +393,39 @@ test("large pastes are two-stage (placeholder then full content, claude-code sty
   const toasts = [];
   const input = new Input({ x: 0, y: 0, w: 60, h: 1, multi: true, app: { toast: (m) => toasts.push(m) } });
   const big = Array.from({ length: 12 }, (_, i) => `line ${i}`).join("\n");
-  // stage 1: placeholder only
+  // stage 1: placeholder token only
   input.onKey({ type: "text", text: big });
   assert.equal(input.value, "[已复制 12 行内容]", "first paste shows the placeholder");
+  assert.deepEqual([input.pasteMark?.start, input.pasteMark?.end], [0, 12], "token span tracked");
   assert.equal(toasts.at(-1), "再次 Ctrl+Shift+V 粘贴完整内容（Ctrl+L 展开输入栏）");
-  // stage 2: the SAME clipboard pastes in full, replacing the placeholder
+  // stage 2: the SAME clipboard replaces the token with the full content
   input.onKey({ type: "text", text: big });
   assert.equal(input.value, big, "second paste inserts the full content");
   assert.equal(toasts.at(-1), "已粘贴完整内容");
+  // the token is ONE immutable unit: a single backspace removes it whole
+  input.setValue("");
+  input.onKey({ type: "text", text: big });
+  assert.equal(input.value, "[已复制 12 行内容]");
+  input.onKey({ type: "key", name: "backspace" });
+  assert.equal(input.value, "", "one backspace consumed the whole token");
+  assert.equal(input.pendingPaste, null, "removing the token cancels the held paste");
+  // typing INSIDE the token replaces it whole (no partial editing)
+  input.onKey({ type: "text", text: big });
+  input.onKey({ type: "key", name: "left" });
+  input.onKey({ type: "key", name: "char", key: "x", text: "x", ctrl: false, alt: false, shift: false });
+  assert.equal(input.value, "x", "typing inside replaced the whole token");
+  // typing AFTER the token keeps it; the second paste still swaps only the token
+  input.setValue("");
+  input.onKey({ type: "text", text: big });
+  input.onKey({ type: "key", name: "end" });
+  input.onKey({ type: "key", name: "char", key: "!", text: "!", ctrl: false, alt: false, shift: false });
+  assert.equal(input.value, "[已复制 12 行内容]!", "text after the token keeps the token");
+  input.onKey({ type: "text", text: big });
+  assert.equal(input.value, big + "!", "second paste swapped only the token");
   // a small paste is always a direct paste (no placeholder)
   input.setValue("");
   input.onKey({ type: "text", text: "small" });
   assert.equal(input.value, "small", "small pastes paste directly");
-  // stage 1 again, then typing cancels the held-back paste
-  input.onKey({ type: "text", text: big });
-  input.onKey({ type: "key", name: "char", key: "x", text: "x", ctrl: false, alt: false, shift: false });
-  assert.equal(input.pendingPaste, null, "typing cancels the held-back paste");
-  // the next paste is a fresh stage-1; pasting again inserts the full content
-  input.onKey({ type: "text", text: big });
-  input.onKey({ type: "text", text: big });
-  assert.ok(input.value.endsWith("line 11"), "full content inserted after the edit");
 });
 
 test("Ctrl+L expands/collapses the input past the 6-line cap", () => {

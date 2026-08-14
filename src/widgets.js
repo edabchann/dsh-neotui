@@ -257,7 +257,7 @@ export class Input extends Widget {
     this.expanded = false;             // Ctrl+L: drop the line cap and fill the window
     this.app = opts.app ?? null;
     this.pendingPaste = null;          // large-paste stage 1: held-back clipboard text
-    this.pendingPlaceholder = null;    // the "[已复制 N 行内容]" marker currently shown
+    this.pasteMark = null;             // code-point span of the immutable "[已复制…]" token
     this.onChange = opts.onChange ?? null;
     this.allowEmptyEnter = opts.allowEmptyEnter ?? false;
     this.history = [];
@@ -325,18 +325,44 @@ export class Input extends Widget {
     this.onChange?.();
   }
   insert(text) {
-    const cps = this.selectAll ? [] : this.#cps();
     const at = this.selectAll ? 0 : this.cursor;
-    this.selectAll = false;
-    cps.splice(at, 0, ...Array.from(text));
-    this.value = cps.join("");
-    this.cursor = at + Array.from(text).length;
+    if (this.selectAll) {
+      this.selectAll = false;
+      this.value = "";
+      this.cursor = 0;
+      this.#touch();
+    }
+    this.#edit(at, at, text);
     this.onChange?.();
   }
-  #deleteAt(idx) {
+  /** EVERY edit goes through here so the immutable paste token behaves as
+   *  one unit: deleting any part of it removes it whole, typing inside it
+   *  replaces it, edits elsewhere just shift it. */
+  #edit(from, to, text = "") {
     const cps = this.#cps();
-    cps.splice(idx, 1);
+    const t = Array.from(text);
+    const m = this.pasteMark;
+    if (m && to > m.start && from < m.end) {
+      // the edit touches the token: apply it over the whole token span
+      const lo = Math.min(from, m.start);
+      const hi = Math.max(to, m.end);
+      cps.splice(lo, hi - lo, ...t);
+      this.cursor = lo + t.length;
+      this.pasteMark = null;
+      this.pendingPaste = null;
+      this.value = cps.join("");
+      return;
+    }
+    if (m && to <= m.start) {
+      const delta = t.length - (to - from);
+      m.start += delta; m.end += delta;
+    }
+    cps.splice(from, to - from, ...t);
+    this.cursor = from + t.length;
     this.value = cps.join("");
+  }
+  #deleteAt(idx) {
+    this.#edit(idx, idx + 1);
   }
   /** Scroll offset that keeps the cursor's visual row inside the window. */
   #scrollStart(h) {
@@ -422,29 +448,31 @@ export class Input extends Widget {
     }
     return false;
   }
-  /** Any manual edit cancels the held-back paste (the placeholder stays as
-   *  ordinary text). */
-  #touch() { this.pendingPaste = null; this.pendingPlaceholder = null; }
+  /** Cancel the held-back paste AND its token. */
+  #touch() { this.pendingPaste = null; this.pasteMark = null; }
   /** Claude-Code-style two-stage paste: the first Ctrl+Shift+V of a large
-   *  clipboard shows a "[已复制 N 行内容]" placeholder; pasting the same
-   *  content again inserts it in full, like a normal paste. */
+   *  clipboard shows a "[已复制 N 行内容]" placeholder — an IMMUTABLE token:
+   *  deleting/typing into it consumes it whole, edits around it keep it, and
+   *  pasting the same content again replaces exactly that token. */
   #paste(text) {
     text = String(text ?? "");
     const large = text.includes("\n") || text.length > 300;
     if (large) {
       if (this.pendingPaste && this.pendingPaste.text === text) {
         const full = this.pendingPaste.text;
-        const placeholder = this.pendingPlaceholder;
+        const m = this.pasteMark;
         this.#touch();
-        if (this.value === placeholder) this.setValue(full);
+        if (m) this.#edit(m.start, m.end, full);
         else this.insert(full);
         this.app?.toast?.("已粘贴完整内容");
         return true;
       }
       const lines = text.split("\n").length;
+      const placeholder = `[已复制 ${lines} 行内容]`;
+      const at = this.selectAll ? 0 : this.cursor;
+      this.insert(placeholder);
+      this.pasteMark = { start: at, end: at + Array.from(placeholder).length };
       this.pendingPaste = { text };
-      this.pendingPlaceholder = `[已复制 ${lines} 行内容]`;
-      this.insert(this.pendingPlaceholder);
       this.app?.toast?.("再次 Ctrl+Shift+V 粘贴完整内容（Ctrl+L 展开输入栏）");
       return true;
     }
@@ -457,10 +485,10 @@ export class Input extends Widget {
     if (ev.type !== "key") return false;
     switch (ev.name) {
       case "backspace":
-        if (this.cursor > 0) { this.#touch(); this.#deleteAt(this.cursor - 1); this.cursor--; this.onChange?.(); }
+        if (this.cursor > 0) { this.#edit(this.cursor - 1, this.cursor); this.onChange?.(); }
         return true;
       case "delete":
-        if (this.cursor < this.#cps().length) { this.#touch(); this.#deleteAt(this.cursor); this.onChange?.(); }
+        if (this.cursor < this.#cps().length) { this.#edit(this.cursor, this.cursor + 1); this.onChange?.(); }
         return true;
       case "left": this.selectAll = false; this.cursor = Math.max(0, this.cursor - 1); return true;
       case "right": this.selectAll = false; this.cursor = Math.min(this.#cps().length, this.cursor + 1); return true;
@@ -500,8 +528,8 @@ export class Input extends Widget {
           switch (ev.key) {
             case "j": if (this.multi) { this.insert("\n"); return true; } return false;
             case "c": this.#touch(); this.value = ""; this.cursor = 0; this.selectAll = false; this.onChange?.(); this.app?.toast?.("已清空输入栏"); return true;
-            case "u": this.#touch(); this.value = this.#cps().slice(this.cursor).join(""); this.cursor = 0; this.onChange?.(); return true;
-            case "k": this.#touch(); this.value = this.#cps().slice(0, this.cursor).join(""); this.onChange?.(); return true;
+            case "u": this.#edit(0, this.cursor); this.onChange?.(); return true;
+            case "k": this.#edit(this.cursor, this.#cps().length); this.onChange?.(); return true;
             case "l": {
               // expand/collapse the input: expanded drops the 6-line cap and
               // lets the editor fill the window above the input
@@ -527,13 +555,13 @@ export class Input extends Widget {
           }
           return false;
         }
-        this.#touch();
         this.insert(ev.text);
         return true;
       case "enter":
         if (ev.shift && this.multi) { this.insert("\n"); return true; }  // Shift+Enter = newline
         if (this.value.trim() === "" && !this.allowEmptyEnter) return false;
         const v = this.value;
+        this.#touch();
         this.history.push(v);
         this.histIdx = -1;
         this.value = "";
