@@ -272,7 +272,7 @@ export class WorkspacePanel extends Widget {
       this.workspaces = items;
       const tree = [];
       for (const ws of items) {
-        tree.push({ depth: 0, name: `▣ ${ws.title}`, path: ws.path, isDir: true, open: false, ws: true });
+        tree.push({ depth: 0, name: `▣ ${ws.title}`, title: ws.title, path: ws.path, isDir: true, open: false, ws: true, workspaceId: ws.workspaceId });
       }
       this.tree = tree;
       this.rebuildTree();
@@ -319,6 +319,25 @@ export class WorkspacePanel extends Widget {
     } catch { node.children = []; }
   }
   onMouse(ev) {
+    if (ev.kind === "press" && ev.button === 2) {
+      // Right-click anywhere in the panel: workspace actions (add is the
+      // primary one; tree rows also offer move/rename).
+      const idx = this.treeScroll.scrollY + (ev.y - this.treeScroll.y);
+      const node = this.treeLinesNode(idx);
+      if (node?.ws) {
+        this.app.openMenu([
+          { label: "添加工作区…", action: () => this.app.addWorkspace() },
+          { label: "重命名工作区", action: () => this.app.renameWorkspace(node) },
+          { label: "上移工作区", action: () => this.app.moveWorkspace(node, -1) },
+          { label: "下移工作区", action: () => this.app.moveWorkspace(node, 1) },
+        ], ev);
+      } else {
+        this.app.openMenu([
+          { label: "添加工作区…", action: () => this.app.addWorkspace() },
+        ], ev);
+      }
+      return true;
+    }
     if (ev.x >= this.x + 1 && ev.x < this.x + Math.floor(this.w / 2)) {
       const idx = this.treeScroll.scrollY + (ev.y - this.treeScroll.y);
       const node = this.treeLinesNode(idx);
@@ -378,11 +397,11 @@ export class WorkspacePanel extends Widget {
     }
   }
   render(screen) {
-    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", {});
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.BG2 });
     const mid = this.x + Math.floor(this.w / 2);
-    screen.put(mid, this.y, "┬", { fg: T.BORDER });
+    screen.put(mid, this.y, "┬", { fg: T.BORDER, bg: T.BG2 });
     screen.vline(mid, this.y + 1, this.y + this.h - 1);
-    screen.text(this.x + 1, this.y, ` 工作区 (${this.workspaces.length}) — 点击目录展开，/ 搜索文件`, { fg: K.DIM });
+    screen.text(this.x + 1, this.y, ` 工作区 (${this.workspaces.length}) — 点击目录展开，/ 搜索文件，右键添加工作区`, { fg: K.DIM, bg: T.BG2 });
     if (this.query) {
       const results = [];
       const walk = (nodes) => {
@@ -424,6 +443,99 @@ export class WorkspacePanel extends Widget {
     if (ev.name === "enter" && this.query && this.searchResults?.length) { this.previewFile(this.searchResults[this.searchSel ?? 0]); return true; }
     if (ev.name === "up" || ev.name === "down" || ev.name === "pgup" || ev.name === "pgdn") return this.treeScroll.onKey?.(ev) ?? false;
     return false;
+  }
+}
+
+// ---- DirPicker: yazi-style folder selection buffer ----
+
+export class DirPicker extends Widget {
+  constructor(app, { startPath, onPick, onCancel }) {
+    const w = Math.min(60, app.screen.w - 4), h = Math.min(20, app.screen.h - 4);
+    super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h });
+    this.app = app;
+    this.path = startPath ?? process.cwd();
+    this.onPick = onPick;
+    this.onCancel = onCancel;
+    this.entries = [];
+    this.sel = 0;
+    this.scroll = 0;
+    this.load();
+  }
+  load() {
+    try {
+      this.entries = readdirSync(this.path, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && !d.name.startsWith("."))
+        .map((d) => d.name)
+        .sort((a, b) => a.localeCompare(b));
+    } catch { this.entries = []; }
+    this.sel = 0;
+    this.scroll = 0;
+  }
+  #items() { return ["✓ 选择此目录", "..", ...this.entries]; }
+  render(screen) {
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.BG2 });
+    screen.box(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, { fg: K.ACCENT, bg: T.BG2 }, "选择文件夹");
+    screen.text(this.x + 2, this.y + 1, truncate("📁 " + this.path, this.w - 4), { fg: K.TXT, bg: T.BG2 });
+    const items = this.#items();
+    const lh = Math.max(1, this.h - 3);
+    if (this.sel < this.scroll) this.scroll = this.sel;
+    else if (this.sel >= this.scroll + lh) this.scroll = this.sel - lh + 1;
+    this.scroll = Math.max(0, Math.min(Math.max(0, items.length - lh), this.scroll));
+    for (let i = 0; i < lh; i++) {
+      const idx = this.scroll + i;
+      const it = items[idx];
+      const y = this.y + 2 + i;
+      if (it === undefined) { screen.hline(this.x + 1, this.x + this.w - 2, y, " ", { bg: T.BG2 }); continue; }
+      const sel = idx === this.sel;
+      const label = it === "✓ 选择此目录" ? it : it === ".." ? ".. （上级目录）" : "▸ " + it + "/";
+      const fg = it === "✓ 选择此目录" ? K.OK : it === ".." ? K.DIM : K.TXT;
+      screen.fillRect(this.x + 1, y, this.x + this.w - 2, y, " ", { bg: sel ? T.MENUSEL : T.BG2 });
+      screen.text(this.x + 2, y, truncate(label, this.w - 4), { fg: sel ? 0xffffff : fg, bg: sel ? T.MENUSEL : T.BG2, attrs: sel ? 1 : 0 });
+    }
+    screen.text(this.x + 2, this.y + this.h - 1, "↑↓/jk 移动 · Enter 进入/选择 · h/Backspace 上级 · Esc 取消", { fg: K.FAINT, bg: T.BG2 });
+  }
+  onKey(ev) {
+    if (ev.type !== "key") return false;
+    const items = this.#items();
+    switch (ev.name) {
+      case "up": this.sel = Math.max(0, this.sel - 1); return true;
+      case "down": this.sel = Math.min(items.length - 1, this.sel + 1); return true;
+      case "enter": {
+        const it = items[this.sel];
+        if (it === "✓ 选择此目录") { this.onPick?.(this.path); return true; }
+        if (it === "..") { this.path = dirname(this.path); this.load(); return true; }
+        this.path = join(this.path, it); this.load(); return true;
+      }
+      case "backspace": this.path = dirname(this.path); this.load(); return true;
+      case "char":
+        if (ev.key === "j" && !ev.ctrl) { this.sel = Math.min(items.length - 1, this.sel + 1); return true; }
+        if (ev.key === "k" && !ev.ctrl) { this.sel = Math.max(0, this.sel - 1); return true; }
+        if (ev.key === "h" && !ev.ctrl) { this.path = dirname(this.path); this.load(); return true; }
+        if (ev.key === "l" && !ev.ctrl) {
+          const it = items[this.sel];
+          if (it && it !== "✓ 选择此目录" && it !== "..") { this.path = join(this.path, it); this.load(); }
+          return true;
+        }
+        return false;
+      case "escape": this.onCancel?.(); return true;
+    }
+    return false;
+  }
+  onMouse(ev) {
+    if (ev.kind === "press" && ev.button === 0) {
+      const idx = this.scroll + (ev.y - this.y - 2);
+      const items = this.#items();
+      if (idx >= 0 && idx < items.length) {
+        const it = items[idx];
+        if (it === "✓ 选择此目录") { this.onPick?.(this.path); return true; }
+        if (it === "..") { this.path = dirname(this.path); this.load(); return true; }
+        this.path = join(this.path, it); this.load(); return true;
+      }
+      return true;
+    }
+    if (ev.kind === "wheel-up") { this.sel = Math.max(0, this.sel - 1); return true; }
+    if (ev.kind === "wheel-down") { this.sel = Math.min(this.#items().length - 1, this.sel + 1); return true; }
+    return true;
   }
 }
 

@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
-  modeName, permName, WorkspacePanel, TrajectoryPanel,
+  modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker,
   ImagePopup, kittyCapable, buildJobsPopup, buildGoalPopup, SettingsPanel, SubagentPanel,
   SkillsPanel, ControlPanel,
 } from "./panels.js";
@@ -541,9 +541,10 @@ export class ChatView extends Widget {
     this.input = new Input({
       x: this.x, y: this.y + this.h - 2, w: this.w, h: 1,
       multi: true, maxLines: 6,
+      bg: T.BG2, border: T.BORDER2,
       placeholder: "输入消息…（Ctrl+J 换行，Enter 发送）",
       onEnter: (v) => this.send(v),
-      onChange: () => this.#inputChanged(),
+      onChange: () => this.inputChanged(),
     });
     this.contextNode = null;
     this.rebuildQueued = false;
@@ -681,18 +682,18 @@ export class ChatView extends Widget {
   }
 
   /** Height of the collapsible todo block (0 when empty or collapsed). */
-  #todoHeight() {
+  todoHeight() {
     const todos = this.app.todos;
     if (!this.todosVisible || !todos || todos.length === 0) return 0;
     return Math.min(todos.length, 6) + 1; // 1 header row + up to 6 todos
   }
 
-  #inputChanged() {
+  inputChanged() {
     // Multi-line input grew/shrunk → reflow view vs input, keep the tail visible.
     const ih = this.input.height();
     const prevIh = this.input.h;
     this.input.h = ih;
-    const th = this.#todoHeight();
+    const th = this.todoHeight();
     this.view.h = this.h - ih - th - 1;
     this.input.y = this.y + this.h - ih;
     if (ih !== prevIh) this.app.layout();
@@ -703,7 +704,7 @@ export class ChatView extends Widget {
     this.x = x; this.y = y; this.w = w; this.h = h;
     const ih = this.input.height();
     this.input.h = ih;
-    const th = this.#todoHeight();
+    const th = this.todoHeight();
     this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = h - ih - th - 1;
     this.input.x = x; this.input.y = y + h - ih; this.input.w = w;
     this.cache.clear();
@@ -965,6 +966,7 @@ export class ChatView extends Widget {
                 { t: open ? "▾ " : "▸ ", fg: K.ACCENT },
                 { t: ` ${b.name ?? "tool"}`, fg: K.TXT, bold: true },
                 { t: ` ${glyph}`, fg: status === "TOOLOK" ? K.OK : status === "TOOLERR" ? K.ERR : K.WARN },
+                { t: open ? " [b 折叠]" : " [b 展开]", fg: K.FAINT },
               ]);
               mark(realIdx, bi);
               if (!open) {
@@ -1124,7 +1126,7 @@ export class ChatView extends Widget {
 
   /** Collapsible todo block between the view and the input (Shift+T toggles). */
   #renderTodos(screen) {
-    const th = this.#todoHeight();
+    const th = this.todoHeight();
     if (th === 0) return;
     const todos = this.app.todos ?? [];
     const y = this.input.y - th - 1;
@@ -1243,7 +1245,7 @@ export class ChatView extends Widget {
       if (ev.shift) {
         this.todosVisible = !this.todosVisible;
         this.app.toast(this.todosVisible ? "任务块：显示（Shift+T 折叠）" : "任务块：折叠（Shift+T 展开）");
-        this.#inputChanged();
+        this.inputChanged();
         return true;
       }
       this.thinkMode = this.thinkMode === "collapsed" ? "expanded" : "collapsed";
@@ -1569,6 +1571,12 @@ export class App {
       this.model = host.model ?? "";
     } catch (e) { this.log(`[app] host.describe: ${e.message}`); }
     await this.refreshSessions();
+    // Open on a blank session at the launch directory (reusing an existing
+    // draft when available) so the blank-session homepage shows immediately
+    // instead of a fully empty chat area.
+    if (!this.currentSession) {
+      await this.newSessionIn(null);
+    }
     this.api.connectMux();
     this.api.connectHost();
     this.api.onFrame = (frame) => this.#onFrame(frame);
@@ -1621,6 +1629,8 @@ export class App {
       case "session/projection":
         this.projections[frame.key] = frame.value;
         if (frame.key === "tokenUsage") this.tokenUsage = frame.value;
+        // the todo block's height depends on the todos projection → reflow
+        if (frame.key === "todos") this.chat.inputChanged();
         break;
       case "approval/resolved":
       case "question/resolved":
@@ -1673,6 +1683,43 @@ export class App {
       });
       await this.refreshSessions();
     } catch (e) { this.toast(`移动失败: ${e.message}`); }
+  }
+
+  /** Move a workspace up/down in the durable display order. */
+  async moveWorkspace(node, delta) {
+    const ws = this.workspaceItems?.find((w) => w.workspaceId === node.workspaceId);
+    if (!ws || !this.workspaceItems) { this.toast("找不到工作区"); return; }
+    const ids = this.workspaceItems.map((w) => w.workspaceId);
+    const idx = ids.indexOf(ws.workspaceId);
+    if (idx < 0) return;
+    const target = idx + delta;
+    if (target < 0 || target >= ids.length) return;
+    const beforeWorkspaceId = delta === -1 ? ids[target] : (target + 1 < ids.length ? ids[target + 1] : undefined);
+    try {
+      await this.api.call("workspace.insertBefore", {
+        workspaceId: ws.workspaceId,
+        ...(beforeWorkspaceId !== undefined ? { beforeWorkspaceId } : {}),
+      });
+      await this.refreshSessions();
+    } catch (e) { this.toast(`移动工作区失败: ${e.message}`); }
+  }
+
+  /** Yazi-style folder picker → workspace.create. */
+  addWorkspace() {
+    this.overlay = new DirPicker(this, {
+      startPath: process.cwd(),
+      onPick: async (path) => {
+        this.overlay = null;
+        try {
+          await this.api.call("workspace.create", { path });
+          await this.refreshSessions();
+          this.toast(`已添加工作区: ${path}`);
+        } catch (e) { this.toast(`添加失败: ${e.message}`); }
+        this.redraw();
+      },
+      onCancel: () => { this.overlay = null; this.redraw(); },
+    });
+    this.redraw();
   }
 
   renameSession(s) {
@@ -1817,8 +1864,10 @@ export class App {
 
   async newSessionIn(group = null) {
     // Reuse an existing empty draft instead of minting a fresh blank session on
-    // every "new session" click (this is how the meaningless blank sessions pile up).
-    const blank = this.sessions.find((s) => s.blank && !s.running && s.sessionId !== this.currentSession);
+    // every "new session" click (this is how the meaningless blank sessions pile
+    // up). Prefer a draft at the same directory (e.g. the launch cwd on open).
+    const blanks = this.sessions.filter((s) => s.blank && !s.running && s.sessionId !== this.currentSession);
+    const blank = blanks.find((s) => s.cwd === process.cwd()) ?? blanks[0];
     if (blank && (group?.workspaceId == null || this.#sessionInWorkspace(blank.sessionId, group.workspaceId))) {
       await this.refreshSessions();
       this.openSession(blank.sessionId);
@@ -2434,12 +2483,11 @@ export class App {
     if (this.overlay) this.overlay.render(s);
     if (this.toastMsg) {
       // Toasts land in the LOWER half (just above the input/footer) where the
-      // user's attention is while pressing shortcuts — a solid color block,
-      // not a top-of-screen whisper.
+      // user's attention is while pressing shortcuts — a solid color block.
       const w = Math.min(s.w - 4, strWidth(this.toastMsg) + 6);
       const x0 = Math.max(2, Math.floor((s.w - w) / 2));
-      const y = Math.max(1, s.h - this.footerHeight() - 2);
-      s.fillRect(x0 - 1, y - 1, x0 + w, y + 1, " ", { bg: T.ACCENT });
+      const y = Math.max(1, this.chat.input.y - this.chat.todoHeight() - 2);
+      s.fillRect(x0, y, x0 + w - 1, y, " ", { bg: T.ACCENT });
       s.text(x0 + 1, y, truncate(this.toastMsg, w - 2), { fg: T.SELFG, bg: T.ACCENT, attrs: 1 });
     }
     if (this.renameInput && this.popup) this.renameInput.render(s);
