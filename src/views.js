@@ -3043,6 +3043,9 @@ export class App {
     // NORMAL is subtle — the user's eyes are at the input line, not the top.
     const editing = this.focused === this.chat?.input;
     row0.left.push({ t: editing ? " INSERT " : " NORMAL ", fg: editing ? T.OK : T.FAINT, bg: T.STATUSBG, bold: editing });
+    // Ctrl+Space (command panel) earns the prime spot right after the mode
+    // badge — the shortcut every session needs to discover first.
+    row0.left.push({ t: " Ctrl+Space 面板 ", fg: T.DIM, bg: T.STATUSBG });
     // Left badge: the session's permission/mode (e.g. "工作区写入/创造模式"),
     // which is far more meaningful than a static "工作区" label.
     const perm = this.projections.permissions?.currentValue;

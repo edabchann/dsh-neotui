@@ -618,6 +618,16 @@ test("non-string block text renders as text instead of throwing", () => {
   assert.equal(strWidth({ a: 1 }), strWidth("[object Object]"), "strWidth coerces non-strings");
 });
 
+test("the footer hints Ctrl+Space between the mode badge and the permission badge", () => {
+  const app = headlessApp();
+  app.renderFrame();
+  const text = [...(app.status.rows[0]?.left ?? []), ...(app.status.rows[0]?.right ?? [])].map((s) => s.t).join(" ");
+  const ni = text.indexOf("NORMAL");
+  const ci = text.indexOf("Ctrl+Space");
+  const bi = text.indexOf("未选会话");
+  assert.ok(ni >= 0 && ci > ni && bi > ci, `hint sits between mode and permission badges: ${text.slice(0, 60)}`);
+});
+
 test("ESC interrupts a running turn with ONE press, from insert or normal", async () => {
   const app = headlessApp();
   const calls = [];
