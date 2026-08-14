@@ -486,6 +486,28 @@ test("folding the last block at the bottom holds the header position (no 5-line 
   assert.equal(hdr3 - chat.view.scrollY, rowBefore, "no delayed snap on the next rebuild");
 });
 
+test("collapsing by clicking a content line lands the fold trailer at the clicked row", () => {
+  const longText = Array.from({ length: 30 }, (_, i) => `para ${i}`).join("\n\n");
+  const { chat } = render([
+    { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [{ kind: "text", text: longText }] },
+    { kind: "assistant", id: "a2", step: 2, streaming: false, blocks: [{ kind: "text", text: "AFTER" }] },
+  ]);
+  // click a CONTENT line deep inside the block (the header is off-screen)
+  const clicked = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 20"));
+  chat.view.scrollY = Math.max(0, clicked - 3); // the clicked line 3 rows below the top
+  const rowBefore = clicked - chat.view.scrollY;
+  const y = chat.view.y + rowBefore;
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
+  assert.ok(chat.collapsedBlocks.has("0:0"), "collapsed");
+  // the fold's trailer ("…共 … 字") must sit EXACTLY at the clicked row
+  const trailerIdx = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("…共"));
+  assert.equal(trailerIdx - chat.view.scrollY, rowBefore, "trailer landed at the clicked row");
+  // and the following content stays right below it
+  const afterIdx = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("AFTER"));
+  assert.ok(afterIdx - chat.view.scrollY >= rowBefore + 1 && afterIdx - chat.view.scrollY <= rowBefore + 3, "the next block sits right below the trailer");
+});
+
 test("the stream growing between press and release cannot shift the hit", () => {
   const longText = Array.from({ length: 40 }, (_, i) => `para ${i}`).join("\n\n");
   const { chat } = render([

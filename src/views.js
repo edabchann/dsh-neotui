@@ -863,7 +863,7 @@ export class ChatView extends Widget {
    *  shift the hit identity between press and release (the 4-line mystery:
    *  the rendered frame and the hit test were consistent, but the identity
    *  was re-resolved at release against a stream that had moved). */
-  #anchorCtx(info) {
+  #anchorCtx(info, pressY = null) {
     const lineKey = (m) => (m ? `${m.nodeIdx}:${m.blockIdx ?? "n"}` : null);
     const topKey = lineKey(this.lineMap[this.view.scrollY]) ?? null;
     let topFirst = -1;
@@ -884,7 +884,8 @@ export class ChatView extends Widget {
     };
     const preHeaderIdx = info ? firstNonEmpty(match) : -1;
     const preHeaderRow = preHeaderIdx >= 0 ? preHeaderIdx - this.view.scrollY : null;
-    return { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow };
+    const pressRow = pressY !== null && pressY !== undefined && pressY >= 0 ? pressY - this.view.scrollY : null;
+    return { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow, pressY, pressRow };
   }
 
   /** Toggle the block/node under a line-mark, then re-anchor the viewport.
@@ -899,11 +900,29 @@ export class ChatView extends Widget {
     }
     const node = this.nodes[info.nodeIdx];
     if (!node) return false;
-    const { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow } = ctx ?? this.#anchorCtx(info);
+    const { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow, pressY, pressRow } = ctx ?? this.#anchorCtx(info);
+    let collapsing = false;
     if (process.env.DSH_TUI_DEBUG_CLICK) {
       this.#clickLog(`toggle mark=${JSON.stringify(info)} kind=${node.kind} blockIdx=${info.blockIdx} preHeaderRow=${preHeaderRow} topKey=${topKey} topOffset=${topOffset}`);
     }
     const reanchor = () => {
+      // COLLAPSING a block by clicking one of its CONTENT lines: the clicked
+      // text itself vanishes, and the content below slides up by the fold
+      // size — the "4-line offset" the user sees. Land the fold's LAST line
+      // (the trailer/summary) exactly at the clicked row so the eye stays
+      // anchored and nothing below visibly shifts.
+      if (collapsing && pressY !== null && pressY !== preHeaderIdx && pressRow !== null && pressRow >= 0) {
+        let lastIdx = -1;
+        for (let i = 0; i < this.lineMap.length; i++) {
+          if (match(this.lineMap[i])) lastIdx = i;
+        }
+        if (lastIdx >= 0) {
+          const sy = lastIdx - pressRow;
+          this.view.scrollY = Math.max(0, sy);
+          if (sy > this.view.maxScroll()) this.view.anchorLock = sy;
+          return;
+        }
+      }
       // primary anchor: the clicked block's header stays at its pre-click
       // viewport row (zero shift) — only when the header was ON-SCREEN.
       // When the fold removed the tail content below, the anchored position
@@ -946,9 +965,11 @@ export class ChatView extends Widget {
         if (b.kind === "reasoning") {
           // clean two-state override: expand ⇄ collapse (never a no-op click)
           const open = this.expanded.has(key) || (!this.collapsedBlocks.has(key) && this.thinkMode === "expanded");
+          collapsing = open;
           if (open) { this.expanded.delete(key); this.collapsedBlocks.add(key); }
           else { this.collapsedBlocks.delete(key); this.expanded.add(key); }
         } else {
+          collapsing = !this.collapsedBlocks.has(key);
           if (this.collapsedBlocks.has(key)) this.collapsedBlocks.delete(key);
           else this.collapsedBlocks.add(key);
         }
@@ -1347,7 +1368,7 @@ export class ChatView extends Widget {
         // between press and release, so resolving the block at release would
         // toggle a block a few lines away from the one the user saw.
         this.pressInfo = this.lineMap?.[this.pressY] ?? null;
-        this.pressCtx = this.pressInfo ? this.#anchorCtx(this.pressInfo) : null;
+        this.pressCtx = this.pressInfo ? this.#anchorCtx(this.pressInfo, this.pressY) : null;
         if (process.env.DSH_TUI_DEBUG_CLICK) {
           const t = this.lines[this.pressY]?.map((g) => g.t).join("") ?? "";
           this.#clickLog(`press screenY=${ev.y} screenX=${ev.x} lineIdx=${this.pressY} mark=${JSON.stringify(this.pressInfo)} text="${t.slice(0, 40)}" scrollY=${this.view.scrollY} viewY=${this.view.y} viewH=${this.view.h}`);
