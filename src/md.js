@@ -246,7 +246,10 @@ export function renderMd(text, width) {
         const codeLines = codeBuf.length === 0 ? [""] : codeBuf;
         let maxLen = Math.max(...codeLines.map((l) => strWidth(l)), 1);
         const barW = Math.min(hw, maxLen + 2);
-        lines.push([SEG("┌" + "─".repeat(Math.max(1, barW - 2)) + "┐", { fg: C.hr }), SEG(" " + lang, { fg: C.dim })]);
+        // a fence WITHOUT a language gets no label — the bare "text" tag next
+        // to the box corner just looks like a rendering artifact
+        const tag = lang && lang !== "text" ? " " + lang : "";
+        lines.push([SEG("┌" + "─".repeat(Math.max(1, barW - 2)) + "┐" + tag, { fg: C.hr })]);
         for (const cl of codeLines) {
           const hls = highlightLine(cl, lang);
           lines.push([SEG("│ ", { fg: C.hr }), ...wrapSegs(hls, hw, { pad: true }).map((l) => l).flatMap((l, k) => (k === 0 ? l : [SEG("  ", { fg: C.hr }), ...l])), SEG(" │", { fg: C.hr })]);
