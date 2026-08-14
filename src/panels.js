@@ -112,7 +112,7 @@ export class Picker extends Widget {
 export function buildModelPicker(app) {
   const w = Math.min(70, app.screen.w - 4), h = Math.min(24, app.screen.h - 4);
   const manageProviders = {
-    label: "⚙ 管理供应商…（填表式）", hint: "M",
+    label: "⚙ 管理供应商…", hint: "M",
     provider: null, model: null,
     action: () => { app.overlay = null; app.setMode("models"); },
   };
@@ -1640,9 +1640,9 @@ export class SettingsPanel extends Widget {
       ns: "默认展开/折叠", applies: "live", local: true,
       value: { 思考块默认展开: fd.think, 工具块默认展开: fd.bash, 任务清单默认显示: fd.todos },
     });
-    // the model provider manager opens its own big form buffer (CC Switch 式)
+    // the model provider manager opens its own simple form buffer
     this.namespaces.splice(2, 0, {
-      ns: "模型供应商…（填表式）", applies: "live", local: true, modelsEntry: true,
+      ns: "模型供应商…", applies: "live", local: true, modelsEntry: true,
       value: {},
     });
     this.selectNs(0);
@@ -1816,9 +1816,7 @@ export class SettingsPanel extends Widget {
   }
 }
 
-// ---- Model provider management (CC Switch-style big form buffer) ----
-
-const MODEL_APIS = ["openai-completions", "anthropic-messages", "google-genai"];
+// ---- Model provider management (simple form buffer) ----
 
 export class ModelPanel extends Widget {
   constructor(app) {
@@ -1833,6 +1831,7 @@ export class ModelPanel extends Widget {
     this.formIdx = 0;      // form item cursor
     this.formItems = [];   // {kind:"field"|"model"|"button", ...}
     this.modelsSel = -1;   // selected model row (shows its subfields)
+    this.draftRoute = null; // the un-saved new provider's route (shows the rename field)
     this.editing = null;   // { label, commit } while the inline editor is open
     this.scanMode = false;
     this.scanItems = [];
@@ -1871,9 +1870,9 @@ export class ModelPanel extends Widget {
     if (route == null) return [];
     const p = this.#profile(route);
     const items = [];
-    items.push({ kind: "field", key: "route", label: "路由名", value: route, editable: !(route in this.providers && this.routes.includes(route)) });
+    // the route key only appears for a brand-new draft (rename once)
+    if (this.draftRoute === route) items.push({ kind: "field", key: "route", label: "路由名", value: route });
     items.push({ kind: "field", key: "displayName", label: "显示名", value: p.displayName ?? "" });
-    items.push({ kind: "field", key: "api", label: "协议 api", value: p.api ?? "openai-completions", cycle: MODEL_APIS });
     items.push({ kind: "field", key: "baseURL", label: "baseURL", value: p.baseURL ?? "" });
     items.push({ kind: "field", key: "apiKeyEnv", label: "apiKeyEnv", value: p.apiKeyEnv ?? "", note: "环境变量名（密钥不落盘）" });
     const models = p.models ?? [];
@@ -1896,22 +1895,28 @@ export class ModelPanel extends Widget {
     return items;
   }
   #rebuild() {
-    // left list
+    // left list: the cursor is ALWAYS visible (● on the selected provider),
+    // and the row being edited shows ✎ — the mode only changes the color.
     const listLines = [];
     for (let i = 0; i < this.routes.length; i++) {
       const r = this.routes[i];
       const p = this.providers[r] ?? {};
-      const sel = i === this.sel && this.mode === "list";
-      listLines.push([{ t: ` ${sel ? "▸" : " "} ${truncate(p.displayName || r, 18)}`, fg: sel ? T.SELFG : T.TXT, bg: sel ? T.MENUSEL : T.BG2, bold: sel }]);
+      const cur = i === this.sel;
+      const editing = cur && this.mode === "form";
+      listLines.push([{
+        t: ` ${cur ? "●" : " "} ${truncate(p.displayName || r, 18)}${editing ? " ✎" : ""}`,
+        fg: cur ? T.SELFG : T.TXT, bg: cur ? (editing ? T.MENUSEL : T.SELBG) : T.BG2, bold: cur,
+      }]);
     }
-    const addSel = this.sel === this.routes.length && this.mode === "list";
-    listLines.push([{ t: ` ${addSel ? "▸" : " "} ＋ 添加供应商`, fg: addSel ? T.SELFG : T.ACCENT, bg: addSel ? T.MENUSEL : T.BG2, bold: true }]);
+    const addCur = this.sel === this.routes.length;
+    listLines.push([{ t: ` ${addCur ? "●" : " "} ＋ 添加供应商`, fg: addCur ? T.SELFG : T.ACCENT, bg: addCur ? T.MENUSEL : T.BG2, bold: true }]);
     this.listView.setLines(listLines);
     // right form
     const route = this.#route();
     const formLines = [];
     if (route == null) {
-      formLines.push([{ t: "  选择左侧供应商,或“＋ 添加供应商”新建(CC Switch 式填表)", fg: K.FAINT }]);
+      formLines.push([{ t: "  左侧 ↑/↓ 选择供应商,Enter 打开编辑", fg: K.FAINT }]);
+      formLines.push([{ t: "  把光标移到底部的“＋ 添加供应商”回车即可新建", fg: K.FAINT }]);
       this.formItems = [];
     } else if (this.scanMode) {
       formLines.push([{ t: `  扫描 ${truncate(this.#profile(route).baseURL ?? "", 44)} — 空格勾选,Enter 添加,↑/↓ 移动`, fg: K.ACCENT, bold: true }]);
@@ -1942,7 +1947,7 @@ export class ModelPanel extends Widget {
         }
         formLines.push([{ t: truncate(t, w), fg: cur ? T.SELFG : T.TXT, bg: cur ? T.MENUSEL : T.BG2 }]);
       }
-      formLines.push([{ t: "  Enter 编辑/执行 · ← 回列表 · Esc 退出面板", fg: K.FAINT }]);
+      formLines.push([{ t: "  ↑/↓ 移动 · Enter 编辑或执行 · ← 回列表 · Esc 退出", fg: K.FAINT }]);
     }
     this.formView.setLines(formLines);
   }
@@ -1978,6 +1983,7 @@ export class ModelPanel extends Widget {
         let name = "新供应商", i = 2;
         while (this.providers[name] !== undefined) name = `新供应商${i++}`;
         this.providers[name] = { displayName: "", api: "openai-completions", baseURL: "", apiKeyEnv: "", models: [] };
+        this.draftRoute = name;
         this.routes = Object.keys(this.providers);
         this.sel = this.routes.indexOf(name);
         this.mode = "form";
@@ -2083,6 +2089,7 @@ export class ModelPanel extends Widget {
         expectedRevision: this.revision,
       });
       this.revision = res?.revision ?? this.revision;
+      this.draftRoute = null;
       this.app.toast(`已保存 ${Object.keys(this.providers).length} 个供应商`);
     } catch (e) { this.app.toast(`保存失败: ${e.message}`); }
   }
@@ -2215,7 +2222,8 @@ export class ModelPanel extends Widget {
     if (this.editing && this.input.inside(ev.x, ev.y)) return this.input.onMouse(ev);
     if (ev.x < this.x + 26) {
       const idx = ev.y - this.listView.y + this.listView.scrollY;
-      if (idx >= 0 && idx <= this.routes.length) { this.sel = idx; this.mode = "list"; this.#rebuild(); this.app.redraw(); return true; }
+      // one click = select AND open (same as Enter)
+      if (idx >= 0 && idx <= this.routes.length) { this.sel = idx; this.#activateItem(); return true; }
       return false;
     }
     if (this.scanMode) {
