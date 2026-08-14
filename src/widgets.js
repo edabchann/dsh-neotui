@@ -260,6 +260,10 @@ export class Input extends Widget {
     this.pasteMark = null;             // code-point span of the immutable "[已复制…]" token
     this.selStart = null;              // drag-selection [start, end) code-point span
     this.selEnd = null;
+    this.commands = opts.commands ?? []; // / command candidates: [{name, desc}]
+    this.cmdOpen = false;              // the candidate bar is showing
+    this.cmdIdx = 0;                   // highlighted candidate
+    this.cmds = [];                    // filtered candidates
     this.onChange = opts.onChange ?? null;
     this.allowEmptyEnter = opts.allowEmptyEnter ?? false;
     this.history = [];
@@ -324,6 +328,7 @@ export class Input extends Widget {
     this.value = String(v);
     this.cursor = this.#cps().length;
     this.selectAll = Boolean(opts.select);  // first insert/text replaces the whole value
+    this.#updateCmds();
     this.onChange?.();
   }
   insert(text) {
@@ -335,6 +340,21 @@ export class Input extends Widget {
       this.#touch();
     }
     this.#edit(at, at, text);
+  }
+  /** The / command candidate bar opens while the value is a bare "/…" prefix. */
+  #updateCmds() {
+    const v = this.value;
+    if (v.startsWith("/") && !v.includes(" ") && !v.includes("\n")) {
+      this.cmds = this.commands.filter((c) => c.name.startsWith(v));
+      if (this.cmds.length > 0) {
+        this.cmdOpen = true;
+        if (this.cmdIdx >= this.cmds.length) this.cmdIdx = 0;
+        return;
+      }
+    }
+    this.cmdOpen = false;
+    this.cmdIdx = 0;
+    this.cmds = [];
   }
   /** EVERY edit goes through here so the immutable paste token behaves as
    *  one unit: deleting any part of it removes it whole, typing inside it
@@ -354,6 +374,7 @@ export class Input extends Widget {
       this.pasteMark = null;
       this.pendingPaste = null;
       this.value = cps.join("");
+      this.#updateCmds();
       this.onChange?.();
       return;
     }
@@ -364,6 +385,7 @@ export class Input extends Widget {
     cps.splice(from, to - from, ...t);
     this.cursor = from + t.length;
     this.value = cps.join("");
+    this.#updateCmds();
     this.onChange?.();
   }
   #deleteAt(idx) {
@@ -568,29 +590,54 @@ export class Input extends Widget {
         this.#snapCursor();
         return true;
       }
-      case "up":
+      case "up": {
         this.selStart = this.selEnd = null;
+        if (this.cmdOpen && this.cmds.length) {
+          this.cmdIdx = (this.cmdIdx - 1 + this.cmds.length) % this.cmds.length;
+          this.onChange?.();
+          return true;
+        }
         if (this.multi) {
           const rows = this.#visualRows();
           const { row, col } = this.#cursorVisual();
-          if (row > 0) { this.cursor = this.#indexAtVisual(row - 1, col); this.#snapCursor(); }
-        } else if (this.history.length) {
+          if (row > 0) { this.cursor = this.#indexAtVisual(row - 1, col); this.#snapCursor(); return true; }
+          // at the first visual row: ↑ walks the history like other clients
+        }
+        if (this.history.length) {
           this.histIdx = this.histIdx < 0 ? this.history.length - 1 : Math.max(0, this.histIdx - 1);
           this.setValue(this.history[this.histIdx] ?? "");
         }
         return true;
-      case "down":
+      }
+      case "down": {
         this.selStart = this.selEnd = null;
+        if (this.cmdOpen && this.cmds.length) {
+          this.cmdIdx = (this.cmdIdx + 1) % this.cmds.length;
+          this.onChange?.();
+          return true;
+        }
         if (this.multi) {
           const rows = this.#visualRows();
           const { row, col } = this.#cursorVisual();
-          if (row < rows.length - 1) { this.cursor = this.#indexAtVisual(row + 1, col); this.#snapCursor(); }
-        } else if (this.histIdx >= 0) {
+          if (row < rows.length - 1) { this.cursor = this.#indexAtVisual(row + 1, col); this.#snapCursor(); return true; }
+          // at the last visual row: ↓ walks the history forward
+        }
+        if (this.histIdx >= 0) {
           this.histIdx++;
           if (this.histIdx >= this.history.length) { this.histIdx = -1; this.setValue(""); }
           else this.setValue(this.history[this.histIdx]);
         }
         return true;
+      }
+      case "tab":
+        if (this.cmdOpen && this.cmds.length) {
+          // Tab completes the highlighted / command candidate
+          const c = this.cmds[this.cmdIdx];
+          this.setValue(c.name + " ");
+          this.cmdOpen = false;
+          return true;
+        }
+        return false;
       case "char":
         if (ev.ctrl) {
           switch (ev.key) {

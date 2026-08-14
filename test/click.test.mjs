@@ -644,6 +644,66 @@ test("orphaned tool results are labeled 结果未保留, not the ambiguous 无�
   assert.ok(text.includes("并非执行失败"), "explanation shown when expanded");
 });
 
+test("the input walks history with ↑/↓ at the row boundaries", () => {
+  const input = new Input({ x: 0, y: 0, w: 40, h: 1, multi: true });
+  input.history = ["first message", "second message"];
+  // empty value: ↑ → most recent
+  input.onKey({ type: "key", name: "up" });
+  assert.equal(input.value, "second message");
+  input.onKey({ type: "key", name: "up" });
+  assert.equal(input.value, "first message");
+  input.onKey({ type: "key", name: "up" }); // stays at the oldest
+  assert.equal(input.value, "first message");
+  input.onKey({ type: "key", name: "down" });
+  assert.equal(input.value, "second message");
+  input.onKey({ type: "key", name: "down" }); // back to a fresh empty input
+  assert.equal(input.value, "");
+  // a multi-line value moves rows first; only the FIRST row falls into history
+  input.setValue("a\nb\nc");
+  input.onKey({ type: "key", name: "up" });
+  assert.equal(input.value, "a\nb\nc", "row move, not history");
+  input.onKey({ type: "key", name: "up" });
+  assert.equal(input.value, "a\nb\nc", "second row move");
+  input.onKey({ type: "key", name: "up" });
+  assert.equal(input.value, "second message", "row 0 ↑ walks into history");
+});
+
+test("slash commands: candidate bar, ↑/↓ cycle, Tab completion", () => {
+  const input = new Input({
+    x: 0, y: 0, w: 40, h: 1, multi: true,
+    commands: [{ name: "/reload", desc: "重载" }, { name: "/restart", desc: "重启" }, { name: "/model", desc: "模型" }],
+  });
+  input.onKey({ type: "text", text: "/re" });
+  assert.equal(input.cmdOpen, true, "candidate bar open");
+  assert.deepEqual(input.cmds.map((c) => c.name), ["/reload", "/restart"], "filtered by prefix");
+  input.onKey({ type: "key", name: "down" });
+  assert.equal(input.cmdIdx, 1, "↓ cycles the highlight");
+  input.onKey({ type: "key", name: "up" });
+  assert.equal(input.cmdIdx, 0, "↑ cycles back");
+  input.onKey({ type: "key", name: "tab" });
+  assert.equal(input.value, "/reload ", "Tab completed the highlighted command");
+  assert.equal(input.cmdOpen, false, "bar closed after completion");
+  input.onKey({ type: "text", text: "/xyz" });
+  assert.equal(input.cmdOpen, false, "no matches → bar closed");
+});
+
+test("INSERT mode exits only via Esc (clicks never switch the mode)", () => {
+  const app = headlessApp();
+  app.focus(app.chat.input);
+  app.onEvent({ type: "mouse", kind: "press", button: 0, x: 60, y: 10, ctrl: false, shift: false, alt: false, motion: false });
+  assert.equal(app.focused, app.chat.input, "clicking the chat does not exit INSERT");
+  app.onEvent({ type: "mouse", kind: "press", button: 0, x: 5, y: 10, ctrl: false, shift: false, alt: false, motion: false });
+  assert.equal(app.focused, app.chat.input, "clicking the sidebar does not exit INSERT");
+  // Esc closes the open / command bar first, staying in INSERT
+  app.chat.input.value = "/re"; app.chat.input.cmdOpen = true;
+  app.onEvent({ type: "key", name: "escape" });
+  assert.equal(app.focused, app.chat.input, "still INSERT after closing the candidate bar");
+  assert.equal(app.chat.input.cmdOpen, false, "bar closed by Esc");
+  // the next Esc exits INSERT
+  app.onEvent({ type: "key", name: "escape" });
+  assert.equal(app.focused, app.chat, "Esc exits INSERT");
+});
+
 test("finalized think blocks keep their start time and turns carry their total", () => {
   const events = [
     { event: { type: "turn/start", seq: 1, time: 1000, data: {} }, view: null },

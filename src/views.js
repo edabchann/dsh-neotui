@@ -14,7 +14,7 @@ import {
   SkillsPanel, ControlPanel, JobsPanel, fmtMs,
 } from "./panels.js";
 
-import { T, themeName } from "./theme.js";
+import { T, themeName, cycleTheme } from "./theme.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
 const K = new Proxy({}, { get(_k, key) { return T[key]; } });
 
@@ -172,7 +172,7 @@ function applyEvent(nodes, event, view, log, state = null) {
         const ch = d.chunk ?? {};
         let node = cur();
         if (!node || node.kind !== "assistant" || node.finalized) {
-          node = { kind: "assistant", blocks: [], streaming: true, finalized: false, step: st.step };
+          node = { kind: "assistant", blocks: [], streaming: true, finalized: false, step: st.step, turnStartAt: st.turnStart ?? undefined };
           nodes.push(node);
         }
         node.streaming = true;
@@ -219,7 +219,7 @@ function applyEvent(nodes, event, view, log, state = null) {
         }
         let node = cur();
         if (!node || node.kind !== "assistant") {
-          node = { kind: "assistant", blocks: [], streaming: true, finalized: false, step: st.step };
+          node = { kind: "assistant", blocks: [], streaming: true, finalized: false, step: st.step, turnStartAt: st.turnStart ?? undefined };
           nodes.push(node);
         }
         node.blocks.push({ kind: "tool", name: d.name, args: d.arguments, callId, view: view?.view, result: null, startedAt: event.time ?? Date.now() });
@@ -584,6 +584,16 @@ class SidebarTree extends Widget {
 
 // ---- ChatView ----
 
+/** Slash commands offered by the input's candidate bar (Tab completes). */
+const SLASH_COMMANDS = [
+  { name: "/reload", desc: "重新载入界面（不重启进程）" },
+  { name: "/restart", desc: "重启 TUI 加载新版本" },
+  { name: "/model", desc: "切换模型" },
+  { name: "/theme", desc: "切换配色主题" },
+  { name: "/permission", desc: "修改权限模式" },
+  { name: "/goal", desc: "查看当前目标" },
+];
+
 export class ChatView extends Widget {
   constructor(opts) {
     super(opts);
@@ -612,9 +622,9 @@ export class ChatView extends Widget {
     });
     this.input = new Input({
       x: this.x, y: this.y + this.h - 2, w: this.w, h: 1,
-      multi: true, maxLines: 6, app: this.app,
+      multi: true, maxLines: 6, app: this.app, commands: SLASH_COMMANDS,
       bg: T.PANEL,
-      placeholder: "输入消息…（Shift+Enter/Ctrl+J 换行，Ctrl+L 展开，Enter 发送）",
+      placeholder: "输入消息…（Shift+Enter/Ctrl+J 换行，Ctrl+L 展开，↑/↓ 历史，Tab 补全 / 命令，Enter 发送）",
       onEnter: (v) => this.send(v),
       onChange: () => this.inputChanged(),
     });
@@ -923,6 +933,10 @@ export class ChatView extends Widget {
     const trimmed = text.trim();
     if (trimmed === "/reload") { this.app.softReload(); return; }
     if (trimmed === "/restart") { this.app.restartApp(); return; }
+    if (trimmed === "/model") { this.app.showModePicker(); return; }
+    if (trimmed === "/theme") { cycleTheme(); this.queueRebuild(); this.app.toast(`主题已切换: ${themeName()}`); return; }
+    if (trimmed === "/permission") { this.app.showPermissionPicker(); return; }
+    if (trimmed === "/goal") { this.app.showGoal(); return; }
     if (!trimmed) return;
     const { parts, images, errors } = buildPromptParts(trimmed, {
       readFile: (p) => {
@@ -1412,6 +1426,10 @@ export class ChatView extends Widget {
           if (node.turnMs != null) {
             lines.push([{ t: `  🕐 本轮回答总耗时 ${fmtDuration(node.turnMs)}`, fg: T.WARN, bold: true }]);
             mark(realIdx);
+          } else if (node.streaming && node.turnStartAt != null && realIdx === this.nodes.length - 1) {
+            // deep-dive style live timer: the running turn ticks in real time
+            lines.push([{ t: `  🕐 本轮进行中…已经过 ${fmtDuration(Date.now() - node.turnStartAt)}`, fg: T.WARN, bold: true }]);
+            mark(realIdx);
           }
           break;
         }
@@ -1524,6 +1542,23 @@ export class ChatView extends Widget {
     }
     this.#renderTodos(screen);
     this.input.render(screen);
+    this.#renderCmdBar(screen);
+  }
+
+  /** / command candidate bar above the input (↑/↓ cycle, Tab completes). */
+  #renderCmdBar(screen) {
+    const inp = this.input;
+    if (!inp.cmdOpen || inp.cmds.length === 0) return;
+    const n = Math.min(inp.cmds.length, 6);
+    const w = Math.min(this.view.w, 44);
+    const y0 = Math.max(this.view.y, inp.y - n - 1);
+    screen.fillRect(this.x, y0, this.x + w - 1, y0 + n - 1, " ", { bg: T.BG2 });
+    for (let i = 0; i < n; i++) {
+      const c = inp.cmds[i];
+      const sel = i === inp.cmdIdx;
+      screen.text(this.x + 1, y0 + i, `${sel ? "▸" : " "} ${c.name}`, { fg: sel ? T.SELFG : T.TXT, bg: sel ? T.MENUSEL : T.BG2, attrs: sel ? 1 : 0 });
+      screen.text(this.x + 2 + strWidth(c.name) + 2, y0 + i, truncate(c.desc ?? "", w - strWidth(c.name) - 6), { fg: T.FAINT, bg: sel ? T.MENUSEL : T.BG2 });
+    }
   }
 
   /** Collapsible todo block between the view and the input (Shift+T toggles). */
@@ -1549,7 +1584,8 @@ export class ChatView extends Widget {
       return true;
     }
     if (this.view.inside(ev.x, ev.y)) {
-      this.app.focus(this);
+      // clicks act, but never exit INSERT mode — Esc is the only way out
+      if (this.app.focused !== this.app.chat?.input) this.app.focus(this);
       // Welcome-screen mode click: select the preset under the cursor.
       if (this.nodes.length === 0 && ev.kind === "press" && ev.button === 0) {
         const id = this.welcomeModes[ev.y];
@@ -2823,7 +2859,7 @@ export class App {
     // mouse routes by position (click = focus + dispatch)
     if (this.mode !== "chat") {
       if (ev.type === "mouse" && this.sidebarVisible && this.sidebar.inside(ev.x, ev.y)) {
-        this.focus(this.sidebar);
+        if (this.focused !== this.chat.input) this.focus(this.sidebar); // INSERT exits only via Esc
         if (this.sidebar.onMouse(ev)) this.redraw();
         return;
       }
@@ -2870,7 +2906,7 @@ export class App {
         return;
       }
       if (this.sidebarVisible && this.sidebar.inside(ev.x, ev.y)) {
-        this.focus(this.sidebar);
+        if (this.focused !== this.chat.input) this.focus(this.sidebar); // INSERT exits only via Esc
         if (this.sidebar.onMouse(ev)) this.redraw();
       } else if (this.chat.input.inside(ev.x, ev.y)) {
         // mouse SELECTION in the input works regardless of mode; typing stays
@@ -2887,7 +2923,7 @@ export class App {
           this.toast("按 i 进入输入（vim 式）");
         }
       } else if (this.chat.inside(ev.x, ev.y)) {
-        this.focus(this.chat);
+        if (this.focused !== this.chat.input) this.focus(this.chat); // INSERT exits only via Esc
         if (this.chat.onMouse(ev)) this.redraw();
       } else if (this.focused?.onMouse(ev)) {
         this.redraw();
@@ -2901,6 +2937,9 @@ export class App {
       // typing and Ctrl+J / Shift+Enter newlines behave like a normal editor.
       if (this.focused === this.chat.input) {
         if (ev.name === "escape") {
+          // Esc closes the open / command candidate bar first, then exits
+          // insert — Esc is the ONLY way out of insert mode.
+          if (this.chat.input.cmdOpen) { this.chat.input.cmdOpen = false; this.redraw(); return; }
           // one ESC press: interrupt a running turn AND leave insert —
           // otherwise the key just exits insert (vim muscle memory).
           const interrupted = this.#interruptIfRunning();
@@ -3056,9 +3095,14 @@ export class App {
           this.renderFrame();
         }
         if (this.toastMsg && Date.now() > this.toastUntil) { this.toastMsg = null; this.dirty = true; }
-        // the status-bar clock ticks once per second
+        // the status-bar clock ticks once per second; while a turn runs the
+        // chat's live timers (已经过 / 🕐) tick with it
         const sec = Math.floor(Date.now() / 1000);
-        if (sec !== this.lastSec) { this.lastSec = sec; this.dirty = true; }
+        if (sec !== this.lastSec) {
+          this.lastSec = sec;
+          if (this.chat.running) this.chat.queueRebuild();
+          this.dirty = true;
+        }
       } catch (e) {
         this.log("render error (kept running):", e);
         // stderr is invisible under the alt screen — record the stack where

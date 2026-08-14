@@ -937,7 +937,9 @@ export class TrajectoryPanel extends Widget {
       const hasResult = step.events.some((e) => e.type === "tool/result");
       const hasReasoning = step.events.some((e) => e.type === "assistant/chunk" && e.data?.chunk?.blockType === "reasoning");
       const t0 = step.events[0]?.time, t1 = step.events[step.events.length - 1]?.time;
-      const dur = t0 && t1 ? fmtMs(t1 - t0) : "—";
+      // deep-dive style live timer: the newest step ticks while the turn runs
+      const isLiveTail = this.app.chat?.running && this.winSeqLo == null && si === this.steps.length - 1;
+      const dur = isLiveTail ? `⏱${fmtMs(Date.now() - (t0 ?? Date.now()))}` : (t0 && t1 ? fmtMs(t1 - t0) : "—");
       const bg = tools.length ? (hasResult ? T.TOOLOK : T.TOOLBG) : hasReasoning ? T.THINKBG : T.CARD;
       const summary = tools.slice(0, 3).join(",") || (hasReasoning ? "模型推理" : "纯文本");
       const open = this.expandedSteps.has(this.stepKey(step));       // 详细
@@ -974,6 +976,11 @@ export class TrajectoryPanel extends Widget {
     if (this.loading && this.steps.length === 0) {
       screen.text(this.x + 2, this.y + 1, "加载轨迹…", { fg: K.FAINT });
       return;
+    }
+    // the live step's ⏱ timer re-renders once per second while the turn runs
+    if (this.app.chat?.running && this.winSeqLo == null && Date.now() - (this.liveTickAt ?? 0) > 1000) {
+      this.liveTickAt = Date.now();
+      this.buildLines();
     }
     this.view.render(screen);
   }
