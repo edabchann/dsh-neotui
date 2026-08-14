@@ -1,6 +1,6 @@
 {
   "name": "dsh-neotui-app",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "dsh-neotui bundle: the terminal surface over dsh-base (mouse-driven TUI + embedded API surface)",
   "type": "module",
   "exports": {
@@ -22,7 +22,7 @@
     "@deepseek-ai/cordis": "*",
     "@deepseek-ai/dsh-cmdline": "*",
     "commander": "*",
-    "dsh-neotui": "0.0.1"
+    "dsh-neotui": "0.0.2"
   },
   "license": "MIT"
 }
