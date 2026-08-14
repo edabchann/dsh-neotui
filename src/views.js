@@ -817,6 +817,7 @@ export class ChatView extends Widget {
   send(text) {
     if (!this.sessionId) return;
     const trimmed = text.trim();
+    if (trimmed === "/reload") { this.app.reloadApp(); return; }
     if (!trimmed) return;
     const { parts, images, errors } = buildPromptParts(trimmed, {
       readFile: (p) => {
@@ -836,12 +837,29 @@ export class ChatView extends Widget {
   }
 
   #clickLine(y, ev) {
-    // Capture the viewport geometry BEFORE any flush: the flush can grow the
-    // streaming tail (and atBottom snaps the view 1–2 rows), so anchoring on
-    // the post-flush state would reproduce exactly the shift the user saw.
-    // The pre-flush lineMap is what the user clicked on.
+    // NO flush here: the click maps against the exact frame the user saw.
+    // Flushing would re-derive the streaming tail (the chunk-stream and the
+    // poll snapshot produce DIFFERENT block structures) and make y point at a
+    // different block — the source of the 5–6 line offsets.
+    return this.#toggleAt(this.lineMap?.[y]);
+  }
+
+  /** Toggle the block/node under a line-mark, then re-anchor the viewport.
+   *  `info` must be the mark of the frame the user clicked on. */
+  #toggleAt(info) {
+    if (!info) return false;
+    if (info.imgIdx !== undefined) {
+      const node = this.nodes[info.nodeIdx];
+      const ref = node?.images?.[info.imgIdx];
+      if (ref) { this.app.openImage(ref, { all: node.images, index: info.imgIdx }); return true; }
+    }
+    const node = this.nodes[info.nodeIdx];
+    if (!node) return false;
+    // anchor context captured from the frame the user saw:
+    // - the clicked block's header line + its viewport row (primary anchor)
+    // - the viewport-top line's identity + offset (fallback for deep clicks)
     const lineKey = (m) => (m ? `${m.nodeIdx}:${m.blockIdx ?? "n"}` : null);
-    const topKey = lineKey(this.lineMap?.[this.view.scrollY]) ?? null;
+    const topKey = lineKey(this.lineMap[this.view.scrollY]) ?? null;
     let topFirst = -1;
     if (topKey !== null) {
       for (let i = 0; i < this.lineMap.length; i++) {
@@ -849,90 +867,71 @@ export class ChatView extends Widget {
       }
     }
     const topOffset = topFirst >= 0 ? this.view.scrollY - topFirst : 0;
-    // the clicked block's header (first non-empty line with its mark) and its
-    // pre-click viewport row — the PRIMARY anchor: keep the clicked thing put
-    const preInfo = this.lineMap?.[y];
-    const clickedMatch = preInfo?.blockIdx !== null
-      ? (m) => m?.nodeIdx === preInfo?.nodeIdx && m?.blockIdx === preInfo?.blockIdx
-      : (m) => m?.nodeIdx === preInfo?.nodeIdx;
-    const firstNonEmpty = (match) => {
+    const match = info.blockIdx !== null
+      ? (m) => m?.nodeIdx === info.nodeIdx && m?.blockIdx === info.blockIdx
+      : (m) => m?.nodeIdx === info.nodeIdx;
+    const firstNonEmpty = (m) => {
       for (let i = 0; i < this.lineMap.length; i++) {
-        if (match(this.lineMap[i]) && (this.lines[i] ?? []).some((g) => g.t.trim() !== "")) return i;
+        if (m(this.lineMap[i]) && (this.lines[i] ?? []).some((g) => g.t.trim() !== "")) return i;
       }
       return -1;
     };
-    const preHeaderIdx = preInfo ? firstNonEmpty(clickedMatch) : -1;
+    const preHeaderIdx = firstNonEmpty(match);
     const preHeaderRow = preHeaderIdx >= 0 ? preHeaderIdx - this.view.scrollY : null;
-    // A queued (deferred) rebuild would leave lineMap one frame behind the
-    // nodes array; flush now so the click maps to the CURRENT node/block.
-    this.flushRebuild();
-    // map rendered line back to node via cached line→node map
-    const info = this.lineMap?.[y];
-    if (info) {
-      if (info.imgIdx !== undefined) {
-        const node = this.nodes[info.nodeIdx];
-        const ref = node?.images?.[info.imgIdx];
-        if (ref) { this.app.openImage(ref, { all: node.images, index: info.imgIdx }); return true; }
-      }
-      const node = this.nodes[info.nodeIdx];
-      // Expand/collapse changes the line count around the click. Primary
-      // anchor: the clicked block's header stays at its pre-click viewport
-      // row (zero shift). Fallback (header was above the viewport — a deep
-      // content click): restore the pre-click viewport-top position.
-      const reanchor = () => {
-        // primary anchor applies only when the header was ON-SCREEN (a deep
-        // content click has the header above the viewport — use the fallback)
-        if (preHeaderRow !== null && preHeaderRow >= 0 && preHeaderIdx >= 0) {
-          const h2 = firstNonEmpty((m) => m?.nodeIdx === info.nodeIdx && m?.blockIdx === info.blockIdx);
-          if (h2 >= 0) {
-            this.view.scrollY = Math.max(0, Math.min(h2 - preHeaderRow, this.view.maxScroll()));
-            return;
-          }
-        }
-        if (topKey === null || topFirst < 0) return;
-        let first = -1, last = -1;
-        for (let i = 0; i < this.lineMap.length; i++) {
-          if (lineKey(this.lineMap[i]) !== topKey) continue;
-          if (first < 0) first = i;
-          last = i;
-        }
-        if (first < 0) return;
-        const target = Math.min(first + topOffset, last);
-        this.view.scrollY = Math.max(0, Math.min(target, this.view.maxScroll()));
-      };
-      // never park the viewport on a blank separator row — it reads as a
-      // spurious offset right after the click
-      const nudge = () => {
-        while (
-          this.view.scrollY < this.lineMap.length - 1 &&
-          !(this.lines[this.view.scrollY] ?? []).some((g) => g.t.trim() !== "")
-        ) this.view.scrollY++;
-      };
-      if (node?.kind === "assistant" && info.blockIdx !== null) {
-        const b = node.blocks[info.blockIdx];
-        if (b && (b.kind === "tool" || b.kind === "reasoning" || b.kind === "other" || b.kind === "text")) {
-          const key = `${info.nodeIdx}:${info.blockIdx}`;
-          if (b.kind === "reasoning") {
-            // clean two-state override: expand ⇄ collapse (never a no-op click)
-            const open = this.expanded.has(key) || (!this.collapsedBlocks.has(key) && this.thinkMode === "expanded");
-            if (open) { this.expanded.delete(key); this.collapsedBlocks.add(key); }
-            else { this.collapsedBlocks.delete(key); this.expanded.add(key); }
-          } else {
-            if (this.collapsedBlocks.has(key)) this.collapsedBlocks.delete(key);
-            else this.collapsedBlocks.add(key);
-          }
-          this.#rebuild();
-          reanchor(); nudge();
-          return true;
+    const reanchor = () => {
+      // primary anchor: the clicked block's header stays at its pre-click
+      // viewport row (zero shift) — only when the header was ON-SCREEN
+      if (preHeaderRow !== null && preHeaderRow >= 0 && preHeaderIdx >= 0) {
+        const h2 = firstNonEmpty(match);
+        if (h2 >= 0) {
+          this.view.scrollY = Math.max(0, Math.min(h2 - preHeaderRow, this.view.maxScroll()));
+          return;
         }
       }
-      if (node && (node.kind === "assistant" || node.kind === "user")) {
-        if (this.expanded.has(info.nodeIdx)) this.expanded.delete(info.nodeIdx);
-        else this.expanded.add(info.nodeIdx);
+      // fallback (deep content click): restore the viewport-top position
+      if (topKey === null || topFirst < 0) return;
+      let first = -1, last = -1;
+      for (let i = 0; i < this.lineMap.length; i++) {
+        if (lineKey(this.lineMap[i]) !== topKey) continue;
+        if (first < 0) first = i;
+        last = i;
+      }
+      if (first < 0) return;
+      const target = Math.min(first + topOffset, last);
+      this.view.scrollY = Math.max(0, Math.min(target, this.view.maxScroll()));
+    };
+    // never park the viewport on a blank separator row — it reads as a
+    // spurious offset right after the click
+    const nudge = () => {
+      while (
+        this.view.scrollY < this.lineMap.length - 1 &&
+        !(this.lines[this.view.scrollY] ?? []).some((g) => g.t.trim() !== "")
+      ) this.view.scrollY++;
+    };
+    if (node.kind === "assistant" && info.blockIdx !== null) {
+      const b = node.blocks[info.blockIdx];
+      if (b && (b.kind === "tool" || b.kind === "reasoning" || b.kind === "other" || b.kind === "text")) {
+        const key = `${info.nodeIdx}:${info.blockIdx}`;
+        if (b.kind === "reasoning") {
+          // clean two-state override: expand ⇄ collapse (never a no-op click)
+          const open = this.expanded.has(key) || (!this.collapsedBlocks.has(key) && this.thinkMode === "expanded");
+          if (open) { this.expanded.delete(key); this.collapsedBlocks.add(key); }
+          else { this.collapsedBlocks.delete(key); this.expanded.add(key); }
+        } else {
+          if (this.collapsedBlocks.has(key)) this.collapsedBlocks.delete(key);
+          else this.collapsedBlocks.add(key);
+        }
         this.#rebuild();
         reanchor(); nudge();
         return true;
       }
+    }
+    if (node.kind === "assistant" || node.kind === "user") {
+      if (this.expanded.has(info.nodeIdx)) this.expanded.delete(info.nodeIdx);
+      else this.expanded.add(info.nodeIdx);
+      this.#rebuild();
+      reanchor(); nudge();
+      return true;
     }
     return false;
   }
@@ -1336,14 +1335,14 @@ export class ChatView extends Widget {
         return true;
       }
       if (ev.kind === "press" && ev.button === 2) {
-        this.flushRebuild(); // keep lineMap current with the nodes array
+        // map against the frame the user saw — no flush (see #clickLine)
         const y = ev.y - this.view.y + this.view.scrollY;
         const info = this.lineMap?.[y];
         if (info) {
           const node = this.nodes[info.nodeIdx];
           const items = [
             { label: "复制消息", action: () => this.app.copyNode(info.nodeIdx) },
-            { label: "展开 / 折叠", action: () => this.#clickLine(y, ev) },
+            { label: "展开 / 折叠", action: () => this.#toggleAt(info) },
           ];
           if (node?.id) {
             items.push({ label: "转跳轨迹", action: () => this.app.jumpToTrajectoryNode(info.nodeIdx) });
@@ -2188,6 +2187,25 @@ export class App {
   showGoal() { this.overlay = buildGoalPopup(this); this.redraw(); }
   showModePicker() { this.overlay = buildModePicker(this); this.redraw(); }
   showPermissionPicker() { this.overlay = buildPermissionPicker(this); this.redraw(); }
+
+  /** /reload: restart the TUI process in the same terminal so a freshly
+   *  published build (the profile symlinks the repo) takes effect without
+   *  quitting and re-running `dsh` by hand. */
+  async reloadApp() {
+    this.toast("正在重启 TUI…");
+    this.redraw();
+    await new Promise((r) => setTimeout(r, 250));
+    try { this.term?.stop?.(); } catch {}
+    try {
+      const { spawn } = await import("node:child_process");
+      const child = spawn(process.argv[0], process.argv.slice(1), { detached: true, stdio: "inherit" });
+      child.unref();
+    } catch (e) {
+      this.toast(`重启失败: ${e.message}（请手动重启）`);
+      return;
+    }
+    process.exit(0);
+  }
 
   /** Ctrl+E: fzf-style quick jump to a step — type to fuzzy-filter the step
    *  list, Enter opens the trajectory window around the picked step. */
