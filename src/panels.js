@@ -950,14 +950,16 @@ export class TrajectoryPanel extends Widget {
       lines.push(segs);
       this.stepLines[lines.length - 1] = si;
       if (open) {
-        // 详细 mode: the step's events inline under its color block, each
-        // with its deep-dive elapsed time since the step started (web-style).
-        const t0 = step.events[0]?.time;
+        // 详细 mode = deep dive: the step's events inline under its color
+        // block, each with its OWN duration (web-style Δ timer: time since
+        // the previous event; the first is measured from the step start).
         const evs = step.events.slice(0, 12);
+        let prev = null;
         for (const e of evs) {
-          const dt = t0 != null && e.time != null ? ` +${fmtMs(e.time - t0)}` : "";
+          const dt = prev != null && e.time != null ? ` Δ${fmtMs(e.time - prev)}` : "";
           lines.push([{ t: `    #${String(e.seq).padStart(4)}${dt} ${truncate(this.#eventSummary(e), w - 12 - strWidth(dt))}`, fg: K.DIM, bg }]);
           this.stepLines[lines.length - 1] = si;
+          prev = e.time;
         }
         if (step.events.length > evs.length) {
           lines.push([{ t: `    …共 ${step.events.length} 个事件（右键 → 查看详情）`, fg: K.FAINT, bg }]);

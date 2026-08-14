@@ -938,7 +938,7 @@ test("trajectory: right click opens 展开/转跳/详情 menu; toggle expands �
   const header = panel.view.lines.map((l) => l.map((g) => g.t).join("")).find((l) => l.includes("step   1"));
   assert.ok(header.includes("▾"), "header shows ▾ when expanded");
   assert.ok(panel.view.lines.some((l) => l.some((g) => g.t.includes("⚙ bash"))), "tool event listed inline");
-  assert.ok(panel.view.lines.some((l) => l.some((g) => /\+[0-9.]+(s|ms)/.test(g.t))), "deep-dive elapsed shown per event");
+  assert.ok(panel.view.lines.some((l) => l.some((g) => /Δ[0-9.]+(s|ms)/.test(g.t))), "deep-dive Δ duration shown per event");
   // second click collapses back to 简略
   panel.onMouse({ type: "mouse", kind: "press", button: 2, x: panel.view.x + 2, y: panel.view.y + li });
   const fold = app.lastMenu.items.find((i) => i.label === "折叠（简略）");
