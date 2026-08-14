@@ -566,7 +566,7 @@ export class ChatView extends Widget {
     this.expandedTools = new Set();
     this.collapsedBlocks = new Set(); // per-block COLLAPSE (default expanded): `${realIdx}:${bi}`
     this.thinkMode = "expanded";        // think blocks: expanded by default (t toggles)
-    this.bashMode = "expanded";         // tool blocks: expanded | collapsed (b toggles)
+    this.bashMode = "collapsed";        // tool blocks: collapsed by default (b toggles)
     this.todosVisible = true;           // todo block above the input (Shift+T toggles)
     this.todoSeen = false;             // once seen, the todo box keeps its height
     this.running = false;
@@ -897,7 +897,20 @@ export class ChatView extends Widget {
     // the segment under the cursor at PRESS time (code-block [复制] hit test):
     // re-resolving it at release would let a streaming rebuild move the line
     const pressSeg = pressY !== null && pressY !== undefined && pressY >= 0 ? this.#segAtLine(pressY, pressX) : null;
-    return { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow, pressY, pressRow, pressX, pressSeg };
+    // press-time BLOCK signature: the streaming tail re-derives between press
+    // and release (syncTail replaces the block objects), so the positional
+    // nodeIdx:blockIdx key can drift; the signature lets release re-locate
+    // the same block by content instead.
+    let pressSig = null;
+    if (info && info.blockIdx !== null) {
+      const b = this.nodes[info.nodeIdx]?.blocks?.[info.blockIdx];
+      if (b) pressSig = {
+        nodeId: this.nodes[info.nodeIdx]?.id ?? null,
+        kind: b.kind,
+        prefix: String(b.text ?? b.args ?? "").slice(0, 40),
+      };
+    }
+    return { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow, pressY, pressRow, pressX, pressSeg, pressSig };
   }
 
   /** The line-segment under a screen x on a rendered line (for the code
@@ -924,15 +937,40 @@ export class ChatView extends Widget {
       const ref = node?.images?.[info.imgIdx];
       if (ref) { this.app.openImage(ref, { all: node.images, index: info.imgIdx }); return true; }
     }
-    const node = this.nodes[info.nodeIdx];
+    let node = this.nodes[info.nodeIdx];
     if (!node) return false;
-    const { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow, pressY, pressRow, pressX, pressSeg } = ctx ?? this.#anchorCtx(info);
+    const { lineKey, topKey, topFirst, topOffset, match, firstNonEmpty, preHeaderIdx, preHeaderRow, pressY, pressRow, pressX, pressSeg, pressSig } = ctx ?? this.#anchorCtx(info);
     // code block [复制] button: copy the raw code, no toggle (hit identity
     // and segment locked at press time)
     if (pressSeg?.copyCode) {
       this.app.copyText(pressSeg.copyCode);
       this.app.toast("已复制代码块");
       return true;
+    }
+    // The stream re-derives between press and release: if the positional
+    // block no longer matches the press-time signature, re-locate the SAME
+    // block by kind + content prefix (node id when the node carries one).
+    if (pressSig && info.blockIdx !== null) {
+      const cur = node.blocks?.[info.blockIdx];
+      const same = cur && cur.kind === pressSig.kind && String(cur.text ?? cur.args ?? "").slice(0, 40) === pressSig.prefix;
+      if (!same) {
+        let found = null;
+        for (let ni = 0; ni < this.nodes.length && !found; ni++) {
+          const n = this.nodes[ni];
+          if (pressSig.nodeId && n?.id && n.id !== pressSig.nodeId) continue;
+          for (let bi = 0; bi < (n?.blocks ?? []).length; bi++) {
+            const b = n.blocks[bi];
+            if (b.kind === pressSig.kind && String(b.text ?? b.args ?? "").slice(0, 40) === pressSig.prefix) {
+              found = { nodeIdx: ni, blockIdx: bi };
+              break;
+            }
+          }
+        }
+        if (found) {
+          info = { ...info, ...found };
+          node = this.nodes[found.nodeIdx];
+        }
+      }
     }
     // formal text blocks are NOT collapsible: clicking them is a no-op
     if (node.kind === "assistant" && info.blockIdx !== null && node.blocks[info.blockIdx]?.kind === "text") {
@@ -1222,18 +1260,33 @@ export class ChatView extends Widget {
               beginCard("CARD");
               // FORMAL text output is NOT collapsible — the user's message
               // content must stay readable; only think/tool blocks fold.
-              // Code blocks inside render as boxes with a [复制] button.
+              // The 🐳 marker distinguishes formal output from 💭 think and
+              // ▸ tool blocks at a glance. Code blocks inside render as boxes
+              // with a [复制] button.
               const key = `${realIdx}:${bi}`;
               const text = b.text ?? "";
               const mdW = Math.max(10, w - 6 - strWidth(stepTag));
               const sink = { codeBlocks: [] };
               const md = renderMd(text, mdW, sink);
+              const whale = { t: "  🐳", fg: K.ACCENT, bold: true };
+              const step = { t: stepTag || " ", fg: K.FAINT };
               if (md.length > 0) {
-                lines.push([{ t: "  " }, { t: stepTag, fg: K.FAINT }, ...md[0]]);
-                mark(realIdx, bi);
-                for (const ln of md.slice(1)) { lines.push([{ t: "  " }, ...ln]); mark(realIdx, bi); }
+                // When the message STARTS with a code box, the whale+step
+                // marker gets its own line so the box's top border keeps the
+                // same indent as its content rows (corners over bars, not
+                // shifted right by the marker).
+                const firstIsBoxTop = md[0].some((g) => g.copyCode);
+                if (firstIsBoxTop) {
+                  lines.push([whale, step]);
+                  mark(realIdx, bi);
+                  for (const ln of md) { lines.push([{ t: "  " }, ...ln]); mark(realIdx, bi); }
+                } else {
+                  lines.push([whale, step, ...md[0]]);
+                  mark(realIdx, bi);
+                  for (const ln of md.slice(1)) { lines.push([{ t: "  " }, ...ln]); mark(realIdx, bi); }
+                }
               } else {
-                lines.push([{ t: "  " + stepTag, fg: K.FAINT }]);
+                lines.push([whale, step]);
                 mark(realIdx, bi);
               }
               sep();

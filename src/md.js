@@ -252,26 +252,31 @@ export function renderMd(text, width, sink = null, opts = {}) {
         const lang = inCode || "text";
         const hw = Math.max(2, width - 4);
         const codeLines = codeBuf.length === 0 ? [""] : codeBuf;
-        let maxLen = Math.max(...codeLines.map((l) => strWidth(l)), 1);
-        const barW = Math.min(hw, maxLen + 2);
-        // web-style box with a click-to-copy button in the top-right corner;
-        // a fence WITHOUT a language gets no label (the bare "text" tag next
-        // to the corner looked like a rendering artifact)
+        if (sink?.codeBlocks) sink.codeBlocks.push({ text: codeBuf.join("\n"), lineIdx: lines.length, lang });
+        // Fixed-width box: EVERY row is exactly (hw + 4) columns wide —
+        // top `┌…[复制]…┐`, content `│ … │`, bottom `└…┘` — so the corners
+        // always sit above the vertical bars, never above the code text.
         const btn = "[复制]";
         const btnW = strWidth(btn);
-        const topLen = Math.max(1, barW - btnW - 4);
+        const inner = hw + 2;                       // columns between the corners
+        const leftLen = Math.max(1, inner - btnW - 2);
         const tag = lang && lang !== "text" ? " " + lang : "";
-        if (sink?.codeBlocks) sink.codeBlocks.push({ text: codeBuf.join("\n"), lineIdx: lines.length, lang });
         lines.push([
-          SEG("┌" + "─".repeat(topLen) + " ", { fg: C.hr }),
+          SEG("┌" + "─".repeat(leftLen) + " ", { fg: C.hr }),
           SEG(btn, { fg: C.link, bold: true, copyCode: codeBuf.join("\n") }),
           SEG(" ┐" + tag, { fg: C.hr }),
         ]);
         for (const cl of codeLines) {
           const hls = highlightLine(cl, lang);
-          lines.push([SEG("│ ", { fg: C.hr }), ...wrapSegs(hls, hw, { pad: true }).map((l) => l).flatMap((l, k) => (k === 0 ? l : [SEG("  ", { fg: C.hr }), ...l])), SEG(" │", { fg: C.hr })]);
+          for (const row of wrapSegs(hls, hw)) {
+            const rowW = strWidth(row.map((g) => g.t ?? "").join(""));
+            const segs = [SEG("│ ", { fg: C.hr }), ...row];
+            if (rowW < hw) segs.push(SEG(" ".repeat(hw - rowW)));
+            segs.push(SEG(" │", { fg: C.hr }));
+            lines.push(segs);
+          }
         }
-        lines.push([SEG("└" + "─".repeat(Math.max(1, barW - 2)) + "┘", { fg: C.hr })]);
+        lines.push([SEG("└" + "─".repeat(inner) + "┘", { fg: C.hr })]);
         inCode = null;
       }
       i++;

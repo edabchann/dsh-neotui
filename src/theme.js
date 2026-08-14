@@ -56,7 +56,7 @@ function themeFile() {
   return join(base, "tui-theme.txt");
 }
 
-let current = "dark";
+let current = "gruvbox";
 const ORDER = ["dark", "light", "gruvbox"];
 
 try {

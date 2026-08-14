@@ -105,6 +105,7 @@ async function main() {
 
   // ---- chat right-click expand/collapse on a tool block ----
   const c = app.chat;
+  c.bashMode = "expanded"; // pin the mode: the shipped default is "collapsed"
   app.renderFrame(); // flush so lines/lineMap match nodes
   const toolLi = c.lines.findIndex((l) => /\[b 折叠\]|\[b 展开\]/.test(rowText(l)) && c.lineMap[l]?.blockIdx !== null);
   check("tool block header in rendered lines", toolLi >= 0, `line ${toolLi}`);

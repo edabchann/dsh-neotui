@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { ChatView, App, userPrefix, saveTuiConfig } from "../src/views.js";
 import { TrajectoryPanel, JobsPanel, SettingsPanel } from "../src/panels.js";
 import { fmtDuration, strWidth } from "../src/text.js";
+import { renderMd } from "../src/md.js";
 import { Screen } from "../src/screen.js";
 
 // isolate TUI config writes from the real ~/.dsh/tui-config.json
@@ -41,10 +42,13 @@ function toolNode(over = {}) {
 }
 
 // Render a chat with the given nodes; returns the chat and its rendered lines.
+// (Tests pin bashMode to "expanded" — the shipped default is "collapsed" —
+// except the all-collapsed-mode tests, which override it explicitly.)
 function render(nodes) {
   const app = fakeApp();
   const chat = new ChatView({ app, x: 0, y: 1, w: 80, h: 24 });
   chat.nodes = nodes;
+  chat.bashMode = "expanded";
   chat.resize(0, 1, 80, 24);
   return { app, chat, lines: chat.lines.map((l) => l.map((g) => g.t).join("")) };
 }
@@ -148,6 +152,74 @@ test("code block [复制] button copies the raw code without toggling", () => {
   chat.onMouse({ type: "mouse", kind: "release", button: 0, x: chat.view.x, y });
   assert.equal(app.copied, undefined, "non-button click does not copy");
   assert.equal(chat.collapsedBlocks.size, 0, "still nothing collapsed");
+});
+
+test("code block box corners align with the vertical bars (fixed row width)", () => {
+  const code = "return { enable_kitty_keyboard = true }";
+  const md = renderMd("```lua\n" + code + "\n```", 63);
+  const top = md[0].map((g) => g.t).join("");
+  const content = md[1].map((g) => g.t).join("");
+  const bottom = md[2].map((g) => g.t).join("");
+  // the corner columns sit exactly above the right border column (columns,
+  // not code units: [复制] is 4 code units but 6 columns wide)
+  assert.equal(strWidth(top.slice(0, top.indexOf("┐"))), strWidth(content.slice(0, content.lastIndexOf("│"))), "top-right corner above the right border");
+  assert.equal(strWidth(bottom.slice(0, bottom.indexOf("┘"))), strWidth(content.slice(0, content.lastIndexOf("│"))), "bottom-right corner above the right border");
+  assert.equal(strWidth(top.slice(0, top.indexOf("┌"))), strWidth(content.slice(0, content.indexOf("│"))), "left corners aligned");
+  assert.equal(strWidth(bottom), strWidth(content), "bottom row exactly as wide as content rows");
+  // in the chat, a message that STARTS with a code box puts the 🐳 marker on
+  // its own line, so the box rows all share the same indent (no top-border
+  // shift from the marker)
+  const { chat } = render([
+    { kind: "assistant", id: "a2", step: 2, streaming: false, blocks: [{ kind: "text", text: "```lua\n" + code + "\n```" }] },
+  ]);
+  const rows = chat.lines.map((l) => l.map((g) => g.t).join(""));
+  const whaleRow = rows.find((r) => r.includes("🐳")) ?? "";
+  assert.ok(whaleRow.trim().endsWith("(step 2)") || /🐳\s*\(step 2\)\s*$/.test(whaleRow), `marker alone on its line: ${whaleRow}`);
+  const cTop = rows.find((r) => r.includes("┌")) ?? "";
+  const cContent = rows.find((r) => r.includes("│")) ?? "";
+  assert.equal(strWidth(cTop.slice(0, cTop.indexOf("┌"))), strWidth(cContent.slice(0, cContent.indexOf("│"))), "chat: left border aligned with the content indent");
+  assert.equal(strWidth(cTop.slice(0, cTop.indexOf("┐"))), strWidth(cContent.slice(0, cContent.lastIndexOf("│"))), "chat: top-right corner above the right border");
+});
+
+test("formal text blocks start with a 🐳 marker (vs 💭 think)", () => {
+  const { lines } = render([
+    { kind: "assistant", id: "a9", step: 3, streaming: false, blocks: [{ kind: "text", text: "hello output" }] },
+  ]);
+  const first = lines.find((l) => l.includes("hello output")) ?? "";
+  assert.ok(first.includes("🐳"), `whale present: ${first}`);
+  const think = render([
+    { kind: "assistant", id: "a10", step: 3, streaming: false, blocks: [{ kind: "reasoning", text: "thinking" }] },
+  ]);
+  const h = think.lines.find((l) => l.includes("💭")) ?? "";
+  assert.ok(h.includes("💭") && !h.includes("🐳"), "think header keeps 💭, no whale");
+});
+
+test("shipped defaults: think expanded, tool blocks collapsed", () => {
+  const app = fakeApp();
+  const chat = new ChatView({ app, x: 0, y: 1, w: 80, h: 24 });
+  assert.equal(chat.thinkMode, "expanded", "think default expanded");
+  assert.equal(chat.bashMode, "collapsed", "bash default collapsed");
+});
+
+test("release re-locates the pressed block when the stream re-derives the tail", () => {
+  const text = "unique reasoning content that identifies this block";
+  const { chat } = render([
+    { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [{ kind: "reasoning", text, done: true }] },
+    { kind: "assistant", id: "a2", step: 2, streaming: false, blocks: [{ kind: "reasoning", text: "other", done: true }] },
+  ]);
+  chat.thinkMode = "collapsed"; chat.expanded.clear(); chat.collapsedBlocks.clear();
+  chat.queueRebuild(); chat.flushRebuild();
+  const hdr = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("💭"));
+  const y = chat.view.y + (hdr - chat.view.scrollY);
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
+  // the stream re-derives: node 0's block objects are replaced AND a new
+  // node is inserted above, shifting the positional key 0:0 → 1:0
+  const moved = { ...chat.nodes[0], blocks: [{ kind: "reasoning", text, done: true }] };
+  chat.nodes = [{ kind: "user", id: "u0", step: 0, streaming: false, text: "new user node" }, moved, { ...chat.nodes[1] }];
+  chat.queueRebuild(); chat.flushRebuild();
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
+  assert.ok(chat.expanded.has("1:0"), "the re-located block toggled, not the stale position");
+  assert.ok(!chat.expanded.has("0:0"), "the stale positional key was not used");
 });
 
 test("user's own message keeps its newlines verbatim (hard breaks)", () => {
