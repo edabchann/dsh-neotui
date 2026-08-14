@@ -433,6 +433,7 @@ export class Input extends Widget {
         const row = start + Math.max(0, Math.min(h - 1, ev.y - this.y));
         const rx = ev.x - this.x - (row === 0 ? strWidth(this.prompt) : 1);
         this.cursor = this.#indexAtVisual(row, Math.max(0, rx));
+        this.#snapCursor();
       } else {
         const rx = ev.x - this.x - strWidth(this.prompt);
         let w = 0, idx = 0;
@@ -443,10 +444,24 @@ export class Input extends Widget {
           idx++;
         }
         this.cursor = idx;
+        this.#snapCursor();
       }
       return true;
     }
     return false;
+  }
+  /** The paste token is a single cursor unit: the caret never rests inside
+   *  its span — LEFT from the end hops to its start, RIGHT from the start
+   *  hops to its end, and clicks/moves snap to the nearest boundary.
+   *  dir: -1 = leftward movement → start, +1 = rightward → end, 0 = nearest. */
+  #snapCursor(dir = 0) {
+    const m = this.pasteMark;
+    if (!m) return;
+    if (this.cursor > m.start && this.cursor < m.end) {
+      if (dir < 0) this.cursor = m.start;
+      else if (dir > 0) this.cursor = m.end;
+      else this.cursor = this.cursor - m.start < m.end - this.cursor ? m.start : m.end;
+    }
   }
   /** Cancel the held-back paste AND its token. */
   #touch() { this.pendingPaste = null; this.pasteMark = null; }
@@ -490,23 +505,25 @@ export class Input extends Widget {
       case "delete":
         if (this.cursor < this.#cps().length) { this.#edit(this.cursor, this.cursor + 1); this.onChange?.(); }
         return true;
-      case "left": this.selectAll = false; this.cursor = Math.max(0, this.cursor - 1); return true;
-      case "right": this.selectAll = false; this.cursor = Math.min(this.#cps().length, this.cursor + 1); return true;
+      case "left": this.selectAll = false; this.cursor = Math.max(0, this.cursor - 1); this.#snapCursor(-1); return true;
+      case "right": this.selectAll = false; this.cursor = Math.min(this.#cps().length, this.cursor + 1); this.#snapCursor(1); return true;
       case "home": {
         if (this.multi) { const rows = this.#visualRows(); const { row } = this.#cursorVisual(); this.cursor = rows[row].start; }
         else this.cursor = 0;
+        this.#snapCursor();
         return true;
       }
       case "end": {
         if (this.multi) { const rows = this.#visualRows(); const { row } = this.#cursorVisual(); this.cursor = rows[row].end; }
         else this.cursor = this.#cps().length;
+        this.#snapCursor();
         return true;
       }
       case "up":
         if (this.multi) {
           const rows = this.#visualRows();
           const { row, col } = this.#cursorVisual();
-          if (row > 0) this.cursor = this.#indexAtVisual(row - 1, col);
+          if (row > 0) { this.cursor = this.#indexAtVisual(row - 1, col); this.#snapCursor(); }
         } else if (this.history.length) {
           this.histIdx = this.histIdx < 0 ? this.history.length - 1 : Math.max(0, this.histIdx - 1);
           this.setValue(this.history[this.histIdx] ?? "");
@@ -516,7 +533,7 @@ export class Input extends Widget {
         if (this.multi) {
           const rows = this.#visualRows();
           const { row, col } = this.#cursorVisual();
-          if (row < rows.length - 1) this.cursor = this.#indexAtVisual(row + 1, col);
+          if (row < rows.length - 1) { this.cursor = this.#indexAtVisual(row + 1, col); this.#snapCursor(); }
         } else if (this.histIdx >= 0) {
           this.histIdx++;
           if (this.histIdx >= this.history.length) { this.histIdx = -1; this.setValue(""); }

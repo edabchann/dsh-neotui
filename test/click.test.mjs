@@ -398,6 +398,15 @@ test("large pastes are two-stage (placeholder then full content, claude-code sty
   assert.equal(input.value, "[已复制 12 行内容]", "first paste shows the placeholder");
   assert.deepEqual([input.pasteMark?.start, input.pasteMark?.end], [0, 12], "token span tracked");
   assert.equal(toasts.at(-1), "再次 Ctrl+Shift+V 粘贴完整内容（Ctrl+L 展开输入栏）");
+  // cursor movement treats the token as ONE unit: [已复制…]| ← → |[已复制…]
+  assert.equal(input.cursor, 12, "cursor starts after the token");
+  input.onKey({ type: "key", name: "left" });
+  assert.equal(input.cursor, 0, "LEFT hops over the WHOLE token, not into it");
+  input.onKey({ type: "key", name: "right" });
+  assert.equal(input.cursor, 12, "RIGHT hops back over the whole token");
+  input.onKey({ type: "key", name: "left" });
+  input.onKey({ type: "key", name: "left" });
+  assert.equal(input.cursor, 0, "LEFT again stays at the start (no inside stop)");
   // stage 2: the SAME clipboard replaces the token with the full content
   input.onKey({ type: "text", text: big });
   assert.equal(input.value, big, "second paste inserts the full content");
@@ -409,9 +418,11 @@ test("large pastes are two-stage (placeholder then full content, claude-code sty
   input.onKey({ type: "key", name: "backspace" });
   assert.equal(input.value, "", "one backspace consumed the whole token");
   assert.equal(input.pendingPaste, null, "removing the token cancels the held paste");
-  // typing INSIDE the token replaces it whole (no partial editing)
+  // a forced cursor inside the token still edits it as one unit (safety net —
+  // movement can never park the cursor there)
+  input.setValue("");
   input.onKey({ type: "text", text: big });
-  input.onKey({ type: "key", name: "left" });
+  input.cursor = 6;
   input.onKey({ type: "key", name: "char", key: "x", text: "x", ctrl: false, alt: false, shift: false });
   assert.equal(input.value, "x", "typing inside replaced the whole token");
   // typing AFTER the token keeps it; the second paste still swaps only the token
