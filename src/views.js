@@ -860,7 +860,7 @@ export class ChatView extends Widget {
       case "session/title": this.title = frame.title ?? this.title; this.queueRebuild(); break;
       case "session/jobs": {
         this.running = (frame.jobs ?? []).some((j) => j.status === "running");
-        this.app.setJobs(frame.jobs ?? []);
+        this.app.setJobs(frame.jobs ?? [], frame.sessionId);
         break;
       }
       case "session/subscribed": {
@@ -1806,6 +1806,7 @@ export class App {
     this.toastMsg = null;
     this.toastUntil = 0;
     this.jobs = [];
+    this.jobsBySession = new Map(); // sessionId → latest session/jobs snapshot
     this.focused = null;
     this.provider = "";
     this.model = "";
@@ -1938,7 +1939,14 @@ export class App {
   }
 
   setStatus(msg) { this.statusMsg = msg; this.redraw(); }
-  setJobs(jobs) { this.jobs = jobs; this.layout(); this.redraw(); }
+  setJobs(jobs, sessionId = null) {
+    // snapshot buffered per session: the mux baseline arrives at connect
+    // time, possibly before the chat opens that session
+    if (sessionId != null) this.jobsBySession.set(sessionId, jobs);
+    if (sessionId == null || sessionId === this.currentSession) this.jobs = jobs;
+    this.layout();
+    this.redraw();
+  }
 
   #startPolling() {
     // Self-rescheduling so the interval actually tracks run state (a fixed
@@ -2019,7 +2027,6 @@ export class App {
       }
       case "session/event":
       case "session/title":
-      case "session/jobs":
       case "session/subscribed":
       case "session/queue":
         if (this.chat.sessionId === frame.sessionId) {
@@ -2027,6 +2034,13 @@ export class App {
         }
         // refresh list on title updates
         if (frame.type === "session/title") this.refreshSessions();
+        break;
+      case "session/jobs":
+        // buffer every session's snapshot even before it is opened (the
+        // connect-time baseline would otherwise be dropped by the filter
+        // below and the footer would stick at "0已完成")
+        this.setJobs(frame.jobs ?? [], frame.sessionId ?? null);
+        if (this.chat.sessionId === frame.sessionId) this.chat.onFrame(frame);
         break;
       case "session/projection":
         this.projections[frame.key] = frame.value;
@@ -2323,6 +2337,16 @@ export class App {
 
   async openSession(sessionId) {
     this.currentSession = sessionId;
+    // apply the buffered jobs snapshot; if this session's connect-time
+    // baseline was never seen, reconnect the mux to re-fetch it (the host
+    // re-pushes the full snapshot on every fresh mux connection)
+    const snap = this.jobsBySession.get(sessionId);
+    this.jobs = snap ?? [];
+    if (snap !== undefined) {
+      this.chat.running = snap.some((j) => j.status === "running");
+    } else if (this.api.connected && typeof this.api.refreshMux === "function") {
+      this.api.refreshMux();
+    }
     await this.chat.open(sessionId);
     this.loadFeedback();
     this.updateModel();

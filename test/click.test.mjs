@@ -349,6 +349,23 @@ test("the sidebar divider drags to resize the session pane", () => {
   assert.equal(app.focused, app.chat, "click routing restored after the drag");
 });
 
+test("session/jobs snapshots buffered before the session opens survive (footer counts)", async () => {
+  const app = headlessApp();
+  const jobs = Array.from({ length: 11 }, (_, i) => ({ id: `j${i}`, kind: "bash", label: `job ${i}`, status: "completed" }));
+  // the mux baseline arrives while NO session is open (the connect-time race)
+  app.injectFrame({ type: "session/jobs", sessionId: "s1", jobs });
+  assert.equal(app.jobs.length, 0, "not applied while no session is open");
+  assert.equal(app.jobsBySession.get("s1"), jobs, "snapshot buffered per session");
+  await app.openSession("s1");
+  assert.equal(app.jobs.length, 11, "buffered snapshot applied on open");
+  app.renderFrame();
+  const text = [...(app.status.rows[2]?.left ?? []), ...(app.status.rows[2]?.right ?? [])].map((s) => s.t).join(" ");
+  assert.ok(text.includes("11已完成"), text);
+  // opening a different session without a snapshot shows 0, not the stale 11
+  await app.openSession("s2");
+  assert.equal(app.jobs.length, 0, "no stale counts leak across sessions");
+});
+
 test("ESC interrupts a running turn with ONE press, from insert or normal", async () => {
   const app = headlessApp();
   const calls = [];

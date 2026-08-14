@@ -26,6 +26,7 @@ export class Api {
     this.onStateChange = onStateChange;
     this.ws = null;
     this.hostWs = null;
+    this.muxWs = null;
     this.closed = false;
     this.connected = false;
     this.retryDelay = 500;
@@ -82,7 +83,9 @@ export class Api {
   #connect(url, kind) {
     if (this.closed) return;
     const ws = new WebSocket(url);
-    (kind === "mux" ? this : this).ws = kind === "mux" ? ws : this.hostWs;
+    if (kind === "mux") this.muxWs = ws;
+    else this.hostWs = ws;
+    this.ws = ws; // most recent socket (for diagnostics)
     ws.onopen = () => {
       this.connected = true;
       this.retryDelay = 500;
@@ -130,10 +133,20 @@ export class Api {
     return body.result.value;
   }
 
+  /** Reconnect the mux stream. The host re-pushes the session baseline
+   *  (session/subscribed + session/jobs snapshots) on every fresh mux
+   *  connection, so this doubles as a "refresh jobs snapshots" request —
+   *  e.g. when the connect-time snapshot arrived before a session opened. */
+  refreshMux() {
+    if (this.closed) return;
+    try { this.muxWs?.close(); } catch {}
+    // the onclose handler reconnects with backoff
+  }
+
   close() {
     this.closed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    try { this.ws?.close(); } catch {}
+    try { this.muxWs?.close(); } catch {}
     try { this.hostWs?.close(); } catch {}
     try { this.rpcWs?.close(); } catch {}
   }

@@ -237,12 +237,13 @@ async function main() {
   if (app.jobs?.length) {
     lines = grid();
     const footer = lines.slice(-4).join(" ");
-    check("footer shows 后台任务 summary", /(没有任务正在后台运行|\d+ 个任务正在后台运行)/.test(footer), footer.trim().slice(-80));
+    check("footer shows 后台任务 summary", /(没\s*有\s*任\s*务\s*正\s*在\s*后\s*台\s*运\s*行|\d+\s*个\s*任\s*务\s*正\s*在\s*后\s*台\s*运\s*行)/.test(footer), footer.trim().slice(-90));
+    check("footer shows the completed count", /\d+\s*已\s*完\s*成/.test(footer), footer.trim().slice(-90));
     check("footer hint Ctrl+J 查看详情", footer.includes("Ctrl+J"));
     app.onEvent({ type: "key", name: "char", key: "j", text: "j", ctrl: true, alt: false, shift: false });
     lines = grid();
     check("Ctrl+J opens 后台任务 panel", app.overlay?.constructor?.name === "JobsPanel");
-    check("jobs panel titled 后台任务", lines.some((l) => l.includes("后台任务")));
+    check("jobs panel titled 后台任务", lines.some((l) => /后\s*台\s*任\s*务/.test(l)));
     if (app.overlay?.constructor?.name === "JobsPanel") {
       app.onEvent({ type: "key", name: "enter" });
       await sleep(300);
