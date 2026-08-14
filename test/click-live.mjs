@@ -92,14 +92,14 @@ async function main() {
   check("chat loaded with nodes", app.chat.nodes.length > 0, `${app.chat.nodes.length} nodes, userIdx=${userIdx}`);
   if (userIdx >= 0) {
     app.renderFrame(); // flush any queued rebuild so lineMap is current
-    // first NON-empty line marked with the user node = the prefix line
-    const li = app.chat.lineMap.findIndex((m, i) => m?.nodeIdx === userIdx && rowText(app.chat.lines[i]).trim() !== "");
+    // the user node's prefix line (any user node renders "  name > …" first)
+    const li = app.chat.lineMap.findIndex((m, i) => m?.nodeIdx === userIdx && /edabchann\s*>/.test(rowText(app.chat.lines[i])));
     if (li >= 0) {
       showChatLine(li);
       const prefixRow = app.chat.lines[li].map((g) => g.t).join("");
       check("user message shows 'name > ' prefix", prefixRow.startsWith("  edabchann > "), prefixRow.slice(0, 60));
       check("message text starts on the same line", prefixRow.trim().length > "  edabchann > ".length, prefixRow.slice(0, 60));
-      check("prefix line carries real content (no blank first line)", prefixRow.includes("还有三个需要的改动") || prefixRow.includes(">"), prefixRow.slice(0, 60));
+      check("prefix line carries real content (no blank first line)", /edabchann\s*>\s*\S/.test(prefixRow), prefixRow.slice(0, 60));
     }
   }
 
@@ -124,14 +124,24 @@ async function main() {
       await sleep(400);
       app.renderFrame();
       check("block collapsed after menu toggle", c.collapsedBlocks.has(key) && !before.has(key));
-      // toggle back
-      right(40, viewY);
-      lines = grid();
-      m = findRowRx(lines, /复\s*制\s*消\s*息/);
-      left(menuX(lines, m.y) + 3, m.y + 1);
-      await sleep(400);
-      app.renderFrame();
-      check("block re-expanded after second toggle", !c.collapsedBlocks.has(key));
+      // toggle back: the collapse re-anchors the viewport, so re-find the
+      // collapsed header (now "[b 展开]") each attempt
+      const hintRx = (label) => new RegExp("\\[b " + label.split("").join("\\s*") + "\\s*\\]");
+      let reexpanded = false;
+      for (let attempt = 0; attempt < 4 && !reexpanded; attempt++) {
+        lines = grid();
+        const hdr = findRowRx(lines, hintRx("展开"));
+        if (!hdr) { await sleep(500); continue; }
+        right(hdr.x + 1, hdr.y);
+        lines = grid();
+        m = findRowRx(lines, /复\s*制\s*消\s*息/);
+        if (!m) { await sleep(500); continue; }
+        left(menuX(lines, m.y) + 3, m.y + 1);
+        await sleep(500);
+        app.renderFrame();
+        reexpanded = !c.collapsedBlocks.has(key);
+      }
+      check("block re-expanded after second toggle", reexpanded);
     }
   }
 
@@ -146,13 +156,13 @@ async function main() {
     const m = findRowRx(lines, /复\s*制\s*消\s*息/);
     if (m) {
       left(menuX(lines, m.y) + 3, m.y + 2); // 转跳轨迹
-      await waitFor(() => app.mode === "trajectory" && app.trajectoryPanel?.steps?.length > 0 && app.trajectoryPanel.winLo != null, 30000, 400);
+      await waitFor(() => app.mode === "trajectory" && app.trajectoryPanel?.steps?.length > 0 && app.trajectoryPanel.winSeqLo != null, 30000, 400);
       await sleep(1500);
       lines = grid();
       check("switched to trajectory mode", app.mode === "trajectory");
       // the jump's async ensureLoaded may page for a while — retry the frame
       let exp = findRowRx(lines, /▾\s*step/);
-      for (let i = 0; i < 12 && !exp; i++) {
+      for (let i = 0; i < 24 && !exp; i++) {
         await sleep(500);
         lines = grid();
         exp = findRowRx(lines, /▾\s*step/);
@@ -165,8 +175,14 @@ async function main() {
         // left click toggles the step's 详细/简略 (the ▸/▾ triangle)
         const expandedBefore = app.trajectoryPanel.expandedSteps.size;
         left(step.x + 2, step.y);
+        await sleep(300);
+        let expandedAfter = app.trajectoryPanel.expandedSteps.size;
+        for (let attempt = 0; attempt < 3 && expandedAfter === expandedBefore; attempt++) {
+          left(step.x + 2, step.y);
+          await sleep(300);
+          expandedAfter = app.trajectoryPanel.expandedSteps.size;
+        }
         lines = grid();
-        const expandedAfter = app.trajectoryPanel.expandedSteps.size;
         check("left click toggles step expansion", expandedBefore > 0 && expandedAfter === 0, `${expandedBefore} → ${expandedAfter}`);
         check("no popup opened by left click", !lines.some((l) => /轨\s*迹\s*详\s*情/.test(l)));
         const collapsedRow = findRowRx(lines, /▸\s*step/);
@@ -247,9 +263,9 @@ async function main() {
     check("picker lists steps", app.overlay.items.length > 0, `${app.overlay.items.length} items`);
     const it = app.overlay.filtered()[0];
     app.overlay.onPick?.(it);
-    await waitFor(() => app.mode === "trajectory" && app.trajectoryPanel?.winLo != null, 10000, 300);
+    await waitFor(() => app.mode === "trajectory" && app.trajectoryPanel?.winSeqLo != null, 10000, 300);
     await sleep(800);
-    check("picker pick jumps to a trajectory window", app.mode === "trajectory" && app.trajectoryPanel?.winLo != null);
+    check("picker pick jumps to a trajectory window", app.mode === "trajectory" && app.trajectoryPanel?.winSeqLo != null);
   }
 
   console.log(`\nsummary: ${results.filter(([, ok]) => ok).length}/${results.length} passed`);

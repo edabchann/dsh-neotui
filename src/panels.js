@@ -556,12 +556,12 @@ export class TrajectoryPanel extends Widget {
     this.allEvents = [];
     this.sessionId = null;
     this.expandedSteps = new Set(); // step identity keys rendered 详细 (expanded)
-    this.flashStep = null;          // step NUMBER just jumped to (brief highlight)
+    this.flashKey = null;           // step key just jumped to (brief highlight)
     this.flashUntil = 0;
     this.loadPromise = null;        // dedupes concurrent load(currentSession)
     this.loadTarget = null;
-    this.winLo = null;              // visible step-number window [winLo, winHi]; null = follow the tail
-    this.winHi = null;
+    this.winSeqLo = null;           // visible window = first-event SEQ range; null = follow the tail
+    this.winSeqHi = null;
     // LEFT click toggles a step's 详细/简略 expansion (the ▸/▾ triangle).
     this.view = new ScrollView({ x: this.x, y: this.y, w: this.w, h: this.h, showScrollbar: true, onClick: (y) => this.#clickLine(y) });
     this.stepLines = [];
@@ -665,98 +665,127 @@ export class TrajectoryPanel extends Widget {
     return -1;
   }
 
-  /** Load older pages until step `loStep` is covered (or the session's first
-   *  step is reached). Used by jumps and Home — many pages when going far. */
-  async ensureLoaded(loStep, maxPages = 80) {
+  /** Load older pages until at least `minCount` steps are loaded (or the
+   *  session's first step is reached). Used by jumps and Home. */
+  async ensureCount(minCount, maxPages = 80) {
     for (let i = 0; i < maxPages; i++) {
-      if (!this.hasMore) break;
-      if (this.steps.length && this.steps[0].step <= loStep) break;
-      this.app.setStatus(`加载更早轨迹…（当前最早 step ${this.steps[0]?.step ?? "?"}）`);
+      if (!this.hasMore || this.steps.length >= minCount) break;
+      this.app.setStatus(`加载更早轨迹…（已加载 ${this.steps.length} 步）`);
       await this.loadOlder();
     }
     this.app.setStatus("");
   }
 
-  /** Set the visible step-number window and re-render. */
-  setWindow(lo, hi) {
-    this.winLo = lo;
-    this.winHi = hi;
+  /** The visible window is a SEQ RANGE (first-event seqs are globally unique
+   *  and monotonic; the server's step numbers restart after compactions and
+   *  cannot be used as boundaries). null = follow the tail (newest 20). */
+  setWindow(loSeq, hiSeq) {
+    this.winSeqLo = loSeq;
+    this.winSeqHi = hiSeq;
     this.buildLines();
   }
 
-  /** Step number at the top of the viewport (for anchoring after growth). */
-  #topVisibleStep() {
-    const si = this.stepLines[this.view.scrollY];
-    return si !== undefined ? this.steps[si]?.step : null;
+  /** Tail-follow window: the newest 20 loaded steps. */
+  #tailWindow() {
+    const n = this.steps.length;
+    if (n === 0) return;
+    const lo = Math.max(0, n - 20);
+    this.winSeqLo = this.stepKey(this.steps[lo]);
+    this.winSeqHi = this.stepKey(this.steps[n - 1]);
   }
 
-  /** Scroll so the given step number sits at the top of the viewport. */
-  #anchorScroll(stepNum) {
-    const li = this.stepLines.findIndex((si) => this.steps[si]?.step === stepNum);
-    if (li >= 0) this.view.scrollY = Math.max(0, li);
+  /** Seq of the step at the top of the viewport (for anchoring after growth). */
+  #topVisibleSeq() {
+    const si = this.stepLines[this.view.scrollY];
+    return si !== undefined ? this.stepKey(this.steps[si]) : null;
+  }
+
+  /** Scroll so the given step seq sits at the top of the viewport. */
+  #anchorScroll(seq) {
+    const li = this.stepLines.findIndex((si) => this.stepKey(this.steps[si]) === seq);
+    if (li >= 0) this.view.scrollY = Math.max(0, Math.min(li, this.view.maxScroll()));
   }
 
   /** Scroll to a step: open a ±20 window around it (loading older pages on
    *  demand), auto-expand and highlight the step. */
   async jumpToStep(si) {
     if (si < 0 || si >= this.steps.length) return;
-    const S = this.steps[si].step;
-    this.expandedSteps.add(this.stepKey(this.steps[si]));
-    this.flashStep = S;
+    const key = this.stepKey(this.steps[si]);
+    this.expandedSteps.add(key);
+    this.flashKey = key;
     this.flashUntil = Date.now() + 3000;
-    await this.ensureLoaded(Math.max(1, S - 20));
-    // ensureLoaded re-segments → re-find the step index by its number
-    const si2 = this.steps.findIndex((s) => s.step === S);
-    this.setWindow(Math.max(1, S - 20), Math.min(this.totalSteps(), S + 20));
-    const li = si2 >= 0 ? this.stepLines.indexOf(si2) : -1;
-    this.view.scrollY = li >= 0 ? Math.max(0, li - 2) : 0;
+    // load older pages until at least 20 steps sit above the target
+    for (let i = 0; i < 80 && this.hasMore; i++) {
+      if (this.steps.findIndex((s) => this.stepKey(s) === key) >= 20) break;
+      await this.loadOlder();
+    }
+    const idx = this.steps.findIndex((s) => this.stepKey(s) === key);
+    if (idx < 0) return;
+    const lo = Math.max(0, idx - 20), hi = Math.min(this.steps.length - 1, idx + 20);
+    this.setWindow(this.stepKey(this.steps[lo]), this.stepKey(this.steps[hi]));
+    const li = this.stepLines.indexOf(idx);
+    this.view.scrollY = li >= 0 ? Math.max(0, Math.min(li - 2, this.view.maxScroll())) : 0;
     this.app.redraw();
   }
 
   /** PgUp: extend the window 10 steps upward (loading older if needed),
    *  keeping the view anchored on the step that was at the top. */
   async extendUp() {
-    const N = this.totalSteps();
-    if (this.winLo == null) { this.winLo = Math.max(1, N - 19); this.winHi = N; }
-    if (this.winLo <= 1 && this.steps.length && this.steps[0].step <= 1) {
-      this.app.toast("已到最早步骤");
-      return;
+    if (this.winSeqLo == null) this.#tailWindow();
+    if (this.steps.length === 0) return;
+    let topIdx = this.steps.findIndex((s) => this.stepKey(s) === this.winSeqLo);
+    if (topIdx < 0) topIdx = 0;
+    if (topIdx === 0 && !this.hasMore) { this.app.toast("已到最早步骤"); return; }
+    // ensure at least 10 steps above the window top are loaded
+    for (let i = 0; i < 80 && this.hasMore && topIdx < 10; i++) {
+      await this.loadOlder();
+      topIdx = this.steps.findIndex((s) => this.stepKey(s) === this.winSeqLo);
     }
-    const anchor = this.#topVisibleStep() ?? this.winLo;
-    this.winLo = Math.max(1, this.winLo - 10);
-    if (!this.steps.length || this.steps[0].step > this.winLo) await this.ensureLoaded(this.winLo);
+    const anchorSeq = this.#topVisibleSeq();
+    this.winSeqLo = this.stepKey(this.steps[Math.max(0, topIdx - 10)]);
     this.buildLines();
-    this.#anchorScroll(anchor);
+    if (anchorSeq != null) this.#anchorScroll(anchorSeq);
     this.app.redraw();
   }
 
   /** PgDn: extend the window 10 steps downward (the newer steps are already
    *  loaded — the tail is always kept). */
   extendDown() {
-    const N = this.totalSteps();
-    if (this.winLo == null) { this.winLo = Math.max(1, N - 19); this.winHi = N; }
-    if (this.winHi >= N) { this.app.toast("已到最新步骤"); return; }
-    this.winHi = Math.min(N, this.winHi + 10);
+    if (this.winSeqLo == null) this.#tailWindow();
+    if (this.steps.length === 0) return;
+    let bottomIdx = this.steps.length - 1;
+    for (let i = this.steps.length - 1; i >= 0; i--) {
+      if (this.stepKey(this.steps[i]) <= this.winSeqHi) { bottomIdx = i; break; }
+    }
+    const target = Math.min(this.steps.length - 1, bottomIdx + 10);
+    if (target === bottomIdx) { this.app.toast("已到最新步骤"); return; }
+    this.winSeqHi = this.stepKey(this.steps[target]);
     this.buildLines();
     this.app.redraw();
   }
 
   /** Home: jump to the very first steps (loading all the way back). */
   async gotoHome() {
-    await this.ensureLoaded(1);
-    this.setWindow(1, 20);
-    const li = this.stepLines.findIndex((si) => this.steps[si]?.step === 1);
-    this.view.scrollY = li >= 0 ? li : 0;
-    this.app.toast("已跳到最早步骤（step 1–20）");
+    for (let i = 0; i < 80 && this.hasMore; i++) {
+      this.app.setStatus(`加载全部步骤…（已加载 ${this.steps.length} 步）`);
+      await this.loadOlder();
+    }
+    this.app.setStatus("");
+    if (this.steps.length === 0) return;
+    const hi = Math.min(19, this.steps.length - 1);
+    this.setWindow(this.stepKey(this.steps[0]), this.stepKey(this.steps[hi]));
+    this.view.scrollY = 0;
+    this.app.toast("已跳到最早步骤");
     this.app.redraw();
   }
 
   /** End: jump to the newest steps. */
   gotoEnd() {
-    const N = this.totalSteps();
-    this.setWindow(Math.max(1, N - 19), N);
+    if (this.steps.length === 0) return;
+    const lo = Math.max(0, this.steps.length - 20);
+    this.setWindow(this.stepKey(this.steps[lo]), this.stepKey(this.steps[this.steps.length - 1]));
     this.view.scrollY = this.view.maxScroll();
-    this.app.toast(`已跳到最新步骤（step ${Math.max(1, N - 19)}–${N}）`);
+    this.app.toast("已跳到最新步骤");
     this.app.redraw();
   }
 
@@ -773,7 +802,7 @@ export class TrajectoryPanel extends Widget {
     }
     if (si < 0 && messageId) {
       // still not found — the message is far back; scan everything (bounded)
-      await this.ensureLoaded(1, 60);
+      await this.ensureCount(Infinity, 60);
       si = this.indexOfMessage(messageId);
     }
     if (si >= 0) {
@@ -871,8 +900,17 @@ export class TrajectoryPanel extends Widget {
   buildLines() {
     const w = Math.max(40, this.w - 2);
     const N = this.totalSteps();
-    const lo = this.winLo ?? Math.max(1, N - 19);
-    const hi = this.winHi ?? N;
+    // Window boundaries are SEQ-based (step numbers restart after compaction).
+    let loSeq = this.winSeqLo, hiSeq = this.winSeqHi;
+    if (loSeq == null && this.steps.length) {
+      const lo = Math.max(0, this.steps.length - 20);
+      loSeq = this.stepKey(this.steps[lo]);
+      hiSeq = this.stepKey(this.steps[this.steps.length - 1]);
+    }
+    const winIdxLo = this.steps.findIndex((s) => this.stepKey(s) === loSeq);
+    const winIdxHi = this.steps.findIndex((s) => this.stepKey(s) === hiSeq);
+    const loStepNum = this.steps[winIdxLo]?.step ?? "?";
+    const hiStepNum = this.steps[winIdxHi]?.step ?? "?";
     const lines = [];
     lines.push([{ t: "轨迹 — 步骤时间轴（左键展开/折叠 · PgUp/PgDn 上下加载 · Home/End 首尾 · Ctrl+E 转跳 · r 刷新）", fg: K.ACCENT, bold: true }]);
     if (this.hasMore) lines.push([{ t: "▲ 更早步骤（点击 / PgUp 向上加载 10 步）", fg: K.FAINT }]);
@@ -881,7 +919,7 @@ export class TrajectoryPanel extends Widget {
     if (st) {
       lines.push([{ t: `回合 ${st.turns} · 步骤 ${st.steps} · LLM ${fmtMs(st.llmMs)} · 工具 ${fmtMs(st.toolMs)}`, fg: K.DIM }]);
     }
-    lines.push([{ t: `窗口 step ${lo}–${hi} · 共 ${N} 步${this.winLo == null ? "（跟随最新）" : ""}：`, fg: K.DIM, underline: true }]);
+    lines.push([{ t: `窗口 #${winIdxLo + 1}–#${winIdxHi + 1}（已加载 ${this.steps.length}${this.hasMore ? "+" : ""}）· step ${loStepNum}–${hiStepNum}${this.winSeqLo == null ? "（跟随最新）" : ""}：`, fg: K.DIM, underline: true }]);
     this.stepLines = [];
     const list = this.query
       ? this.steps.filter((t) => t.events.some((e) => {
@@ -889,7 +927,10 @@ export class TrajectoryPanel extends Widget {
         const hay = `${e.type} ${d.name ?? ""} ${typeof d.content === "string" ? d.content : ""}`.toLowerCase();
         return hay.includes(this.query.toLowerCase());
       }))
-      : this.steps.filter((s) => s.step >= lo && s.step <= hi);
+      : this.steps.filter((s) => {
+        const k = this.stepKey(s);
+        return k >= loSeq && k <= hiSeq;
+      });
     for (const step of list.reverse()) {
       const si = this.steps.indexOf(step);
       const tools = [...new Set(step.events.filter((e) => e.type === "tool/call").map((e) => e.data?.name))];
@@ -900,7 +941,7 @@ export class TrajectoryPanel extends Widget {
       const bg = tools.length ? (hasResult ? T.TOOLOK : T.TOOLBG) : hasReasoning ? T.THINKBG : T.CARD;
       const summary = tools.slice(0, 3).join(",") || (hasReasoning ? "模型推理" : "纯文本");
       const open = this.expandedSteps.has(this.stepKey(step));       // 详细
-      const flash = this.flashStep === step.step && Date.now() < this.flashUntil;
+      const flash = this.flashKey === this.stepKey(step) && Date.now() < this.flashUntil;
       const rowBg = flash ? T.ACCENT : bg;
       const label = `${open ? "▾" : "▸"} step ${String(step.step).padStart(3)}  ${pad(dur, 8)}  ${summary}  ${open ? "[折叠]" : "[展开]"}`;
       const segs = [{ t: label, fg: flash ? T.SELFG : K.TXT, bg: rowBg, bold: true }];
@@ -971,7 +1012,7 @@ export class TrajectoryPanel extends Widget {
     }
     if (ev.name === "backspace") { this.query = this.query.slice(0, -1); this.buildLines(); this.app.redraw(); return true; }
     if (ev.name === "char" && ev.key === "r" && !ev.ctrl) {
-      this.winLo = this.winHi = null;
+      this.winSeqLo = this.winSeqHi = null;
       this.steps = [];
       this.load(this.sessionId);
       return true;

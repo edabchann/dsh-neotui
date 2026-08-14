@@ -132,6 +132,40 @@ test("text block left-click collapses to a 3-line preview + trailer, click resto
   assert.ok(text2.includes("line four"), "full text back");
 });
 
+test("collapsing a long text block keeps the viewport anchored (no view jump)", () => {
+  // a long text block followed by plenty of later nodes so the buffer stays
+  // scrollable after the collapse
+  const longText = Array.from({ length: 100 }, (_, i) => `para ${i}`).join("\n\n");
+  const tail = Array.from({ length: 40 }, (_, i) => ({
+    kind: "assistant", id: `t${i}`, step: 2 + i, streaming: false,
+    blocks: [{ kind: "text", text: `tail-node-${i}` }],
+  }));
+  const { chat } = render([
+    { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [{ kind: "text", text: longText }] },
+    ...tail,
+  ]);
+  // scroll so a MIDDLE line of the long block is at the top of the viewport
+  const clicked = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 50"));
+  assert.ok(clicked >= 0);
+  chat.view.scrollY = clicked;
+  const topKey = () => {
+    const m = chat.lineMap[chat.view.scrollY];
+    return `${m?.nodeIdx}:${m?.blockIdx ?? "n"}`;
+  };
+  assert.equal(topKey(), "0:0", "viewport starts inside the long text block");
+  assert.ok(chat.view.maxScroll() > 0, "buffer stays scrollable after collapse");
+  const clickY = chat.view.y + (clicked - chat.view.scrollY);
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y: clickY });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y: clickY });
+  assert.ok(chat.collapsedBlocks.has("0:0"), "collapsed");
+  // the viewport must stay on the SAME block (its header now) — not flung to
+  // unrelated content
+  assert.equal(topKey(), "0:0", "viewport stays anchored on the clicked block");
+  const topText = chat.lines[chat.view.scrollY].map((g) => g.t).join("");
+  assert.ok(topText.includes("▸"), "block header (collapsed glyph) at the top");
+  assert.ok(!topText.includes("tail-node"), "did not jump past the block");
+});
+
 test("expanded think renders the WHOLE reasoning, collapsed only a preview", () => {
   const long = "开头\n\n" + "A".repeat(4000) + "ENDMARKER";
   const { chat, lines } = render([{
@@ -442,52 +476,65 @@ async function trajWindow(stepsTotal) {
   return { app, panel };
 }
 
+/** Step numbers currently rendered in the window (extracted from the rows). */
+function winNums(panel) {
+  const out = [];
+  for (const l of panel.view.lines) {
+    for (const g of l) {
+      const m = /^[▾▸] step\s+(\d+)/.exec(g.t ?? "");
+      if (m) out.push(Number(m[1]));
+    }
+  }
+  return out;
+}
+
 test("trajectory window: initial tail window + PgUp/PgDn/Home/End", async () => {
   const { app, panel } = await trajWindow(60);
   assert.equal(panel.steps.length, 20, "initial page = 20 steps");
-  assert.equal(panel.winLo, null, "starts in tail-follow mode");
-  assert.equal(panel.winHi, null);
+  assert.equal(panel.winSeqLo, null, "starts in tail-follow mode");
+  assert.equal(panel.winSeqHi, null);
 
-  // jump to step 50 (loaded) → window [30, 60]; loading older pages as needed
+  // jump to step 50 (loaded) → window = the 20 neighbors on each side (30..60)
   const si = panel.steps.findIndex((s) => s.step === 50);
   assert.ok(si >= 0, "step 50 in the initial page");
   await panel.jumpToStep(si);
-  assert.equal(panel.winLo, 30);
-  assert.equal(panel.winHi, 60);
-  assert.ok(panel.steps[0].step <= 30, "older pages loaded down to window edge");
+  let nums = winNums(panel);
+  assert.ok(nums.includes(30) && nums.includes(60) && !nums.includes(29), `window 30..60, got ${nums[0]}..${nums[nums.length - 1]}`);
 
   // PgDn at the newest edge is a no-op with a toast
   panel.extendDown();
-  assert.equal(panel.winHi, 60);
   assert.ok(app.toastMsg?.includes("最新"), "toast says already at newest");
 
   // PgUp extends the window up by 10 each time
   await panel.extendUp();
-  assert.equal(panel.winLo, 20);
+  nums = winNums(panel);
+  assert.ok(nums.includes(20) && !nums.includes(19), `window starts at 20, got ${nums[0]}..${nums[nums.length - 1]}`);
   await panel.extendUp();
-  assert.equal(panel.winLo, 10);
+  nums = winNums(panel);
+  assert.ok(nums.includes(10) && !nums.includes(9));
   await panel.extendUp();
-  assert.equal(panel.winLo, 1);
+  nums = winNums(panel);
+  assert.ok(nums.includes(1), "window reaches step 1");
 
   // PgUp at the very start is a no-op
   await panel.extendUp();
-  assert.equal(panel.winLo, 1);
   assert.ok(app.toastMsg?.includes("最早"), "toast says already at earliest");
 
-  // Home → step 1–20 window, End → newest 20
+  // Home → first 20 steps, End → newest 20
   await panel.gotoHome();
-  assert.equal(panel.winLo, 1);
-  assert.equal(panel.winHi, 20);
+  nums = winNums(panel);
+  assert.ok(nums.includes(1) && nums.includes(20) && !nums.includes(21), "Home shows steps 1–20");
   panel.gotoEnd();
-  assert.equal(panel.winLo, 41);
-  assert.equal(panel.winHi, 60);
+  nums = winNums(panel);
+  assert.ok(nums.includes(41) && nums.includes(60) && !nums.includes(40), "End shows steps 41–60");
 });
 
 test("trajectory window: PgUp from tail-follow switches to a manual window", async () => {
   const { panel } = await trajWindow(40);
   await panel.extendUp();
-  assert.equal(panel.winLo, 11);
-  assert.equal(panel.winHi, 40);
+  const nums = winNums(panel);
+  assert.ok(nums.includes(11) && !nums.includes(10), `window starts at 11, got ${nums[0]}..${nums[nums.length - 1]}`);
+  assert.ok(nums.includes(40), "tail edge preserved");
 });
 
 // ---- jobs: footer summary + JobsPanel expand/collapse ----

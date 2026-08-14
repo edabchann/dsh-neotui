@@ -848,6 +848,25 @@ export class ChatView extends Widget {
         if (ref) { this.app.openImage(ref, { all: node.images, index: info.imgIdx }); return true; }
       }
       const node = this.nodes[info.nodeIdx];
+      // Expand/collapse changes the line count ABOVE the viewport, which would
+      // leave scrollY pointing at unrelated content (the "chaotic" jump).
+      // Anchor: after the rebuild, scroll so the clicked block's first line
+      // sits at the top of the viewport. At the bottom the tail-follow snap
+      // in setLines is the right behavior instead.
+      const wasAtBottom = this.view.scrollY + this.view.h >= this.view.lines.length - 1;
+      const reanchor = (match) => {
+        if (wasAtBottom) return;
+        let fallback = -1;
+        for (let i = 0; i < this.lineMap.length; i++) {
+          if (!match(this.lineMap[i])) continue;
+          if ((this.lines[i] ?? []).some((g) => g.t.trim() !== "")) {
+            this.view.scrollY = Math.max(0, Math.min(i, this.view.maxScroll()));
+            return;
+          }
+          if (fallback < 0) fallback = i;
+        }
+        if (fallback >= 0) this.view.scrollY = Math.max(0, Math.min(fallback, this.view.maxScroll()));
+      };
       if (node?.kind === "assistant" && info.blockIdx !== null) {
         const b = node.blocks[info.blockIdx];
         if (b && (b.kind === "tool" || b.kind === "reasoning" || b.kind === "other" || b.kind === "text")) {
@@ -862,6 +881,7 @@ export class ChatView extends Widget {
             else this.collapsedBlocks.add(key);
           }
           this.#rebuild();
+          reanchor((m) => m?.nodeIdx === info.nodeIdx && m?.blockIdx === info.blockIdx);
           return true;
         }
       }
@@ -869,6 +889,7 @@ export class ChatView extends Widget {
         if (this.expanded.has(info.nodeIdx)) this.expanded.delete(info.nodeIdx);
         else this.expanded.add(info.nodeIdx);
         this.#rebuild();
+        reanchor((m) => m?.nodeIdx === info.nodeIdx);
         return true;
       }
     }
