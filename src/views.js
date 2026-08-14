@@ -1511,10 +1511,18 @@ export class App {
   setJobs(jobs) { this.jobs = jobs; this.layout(); this.redraw(); }
 
   #startPolling() {
-    this.pollTimer = setInterval(() => {
+    // Self-rescheduling so the interval actually tracks run state (a fixed
+    // setInterval would freeze at the idle 1500ms forever).
+    let ticks = 0;
+    const tick = () => {
       if (this.chat.sessionId) this.chat.pollTail();
-      this.refreshSessions();
-    }, this.chat.pollSlow ? 2000 : (this.chat.running ? 500 : 1500));
+      // session.list is expensive (~100ms); refresh the sidebar every ~5s, not
+      // on every streaming poll.
+      if (ticks++ % 10 === 0) this.refreshSessions();
+      const delay = this.chat.pollSlow ? 2000 : (this.chat.running ? 500 : 1500);
+      this.pollTimer = setTimeout(tick, delay);
+    };
+    this.pollTimer = setTimeout(tick, 500);
   }
 
   async init() {
@@ -2007,9 +2015,6 @@ export class App {
       tx += strWidth(seg);
     }
     if (this.currentSession == null) s.text(x + w - 16, 0, "未选会话", { fg: T.FAINT, bg: T.PANEL });
-    const modeLabel = this.focused === this.chat?.input ? " INSERT " : " NORMAL ";
-    const modeColor = this.focused === this.chat?.input ? T.OK : T.FAINT;
-    s.text(x + w - strWidth(modeLabel), 0, modeLabel, { fg: modeColor, bg: T.PANEL, attrs: 1 });
   }
 
   #clickTab(px) {
@@ -2135,6 +2140,19 @@ export class App {
     }
     // global keys
     if (ev.type === "key") {
+      // INSERT mode: Esc exits, everything else goes to the input for editing.
+      // Global shortcuts (Ctrl+P, Ctrl+B, F7, …) are disabled here so plain
+      // typing and Ctrl+J / Shift+Enter newlines behave like a normal editor.
+      if (this.focused === this.chat.input) {
+        if (ev.name === "escape") {
+          this.focus(this.chat);
+          this.toast("已退出输入（i 重新进入）");
+        } else {
+          this.chat.input.onKey(ev);
+        }
+        this.redraw();
+        return;
+      }
       if (this.searchActive && (ev.ctrl && ev.key === " " || ev.name === "f7")) {
         this.overlay = new ControlPanel(this, { startPage: 0 });
         this.redraw();
@@ -2174,11 +2192,13 @@ export class App {
       if (ev.name === "char" && ev.key === "/" && !ev.ctrl && this.focused !== this.chat.input) { this.startSearch(); this.redraw(); return; }
       if (ev.name === "char" && ev.key === "n" && !ev.ctrl && this.focused === this.sidebar) { this.newSession(); return; }
       if (ev.name === "escape") {
-        if (this.focused === this.chat.input) {
-          this.focus(this.chat);
-          this.toast("已退出输入（i 重新进入）");
-          this.redraw();
-        } else if (this.focused === this.sidebar) { this.focus(this.chat); this.redraw(); }
+        if (this.focused === this.sidebar) { this.focus(this.chat); this.redraw(); }
+        else {
+          // Esc in NORMAL mode interrupts a running turn (insert→normal→interrupt).
+          const cur = this.sessions.find((s) => s.sessionId === this.currentSession);
+          if (cur?.running) { this.cancelSession(cur); this.toast("已请求中断当前回合"); }
+          else if (this.mode !== "chat") this.setMode("chat");
+        }
         return;
       }
       if (ev.name === "char" && ev.key === "i" && this.focused === this.sidebar) { this.focus(this.chat.input); this.redraw(); return; }
@@ -2297,6 +2317,10 @@ export class App {
     const rows = [];
     // ── row 0: identity ──
     const row0 = { left: [], right: [] };
+    // Editing-mode badge first (near the input at the bottom): INSERT is loud,
+    // NORMAL is subtle — the user's eyes are at the input line, not the top.
+    const editing = this.focused === this.chat?.input;
+    row0.left.push({ t: editing ? " INSERT " : " NORMAL ", fg: editing ? T.OK : T.FAINT, bg: T.STATUSBG, bold: editing });
     // Left badge: the session's permission/mode (e.g. "工作区写入/创造模式"),
     // which is far more meaningful than a static "工作区" label.
     const perm = this.projections.permissions?.currentValue;

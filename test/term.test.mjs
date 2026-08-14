@@ -97,6 +97,10 @@ console.log("term.js decoder tests:");
   check("alt+x", events[0], { type: "key", name: "char", key: "x", text: "x", ctrl: false, alt: true, shift: false });
 }
 {
+  const { events } = harness("\x1b");
+  check("bare ESC = escape key", events[0], { type: "key", name: "escape", ctrl: false, alt: false, shift: false });
+}
+{
   const { events } = harness("\x1b[200~paste me\x1b[201~");
   check("bracketed paste passes text", events[0], { type: "text", text: "paste me" });
 }

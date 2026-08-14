@@ -496,6 +496,15 @@ export class TrajectoryPanel extends Widget {
     this.buildLines();
   }
   async load(sessionId) {
+    // Re-entry into the same session reuses the already-built steps — instant,
+    // like the web view (which keeps its timeline in memory). A fresh session
+    // or an explicit refresh (r) re-fetches the recent window.
+    if (this.sessionId === sessionId && this.steps.length > 0) {
+      this.loading = false;
+      this.buildLines();
+      this.app.redraw();
+      return;
+    }
     this.sessionId = sessionId;
     this.loading = true;
     this.steps = [];
@@ -506,8 +515,8 @@ export class TrajectoryPanel extends Widget {
     this.app.setStatus("加载轨迹…");
     try {
       // One bounded call for the recent steps (maxMessages = model messages =
-      // steps). Instant, and older steps load on demand via PgUp/click.
-      const h = await this.app.api.call("session.history", { sessionId, maxMessages: 40 });
+      // steps). Older steps load on demand via PgUp/click.
+      const h = await this.app.api.call("session.history", { sessionId, maxMessages: 20 });
       this.stats = h.projections?.values?.sessionStats ?? null;
       this.minSeq = h.events[0]?.event?.seq ?? null;
       this.hasMore = h.hasMore;
@@ -557,7 +566,7 @@ export class TrajectoryPanel extends Widget {
   buildLines() {
     const w = Math.max(40, this.w - 2);
     const lines = [];
-    lines.push([{ t: "轨迹 — 步骤时间轴（每行一个色块，点击查看详情）", fg: K.ACCENT, bold: true }]);
+    lines.push([{ t: "轨迹 — 步骤时间轴（每行一个色块，点击查看详情 · r 刷新）", fg: K.ACCENT, bold: true }]);
     if (this.hasMore) lines.push([{ t: "▲ 更早步骤（点击 / PgUp 加载）", fg: K.FAINT }]);
     else lines.push([{ t: "" }]);
     const st = this.stats;
@@ -609,6 +618,7 @@ export class TrajectoryPanel extends Widget {
       return true;
     }
     if (ev.name === "backspace") { this.query = this.query.slice(0, -1); this.buildLines(); this.app.redraw(); return true; }
+    if (ev.name === "char" && ev.key === "r" && !ev.ctrl) { this.steps = []; this.load(this.sessionId); return true; }
     if (ev.name === "pgup") { if (this.view.scrollY === 0 && this.hasMore) { this.loadOlder(); return true; } return this.view.scroll(-this.view.h); }
     if (ev.name === "pgdn" || ev.name === "up" || ev.name === "down") return this.view.onKey(ev);
     return false;

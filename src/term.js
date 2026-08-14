@@ -128,7 +128,13 @@ export class Term {
           if (cp === 13) this.#emit({ type: "key", name: "enter", ctrl: false, alt: true, shift: false });
           else this.#emit({ type: "key", name: "char", key: next.toLowerCase(), text: next, ctrl: false, alt: true, shift: false });
           i += 2;
-        } else { i = buf.length; break; }
+        } else {
+          // Lone ESC at end of buffer = the standalone Escape key. Terminals
+          // deliver escape sequences atomically, so a bare \x1b is never the
+          // head of a sequence that will arrive in a later chunk.
+          this.#emit({ type: "key", name: "escape", ctrl: false, alt: false, shift: false });
+          i++;
+        }
       } else if (ch === "\r") {
         this.#emit({ type: "key", name: "enter", ctrl: false, alt: false, shift: false });
         i++;

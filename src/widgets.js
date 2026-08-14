@@ -401,6 +401,7 @@ export class Input extends Widget {
         this.insert(ev.text);
         return true;
       case "enter":
+        if (ev.shift && this.multi) { this.insert("\n"); return true; }  // Shift+Enter = newline
         if (this.value.trim() === "" && !this.allowEmptyEnter) return false;
         const v = this.value;
         this.history.push(v);
