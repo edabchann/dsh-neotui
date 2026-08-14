@@ -1365,7 +1365,7 @@ export class ChatView extends Widget {
         this.pressCtx = this.pressInfo ? this.#anchorCtx(this.pressInfo, this.pressY) : null;
         if (process.env.DSH_TUI_DEBUG_CLICK) {
           const t = this.lines[this.pressY]?.map((g) => g.t).join("") ?? "";
-          this.#clickLog(`press screenY=${ev.y} screenX=${ev.x} lineIdx=${this.pressY} mark=${JSON.stringify(this.pressInfo)} text="${t.slice(0, 40)}" scrollY=${this.view.scrollY} viewY=${this.view.y} viewH=${this.view.h}`);
+          this.#clickLog(`press screenY=${ev.y} screenX=${ev.x} lineIdx=${this.pressY} mark=${JSON.stringify(this.pressInfo)} text="${t.slice(0, 40)}" scrollY=${this.view.scrollY} viewY=${this.view.y} viewH=${this.view.h} assumedH=${this.app.screen?.h} assumedW=${this.app.screen?.w} ttyRows=${process.stdout.rows} ttyCols=${process.stdout.columns} inputY=${this.input.y} inputH=${this.input.h} todoH=${this.todoHeight()} footerH=${this.app.footerHeight?.() ?? "?"}`);
         }
         return true;
       }
