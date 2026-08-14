@@ -637,7 +637,7 @@ test("orphaned tool results are labeled 结果未保留, not the ambiguous 无�
   chat.bashMode = "expanded";
   chat.queueRebuild(); chat.flushRebuild();
   const text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
-  assert.ok(text.includes("结果未保留,耗时 3秒"), text);
+  assert.ok(text.includes("结果未保留,耗时 ≤3秒"), text);
   assert.ok(!text.includes("无结果"), "the ambiguous label is gone");
   const hdr = text.split("\n").find((l) => l.includes("bash")) ?? "";
   assert.ok(!hdr.includes("✗") && !hdr.includes("失败"), `header is not a failure: ${hdr}`);

@@ -1318,7 +1318,10 @@ export class ChatView extends Widget {
               if (running) {
                 timing = ` 已经过 ${fmtDuration(Date.now() - (b.startedAt ?? Date.now()))}`;
               } else if (b.startedAt !== undefined && b.endedAt !== undefined) {
-                timing = ` ${failed ? "失败" : orphan ? "结果未保留" : "已完成"},耗时 ${fmtDuration(b.endedAt - b.startedAt)}`;
+                // orphan note: the tool's own end timestamp was pruned WITH
+                // its result, so endedAt here is the step-end stamp — the
+                // duration is an upper bound, shown as ≤.
+                timing = ` ${failed ? "失败" : orphan ? "结果未保留" : "已完成"},耗时 ${orphan ? "≤" : ""}${fmtDuration(b.endedAt - b.startedAt)}`;
               } else if (orphan) {
                 timing = " 结果未保留";
               }
