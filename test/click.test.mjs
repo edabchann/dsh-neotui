@@ -772,6 +772,35 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
   }
 });
 
+test("ModelPanel navigation: ↑/↓ always walk the provider column, Tab/← move in the form", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  app.api.call = async (m) => (m === "settings.describe"
+    ? { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { a: { displayName: "A" }, b: { displayName: "B" } } } }], writable: true }
+    : {});
+  const panel = new ModelPanel(app);
+  await panel.load();
+  assert.deepEqual(panel.routes, ["a", "b"]);
+  // ↓ reaches the ＋ 添加供应商 row (routes.length), ↑ comes back
+  panel.onKey({ type: "key", name: "down" });
+  panel.onKey({ type: "key", name: "down" });
+  assert.equal(panel.sel, 2, "two downs reach the add row");
+  panel.onKey({ type: "key", name: "up" });
+  assert.equal(panel.sel, 1, "up walks back to provider b");
+  // Enter opens the form; ↑ from the FORM still walks the provider column
+  panel.onKey({ type: "key", name: "enter" });
+  assert.equal(panel.mode, "form", "Enter opened the provider form");
+  panel.onKey({ type: "key", name: "down" });
+  assert.equal(panel.sel, 2, "↓ from the form moves the provider cursor, reaching the add row");
+  assert.equal(panel.mode, "list", "and returns the focus to the list");
+  // Tab enters the form; ← at the top returns to the list
+  panel.sel = 0;
+  panel.onKey({ type: "key", name: "tab" });
+  assert.equal(panel.mode, "form");
+  panel.onKey({ type: "key", name: "left" });
+  assert.equal(panel.mode, "list", "← at the top of the form returns to the list");
+});
+
 test("finalized think blocks keep their start time and turns carry their total", () => {
   const events = [
     { event: { type: "turn/start", seq: 1, time: 1000, data: {} }, view: null },
