@@ -183,8 +183,25 @@ setTimeout(() => {
         setTimeout(() => {
           check("split SGR mouse reassembled", events[0], { type: "mouse", kind: "press", button: 0, x: 10, y: 5, ctrl: false, shift: false, alt: false, motion: false });
           term.stop();
-          console.log(`\n${pass} passed, ${fail} failed`);
-          process.exit(fail > 0 ? 1 : 0);
+          // a large bracketed paste arriving in arbitrary chunks (even the
+          // END marker split) must emit ONE text event — the input's
+          // two-stage paste depends on seeing the whole clipboard at once
+          {
+            const input2 = new PassThrough();
+            const events2 = [];
+            const term2 = new Term({ input: input2, output: { write: () => true }, onEvent: (e) => events2.push(e) });
+            term2.start();
+            input2.write("\x1b[200~line one\nline two\nline t");
+            input2.write("hree\x1b[20");
+            input2.write("1~tail");
+            setTimeout(() => {
+              check("chunked bracketed paste = one text event", events2[0], { type: "text", text: "line one\nline two\nline three" });
+              check("text after paste parses normally", events2[1], { type: "text", text: "tail" });
+              term2.stop();
+              console.log(`\n${pass} passed, ${fail} failed`);
+              process.exit(fail > 0 ? 1 : 0);
+            }, 70);
+          }
         }, 70);
       }
     }, 70);

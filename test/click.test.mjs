@@ -429,6 +429,24 @@ test("Ctrl+L expands/collapses the input past the 6-line cap", () => {
   assert.ok(input.height() <= 6, "back to the 6-line cap");
 });
 
+test("end-to-end: a bracketed paste through the term reaches the two-stage input", async () => {
+  const { PassThrough } = await import("node:stream");
+  const { Term } = await import("../src/term.js");
+  const app = headlessApp();
+  const term = new Term({ input: new PassThrough(), output: { write: () => true }, onEvent: (ev) => app.onEvent(ev) });
+  app.term = term;
+  term.start();
+  app.focus(app.chat.input);
+  const big = Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n");
+  term.input.write("\x1b[200~" + big + "\x1b[201~");
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(app.chat.input.value, "[已复制 20 行内容]", "first paste shows the placeholder");
+  term.input.write("\x1b[200~" + big + "\x1b[201~");
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(app.chat.input.value, big, "second paste inserts the full content");
+  term.stop();
+});
+
 test("a mouse report split across chunks never becomes input text", async () => {
   const { PassThrough } = await import("node:stream");
   const { Term } = await import("../src/term.js");

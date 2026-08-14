@@ -35,6 +35,7 @@ export class Term {
     this.buf = "";
     this.started = false;
     this.pasteBuf = null;
+    this.pasting = false;  // inside a bracketed paste (200~ … 201~)
     this.w = (output.columns || 80); this.h = (output.rows || 24);
   }
 
@@ -108,8 +109,31 @@ export class Term {
 
   #parse() {
     const buf = this.buf;
+    const PASTE_END = "\x1b[201~";
     let i = 0;
     while (i < buf.length) {
+      // Inside a bracketed paste: collect raw content up to the END marker
+      // and emit it as ONE text event — otherwise a large paste arrives as
+      // many small text chunks and the input's two-stage paste never fires.
+      if (this.pasting) {
+        const end = buf.indexOf(PASTE_END, i);
+        if (end === -1) {
+          // keep any partial END-marker suffix in the buffer for reassembly
+          let keep = 0;
+          for (let k = 1; k < PASTE_END.length; k++) {
+            if (buf.length - k >= 0 && buf.endsWith(PASTE_END.slice(0, k))) keep = k;
+          }
+          this.pasteBuf += buf.slice(i, buf.length - keep);
+          i = buf.length - keep;
+          break;
+        }
+        this.pasteBuf += buf.slice(i, end);
+        this.pasting = false;
+        this.#emit({ type: "text", text: this.pasteBuf });
+        this.pasteBuf = "";
+        i = end + PASTE_END.length;
+        continue;
+      }
       const ch = buf[i];
       if (ch === "\x1b") {
         // escape sequence
@@ -262,6 +286,13 @@ export class Term {
         return;
       }
       const [n = 0, mod = 1] = nums;
+      if (n === 200) { this.pasting = true; this.pasteBuf = ""; return; } // bracketed paste START
+      if (n === 201) { // bracketed paste END (normally consumed by the collector)
+        this.pasting = false;
+        if (this.pasteBuf !== "") this.#emit({ type: "text", text: this.pasteBuf });
+        this.pasteBuf = "";
+        return;
+      }
       const name = TILDE_NAMES[n];
       if (!name) return;
       const ctrl = !!(mod - 1 & 4), alt = !!(mod - 1 & 2), shift = !!(mod - 1 & 1);
