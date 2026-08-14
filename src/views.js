@@ -836,8 +836,35 @@ export class ChatView extends Widget {
   }
 
   #clickLine(y, ev) {
+    // Capture the viewport geometry BEFORE any flush: the flush can grow the
+    // streaming tail (and atBottom snaps the view 1–2 rows), so anchoring on
+    // the post-flush state would reproduce exactly the shift the user saw.
+    // The pre-flush lineMap is what the user clicked on.
+    const lineKey = (m) => (m ? `${m.nodeIdx}:${m.blockIdx ?? "n"}` : null);
+    const topKey = lineKey(this.lineMap?.[this.view.scrollY]) ?? null;
+    let topFirst = -1;
+    if (topKey !== null) {
+      for (let i = 0; i < this.lineMap.length; i++) {
+        if (lineKey(this.lineMap[i]) === topKey) { topFirst = i; break; }
+      }
+    }
+    const topOffset = topFirst >= 0 ? this.view.scrollY - topFirst : 0;
+    // the clicked block's header (first non-empty line with its mark) and its
+    // pre-click viewport row — the PRIMARY anchor: keep the clicked thing put
+    const preInfo = this.lineMap?.[y];
+    const clickedMatch = preInfo?.blockIdx !== null
+      ? (m) => m?.nodeIdx === preInfo?.nodeIdx && m?.blockIdx === preInfo?.blockIdx
+      : (m) => m?.nodeIdx === preInfo?.nodeIdx;
+    const firstNonEmpty = (match) => {
+      for (let i = 0; i < this.lineMap.length; i++) {
+        if (match(this.lineMap[i]) && (this.lines[i] ?? []).some((g) => g.t.trim() !== "")) return i;
+      }
+      return -1;
+    };
+    const preHeaderIdx = preInfo ? firstNonEmpty(clickedMatch) : -1;
+    const preHeaderRow = preHeaderIdx >= 0 ? preHeaderIdx - this.view.scrollY : null;
     // A queued (deferred) rebuild would leave lineMap one frame behind the
-    // nodes array; flush first so the click maps to the CURRENT node/block.
+    // nodes array; flush now so the click maps to the CURRENT node/block.
     this.flushRebuild();
     // map rendered line back to node via cached line→node map
     const info = this.lineMap?.[y];
@@ -848,22 +875,20 @@ export class ChatView extends Widget {
         if (ref) { this.app.openImage(ref, { all: node.images, index: info.imgIdx }); return true; }
       }
       const node = this.nodes[info.nodeIdx];
-      // Expand/collapse changes the line count ABOVE the viewport, which would
-      // leave scrollY pointing at unrelated content. Anchor: remember the
-      // viewport-top line's identity AND its offset within that block, then
-      // restore the same position after the rebuild — the view does not move
-      // at all when the top line survives (e.g. clicking a block header), and
-      // lands on the fold's last line when the top line itself was collapsed.
-      const lineKey = (m) => (m ? `${m.nodeIdx}:${m.blockIdx ?? "n"}` : null);
-      const topKey = lineKey(this.lineMap[this.view.scrollY]);
-      let topFirst = -1;
-      if (topKey !== null) {
-        for (let i = 0; i < this.lineMap.length; i++) {
-          if (lineKey(this.lineMap[i]) === topKey) { topFirst = i; break; }
-        }
-      }
-      const topOffset = topFirst >= 0 ? this.view.scrollY - topFirst : 0;
+      // Expand/collapse changes the line count around the click. Primary
+      // anchor: the clicked block's header stays at its pre-click viewport
+      // row (zero shift). Fallback (header was above the viewport — a deep
+      // content click): restore the pre-click viewport-top position.
       const reanchor = () => {
+        // primary anchor applies only when the header was ON-SCREEN (a deep
+        // content click has the header above the viewport — use the fallback)
+        if (preHeaderRow !== null && preHeaderRow >= 0 && preHeaderIdx >= 0) {
+          const h2 = firstNonEmpty((m) => m?.nodeIdx === info.nodeIdx && m?.blockIdx === info.blockIdx);
+          if (h2 >= 0) {
+            this.view.scrollY = Math.max(0, Math.min(h2 - preHeaderRow, this.view.maxScroll()));
+            return;
+          }
+        }
         if (topKey === null || topFirst < 0) return;
         let first = -1, last = -1;
         for (let i = 0; i < this.lineMap.length; i++) {
@@ -874,8 +899,10 @@ export class ChatView extends Widget {
         if (first < 0) return;
         const target = Math.min(first + topOffset, last);
         this.view.scrollY = Math.max(0, Math.min(target, this.view.maxScroll()));
-        // never park the viewport on a blank separator row — it reads as a
-        // spurious offset right after the click
+      };
+      // never park the viewport on a blank separator row — it reads as a
+      // spurious offset right after the click
+      const nudge = () => {
         while (
           this.view.scrollY < this.lineMap.length - 1 &&
           !(this.lines[this.view.scrollY] ?? []).some((g) => g.t.trim() !== "")
@@ -895,7 +922,7 @@ export class ChatView extends Widget {
             else this.collapsedBlocks.add(key);
           }
           this.#rebuild();
-          reanchor();
+          reanchor(); nudge();
           return true;
         }
       }
@@ -903,7 +930,7 @@ export class ChatView extends Widget {
         if (this.expanded.has(info.nodeIdx)) this.expanded.delete(info.nodeIdx);
         else this.expanded.add(info.nodeIdx);
         this.#rebuild();
-        reanchor();
+        reanchor(); nudge();
         return true;
       }
     }

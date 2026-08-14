@@ -420,6 +420,32 @@ test("a finished snapshot think block without a start time shows plain 已完成
   assert.ok(!think.includes("耗时"), "no fabricated duration");
 });
 
+test("a queued streaming rebuild inside the click does not shift the view", () => {
+  const longText = Array.from({ length: 30 }, (_, i) => `para ${i}`).join("\n\n");
+  const { chat } = render([
+    { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [{ kind: "text", text: longText }] },
+    { kind: "assistant", id: "a2", step: 2, streaming: false, blocks: [{ kind: "text", text: "CLICK-ME" }] },
+    { kind: "assistant", id: "a3", step: 3, streaming: true, blocks: [{ kind: "text", text: "tail-line", streaming: true, startedAt: Date.now() }] },
+  ]);
+  const rowText = (l) => l.map((g) => g.t).join("");
+  // follow the tail
+  chat.view.scrollY = chat.view.maxScroll();
+  const topBefore = rowText(chat.lines[chat.view.scrollY]);
+  assert.ok(topBefore.trim() !== "", "top line is real content");
+  // the stream grows between frames; queue a rebuild like the poll does
+  const tail = chat.nodes[2];
+  tail.blocks[0].text = "tail-line\n\nline2\n\nline3";
+  chat.queueRebuild();
+  // click the CLICK-ME header (coordinate from the PRE-click state the user saw)
+  const hdr = chat.lines.findIndex((l) => rowText(l).includes("CLICK-ME"));
+  const y = chat.view.y + (hdr - chat.view.scrollY);
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
+  assert.ok(chat.collapsedBlocks.has("1:0"), "clicked block collapsed");
+  const topAfter = rowText(chat.lines[chat.view.scrollY]);
+  assert.equal(topAfter, topBefore, "viewport top unchanged despite the streaming flush inside the click");
+});
+
 test("a missed block-end cannot leave a forever-running timer", () => {
   const now = Date.now();
   const { lines } = render([{
