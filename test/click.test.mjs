@@ -628,6 +628,22 @@ test("the footer hints Ctrl+Space between the mode badge and the permission badg
   assert.ok(ni >= 0 && ci > ni && bi > ci, `hint sits between mode and permission badges: ${text.slice(0, 60)}`);
 });
 
+test("orphaned tool results are labeled 结果未保留, not the ambiguous 无结果", () => {
+  const { chat } = render([
+    { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [
+      { kind: "tool", name: "bash", args: "ls", result: null, startedAt: 1000, endedAt: 4000, view: null },
+    ] },
+  ]);
+  chat.bashMode = "expanded";
+  chat.queueRebuild(); chat.flushRebuild();
+  const text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
+  assert.ok(text.includes("结果未保留,耗时 3秒"), text);
+  assert.ok(!text.includes("无结果"), "the ambiguous label is gone");
+  const hdr = text.split("\n").find((l) => l.includes("bash")) ?? "";
+  assert.ok(!hdr.includes("✗") && !hdr.includes("失败"), `header is not a failure: ${hdr}`);
+  assert.ok(text.includes("并非执行失败"), "explanation shown when expanded");
+});
+
 test("finalized think blocks keep their start time and turns carry their total", () => {
   const events = [
     { event: { type: "turn/start", seq: 1, time: 1000, data: {} }, view: null },

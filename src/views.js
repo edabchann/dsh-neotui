@@ -233,7 +233,7 @@ function applyEvent(nodes, event, view, log, state = null) {
         if (!block) {
           // the callId did not match (missed tool/call in the loaded window):
           // attach to the most recent tool block still awaiting a result —
-          // otherwise a SUCCESSFUL bash renders as a red "无结果" failure
+          // otherwise a SUCCESSFUL bash renders as a red failure label
           outer:
           for (let ni = nodes.length - 1; ni >= 0; ni--) {
             const nd = nodes[ni];
@@ -1301,9 +1301,14 @@ export class ChatView extends Widget {
               // whose result never matched (orphan) must freeze at 无结果 —
               // otherwise the timer runs forever ("timing chaos").
               const running = b.result == null && !b.done && node.streaming;
+              // An ORPHAN = a finalized tool call whose result is absent from
+              // the history (context compaction prunes old tool results, or
+              // the result event never matched). It is NOT a failure and NOT
+              // "the tool output nothing" — label it 结果未保留 to say what
+              // it actually is.
               const orphan = b.result == null && !b.done && !node.streaming;
-              // An orphan (result never matched) is NOT a failure — it renders
-              // neutral (◌, TOOLBG), never the red ✗ of a failed exit code.
+              // An orphan renders neutral (◌, TOOLBG), never the red ✗ of a
+              // failed exit code.
               const failed = !orphan && exitCode !== undefined && exitCode !== 0;
               const status = running ? "TOOLBG" : failed ? "TOOLERR" : "TOOLOK";
               const glyph = running ? "⏳" : failed ? "✗" : orphan ? "◌" : "✓";
@@ -1313,9 +1318,9 @@ export class ChatView extends Widget {
               if (running) {
                 timing = ` 已经过 ${fmtDuration(Date.now() - (b.startedAt ?? Date.now()))}`;
               } else if (b.startedAt !== undefined && b.endedAt !== undefined) {
-                timing = ` ${failed ? "失败" : orphan ? "无结果" : "已完成"},耗时 ${fmtDuration(b.endedAt - b.startedAt)}`;
+                timing = ` ${failed ? "失败" : orphan ? "结果未保留" : "已完成"},耗时 ${fmtDuration(b.endedAt - b.startedAt)}`;
               } else if (orphan) {
-                timing = " 无结果";
+                timing = " 结果未保留";
               }
               lines.push([
                 { t: open ? "▾ " : "▸ ", fg: K.ACCENT },
@@ -1343,6 +1348,10 @@ export class ChatView extends Widget {
                   const rl = truncateText(b.result, 4000).split("\n");
                   for (const r of rl.slice(0, 30)) { lines.push([{ t: "  " + truncate(r, w - 4), fg: K.DIM }]); mark(realIdx, bi); }
                   if (rl.length > 30) { lines.push([{ t: `  …共 ${rl.length} 行`, fg: K.FAINT }]); mark(realIdx, bi); }
+                } else if (orphan) {
+                  // explain the ambiguous state instead of a bare 无结果
+                  lines.push([{ t: "  结果未保留：该工具调用的结果不在当前会话历史中（上下文压缩会修剪早期工具结果），并非执行失败或输出为空。", fg: K.FAINT }]);
+                  mark(realIdx, bi);
                 }
               }
               sep();
