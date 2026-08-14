@@ -1,5 +1,5 @@
 // startup.js — The TUI profile's command-line provider: parses the
-// `dsh --profile ntui` flag family (--host/--port/--session/--cwd) and its
+// `dsh --profile dsh-neotui` flag family (--host/--port/--session/--cwd) and its
 // --help text, then provides the immutable values as the tuiStartup service.
 import { Command } from "commander";
 import { parseCmdline } from "@deepseek-ai/dsh-cmdline";
@@ -13,7 +13,7 @@ export const TUI_STARTUP_SERVICE = "tuiStartup";
 
 function tuiCommand() {
   return new Command()
-    .name("dsh --profile ntui")
+    .name("dsh --profile dsh-neotui")
     .description("Interactive mouse-driven terminal UI for DeepSeek Harness.")
     .helpOption("-h, --help", "show this help")
     .option("--host <host>", "API bind host (default 127.0.0.1)")
@@ -23,10 +23,10 @@ function tuiCommand() {
     .option("--attach <url-or-port>", "attach to a RUNNING host instead of booting one (coexists with the web UI; e.g. --attach 3080)")
     .addHelpText("after", `
 Examples:
-  dsh --profile ntui                          open the TUI on its own host
-  dsh --profile ntui --attach 3080            attach to the web UI's host (side-by-side debugging)
-  dsh --profile ntui --session <id>           resume one session
-  dsh --profile ntui --cwd ~/work             default directory for new sessions
+  dsh --profile dsh-neotui                          open the TUI on its own host
+  dsh --profile dsh-neotui --attach 3080            attach to the web UI's host (side-by-side debugging)
+  dsh --profile dsh-neotui --session <id>           resume one session
+  dsh --profile dsh-neotui --cwd ~/work             default directory for new sessions
 `);
 }
 

@@ -12,12 +12,12 @@
   config:
     root: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-neotui-attach/sessions' || dshHomePath('sessions'))
 
-- id: settings-file
+- id: settings
   inject: [tuiStartup]
   config:
     path: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-neotui-attach/settings.yaml' || dshHomePath('settings.yaml'))
 
-- id: credentials-local
+- id: credentials
   inject: [tuiStartup]
   config:
     path: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-neotui-attach/.credentials.yaml' || dshHomePath('.credentials.yaml'))

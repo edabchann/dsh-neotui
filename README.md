@@ -13,11 +13,11 @@ dsh --profile dsh-neotui                   # 启动
 ## 运行
 
 ```bash
-dsh --profile ntui                         # 本地开发 profile（~/.dsh/profiles/ntui，软链到本仓库）
-dsh --profile ntui --session <id>          # 启动即打开某会话
-dsh --profile ntui --cwd ~/work            # 新建会话的默认目录
-dsh --profile ntui --port 3981             # 内嵌 API 指定端口（默认 0 = 系统分配）
-dsh --profile ntui --attach 3080           # 共存调试：连已运行的 web 宿主（存储自动隔离，不碰 $DSH_HOME）
+dsh --profile dsh-neotui                   # 本地开发 profile（~/.dsh/profiles/dsh-neotui，软链到本仓库）
+dsh --profile dsh-neotui --session <id>    # 启动即打开某会话
+dsh --profile dsh-neotui --cwd ~/work      # 新建会话的默认目录
+dsh --profile dsh-neotui --port 3981       # 内嵌 API 指定端口（默认 0 = 系统分配）
+dsh --profile dsh-neotui --attach 3080     # 共存调试：连已运行的 web 宿主（存储自动隔离，不碰 $DSH_HOME）
 
 node bin/dsh-tui.js                        # 纯客户端模式：连接已运行的 web 宿主（默认 3080）
 node bin/dsh-tui.js --base http://host:port
