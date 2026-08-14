@@ -784,8 +784,8 @@ export class ChatView extends Widget {
     this.view.follow = true;
   }
 
-  async loadOlder() {
-    if (!this.hasMore || this.loadingOlder || this.minSeq == null) return;
+  async loadOlder(onDone = null) {
+    if (!this.hasMore || this.loadingOlder || this.minSeq == null) { onDone?.(); return; }
     this.loadingOlder = true;
     this.app.setStatus("加载更早记录…");
     try {
@@ -803,6 +803,51 @@ export class ChatView extends Widget {
     }
     this.loadingOlder = false;
     this.#rebuild();
+    onDone?.();
+  }
+
+  /** [ / ] — jump the viewport to the END of the previous (dir -1) or next
+   *  (dir +1) user question. `previous` walks to the question entirely above
+   *  the viewport top (loading older history first when needed); `next` walks
+   *  to the first question that starts below the viewport top. */
+  #jumpQuestion(dir) {
+    this.flushRebuild(); // lineMap must reflect the current nodes array
+    const top = this.view.scrollY;
+    const qs = [];
+    for (let i = 0; i < this.nodes.length; i++) {
+      if (this.nodes[i]?.kind !== "user") continue;
+      let first = -1, last = -1;
+      for (let li = 0; li < this.lineMap.length; li++) {
+        if (this.lineMap[li]?.nodeIdx === i) { if (first < 0) first = li; last = li; }
+      }
+      if (first < 0) continue; // node outside the rendered window
+      qs.push({ first, last });
+    }
+    let target = null;
+    if (dir < 0) {
+      for (let k = qs.length - 1; k >= 0; k--) {
+        if (qs[k].last < top) { target = qs[k]; break; }
+      }
+      if (!target && this.hasMore && this.minSeq != null) {
+        this.loadOlder(() => this.#jumpQuestion(-1)); // after the prepend, retry against the fuller window
+        return true;
+      }
+    } else {
+      target = qs.find((q) => q.first > top) ?? null;
+    }
+    if (!target) {
+      this.app.toast(dir < 0 ? "已到最早的问题" : "已到最后的问题");
+      return false;
+    }
+    // the question's last CONTENT line (skip trailing blank separator rows);
+    // put it ~3 rows into the viewport, never above the question's own start
+    let end = target.last;
+    while (end > target.first && !(this.lines[end] ?? []).some((g) => g.t.trim() !== "")) end--;
+    this.view.anchorLock = null;
+    this.view.follow = false;
+    this.view.scrollY = Math.max(0, Math.max(target.first, end - 3));
+    this.app.redraw();
+    return true;
   }
 
   onFrame(frame) {
@@ -1540,6 +1585,11 @@ export class ChatView extends Widget {
       return true;
     }
     if (ev.name === "char" && ev.key === "g" && ev.shift) { this.view.anchorLock = null; this.view.follow = true; this.view.scrollY = this.view.maxScroll(); return true; }
+    // [ / ] — jump to the end of the previous / next user question. Guarded by
+    // focus so the sidebar's session-move [ ] keys keep working there.
+    if (ev.name === "char" && (ev.key === "[" || ev.key === "]") && !ev.ctrl && !ev.shift && this.app.focused === this) {
+      return this.#jumpQuestion(ev.key === "[" ? -1 : 1);
+    }
     if (ev.name === "escape" && this.app.searchQuery) { this.app.searchQuery = null; this.queueRebuild(); return true; }
     if (ev.name === "escape" && this.selStart !== null) { this.selStart = this.selEnd = null; this.app.redraw(); return true; }
     if (ev.name === "char" && ev.key === "i" && !ev.ctrl) { this.app.focus(this.input); return true; }
@@ -1768,6 +1818,8 @@ export class App {
     this.overlay = null;       // Picker / Popup / ImagePopup modal
     this.mode = "chat";        // chat | workspace | trajectory
     this.sidebarVisible = true; // Ctrl+B hides the whole session pane (nvim-style)
+    this.sidebarWidth = 30;     // draggable divider: the session pane's column width
+    this.draggingDivider = false;
     this.feedbackMap = new Map(); // messageId → {rating, version}
     this.searchQuery = null;      // active find-in-conversation term (highlight)
     this.findQuery = null;        // term being typed in the find picker
@@ -1779,10 +1831,10 @@ export class App {
     this.skillsPanel = null;
 
     this.sidebar = new SidebarTree(this);
-    this.sidebar.w = 30;
+    this.sidebar.w = this.sidebarWidth;
     this.sidebar.h = screen.h - 1;
-    this.searchInput = new Input({ x: 0, y: 0, w: 30, h: 1, prompt: "/ ", placeholder: "搜索会话…" });
-    this.chat = new ChatView({ x: 30, y: 0, w: screen.w - 30, h: screen.h - 1, app: this });
+    this.searchInput = new Input({ x: 0, y: 0, w: this.sidebarWidth, h: 1, prompt: "/ ", placeholder: "搜索会话…" });
+    this.chat = new ChatView({ x: this.sidebarWidth, y: 0, w: screen.w - this.sidebarWidth, h: screen.h - 1, app: this });
     this.status = new StatusBar({ x: 0, y: screen.h - 1, w: screen.w, h: 1 });
     this.focus(this.chat);
     this.layout();
@@ -1795,11 +1847,12 @@ export class App {
   }
 
   layout() {
-    const x = this.sidebarVisible ? 30 : 0;
+    const x = this.sidebarVisible ? this.sidebarWidth : 0;
     const w = this.screen.w - x;
     const footerH = this.footerHeight();
     const mainH = this.screen.h - 1 - footerH;
-    this.sidebar.x = 0; this.sidebar.y = 0; this.sidebar.w = 30; this.sidebar.h = this.screen.h - 1;
+    this.sidebar.x = 0; this.sidebar.y = 0; this.sidebar.w = this.sidebarWidth; this.sidebar.h = this.screen.h - 1;
+    this.searchInput.w = this.sidebarWidth;
     this.chat.resize(x, 1, w, mainH);
     for (const p of [this.workspacePanel, this.trajectoryPanel, this.settingsPanel, this.subagentPanel, this.skillsPanel]) {
       if (p?.relayout) p.relayout(x, 1, w, mainH);
@@ -2661,7 +2714,7 @@ export class App {
     }
 
     // tab bar clicks (row 0 of the main area)
-    if (ev.type === "mouse" && ev.kind === "press" && ev.button === 0 && ev.y === 0 && ev.x >= (this.sidebarVisible ? 30 : 0)) {
+    if (ev.type === "mouse" && ev.kind === "press" && ev.button === 0 && ev.y === 0 && ev.x >= (this.sidebarVisible ? this.sidebarWidth : 0)) {
       if (this.#clickTab(ev.x)) { this.redraw(); return; }
     }
     // mouse routes by position (click = focus + dispatch)
@@ -2679,6 +2732,23 @@ export class App {
       // unhandled keys fall through to global shortcuts
     }
     if (ev.type === "mouse") {
+      // Draggable sidebar divider: press on the boundary column (±1) starts a
+      // resize; drag events (motion flag) update the width live.
+      const divX = this.sidebarVisible ? this.sidebarWidth : -1;
+      const onDivider = divX >= 0 && ev.y >= 1 && ev.x >= divX - 1 && ev.x <= divX + 1;
+      if (ev.kind === "press" && ev.button === 0 && onDivider) {
+        this.draggingDivider = true;
+        this.redraw();
+        return;
+      }
+      if (this.draggingDivider) {
+        if (ev.kind === "drag" && ev.button === 0) {
+          const nw = Math.max(14, Math.min(ev.x, Math.floor(this.screen.w * 0.6)));
+          if (nw !== this.sidebarWidth) { this.sidebarWidth = nw; this.layout(); this.redraw(); }
+          return;
+        }
+        if (ev.kind === "release" && ev.button === 0) { this.draggingDivider = false; this.redraw(); return; }
+      }
       // Pure mouse motion must never change focus/mode (vim-style: INSERT is
       // keyboard-only). It reaches just the already-focused widget (drag select).
       if (ev.motion) {

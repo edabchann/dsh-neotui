@@ -1216,6 +1216,8 @@ export class ControlPanel extends Widget {
       ["n", "新建会话", () => this.app.newSession()],
       ["g g", "滚动到顶", () => { this.app.closeOverlay(); this.app.chat.view.scrollY = 0; }],
       ["G", "滚动到底", () => { this.app.closeOverlay(); this.app.chat.view.scrollY = this.app.chat.view.maxScroll(); }],
+      ["[", "上一提问的终点", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); this.app.chat.onKey({ type: "key", name: "char", key: "[", text: "[", ctrl: false, alt: false, shift: false }); }],
+      ["]", "下一提问的终点", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); this.app.chat.onKey({ type: "key", name: "char", key: "]", text: "]", ctrl: false, alt: false, shift: false }); }],
       ["Ctrl+P", "控制面板", () => { this.page = 1; this.sel = 0; this.app.redraw(); }],
       ["Ctrl+M", "切换模型", () => { this.app.overlay = buildModelPicker(this.app); }],
       ["Ctrl+T", "轨迹视图", () => { this.app.closeOverlay(); this.app.setMode("trajectory"); }],

@@ -278,6 +278,72 @@ test("clicking a think header in all-collapsed mode (t) expands it alone", () =>
   assert.ok(text.includes("deep thought two"), "full reasoning visible");
 });
 
+test("[ and ] jump to the previous/next question's end", () => {
+  const mk = (id, text) => ({ kind: "user", id, step: 0, streaming: false, text });
+  const mkA = (id, step, text) => ({ kind: "assistant", id, step, streaming: false, blocks: [{ kind: "text", text }] });
+  const { app, chat } = render([
+    mk("q1", "question one"),
+    mkA("a1", 1, "answer one\n\nmore answer one"),
+    mk("q2", "question two"),
+    mkA("a2", 2, "answer two\n\nmore answer two"),
+    mk("q3", "question three"),
+    mkA("a3", 3, "answer three"),
+  ]);
+  app.focus(chat);
+  chat.view.follow = false;
+  const lastContentLine = (nodeIdx) => {
+    let end = -1, first = -1;
+    for (let li = 0; li < chat.lineMap.length; li++) {
+      if (chat.lineMap[li]?.nodeIdx === nodeIdx) {
+        if (first < 0) first = li;
+        if ((chat.lines[li] ?? []).some((g) => g.t.trim() !== "")) end = li;
+      }
+    }
+    return { first, end };
+  };
+  // start inside answer one → ] goes to question two's end
+  chat.view.scrollY = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("answer one"));
+  chat.onKey({ type: "key", name: "char", key: "]", text: "]", ctrl: false, alt: false, shift: false });
+  const q2 = lastContentLine(2);
+  assert.equal(chat.view.scrollY, Math.max(q2.first, q2.end - 3), "] jumped to q2's end");
+  // [ goes back to question one's end
+  chat.onKey({ type: "key", name: "char", key: "[", text: "[", ctrl: false, alt: false, shift: false });
+  const q1 = lastContentLine(0);
+  assert.equal(chat.view.scrollY, Math.max(q1.first, q1.end - 3), "[ jumped to q1's end");
+  // at the first question, [ again is a no-op with a toast
+  app.toastMsg = undefined;
+  const ok = chat.onKey({ type: "key", name: "char", key: "[", text: "[", ctrl: false, alt: false, shift: false });
+  assert.equal(ok, false, "nothing before the first question");
+  assert.equal(app.toastMsg, "已到最早的问题");
+  // inside question three's own block, ] → no question after it
+  chat.view.scrollY = lastContentLine(4).end;
+  app.toastMsg = undefined;
+  const ok2 = chat.onKey({ type: "key", name: "char", key: "]", text: "]", ctrl: false, alt: false, shift: false });
+  assert.equal(ok2, false, "nothing after the last question");
+  assert.equal(app.toastMsg, "已到最后的问题");
+});
+
+test("the sidebar divider drags to resize the session pane", () => {
+  const app = headlessApp();
+  app.layout();
+  assert.equal(app.sidebarWidth, 30, "default width");
+  app.onEvent({ type: "mouse", kind: "press", button: 0, x: 30, y: 5, ctrl: false, shift: false, alt: false, motion: false });
+  app.onEvent({ type: "mouse", kind: "drag", button: 0, x: 42, y: 5, ctrl: false, shift: false, alt: false, motion: true });
+  assert.equal(app.sidebarWidth, 42, "width followed the drag");
+  assert.equal(app.chat.x, 42, "chat moved with the divider");
+  assert.equal(app.sidebar.w, 42, "sidebar resized");
+  // clamp bounds
+  app.onEvent({ type: "mouse", kind: "drag", button: 0, x: 4, y: 5, ctrl: false, shift: false, alt: false, motion: true });
+  assert.equal(app.sidebarWidth, 14, "clamped to the minimum");
+  app.onEvent({ type: "mouse", kind: "drag", button: 0, x: 999, y: 5, ctrl: false, shift: false, alt: false, motion: true });
+  assert.equal(app.sidebarWidth, Math.floor(app.screen.w * 0.6), "clamped to the maximum");
+  app.onEvent({ type: "mouse", kind: "release", button: 0, x: 42, y: 5, ctrl: false, shift: false, alt: false, motion: false });
+  // after the release, a normal click inside the chat area (right of the
+  // widened pane) routes to the chat
+  app.onEvent({ type: "mouse", kind: "press", button: 0, x: 70, y: 10, ctrl: false, shift: false, alt: false, motion: false });
+  assert.equal(app.focused, app.chat, "click routing restored after the drag");
+});
+
 test("ESC interrupts a running turn with ONE press, from insert or normal", async () => {
   const app = headlessApp();
   const calls = [];
