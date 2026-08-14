@@ -582,7 +582,7 @@ export class ChatView extends Widget {
       x: this.x, y: this.y + this.h - 2, w: this.w, h: 1,
       multi: true, maxLines: 6,
       bg: T.PANEL,
-      placeholder: "输入消息…（Ctrl+J 换行，Enter 发送）",
+      placeholder: "输入消息…（Shift+Enter / Ctrl+J 换行，Enter 发送）",
       onEnter: (v) => this.send(v),
       onChange: () => this.inputChanged(),
     });
@@ -992,6 +992,14 @@ export class ChatView extends Widget {
           collapsing = open;
           if (open) { this.expanded.delete(key); this.collapsedBlocks.add(key); }
           else { this.collapsedBlocks.delete(key); this.expanded.add(key); }
+        } else if (b.kind === "tool") {
+          // same two-state override, driven by bashMode: in all-collapsed
+          // mode (b) a click expands this block alone; a second click folds
+          // it again — never a no-op.
+          const open = this.expanded.has(key) || (this.bashMode !== "collapsed" && !this.collapsedBlocks.has(key));
+          collapsing = open;
+          if (open) { this.expanded.delete(key); this.collapsedBlocks.add(key); }
+          else { this.collapsedBlocks.delete(key); this.expanded.add(key); }
         } else {
           collapsing = !this.collapsedBlocks.has(key);
           if (this.collapsedBlocks.has(key)) this.collapsedBlocks.delete(key);
@@ -1091,7 +1099,9 @@ export class ChatView extends Widget {
           // message text starts on that same line (no blank first row).
           const prefix = userPrefix();
           const pw = strWidth(prefix);
-          const md = renderMd(shown, Math.max(10, w - 4 - pw));
+          // The user's own submitted text keeps its line breaks verbatim
+          // (what they typed is what they see); only the width wraps.
+          const md = renderMd(shown, Math.max(10, w - 4 - pw), null, { hardBreaks: true });
           if (md.length === 0) {
             lines.push([{ t: "  " + prefix, fg: K.OK, bold: true }]);
             mark(realIdx);
@@ -1154,7 +1164,7 @@ export class ChatView extends Widget {
               sep();
             } else if (b.kind === "tool") {
               const key = `${realIdx}:${bi}`;
-              const open = this.bashMode !== "collapsed" && !this.collapsedBlocks.has(key);
+              const open = this.expanded.has(key) || (this.bashMode !== "collapsed" && !this.collapsedBlocks.has(key));
               const exitCode = b.view?.view?.exitCode;
               // A tool only TICKS while its turn is live. A finalized turn
               // whose result never matched (orphan) must freeze at 无结果 —
@@ -1483,6 +1493,7 @@ export class ChatView extends Widget {
     if (ev.name === "char" && ev.key === "/" && !ev.ctrl) { this.app.startSearch(); return true; }
     if (ev.name === "char" && ev.key === "b" && !ev.ctrl) {
       this.bashMode = this.bashMode === "collapsed" ? "expanded" : "collapsed";
+      this.expanded.clear();
       this.collapsedBlocks.clear();
       this.app.toast(this.bashMode === "collapsed" ? "工具块：折叠（b 展开）" : "工具块：展开（b 折叠）");
       this.queueRebuild();
@@ -1857,6 +1868,17 @@ export class App {
     this.api.onHostFrame = (frame) => this.#onHostFrame(frame);
     this.api.onStateChange = (s) => { this.connState = s; this.redraw(); };
     this.#startPolling();
+    // WezTerm ships with enable_kitty_keyboard = false: the terminal ignores
+    // our CSI > 1u request AND the CSI ? u query, so Shift+Enter arrives as a
+    // plain CR (indistinguishable from Enter). Detect the dead query and say
+    // so once, instead of letting Shift+Enter silently submit.
+    if (this.term?.kitty && !this.term?.kittyActive) {
+      setTimeout(() => {
+        if (!this.term?.kittyActive) {
+          this.toast("终端未开启 kitty 键盘协议：Shift+Enter 换行不可用（可用 Ctrl+J）。WezTerm 请在配置中设置 enable_kitty_keyboard = true 后重启终端");
+        }
+      }, 1500);
+    }
   }
 
   async refreshSessions() {
@@ -2148,6 +2170,19 @@ export class App {
   async cancelSession(s) {
     await this.api.call("session.cancel", { sessionId: s.sessionId }).catch((e) => this.toast(e.message));
     this.refreshSessions();
+  }
+
+  /** ESC 打断: cancel the current turn if it is running. The chat's live
+   *  `running` flag (jobs mux frames + streaming nodes) is the fast source;
+   *  the (≤5s-fresh) session list is the fallback. Returns true if a cancel
+   *  request was actually sent. */
+  #interruptIfRunning() {
+    if (!this.currentSession) return false;
+    const running = this.chat.running || !!this.sessions.find((s) => s.sessionId === this.currentSession)?.running;
+    if (!running) return false;
+    this.cancelSession({ sessionId: this.currentSession });
+    this.toast("已请求中断当前回合");
+    return true;
   }
 
   async newSessionIn(group = null) {
@@ -2623,8 +2658,11 @@ export class App {
       // typing and Ctrl+J / Shift+Enter newlines behave like a normal editor.
       if (this.focused === this.chat.input) {
         if (ev.name === "escape") {
+          // one ESC press: interrupt a running turn AND leave insert —
+          // otherwise the key just exits insert (vim muscle memory).
+          const interrupted = this.#interruptIfRunning();
           this.focus(this.chat);
-          this.toast("已退出输入（i 重新进入）");
+          if (!interrupted) this.toast("已退出输入（i 重新进入）");
         } else {
           this.chat.input.onKey(ev);
         }
@@ -2674,13 +2712,11 @@ export class App {
       if (ev.name === "char" && ev.key === "/" && !ev.ctrl && this.focused !== this.chat.input) { this.startSearch(); this.redraw(); return; }
       if (ev.name === "char" && ev.key === "n" && !ev.ctrl && this.focused === this.sidebar) { this.newSession(); return; }
       if (ev.name === "escape") {
+        // Esc in NORMAL mode interrupts a running turn (one press, regardless
+        // of focus); otherwise it steps back toward the chat view.
+        if (this.#interruptIfRunning()) return;
         if (this.focused === this.sidebar) { this.focus(this.chat); this.redraw(); }
-        else {
-          // Esc in NORMAL mode interrupts a running turn (insert→normal→interrupt).
-          const cur = this.sessions.find((s) => s.sessionId === this.currentSession);
-          if (cur?.running) { this.cancelSession(cur); this.toast("已请求中断当前回合"); }
-          else if (this.mode !== "chat") this.setMode("chat");
-        }
+        else if (this.mode !== "chat") this.setMode("chat");
         return;
       }
       if (ev.name === "char" && ev.key === "i" && this.focused === this.sidebar) { this.focus(this.chat.input); this.redraw(); return; }

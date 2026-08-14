@@ -105,19 +105,43 @@ console.log("term.js decoder tests:");
   check("bracketed paste passes text", events[0], { type: "text", text: "paste me" });
 }
 {
-  const { events } = harness("\x1b[97;4u", true);
+  const { events } = harness("\x1b[97;5u", true);
   check("kitty ctrl+a", events[0], { type: "key", name: "char", key: "a", text: "a", ctrl: true, alt: false, shift: false });
 }
 {
-  const { events } = harness("\x1b[57360;4u", true);
+  const { events } = harness("\x1b[57360;5u", true);
   check("kitty ctrl+pgup", events[0], { type: "key", name: "pgup", ctrl: true, alt: false, shift: false });
+}
+{
+  const { events } = harness("\x1b[13;1u", true);
+  check("kitty enter (no mods)", events[0], { type: "key", name: "enter", ctrl: false, alt: false, shift: false });
+}
+{
+  const { events } = harness("\x1b[13;2u", true);
+  check("kitty shift+enter = newline key", events[0], { type: "key", name: "enter", ctrl: false, alt: false, shift: true });
+}
+{
+  const { events } = harness("\x1b[13;2:1u", true);
+  check("kitty shift+enter with event-type suffix", events[0], { type: "key", name: "enter", ctrl: false, alt: false, shift: true });
+}
+{
+  const { events } = harness("\x1b[97:65;2u", true);
+  check("kitty shift+a with alternate-key field", events[0], { type: "key", name: "char", key: "a", text: "a", ctrl: false, alt: false, shift: true });
+}
+{
+  const { term } = harness("\x1b[?5u", true);
+  check("kitty flags query reply marks protocol active", term.kittyActive, true);
+}
+{
+  const { term } = harness("plain", true);
+  check("no flags reply = protocol not active", term.kittyActive, false);
 }
 {
   const { events } = harness("\x1b]52;c;dGhp\x07rest");
   check("OSC 52 skipped, text after survives", events[0], { type: "text", text: "rest" });
 }
 {
-  const { events } = harness("\x1b[32;4u", true);
+  const { events } = harness("\x1b[32;5u", true);
   check("kitty ctrl+space", events[0], { type: "key", name: "char", key: " ", text: " ", ctrl: true, alt: false, shift: false });
 }
 {

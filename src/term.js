@@ -29,6 +29,7 @@ export class Term {
     this.onEvent = onEvent ?? (() => {});
     this.onResize = onResize ?? (() => {});
     this.kitty = kitty;
+    this.kittyActive = false;  // set when the terminal answers the CSI ? u query
     this.decoder = new StringDecoder("utf8");
     this.buf = "";
     this.started = false;
@@ -52,7 +53,7 @@ export class Term {
     o.write("\x1b[?1006h"); // SGR extended coordinates
     o.write("\x1b[?2004h"); // bracketed paste
     o.write("\x1b[?7l");    // no autowrap (we clip ourselves)
-    if (this.kitty) o.write("\x1b[>1u"); // kitty: disambiguate escape codes
+    if (this.kitty) { o.write("\x1b[>1u"); o.write("\x1b[?u"); }
     this.resizeHandler = () => this.#resize();
     process.on("SIGWINCH", this.resizeHandler);
     this.#resize();
@@ -206,7 +207,13 @@ export class Term {
       this.#mouse(params, final);
       return;
     }
-    if (prefix === "?") return; // private responses (cursor pos, kitty flags) — ignored
+    if (prefix === "?") {
+      // CSI ? flags u — the terminal answered our kitty-protocol query, so
+      // it DOES honor the protocol (WezTerm etc. reply with the flags it
+      // supports; terminals with the feature off reply nothing at all).
+      if (final === "u") this.kittyActive = true;
+      return; // other private responses (cursor pos) stay ignored
+    }
     if (prefix === ">") return;
     if (final === "Z") { // Shift+Tab (backtab)
       this.#emit({ type: "key", name: "backtab", ctrl: false, alt: false, shift: true });
@@ -244,8 +251,13 @@ export class Term {
   }
 
   #kittyKey(params) {
-    const [cp = 0, mod = 1] = params.split(";").filter((s) => s !== "").map(Number);
-    const ctrl = !!(mod & 4), alt = !!(mod & 2), shift = !!(mod & 1);
+    // kitty: CSI code[:alternates] ; modifiers[:event-type] u — the modifier
+    // value is 1 + the bitmask (shift=1, alt=2, ctrl=4), and the event-type
+    // sub-field (press/repeat/release) rides after a colon on the modifier.
+    const [cpRaw = "0", modRaw = "1"] = params.split(";");
+    const cp = Number(String(cpRaw).split(":")[0]) || 0;
+    const m = (Number(String(modRaw).split(":")[0]) || 1) - 1;
+    const ctrl = !!(m & 4), alt = !!(m & 2), shift = !!(m & 1);
     let name = KITTY_KEY_NAMES[cp];
     if (name === "tab" && shift) name = "backtab";
     if (name) {

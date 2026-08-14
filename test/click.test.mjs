@@ -150,6 +150,84 @@ test("code block [复制] button copies the raw code without toggling", () => {
   assert.equal(chat.collapsedBlocks.size, 0, "still nothing collapsed");
 });
 
+test("user's own message keeps its newlines verbatim (hard breaks)", () => {
+  const { chat, lines } = render([
+    { kind: "user", id: "u1", step: 1, streaming: false, text: "第一行\n第二行\n\n第三行" },
+  ]);
+  const text = lines.join("\n");
+  assert.ok(/第一行\s*$/.test(lines.find((l) => l.includes("第一行")) ?? ""), "line 1 on its own row");
+  assert.ok(/第二行\s*$/.test(lines.find((l) => l.includes("第二行")) ?? ""), "line 2 on its own row (no space join)");
+  assert.ok(lines.some((l) => l.includes("第三行")), "line 3 present");
+  assert.ok(!lines.some((l) => l.includes("第一行 第二行")), "newlines never collapse into spaces");
+});
+
+test("clicking a tool header in all-collapsed mode (b) expands it alone", () => {
+  const result = Array.from({ length: 20 }, (_, i) => `res ${i}`).join("\n");
+  const { chat } = render([
+    { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [
+      { kind: "tool", name: "bash", args: "ls", result, startedAt: 1, endedAt: 2, view: null },
+      { kind: "tool", name: "bash", args: "pwd", result: "home", startedAt: 1, endedAt: 2, view: null },
+    ] },
+  ]);
+  chat.bashMode = "collapsed"; chat.expanded.clear(); chat.collapsedBlocks.clear();
+  chat.queueRebuild(); chat.flushRebuild();
+  const hdr = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("bash"));
+  const y = chat.view.y + (hdr - chat.view.scrollY);
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
+  assert.ok(chat.expanded.has("0:0"), "click expanded the tool individually in all-collapsed mode");
+  chat.queueRebuild(); chat.flushRebuild();
+  const text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
+  assert.ok(text.includes("结果:"), "the clicked tool now shows its result");
+  assert.ok(text.includes("res 0"), "result content visible");
+  // second click folds it again
+  const hdr2 = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("bash"));
+  const y2 = chat.view.y + (hdr2 - chat.view.scrollY);
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y: y2 });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y: y2 });
+  assert.ok(chat.collapsedBlocks.has("0:0") && !chat.expanded.has("0:0"), "second click folded it again");
+});
+
+test("clicking a think header in all-collapsed mode (t) expands it alone", () => {
+  const { chat } = render([
+    { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [
+      { kind: "reasoning", text: "deep thought one\n\ndeep thought two", done: true },
+    ] },
+  ]);
+  chat.thinkMode = "collapsed"; chat.expanded.clear(); chat.collapsedBlocks.clear();
+  chat.queueRebuild(); chat.flushRebuild();
+  const hdr = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("思考"));
+  const y = chat.view.y + (hdr - chat.view.scrollY);
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
+  assert.ok(chat.expanded.has("0:0"), "think block expanded individually");
+  chat.queueRebuild(); chat.flushRebuild();
+  const text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
+  assert.ok(text.includes("deep thought two"), "full reasoning visible");
+});
+
+test("ESC interrupts a running turn with ONE press, from insert or normal", async () => {
+  const app = headlessApp();
+  const calls = [];
+  app.api.call = async (m, p) => { calls.push([m, p]); return { items: [] }; };
+  app.currentSession = "s1";
+  app.chat.running = true;
+  // INSERT mode: one ESC = interrupt + leave insert
+  app.focus(app.chat.input);
+  app.onEvent({ type: "key", name: "escape" });
+  assert.deepEqual(calls.at(-1), ["session.cancel", { sessionId: "s1" }], "cancel sent");
+  assert.equal(app.focused, app.chat, "esc also left insert mode");
+  // NORMAL mode, idle: no cancel call
+  app.chat.running = false;
+  calls.length = 0;
+  app.onEvent({ type: "key", name: "escape" });
+  assert.equal(calls.length, 0, "no cancel when nothing runs");
+  // NORMAL mode, running via the sessions snapshot only: still interrupts
+  app.sessions = [{ sessionId: "s1", running: true }];
+  app.onEvent({ type: "key", name: "escape" });
+  assert.deepEqual(calls.at(-1), ["session.cancel", { sessionId: "s1" }], "sessions snapshot fallback works");
+});
+
 test("re-expanding a folded tool at the bottom keeps the header in view", () => {
   const result = Array.from({ length: 40 }, (_, i) => `res ${i}`).join("\n");
   const { chat } = render([

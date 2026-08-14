@@ -160,7 +160,8 @@ function highlightLine(line, lang) {
 // ---- block renderer ----
 // Returns array of lines; each line = array of segments.
 
-export function renderMd(text, width, sink = null) {
+export function renderMd(text, width, sink = null, opts = {}) {
+  const hardBreaks = !!opts.hardBreaks;
   const lines = [];
   const pushLine = (segs = []) => {
     if (segs.length === 0) segs = [SEG(" ")];
@@ -178,8 +179,15 @@ export function renderMd(text, width, sink = null) {
 
   const flushPara = () => {
     if (para.length === 0) return;
-    const segs = parseInline(para.join(" "));
-    lines.push(...wrapSegs(segs, width));
+    if (hardBreaks) {
+      // verbatim line breaks: each source line renders on its own row
+      for (const line of para) {
+        lines.push(...wrapSegs(parseInline(line), width));
+      }
+    } else {
+      const segs = parseInline(para.join(" "));
+      lines.push(...wrapSegs(segs, width));
+    }
     para = [];
   };
   const flushQuote = () => {
