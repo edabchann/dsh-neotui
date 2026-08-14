@@ -1,7 +1,7 @@
 // index.js — tui-runtime: the TUI application row. Waits for the embedded
 // webserver's real listening port, then hands stdin/stdout to the terminal UI
 // and disposes with the tree.
-import { launchTui } from "../../src/index.js";
+import { launchTui } from "dsh-neotui";
 
 /** Stable Cordis plugin name. */
 export const name = "tui-runtime";

@@ -8,6 +8,11 @@
     "./startup": "./src/startup.js",
     "./package.json": "./package.json"
   },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "LICENSE"
+  ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -16,7 +21,8 @@
   "dependencies": {
     "@deepseek-ai/cordis": "*",
     "@deepseek-ai/dsh-cmdline": "*",
-    "commander": "*"
+    "commander": "*",
+    "dsh-neotui": "0.0.0"
   },
   "license": "MIT"
 }

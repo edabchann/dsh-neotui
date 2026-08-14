@@ -1,4 +1,4 @@
-# The dsh-tui-app bundle patch: the terminal surface over the dsh-base layer.
+# The dsh-neotui-app bundle patch: the terminal surface over the dsh-base layer.
 #
 # --attach mode (coexists with a running web UI): the local host plane is
 # disabled below and these disk-backed rows redirect to a throwaway directory,
@@ -10,19 +10,19 @@
 - id: session-persistence-jsonl
   inject: [tuiStartup]
   config:
-    root: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-tui-attach/sessions' || dshHomePath('sessions'))
+    root: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-neotui-attach/sessions' || dshHomePath('sessions'))
 
 - id: settings-file
   inject: [tuiStartup]
   config:
-    path: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-tui-attach/settings.yaml' || dshHomePath('settings.yaml'))
+    path: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-neotui-attach/settings.yaml' || dshHomePath('settings.yaml'))
 
 - id: credentials-local
   inject: [tuiStartup]
   config:
-    path: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-tui-attach/.credentials.yaml' || dshHomePath('.credentials.yaml'))
+    path: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-neotui-attach/.credentials.yaml' || dshHomePath('.credentials.yaml'))
 
-# The dsh-tui-app bundle patch: the terminal surface over the dsh-base layer.
+# The dsh-neotui-app bundle patch: the terminal surface over the dsh-base layer.
 # Applied after dsh-base's insert; rows here add the API surface the TUI
 # client speaks (HTTP unary + WS frame streams) plus the two tui rows.
 #
@@ -33,7 +33,7 @@
 - insert:
     # Ordinary provider for the parsed TUI flags (--host/--port/--session/--cwd).
     - id: tui-startup
-      name: 'dsh-tui-app/startup'
+      name: 'dsh-neotui-app/startup'
 
     # Plain route-registration carrier; host/port come from the tui-startup
     # provider. Default port 0 = OS-picked (the TUI reads the real port from
@@ -74,7 +74,7 @@
       name: '@deepseek-ai/dsh-storage-json'
       inject: [tuiStartup]
       config:
-        root: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-tui-attach/storages' || dshHomePath('storages'))
+        root: !!js (ctx.tuiStartup.attach && (process.env.TMPDIR ?? '/tmp') + '/dsh-neotui-attach/storages' || dshHomePath('storages'))
 
     - id: storage-domain
       name: '@deepseek-ai/dsh-storage-domain'
@@ -105,5 +105,5 @@
     # over stdin/stdout (alternate screen, SGR mouse, polling client) and
     # disposes with the tree.
     - id: tui-runtime
-      name: 'dsh-tui-app'
+      name: 'dsh-neotui-app'
       inject: [tuiStartup]
