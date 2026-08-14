@@ -528,6 +528,7 @@ export class ChatView extends Widget {
     this.collapsedBlocks = new Set(); // per-block COLLAPSE (default expanded): `${realIdx}:${bi}`
     this.thinkMode = "expanded";        // think blocks: expanded by default (t toggles)
     this.bashMode = "expanded";         // tool blocks: expanded | collapsed (b toggles)
+    this.todosVisible = true;           // todo block above the input (Shift+T toggles)
     this.running = false;
     this.hasMore = false;
     this.loadingOlder = false;
@@ -679,12 +680,20 @@ export class ChatView extends Widget {
     }
   }
 
+  /** Height of the collapsible todo block (0 when empty or collapsed). */
+  #todoHeight() {
+    const todos = this.app.todos;
+    if (!this.todosVisible || !todos || todos.length === 0) return 0;
+    return Math.min(todos.length, 6) + 1; // 1 header row + up to 6 todos
+  }
+
   #inputChanged() {
     // Multi-line input grew/shrunk → reflow view vs input, keep the tail visible.
     const ih = this.input.height();
     const prevIh = this.input.h;
     this.input.h = ih;
-    this.view.h = this.h - ih - 1;
+    const th = this.#todoHeight();
+    this.view.h = this.h - ih - th - 1;
     this.input.y = this.y + this.h - ih;
     if (ih !== prevIh) this.app.layout();
     this.app.redraw();
@@ -694,7 +703,8 @@ export class ChatView extends Widget {
     this.x = x; this.y = y; this.w = w; this.h = h;
     const ih = this.input.height();
     this.input.h = ih;
-    this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = h - ih - 1;
+    const th = this.#todoHeight();
+    this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = h - ih - th - 1;
     this.input.x = x; this.input.y = y + h - ih; this.input.w = w;
     this.cache.clear();
     this.#rebuild();
@@ -1107,8 +1117,25 @@ export class ChatView extends Widget {
         screen.invertRect(this.view.x, this.view.y + (y0 - this.view.scrollY), this.view.x + this.view.w - 2, this.view.y + (y1 - this.view.scrollY));
       }
     }
+    this.#renderTodos(screen);
     screen.hline(this.x, this.x + this.w - 1, this.input.y - 1, "─", { fg: T.BORDER2 });
     this.input.render(screen);
+  }
+
+  /** Collapsible todo block between the view and the input (Shift+T toggles). */
+  #renderTodos(screen) {
+    const th = this.#todoHeight();
+    if (th === 0) return;
+    const todos = this.app.todos ?? [];
+    const y = this.input.y - th - 1;
+    screen.fillRect(this.x, y, this.x + this.w - 1, y + th - 1, " ", { bg: T.THINKBG });
+    screen.text(this.x, y, " ☐ 任务清单（Shift+T 折叠）", { fg: K.FAINT });
+    for (let i = 0; i < Math.min(todos.length, th - 1); i++) {
+      const t = todos[i];
+      const icon = t.status === "completed" ? "✓" : t.status === "in_progress" ? "◉" : "○";
+      const color = t.status === "completed" ? T.FAINT : t.status === "in_progress" ? T.WARN : T.DIM;
+      screen.text(this.x + 2, y + 1 + i, `${icon} ${truncate(t.content ?? String(t), this.w - 6)}`, { fg: color });
+    }
   }
 
   onMouse(ev) {
@@ -1213,6 +1240,12 @@ export class ChatView extends Widget {
       return true;
     }
     if (ev.name === "char" && ev.key === "t" && !ev.ctrl) {
+      if (ev.shift) {
+        this.todosVisible = !this.todosVisible;
+        this.app.toast(this.todosVisible ? "任务块：显示（Shift+T 折叠）" : "任务块：折叠（Shift+T 展开）");
+        this.#inputChanged();
+        return true;
+      }
       this.thinkMode = this.thinkMode === "collapsed" ? "expanded" : "collapsed";
       this.expanded.clear();
       this.collapsedBlocks.clear();
@@ -1227,12 +1260,16 @@ export class ChatView extends Widget {
 function toolSummary(b) {
   // Prefer the human description of what the tool did (the agent's `description`
   // argument), then the host card title, then the raw command — mirrors the web.
+  // File tools get a path-based summary so read/edit collapse as concisely as bash.
   if (b.args) {
     try {
       const a = JSON.parse(b.args);
       if (typeof a === "object" && a !== null) {
-        const desc = a.description ?? a.summary ?? a.title ?? a.path ?? a.query ?? a.content ?? a.name;
+        const desc = a.description ?? a.summary ?? a.title ?? a.query ?? a.content ?? a.name;
         if (desc) return String(desc).slice(0, 120);
+        if (a.file_path) return `read ${String(a.file_path)}`.slice(0, 120);
+        if (a.path && a.command) return `${a.command} ${String(a.path)}`.slice(0, 120);
+        if (a.path) return String(a.path).slice(0, 120);
         return a.command ?? null;
       }
       return String(a).slice(0, 120);
@@ -2396,11 +2433,14 @@ export class App {
     if (this.menu) this.menu.render(s);
     if (this.overlay) this.overlay.render(s);
     if (this.toastMsg) {
-      const w = strWidth(this.toastMsg) + 4;
-      const x0 = Math.max(0, Math.floor(s.w / 2 - w / 2));
-      const x1 = Math.min(s.w - 1, Math.floor(s.w / 2 + w / 2));
-      s.fillRect(x0, 0, x1, 0, " ", { bg: T.BORDER });
-      s.text(x0 + 2, 0, truncate(this.toastMsg, s.w - 4), { fg: T.BOLD, bg: T.BORDER });
+      // Toasts land in the LOWER half (just above the input/footer) where the
+      // user's attention is while pressing shortcuts — a solid color block,
+      // not a top-of-screen whisper.
+      const w = Math.min(s.w - 4, strWidth(this.toastMsg) + 6);
+      const x0 = Math.max(2, Math.floor((s.w - w) / 2));
+      const y = Math.max(1, s.h - this.footerHeight() - 2);
+      s.fillRect(x0 - 1, y - 1, x0 + w, y + 1, " ", { bg: T.ACCENT });
+      s.text(x0 + 1, y, truncate(this.toastMsg, w - 2), { fg: T.SELFG, bg: T.ACCENT, attrs: 1 });
     }
     if (this.renameInput && this.popup) this.renameInput.render(s);
 
@@ -2409,6 +2449,11 @@ export class App {
     if (this.overlay && typeof this.overlay.kittyTransmit === "function" && kittyCapable()) {
       tail = this.overlay.kittyTransmit();
     }
+    // Native terminal caret: a blinking vertical bar (text-editor style) at
+    // the focused input's cursor cell; hidden everywhere else.
+    const cell = this.focused?.cursorCell;
+    if (cell) tail = `\x1b[?25h\x1b[${cell.y + 1};${cell.x + 1}H` + tail;
+    else tail = "\x1b[?25l" + tail;
     this.term.output.write(out + tail);
   }
 

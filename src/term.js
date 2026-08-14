@@ -44,7 +44,8 @@ export class Term {
     this.input.on("data", (chunk) => this.#feed(this.decoder.write(chunk)));
     const o = this.output;
     o.write("\x1b[?1049h"); // alt screen
-    o.write("\x1b[?25l");   // hide cursor
+    o.write("\x1b[?25l");   // hide cursor (shown only over the focused input)
+    o.write("\x1b[5 q");    // DECSCUSR: blinking vertical bar caret
     o.write("\x1b[?1000h"); // mouse: clicks
     o.write("\x1b[?1002h"); // mouse: drag
     o.write("\x1b[?1003h"); // mouse: all motion

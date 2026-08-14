@@ -247,9 +247,59 @@ export class Input extends Widget {
     this.histIdx = -1;
   }
   #cps() { return Array.from(this.value); }            // code points
-  #lines() { return this.value.split("\n"); }
-  /** Rendered height: 1 line, or up to maxLines when multi-line. */
-  height() { return this.multi ? Math.max(1, Math.min(this.maxLines, this.#lines().length)) : 1; }
+  /** Visual rows for multi-line input: logical lines wrapped at the width. */
+  #visualRows() {
+    const inner0 = Math.max(1, this.w - strWidth(this.prompt) - 2);
+    const innerN = Math.max(1, this.w - 2);
+    const rows = [];
+    const cps = Array.from(this.value);
+    let text = "", width = 0, limit = inner0, start = 0;
+    for (let i = 0; i < cps.length; i++) {
+      const ch = cps[i];
+      if (ch === "\n") {
+        rows.push({ text, start, end: i, limit });
+        text = ""; width = 0; limit = innerN; start = i + 1;
+        continue;
+      }
+      const cw = strWidth(ch);
+      if (width + cw > limit && width > 0) {
+        rows.push({ text, start, end: i, limit });
+        text = ""; width = 0; limit = innerN; start = i;
+      }
+      text += ch; width += cw;
+    }
+    rows.push({ text, start, end: cps.length, limit });
+    return rows;
+  }
+  /** [visualRow, display-col] of the cursor in wrapped coordinates. */
+  #cursorVisual() {
+    const rows = this.#visualRows();
+    const cursor = Math.max(0, Math.min(this.cursor, Array.from(this.value).length));
+    for (let ri = 0; ri < rows.length; ri++) {
+      const r = rows[ri];
+      if (cursor >= r.start && cursor <= r.end) {
+        const before = Array.from(r.text).slice(0, cursor - r.start);
+        return { row: ri, col: before.reduce((w, ch) => w + strWidth(ch), 0) };
+      }
+    }
+    const last = rows[rows.length - 1];
+    return { row: rows.length - 1, col: strWidth(last.text) };
+  }
+  /** Code-point index of the nearest position at a visual [row, col]. */
+  #indexAtVisual(row, col) {
+    const rows = this.#visualRows();
+    const r = rows[Math.max(0, Math.min(row, rows.length - 1))];
+    const cps = Array.from(r.text);
+    let w = 0, j = 0;
+    for (; j < cps.length; j++) {
+      const cw = strWidth(cps[j]);
+      if (col < w + cw / 2) break;
+      w += cw;
+    }
+    return r.start + j;
+  }
+  /** Rendered height: 1, or wrapped rows capped at maxLines when multi. */
+  height() { return this.multi ? Math.max(1, Math.min(this.maxLines, this.#visualRows().length)) : 1; }
   setValue(v, opts = {}) {
     this.value = String(v);
     this.cursor = this.#cps().length;
@@ -270,75 +320,88 @@ export class Input extends Widget {
     cps.splice(idx, 1);
     this.value = cps.join("");
   }
-  /** [line, display-col] of the cursor. */
-  #cursorPos() {
-    const before = this.#cps().slice(0, this.cursor);
-    let line = 0, col = 0;
-    for (const ch of before) {
-      if (ch === "\n") { line++; col = 0; }
-      else col += strWidth(ch);
-    }
-    return [line, col];
-  }
-  /** Code-point index of the nearest position at [line, col]. */
-  #indexAtLineCol(line, col) {
-    const lines = this.#lines();
-    let idx = 0;
-    for (let i = 0; i < Math.min(line, lines.length); i++) idx += Array.from(lines[i]).length + 1;
-    const target = lines[Math.min(line, lines.length - 1)] ?? "";
-    const cps = Array.from(target);
-    let w = 0;
-    for (let j = 0; j < cps.length; j++) {
-      const cw = strWidth(cps[j]);
-      if (col < w + cw / 2) break;
-      w += cw;
-      idx++;
-    }
-    return idx;
+  /** Scroll offset that keeps the cursor's visual row inside the window. */
+  #scrollStart(h) {
+    const rows = this.#visualRows();
+    const { row } = this.#cursorVisual();
+    const maxStart = Math.max(0, rows.length - this.maxLines);
+    let start = this.scrollY ?? 0;
+    if (row < start) start = row;
+    else if (row >= start + h) start = row - h + 1;
+    start = Math.max(0, Math.min(maxStart, start));
+    this.scrollY = start;
+    return start;
   }
   render(screen) {
-    const n = this.height();
-    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + n - 1, " ", { bg: this.bg });
-    screen.hline(this.x, this.x + this.w - 1, this.y, "─", { fg: this.border, bg: this.bg });
-    const lines = this.#lines();
-    const [curLine, curCol] = this.#cursorPos();
-    const promptW = strWidth(this.prompt);
-    const inner0 = Math.max(0, this.w - promptW - 2);
-    const innerN = Math.max(0, this.w - 2);
-    if (this.value === "" && this.placeholder) {
+    if (!this.multi) {
+      // single-line: horizontal scroll (search/rename/picker inputs)
+      screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y, " ", { bg: this.bg });
+      screen.hline(this.x, this.x + this.w - 1, this.y, "─", { fg: this.border, bg: this.bg });
+      const promptW = strWidth(this.prompt);
+      const inner = Math.max(0, this.w - promptW - 2);
       screen.text(this.x, this.y, this.prompt, { fg: T.ACCENT, bg: this.bg });
-      screen.text(this.x + promptW, this.y, truncate(this.placeholder, inner0), { fg: T.FAINT, bg: this.bg });
+      if (this.value === "" && this.placeholder) {
+        screen.text(this.x + promptW, this.y, truncate(this.placeholder, inner), { fg: T.FAINT, bg: this.bg });
+        this.cursorCell = { x: this.x + promptW, y: this.y };
+        return;
+      }
+      const before = Array.from(this.value).slice(0, this.cursor).join("");
+      const cx = strWidth(before);
+      let start = 0;
+      while (cx - start >= inner) start += Math.max(1, Math.floor(inner / 2));
+      const visible = truncate(Array.from(this.value).slice(start).join(""), inner);
+      screen.text(this.x + promptW, this.y, visible, { fg: this.fg, bg: this.bg });
+      this.cursorCell = { x: this.x + promptW + Math.min(inner, Math.max(0, cx - start)), y: this.y };
       return;
     }
-    for (let li = 0; li < n; li++) {
-      const y = this.y + li;
-      const line = lines[li] ?? "";
-      if (li === 0) {
+    // multi-line: auto-wrap + scroll window that follows the cursor
+    const rows = this.#visualRows();
+    const h = Math.min(this.maxLines, rows.length);
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + h - 1, " ", { bg: this.bg });
+    screen.hline(this.x, this.x + this.w - 1, this.y, "─", { fg: this.border, bg: this.bg });
+    if (this.value === "" && this.placeholder) {
+      screen.text(this.x, this.y, this.prompt, { fg: T.ACCENT, bg: this.bg });
+      screen.text(this.x + strWidth(this.prompt), this.y, truncate(this.placeholder, this.w - strWidth(this.prompt) - 2), { fg: T.FAINT, bg: this.bg });
+      this.cursorCell = { x: this.x + strWidth(this.prompt), y: this.y };
+      return;
+    }
+    const { row: curRow, col: curCol } = this.#cursorVisual();
+    const start = this.#scrollStart(h);
+    for (let ri = start; ri < Math.min(rows.length, start + h); ri++) {
+      const r = rows[ri];
+      const y = this.y + (ri - start);
+      if (ri === 0) {
         screen.text(this.x, y, this.prompt, { fg: T.ACCENT, bg: this.bg });
-        let start = 0;
-        if (curLine === 0) {
-          while (curCol - start >= inner0) start += Math.max(1, Math.floor(inner0 / 2));
-        }
-        const visible = truncate(Array.from(line).slice(start).join(""), inner0);
-        screen.text(this.x + promptW, y, visible, { fg: this.fg, bg: this.bg });
-        if (curLine === 0) {
-          const at = Math.min(inner0, Math.max(0, curCol - start));
-          screen.put(this.x + promptW + at, y, "█", { fg: T.FAINT, bg: this.bg });
-        }
+        screen.text(this.x + strWidth(this.prompt), y, r.text, { fg: this.fg, bg: this.bg });
       } else {
-        screen.text(this.x + 1, y, truncate(line, innerN), { fg: this.fg, bg: this.bg });
-        if (curLine === li) {
-          const at = Math.min(innerN, Math.max(0, curCol));
-          screen.put(this.x + 1 + at, y, "█", { fg: T.FAINT, bg: this.bg });
-        }
+        screen.text(this.x + 1, y, r.text, { fg: this.fg, bg: this.bg });
       }
     }
+    // Native terminal caret (blinking bar) is positioned by the app after the
+    // frame; store the cell it should occupy (the char at the cursor index).
+    const curY = this.y + (curRow - start);
+    const curX = curRow === 0 ? this.x + strWidth(this.prompt) + curCol : this.x + 1 + curCol;
+    this.cursorCell = { x: Math.min(this.x + this.w - 1, curX), y: Math.min(this.y + h - 1, curY) };
   }
   onMouse(ev) {
     if (ev.kind === "press" && ev.button === 0) {
-      const line = Math.max(0, Math.min(this.#lines().length - 1, ev.y - this.y));
-      const rx = ev.x - this.x - (line === 0 ? strWidth(this.prompt) : 1);
-      this.cursor = this.#indexAtLineCol(line, Math.max(0, rx));
+      if (this.multi) {
+        const h = this.height();
+        const start = this.scrollY ?? 0;
+        const row = start + Math.max(0, Math.min(h - 1, ev.y - this.y));
+        const rx = ev.x - this.x - (row === 0 ? strWidth(this.prompt) : 1);
+        this.cursor = this.#indexAtVisual(row, Math.max(0, rx));
+      } else {
+        const rx = ev.x - this.x - strWidth(this.prompt);
+        let w = 0, idx = 0;
+        for (const ch of Array.from(this.value)) {
+          const cw = strWidth(ch);
+          if (rx < w + cw / 2) break;
+          w += cw;
+          idx++;
+        }
+        this.cursor = idx;
+      }
       return true;
     }
     return false;
@@ -355,12 +418,21 @@ export class Input extends Widget {
         return true;
       case "left": this.selectAll = false; this.cursor = Math.max(0, this.cursor - 1); return true;
       case "right": this.selectAll = false; this.cursor = Math.min(this.#cps().length, this.cursor + 1); return true;
-      case "home": { const [l] = this.#cursorPos(); this.cursor = this.#indexAtLineCol(l, 0); return true; }
-      case "end": { const [l] = this.#cursorPos(); const line = this.#lines()[l] ?? ""; this.cursor = this.#indexAtLineCol(l, strWidth(line)); return true; }
+      case "home": {
+        if (this.multi) { const rows = this.#visualRows(); const { row } = this.#cursorVisual(); this.cursor = rows[row].start; }
+        else this.cursor = 0;
+        return true;
+      }
+      case "end": {
+        if (this.multi) { const rows = this.#visualRows(); const { row } = this.#cursorVisual(); this.cursor = rows[row].end; }
+        else this.cursor = this.#cps().length;
+        return true;
+      }
       case "up":
         if (this.multi) {
-          const [l, c] = this.#cursorPos();
-          if (l > 0) this.cursor = this.#indexAtLineCol(l - 1, c);
+          const rows = this.#visualRows();
+          const { row, col } = this.#cursorVisual();
+          if (row > 0) this.cursor = this.#indexAtVisual(row - 1, col);
         } else if (this.history.length) {
           this.histIdx = this.histIdx < 0 ? this.history.length - 1 : Math.max(0, this.histIdx - 1);
           this.setValue(this.history[this.histIdx] ?? "");
@@ -368,8 +440,9 @@ export class Input extends Widget {
         return true;
       case "down":
         if (this.multi) {
-          const [l, c] = this.#cursorPos();
-          if (l < this.#lines().length - 1) this.cursor = this.#indexAtLineCol(l + 1, c);
+          const rows = this.#visualRows();
+          const { row, col } = this.#cursorVisual();
+          if (row < rows.length - 1) this.cursor = this.#indexAtVisual(row + 1, col);
         } else if (this.histIdx >= 0) {
           this.histIdx++;
           if (this.histIdx >= this.history.length) { this.histIdx = -1; this.setValue(""); }

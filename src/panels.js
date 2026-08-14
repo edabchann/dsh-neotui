@@ -393,10 +393,16 @@ export class WorkspacePanel extends Widget {
       };
       walk(this.tree);
       this.searchResults = results;
-      for (let i = 0; i < Math.min(this.h - 2, results.length); i++) {
-        const sel = i === this.searchSel;
+      const visH = Math.max(1, this.h - 2);
+      if (this.searchSel < (this.searchScroll ?? 0)) this.searchScroll = this.searchSel;
+      else if (this.searchSel >= (this.searchScroll ?? 0) + visH) this.searchScroll = this.searchSel - visH + 1;
+      this.searchScroll = Math.max(0, Math.min(Math.max(0, results.length - visH), this.searchScroll ?? 0));
+      for (let i = 0; i < visH; i++) {
+        const idx = this.searchScroll + i;
+        if (idx >= results.length) break;
+        const sel = idx === this.searchSel;
         screen.fillRect(this.x + 1, this.y + 2 + i, mid - 2, this.y + 2 + i, " ", { bg: sel ? K.MENUSEL : -1 });
-        screen.text(this.x + 2, this.y + 2 + i, truncate("⚲ " + basename(results[i]), mid - 6), { fg: sel ? K.BOLD : K.TXT, bg: sel ? K.MENUSEL : -1 });
+        screen.text(this.x + 2, this.y + 2 + i, truncate("⚲ " + basename(results[idx]), mid - 6), { fg: sel ? K.BOLD : K.TXT, bg: sel ? K.MENUSEL : -1 });
       }
       screen.text(this.x + 1, this.y + this.h - 1, ` 匹配 ${results.length} 个文件 · Esc 退出搜索`, { fg: K.FAINT });
       return;
@@ -781,6 +787,7 @@ export class ControlPanel extends Widget {
     this.subPages = ["常规", "插件"];
     this.subPage = 0;
     this.sel = 0;
+    this.scroll = 0;
     this.commands = DEFAULT_COMMANDS;
     this.plugins = null;
     this.pluginError = null;
@@ -884,9 +891,15 @@ export class ControlPanel extends Widget {
     }
     const items = this.items();
     if (this.sel >= items.length) this.sel = Math.max(0, items.length - 1);
-    for (let i = 0; i < Math.min(this.h - 3, items.length); i++) {
-      const it = items[i];
-      const sel = i === this.sel;
+    const visible = Math.max(1, this.h - 3);
+    if (this.sel < this.scroll) this.scroll = this.sel;
+    else if (this.sel >= this.scroll + visible) this.scroll = this.sel - visible + 1;
+    this.scroll = Math.max(0, Math.min(Math.max(0, items.length - visible), this.scroll));
+    for (let i = 0; i < visible; i++) {
+      const idx = this.scroll + i;
+      const it = items[idx];
+      if (!it) { s.hline(this.x + 1, this.x + this.w - 2, this.y + 2 + i, " ", { bg: T.PANEL }); continue; }
+      const sel = idx === this.sel;
       s.fillRect(this.x + 1, this.y + 2 + i, this.x + this.w - 2, this.y + 2 + i, " ", { bg: sel ? T.MENUSEL : T.PANEL });
       const label = it[0];
       s.text(this.x + 2, this.y + 2 + i, truncate(label, this.w - 34), { fg: sel ? T.BOLD : (this.page === 0 ? T.ACCENT : T.TXT), bg: sel ? T.MENUSEL : T.PANEL, attrs: sel ? 1 : 0 });
@@ -947,9 +960,9 @@ export class ControlPanel extends Widget {
         }
         return true;
       }
-      const idx = ev.y - this.y - 2;
+      const idx = this.scroll + (ev.y - this.y - 2);
       const items = this.items();
-      if (idx >= 0 && idx < items.length && idx < this.h - 3) {
+      if (idx >= 0 && idx < items.length && (ev.y - this.y - 2) < this.h - 3) {
         this.sel = idx;
         const it = items[idx];
         if (it && it[2]) { it[2](); this.app.redraw(); }
