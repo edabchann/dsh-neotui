@@ -132,6 +132,33 @@ test("text block left-click collapses to a 3-line preview + trailer, click resto
   assert.ok(text2.includes("line four"), "full text back");
 });
 
+test("re-expanding a folded block at the bottom keeps the header in view", () => {
+  const longText = Array.from({ length: 40 }, (_, i) => `para ${i}`).join("\n\n");
+  const { chat } = render([
+    { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [{ kind: "text", text: longText }] },
+  ]);
+  const clickLine = (li) => {
+    chat.view.scrollY = Math.max(0, li - 5);
+    const y = chat.view.y + (li - chat.view.scrollY);
+    chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
+    chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
+  };
+  // collapse it first
+  const headerIdx = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 0"));
+  clickLine(headerIdx);
+  assert.ok(chat.collapsedBlocks.has("0:0"), "collapsed");
+  // the view now sits at the bottom of the short buffer (tail-follow region)
+  chat.view.scrollY = chat.view.maxScroll();
+  const wasAtBottom = chat.view.scrollY + chat.view.h >= chat.view.lines.length - 1;
+  assert.ok(wasAtBottom, "test setup: view is at the bottom");
+  // click the folded header to re-expand
+  const hdr = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("para 0"));
+  clickLine(hdr);
+  assert.ok(!chat.collapsedBlocks.has("0:0"), "re-expanded");
+  const topText = chat.lines[chat.view.scrollY].map((g) => g.t).join("");
+  assert.ok(topText.includes("▾"), `expanded header anchored at the viewport top (got: ${JSON.stringify(topText.slice(0, 40))})`);
+});
+
 test("collapsing a long text block keeps the viewport anchored (no view jump)", () => {
   // a long text block followed by plenty of later nodes so the buffer stays
   // scrollable after the collapse

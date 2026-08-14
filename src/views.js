@@ -851,11 +851,10 @@ export class ChatView extends Widget {
       // Expand/collapse changes the line count ABOVE the viewport, which would
       // leave scrollY pointing at unrelated content (the "chaotic" jump).
       // Anchor: after the rebuild, scroll so the clicked block's first line
-      // sits at the top of the viewport. At the bottom the tail-follow snap
-      // in setLines is the right behavior instead.
-      const wasAtBottom = this.view.scrollY + this.view.h >= this.view.lines.length - 1;
+      // sits at the top of the viewport. This applies ALWAYS — even at the
+      // bottom: the tail-follow snap would otherwise fling the clicked header
+      // out of view when a folded block re-expands.
       const reanchor = (match) => {
-        if (wasAtBottom) return;
         let fallback = -1;
         for (let i = 0; i < this.lineMap.length; i++) {
           if (!match(this.lineMap[i])) continue;
