@@ -580,9 +580,9 @@ export class ChatView extends Widget {
     });
     this.input = new Input({
       x: this.x, y: this.y + this.h - 2, w: this.w, h: 1,
-      multi: true, maxLines: 6,
+      multi: true, maxLines: 6, app: this.app,
       bg: T.PANEL,
-      placeholder: "输入消息…（Shift+Enter / Ctrl+J 换行，Enter 发送）",
+      placeholder: "输入消息…（Shift+Enter/Ctrl+J 换行，Ctrl+L 展开，Enter 发送）",
       onEnter: (v) => this.send(v),
       onChange: () => this.inputChanged(),
     });
@@ -731,10 +731,12 @@ export class ChatView extends Widget {
 
   inputChanged() {
     // Multi-line input grew/shrunk → reflow view vs input, keep the tail visible.
-    const ih = this.input.height();
+    // The expanded (Ctrl+L) input may claim the whole window: clamp so the
+    // scroll view keeps at least one row.
+    const th = this.todoHeight();
+    const ih = Math.min(this.input.height(), Math.max(1, this.h - th - 2));
     const prevIh = this.input.h;
     this.input.h = ih;
-    const th = this.todoHeight();
     this.view.h = this.h - ih - th - 1;
     this.input.y = this.y + this.h - ih;
     if (ih !== prevIh) this.app.layout();
@@ -743,9 +745,9 @@ export class ChatView extends Widget {
 
   resize(x, y, w, h) {
     this.x = x; this.y = y; this.w = w; this.h = h;
-    const ih = this.input.height();
-    this.input.h = ih;
     const th = this.todoHeight();
+    const ih = Math.min(this.input.height(), Math.max(1, h - th - 2));
+    this.input.h = ih;
     this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = h - ih - th - 1;
     this.input.x = x; this.input.y = y + h - ih; this.input.w = w;
     this.cache.clear();
@@ -1970,10 +1972,16 @@ export class App {
       this.model = host.model ?? "";
     } catch (e) { this.log(`[app] host.describe: ${e.message}`); }
     await this.refreshSessions();
-    // Open on a blank session at the launch directory (reusing an existing
-    // draft when available) so the blank-session homepage shows immediately
-    // instead of a fully empty chat area.
-    if (!this.currentSession) {
+    // A /restart handoff carries the session to reopen: resume it instead of
+    // minting a fresh blank session (which was leaking a stray "new session"
+    // into 未分组 on every restart).
+    const resumeId = process.env.DSH_TUI_RESUME_SESSION;
+    if (resumeId && this.sessions.some((s) => s.sessionId === resumeId)) {
+      await this.openSession(resumeId);
+    } else if (!this.currentSession) {
+      // Open on a blank session at the launch directory (reusing an existing
+      // draft when available) so the blank-session homepage shows immediately
+      // instead of a fully empty chat area.
       await this.newSessionIn(null);
     }
     this.api.connectMux();
@@ -2488,7 +2496,10 @@ export class App {
     try {
       const { spawn } = await import("node:child_process");
       const argv = process.argv.slice(1);
-      const child = spawn("sh", ["-c", 'sleep 1; exec "$@"', "sh", ...argv], { detached: true, stdio: "inherit" });
+      // hand the CURRENT session to the new instance so it reopens it instead
+      // of minting a fresh blank session (the "strange new session" in 未分组)
+      const env = { ...process.env, DSH_TUI_RESUME_SESSION: this.currentSession ?? "" };
+      const child = spawn("sh", ["-c", 'sleep 1; exec "$@"', "sh", ...argv], { detached: true, stdio: "inherit", env });
       child.unref();
     } catch (e) {
       this.toast(`重启失败: ${e.message}（请手动重启）`);

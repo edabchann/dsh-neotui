@@ -9,6 +9,7 @@ import { ChatView, App, userPrefix, saveTuiConfig } from "../src/views.js";
 import { TrajectoryPanel, JobsPanel, SettingsPanel } from "../src/panels.js";
 import { fmtDuration, strWidth } from "../src/text.js";
 import { renderMd } from "../src/md.js";
+import { Input } from "../src/widgets.js";
 import { Screen } from "../src/screen.js";
 
 // isolate TUI config writes from the real ~/.dsh/tui-config.json
@@ -366,16 +367,79 @@ test("session/jobs snapshots buffered before the session opens survive (footer c
   assert.equal(app.jobs.length, 0, "no stale counts leak across sessions");
 });
 
+test("a /restart handoff resumes the session instead of minting a new one", async () => {
+  const saved = process.env.DSH_TUI_RESUME_SESSION;
+  process.env.DSH_TUI_RESUME_SESSION = "s-resume";
+  try {
+    const app = headlessApp();
+    const calls = [];
+    app.api.call = async (m, p) => {
+      calls.push(m);
+      if (m === "session.list") return { items: [{ sessionId: "s-resume" }] };
+      if (m === "session.history") return { events: [] };
+      return {};
+    };
+    await app.init();
+    assert.equal(app.currentSession, "s-resume", "resumed the handed-over session");
+    assert.ok(!calls.includes("session.create"), "no fresh blank session minted");
+    clearTimeout(app.pollTimer);
+  } finally {
+    if (saved === undefined) delete process.env.DSH_TUI_RESUME_SESSION;
+    else process.env.DSH_TUI_RESUME_SESSION = saved;
+  }
+});
+
+test("large pastes are two-stage (placeholder then full content, claude-code style)", () => {
+  const toasts = [];
+  const input = new Input({ x: 0, y: 0, w: 60, h: 1, multi: true, app: { toast: (m) => toasts.push(m) } });
+  const big = Array.from({ length: 12 }, (_, i) => `line ${i}`).join("\n");
+  // stage 1: placeholder only
+  input.onKey({ type: "text", text: big });
+  assert.equal(input.value, "[已复制 12 行内容]", "first paste shows the placeholder");
+  assert.equal(toasts.at(-1), "再次 Ctrl+Shift+V 粘贴完整内容（Ctrl+L 展开输入栏）");
+  // stage 2: the SAME clipboard pastes in full, replacing the placeholder
+  input.onKey({ type: "text", text: big });
+  assert.equal(input.value, big, "second paste inserts the full content");
+  assert.equal(toasts.at(-1), "已粘贴完整内容");
+  // a small paste is always a direct paste (no placeholder)
+  input.setValue("");
+  input.onKey({ type: "text", text: "small" });
+  assert.equal(input.value, "small", "small pastes paste directly");
+  // stage 1 again, then typing cancels the held-back paste
+  input.onKey({ type: "text", text: big });
+  input.onKey({ type: "key", name: "char", key: "x", text: "x", ctrl: false, alt: false, shift: false });
+  assert.equal(input.pendingPaste, null, "typing cancels the held-back paste");
+  // the next paste is a fresh stage-1; pasting again inserts the full content
+  input.onKey({ type: "text", text: big });
+  input.onKey({ type: "text", text: big });
+  assert.ok(input.value.endsWith("line 11"), "full content inserted after the edit");
+});
+
+test("Ctrl+L expands/collapses the input past the 6-line cap", () => {
+  const app = { toast: () => {} };
+  const input = new Input({ x: 0, y: 0, w: 40, h: 1, multi: true, maxLines: 6, app });
+  const big = Array.from({ length: 40 }, (_, i) => `row ${i}`).join("\n");
+  input.setValue(big);
+  assert.ok(input.height() <= 6, "capped at 6 lines by default");
+  input.onKey({ type: "key", name: "char", key: "l", text: "l", ctrl: true, alt: false, shift: false });
+  assert.equal(input.expanded, true, "expanded");
+  assert.ok(input.height() > 6, "expanded input exceeds the cap");
+  input.onKey({ type: "key", name: "char", key: "l", text: "l", ctrl: true, alt: false, shift: false });
+  assert.equal(input.expanded, false, "collapsed again");
+  assert.ok(input.height() <= 6, "back to the 6-line cap");
+});
+
 test("JobsPanel expanded detail shows the FULL command via wrapping + scrolling", () => {
   const app = fakeApp();
   app.screen = { w: 100, h: 30 };
   const longCmd = "bash -c 'echo " + Array.from({ length: 40 }, (_, i) => `arg-${i}`).join(" ") + "'";
-  app.jobs = [{ status: "completed", kind: "bash", label: "long job", args: longCmd }];
+  // the real frame shape: the full command lives in `label`
+  app.jobs = [{ status: "completed", kind: "bash", label: longCmd }];
   const panel = new JobsPanel(app);
   panel.expanded.add(0);
   panel.rebuild();
   const text = panel.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
-  assert.ok(text.includes(longCmd.slice(0, 40)), "command head present");
+  assert.ok(text.includes("命令:"), "label shown under 命令");
   // the full command is present across the wrapped lines (strip the wrap
   // indents so the continuation chunks join contiguously)
   const detail = panel.lines.slice(2).map((l) => l.map((g) => g.t).join("").replace(/^\s+/, "")).join("");
@@ -387,6 +451,7 @@ test("JobsPanel expanded detail shows the FULL command via wrapping + scrolling"
   panel.onKey({ type: "key", name: "pgup" });
   assert.equal(panel.scrollY, before, "pgup scrolls back");
   // wheel scrolling reaches the very end of the content
+  panel.onMouse({ type: "mouse", kind: "wheel-down", button: 4, x: 10, y: 10, ctrl: false, shift: false, alt: false, motion: false });
   panel.onMouse({ type: "mouse", kind: "wheel-down", button: 4, x: 10, y: 10, ctrl: false, shift: false, alt: false, motion: false });
   assert.equal(panel.scrollY, panel.maxScroll(), "wheel reaches the end");
 });
@@ -892,11 +957,11 @@ test("JobsPanel: title, Enter/→ expand, ←/h collapse, q close", () => {
   const panel = new JobsPanel(app);
   assert.ok(panel.title.includes("后台任务"), panel.title);
   assert.equal(panel.expanded.size, 0);
-  assert.equal(panel.lines.filter((l) => l.some((g) => g.t.includes("detail:"))).length, 0, "detail hidden before expand");
+  assert.equal(panel.lines.filter((l) => l.some((g) => g.t.includes("结果:"))).length, 0, "detail hidden before expand");
   // Enter expands the selected job
   panel.onKey({ type: "key", name: "enter" });
   assert.equal(panel.expanded.size, 1);
-  assert.ok(panel.lines.some((l) => l.some((g) => g.t.includes("detail:"))), "detail row visible");
+  assert.ok(panel.lines.some((l) => l.some((g) => g.t.includes("结果:"))), "detail row visible");
   // j moves down, h collapses the second... move down then collapse
   panel.onKey({ type: "key", name: "char", key: "j", text: "j", ctrl: false, alt: false, shift: false });
   assert.equal(panel.sel, 1);

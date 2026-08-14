@@ -1218,6 +1218,7 @@ export class ControlPanel extends Widget {
       ["G", "滚动到底", () => { this.app.closeOverlay(); this.app.chat.view.scrollY = this.app.chat.view.maxScroll(); }],
       ["[", "上一提问的终点", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); this.app.chat.onKey({ type: "key", name: "char", key: "[", text: "[", ctrl: false, alt: false, shift: false }); }],
       ["]", "下一提问的终点", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); this.app.chat.onKey({ type: "key", name: "char", key: "]", text: "]", ctrl: false, alt: false, shift: false }); }],
+      ["Ctrl+L", "输入栏 展开/折叠", () => { this.app.closeOverlay(); this.app.focus(this.app.chat.input); this.app.chat.input.onKey({ type: "key", name: "char", key: "l", text: "l", ctrl: true, alt: false, shift: false }); }],
       ["Ctrl+P", "控制面板", () => { this.page = 1; this.sel = 0; this.app.redraw(); }],
       ["Ctrl+M", "切换模型", () => { this.app.overlay = buildModelPicker(this.app); }],
       ["Ctrl+T", "轨迹视图", () => { this.app.closeOverlay(); this.app.setMode("trajectory"); }],
@@ -1408,16 +1409,20 @@ export class JobsPanel extends Popup {
   #detailLines(j) {
     // Expanded = EVERYTHING: every field, full values — long commands wrap
     // across lines instead of being truncated (the web clips them; we don't).
+    // `label` carries the full command, so it is shown here too (the header
+    // row keeps only a 36-column preview of it).
+    const names = { label: "命令", detail: "结果", startedAt: "开始于", finishedAt: "结束于" };
     const lines = [];
     const budget = Math.max(20, this.w - 10);
     for (const [k, v] of Object.entries(j)) {
-      if (["status", "kind", "label"].includes(k)) continue;
+      if (["status", "kind"].includes(k)) continue;
       const s = v !== null && typeof v === "object" ? JSON.stringify(v) : String(v ?? "");
       if (s === "") continue;
+      const key = names[k] ?? k;
       let rest = s;
       let first = true;
       while (rest.length > 0 || first) {
-        const head = first ? `${k}: ` : "     ";
+        const head = first ? `${key}: ` : "     ";
         const take = JobsPanel.#cutWidth(rest, budget - strWidth(head));
         lines.push([{ t: `      ${head}${take}`, fg: K.DIM }]);
         rest = rest.slice(take.length);

@@ -253,6 +253,11 @@ export class Input extends Widget {
     this.border = opts.border ?? T.BORDER2;
     this.multi = opts.multi ?? false;
     this.maxLines = opts.maxLines ?? 6;
+    this.baseMaxLines = this.maxLines; // restored when the input collapses
+    this.expanded = false;             // Ctrl+L: drop the line cap and fill the window
+    this.app = opts.app ?? null;
+    this.pendingPaste = null;          // large-paste stage 1: held-back clipboard text
+    this.pendingPlaceholder = null;    // the "[已复制 N 行内容]" marker currently shown
     this.onChange = opts.onChange ?? null;
     this.allowEmptyEnter = opts.allowEmptyEnter ?? false;
     this.history = [];
@@ -313,6 +318,7 @@ export class Input extends Widget {
   /** Rendered height: 1, or wrapped rows capped at maxLines when multi. */
   height() { return this.multi ? Math.max(1, Math.min(this.maxLines, this.#visualRows().length)) : 1; }
   setValue(v, opts = {}) {
+    this.#touch();
     this.value = String(v);
     this.cursor = this.#cps().length;
     this.selectAll = Boolean(opts.select);  // first insert/text replaces the whole value
@@ -416,15 +422,45 @@ export class Input extends Widget {
     }
     return false;
   }
+  /** Any manual edit cancels the held-back paste (the placeholder stays as
+   *  ordinary text). */
+  #touch() { this.pendingPaste = null; this.pendingPlaceholder = null; }
+  /** Claude-Code-style two-stage paste: the first Ctrl+Shift+V of a large
+   *  clipboard shows a "[已复制 N 行内容]" placeholder; pasting the same
+   *  content again inserts it in full, like a normal paste. */
+  #paste(text) {
+    text = String(text ?? "");
+    const large = text.includes("\n") || text.length > 300;
+    if (large) {
+      if (this.pendingPaste && this.pendingPaste.text === text) {
+        const full = this.pendingPaste.text;
+        const placeholder = this.pendingPlaceholder;
+        this.#touch();
+        if (this.value === placeholder) this.setValue(full);
+        else this.insert(full);
+        this.app?.toast?.("已粘贴完整内容");
+        return true;
+      }
+      const lines = text.split("\n").length;
+      this.pendingPaste = { text };
+      this.pendingPlaceholder = `[已复制 ${lines} 行内容]`;
+      this.insert(this.pendingPlaceholder);
+      this.app?.toast?.("再次 Ctrl+Shift+V 粘贴完整内容（Ctrl+L 展开输入栏）");
+      return true;
+    }
+    this.#touch();
+    this.insert(text);
+    return true;
+  }
   onKey(ev) {
-    if (ev.type === "text") { this.insert(ev.text); return true; }
+    if (ev.type === "text") { return this.#paste(ev.text ?? ""); }
     if (ev.type !== "key") return false;
     switch (ev.name) {
       case "backspace":
-        if (this.cursor > 0) { this.#deleteAt(this.cursor - 1); this.cursor--; this.onChange?.(); }
+        if (this.cursor > 0) { this.#touch(); this.#deleteAt(this.cursor - 1); this.cursor--; this.onChange?.(); }
         return true;
       case "delete":
-        if (this.cursor < this.#cps().length) { this.#deleteAt(this.cursor); this.onChange?.(); }
+        if (this.cursor < this.#cps().length) { this.#touch(); this.#deleteAt(this.cursor); this.onChange?.(); }
         return true;
       case "left": this.selectAll = false; this.cursor = Math.max(0, this.cursor - 1); return true;
       case "right": this.selectAll = false; this.cursor = Math.min(this.#cps().length, this.cursor + 1); return true;
@@ -463,8 +499,17 @@ export class Input extends Widget {
         if (ev.ctrl) {
           switch (ev.key) {
             case "j": if (this.multi) { this.insert("\n"); return true; } return false;
-            case "u": this.value = this.#cps().slice(this.cursor).join(""); this.cursor = 0; this.onChange?.(); return true;
-            case "k": this.value = this.#cps().slice(0, this.cursor).join(""); this.onChange?.(); return true;
+            case "u": this.#touch(); this.value = this.#cps().slice(this.cursor).join(""); this.cursor = 0; this.onChange?.(); return true;
+            case "k": this.#touch(); this.value = this.#cps().slice(0, this.cursor).join(""); this.onChange?.(); return true;
+            case "l": {
+              // expand/collapse the input: expanded drops the 6-line cap and
+              // lets the editor fill the window above the input
+              this.expanded = !this.expanded;
+              this.maxLines = this.expanded ? 1000 : this.baseMaxLines;
+              this.onChange?.();
+              this.app?.toast?.(this.expanded ? "输入栏已展开（Ctrl+L 折叠）" : "输入栏已折叠（Ctrl+L 展开）");
+              return true;
+            }
             case "a": this.cursor = 0; return true;
             case "e": this.cursor = this.#cps().length; return true;
             case "w": {
@@ -481,6 +526,7 @@ export class Input extends Widget {
           }
           return false;
         }
+        this.#touch();
         this.insert(ev.text);
         return true;
       case "enter":
