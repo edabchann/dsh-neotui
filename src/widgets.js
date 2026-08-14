@@ -27,6 +27,7 @@ export class ScrollView extends Widget {
     super(opts);
     this.lines = [];       // array of arrays of segs: {t, fg, bg, bold, italic, underline, strike, code, link}
     this.scrollY = 0;
+    this.anchorLock = null; // click anchor held beyond maxScroll (fold at the tail)
     this.autoScroll = opts.autoScroll ?? false;
     this.onClick = opts.onClick ?? null;    // (y, ev) => bool
     this.onWheel = null;                    // optional custom wheel handler
@@ -36,7 +37,12 @@ export class ScrollView extends Widget {
   setLines(lines, { keep = false } = {}) {
     const atBottom = this.autoScroll && this.scrollY + this.h >= this.lines.length - 1 || (keep && this.scrollY + this.h >= this.lines.length);
     this.lines = lines;
-    if (atBottom || this.scrollY > Math.max(0, this.lines.length - this.h)) {
+    if (this.anchorLock != null) {
+      // A click fold removed the tail content: hold the exact anchored
+      // position even though the buffer now ends above it (no delayed snap).
+      this.scrollY = this.anchorLock;
+      if (this.scrollY <= Math.max(0, this.lines.length - this.h)) this.anchorLock = null;
+    } else if (atBottom || this.scrollY > Math.max(0, this.lines.length - this.h)) {
       this.scrollY = Math.max(0, this.lines.length - this.h);
     }
   }
@@ -44,6 +50,7 @@ export class ScrollView extends Widget {
   maxScroll() { return Math.max(0, this.lines.length - this.h); }
   scroll(dy) {
     const before = this.scrollY;
+    this.anchorLock = null; // explicit scroll releases the click anchor
     this.scrollY = Math.max(0, Math.min(this.maxScroll(), this.scrollY + dy));
     return this.scrollY !== before;
   }
@@ -78,7 +85,8 @@ export class ScrollView extends Widget {
       const trackH = Math.max(1, this.h - 2);
       const total = Math.max(1, this.lines.length);
       const thumbH = Math.max(1, Math.floor(this.h * this.h / total));
-      const thumbY = Math.floor((this.h - 2) * this.scrollY / Math.max(1, this.maxScroll()));
+      const frac = Math.min(1, this.scrollY / Math.max(1, this.maxScroll()));
+      const thumbY = Math.floor((this.h - 2) * frac);
       for (let i = 0; i < this.h; i++) {
         const inThumb = i >= 1 + thumbY && i < 1 + thumbY + thumbH;
         const inTrack = i >= 1 && i < this.h - 1;
@@ -114,6 +122,7 @@ export class ScrollView extends Widget {
     return false;
   }
   #scrubTo(ey) {
+    this.anchorLock = null; // scrubbing releases the click anchor
     const trackH = Math.max(1, this.h - 2);
     const total = Math.max(1, this.lines.length);
     const thumbH = Math.max(1, Math.floor(this.h * this.h / total));

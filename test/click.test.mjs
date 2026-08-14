@@ -461,6 +461,28 @@ test("/reload in the input restarts the app instead of sending", async () => {
   assert.equal(sent?.m, "session.prompt", "other slash commands still send");
 });
 
+test("folding the last block at the bottom holds the header position (no 5-line slide)", () => {
+  const longText = Array.from({ length: 40 }, (_, i) => `para ${i}`).join("\n\n");
+  const { chat } = render([
+    { kind: "assistant", id: "a1", step: 1, streaming: false, blocks: [{ kind: "text", text: longText }] },
+    { kind: "assistant", id: "a2", step: 2, streaming: false, blocks: [{ kind: "tool", name: "bash", args: "ls", result: "ok", startedAt: 1, endedAt: 2, view: null }] },
+  ]);
+  chat.view.scrollY = chat.view.maxScroll();
+  const hdr = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("bash"));
+  const rowBefore = hdr - chat.view.scrollY;
+  const y = chat.view.y + rowBefore;
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
+  assert.ok(chat.collapsedBlocks.has("1:0"), "tool collapsed");
+  const hdr2 = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("bash"));
+  assert.equal(hdr2 - chat.view.scrollY, rowBefore, "header stays at its viewport row after the fold");
+  // a later poll rebuild must not snap the view back
+  chat.queueRebuild();
+  chat.flushRebuild();
+  const hdr3 = chat.lines.findIndex((l) => l.map((g) => g.t).join("").includes("bash"));
+  assert.equal(hdr3 - chat.view.scrollY, rowBefore, "no delayed snap on the next rebuild");
+});
+
 test("a missed block-end cannot leave a forever-running timer", () => {
   const now = Date.now();
   const { lines } = render([{

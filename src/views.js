@@ -696,7 +696,7 @@ export class ChatView extends Widget {
     if (idx < 0 || idx >= this.nodes.length) return false;
     for (let li = 0; li < this.lineMap.length; li++) {
       if (this.lineMap[li]?.nodeIdx === idx) {
-        this.view.scrollY = Math.max(0, li - 2);
+        this.view.anchorLock = null; this.view.scrollY = Math.max(0, li - 2);
         this.app.redraw();
         return true;
       }
@@ -770,7 +770,7 @@ export class ChatView extends Widget {
     this.#rebuild();
     // Jump to the LIVE tail (the newest content) on open — the view would
     // otherwise sit at the top showing the oldest turns.
-    this.view.scrollY = this.view.maxScroll();
+    this.view.anchorLock = null; this.view.scrollY = this.view.maxScroll();
   }
 
   async loadOlder() {
@@ -880,11 +880,16 @@ export class ChatView extends Widget {
     const preHeaderRow = preHeaderIdx >= 0 ? preHeaderIdx - this.view.scrollY : null;
     const reanchor = () => {
       // primary anchor: the clicked block's header stays at its pre-click
-      // viewport row (zero shift) — only when the header was ON-SCREEN
+      // viewport row (zero shift) — only when the header was ON-SCREEN.
+      // When the fold removed the tail content below, the anchored position
+      // may exceed maxScroll: hold it via the view's anchorLock instead of
+      // clamping (the clamp is exactly the 5–6 line slide the user sees).
       if (preHeaderRow !== null && preHeaderRow >= 0 && preHeaderIdx >= 0) {
         const h2 = firstNonEmpty(match);
         if (h2 >= 0) {
-          this.view.scrollY = Math.max(0, Math.min(h2 - preHeaderRow, this.view.maxScroll()));
+          const sy = h2 - preHeaderRow;
+          this.view.scrollY = Math.max(0, sy);
+          if (sy > this.view.maxScroll()) this.view.anchorLock = sy;
           return;
         }
       }
@@ -898,7 +903,8 @@ export class ChatView extends Widget {
       }
       if (first < 0) return;
       const target = Math.min(first + topOffset, last);
-      this.view.scrollY = Math.max(0, Math.min(target, this.view.maxScroll()));
+      this.view.scrollY = Math.max(0, target);
+      if (target > this.view.maxScroll()) this.view.anchorLock = target;
     };
     // never park the viewport on a blank separator row — it reads as a
     // spurious offset right after the click
@@ -1380,12 +1386,12 @@ export class ChatView extends Widget {
       case "pgdn": return this.view.scroll(this.view.h);
     }
     if (ev.name === "char" && ev.key === "g" && !ev.ctrl && !ev.shift) {
-      if (this.gKey) { this.gKey = false; this.view.scrollY = 0; return true; }
+      if (this.gKey) { this.gKey = false; this.view.anchorLock = null; this.view.scrollY = 0; return true; }
       this.gKey = true;
       this.app.toast("再按 g 回顶");
       return true;
     }
-    if (ev.name === "char" && ev.key === "g" && ev.shift) { this.view.scrollY = this.view.maxScroll(); return true; }
+    if (ev.name === "char" && ev.key === "g" && ev.shift) { this.view.anchorLock = null; this.view.scrollY = this.view.maxScroll(); return true; }
     if (ev.name === "escape" && this.app.searchQuery) { this.app.searchQuery = null; this.queueRebuild(); return true; }
     if (ev.name === "escape" && this.selStart !== null) { this.selStart = this.selEnd = null; this.app.redraw(); return true; }
     if (ev.name === "char" && ev.key === "i" && !ev.ctrl) { this.app.focus(this.input); return true; }
