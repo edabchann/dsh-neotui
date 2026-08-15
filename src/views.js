@@ -283,7 +283,15 @@ function applyEvent(nodes, event, view, log, state = null) {
           node = { kind: "assistant", blocks: [], streaming: true, finalized: false, step: st.step, turnStartAt: st.turnStart ?? undefined };
           nodes.push(node);
         }
-        node.blocks.push({ kind: "tool", name: d.name, args: d.arguments, callId, view: view?.view, result: null, startedAt: event.time ?? Date.now() });
+        node.blocks.push({ kind: "tool", name: d.name, args: d.arguments, callId, view: view?.view, result: null, subCalls: [], startedAt: event.time ?? Date.now() });
+        break;
+      }
+      case "tool/code-dispatch-start": {
+        addDispatch(nodes, d, event, false);
+        break;
+      }
+      case "tool/code-dispatch": {
+        addDispatch(nodes, d, event, true);
         break;
       }
       case "tool/result": {
@@ -434,6 +442,161 @@ function partsToText(content) {
   };
   walk(content);
   return texts.length ? texts.join("\n") : null;
+}
+
+// ---- Nested code-dispatch (run_code sub-tool calls) ----
+// A run_code tool call can itself dispatch sub-tools (bash/read/…), which may
+// nest. The host streams `tool/code-dispatch-start` (a sub-call began) and
+// `tool/code-dispatch` (that sub-call settled) with a rootCallId → parentCallId
+// → subCallId linkage. We fold those into the parent tool block's subCalls
+// tree, bounded so a malformed/deep stream cannot blow up the terminal render.
+
+const DISPATCH_MAX_DEPTH = 16;     // max nesting depth (tool block = depth 0)
+const DISPATCH_MAX_NODES = 128;    // max total sub-dispatch nodes per tool call
+const DISPATCH_RESULT_MAX = 4000;  // max result text chars kept per sub-dispatch
+const DISPATCH_RENDER_LINES = 400; // max rendered lines for one tool's sub-tree
+
+/** Find the tool block whose callId matches (search newest assistant first). */
+function findToolBlock(nodes, callId) {
+  for (let ni = nodes.length - 1; ni >= 0; ni--) {
+    const nd = nodes[ni];
+    if (nd.kind !== "assistant") continue;
+    for (let bi = (nd.blocks ?? []).length - 1; bi >= 0; bi--) {
+      const b = nd.blocks[bi];
+      if (b.kind === "tool" && b.callId === callId) return b;
+    }
+  }
+  return null;
+}
+
+/** Total number of sub-dispatch nodes in a tool block's tree. */
+function countDispatch(block) {
+  let n = 0;
+  const stack = [...(block.subCalls ?? [])];
+  while (stack.length) {
+    const c = stack.pop();
+    n++;
+    if (c.subCalls?.length) stack.push(...c.subCalls);
+  }
+  return n;
+}
+
+/** Visit every sub-dispatch node under a node's tool blocks (pre-order-ish). */
+function forEachDispatch(node, fn) {
+  for (const b of node.blocks ?? []) {
+    if (b.kind !== "tool") continue;
+    const stack = [...(b.subCalls ?? [])];
+    while (stack.length) {
+      const c = stack.pop();
+      fn(c, b);
+      if (c.subCalls?.length) stack.push(...c.subCalls);
+    }
+  }
+}
+
+/** Locate a sub-dispatch node by callId within one tool block's tree. */
+function findDispatchInTree(block, callId) {
+  const stack = [{ children: block.subCalls ?? [], depth: 0 }];
+  while (stack.length) {
+    const frame = stack.pop();
+    for (let i = 0; i < frame.children.length; i++) {
+      const child = frame.children[i];
+      const depth = frame.depth + 1;
+      if (child.callId === callId) return { child, container: frame.children, index: i, depth };
+      if (child.subCalls?.length) stack.push({ children: child.subCalls, depth });
+    }
+  }
+  return null;
+}
+
+/** Find a dispatch parent by callId (the tool block itself counts as depth 0),
+ *  returning the node plus its depth and ancestor callIds for cycle checks. */
+function findDispatchParent(block, parentCallId) {
+  if (block.callId === parentCallId) return { node: block, depth: 0, ancestors: [] };
+  const stack = [{ node: block, children: block.subCalls ?? [], depth: 0, ancestors: [] }];
+  while (stack.length) {
+    const frame = stack.pop();
+    for (let i = 0; i < frame.children.length; i++) {
+      const child = frame.children[i];
+      const depth = frame.depth + 1;
+      const ancestors = [...frame.ancestors, frame.node.callId];
+      if (child.callId === parentCallId) return { node: child, depth, ancestors };
+      if (child.subCalls?.length) stack.push({ node: child, children: child.subCalls, depth, ancestors });
+    }
+  }
+  return null;
+}
+
+/** The root tool block a dispatch event targets: exact rootCallId match, else
+ *  the most recent tool block (prefer one still awaiting its result). */
+function locateDispatchRoot(nodes, rootCallId) {
+  if (rootCallId != null) {
+    const exact = findToolBlock(nodes, rootCallId);
+    if (exact) return exact;
+  }
+  const scan = (wantPending) => {
+    for (let ni = nodes.length - 1; ni >= 0; ni--) {
+      const nd = nodes[ni];
+      if (nd.kind !== "assistant") continue;
+      for (let bi = (nd.blocks ?? []).length - 1; bi >= 0; bi--) {
+        const b = nd.blocks[bi];
+        if (b.kind === "tool" && (!wantPending || b.result == null)) return b;
+      }
+    }
+    return null;
+  };
+  return scan(true) ?? scan(false);
+}
+
+function dispatchArgs(d) {
+  if (d.arguments === undefined || d.arguments === null) return "";
+  return typeof d.arguments === "string" ? d.arguments : JSON.stringify(d.arguments);
+}
+
+/** Fill a dispatch node with the settle payload of a tool/code-dispatch event. */
+function settleDispatch(node, d, event) {
+  if (d.name !== undefined) node.name = d.name;
+  if (d.arguments !== undefined) node.args = dispatchArgs(d);
+  node.content = d.content ?? null;
+  node.isError = d.isError === true || !!d.error;
+  node.error = d.error ?? null;
+  const text = partsToText(d.content);
+  node.result = text != null ? String(text).slice(0, DISPATCH_RESULT_MAX)
+    : (node.isError ? String(d.error?.message ?? "错误").slice(0, DISPATCH_RESULT_MAX) : "");
+  node.endedAt = event.time ?? node.endedAt ?? Date.now();
+}
+
+/** Apply one code-dispatch event onto the tree rooted at its tool block. */
+function addDispatch(nodes, d, event, settle) {
+  const subCallId = typeof d.subCallId === "string" && d.subCallId !== "" ? d.subCallId : null;
+  if (subCallId == null) return;
+  const block = locateDispatchRoot(nodes, typeof d.rootCallId === "string" && d.rootCallId !== "" ? d.rootCallId : null);
+  if (!block) return;
+  if (!Array.isArray(block.subCalls)) block.subCalls = [];
+
+  const existing = findDispatchInTree(block, subCallId)?.child;
+  if (existing) {
+    if (settle) settleDispatch(existing, d, event);
+    return;
+  }
+
+  const parent = findDispatchParent(block, typeof d.parentCallId === "string" && d.parentCallId !== "" ? d.parentCallId : block.callId);
+  const parentNode = parent ? parent.node : block;
+  const depth = parent ? parent.depth + 1 : 1;
+  if (depth > DISPATCH_MAX_DEPTH) return;                       // depth guard
+  if (subCallId === parentNode.callId) return;                  // self-loop
+  if (parent?.ancestors?.includes(subCallId)) return;           // cycle
+  if (countDispatch(block) >= DISPATCH_MAX_NODES) return;       // volume guard
+  if (findDispatchInTree(block, subCallId)) return;             // duplicate under another parent
+
+  const node = {
+    kind: "dispatch", callId: subCallId, name: d.name, args: dispatchArgs(d),
+    result: null, content: null, isError: false, error: null,
+    startedAt: event.time ?? Date.now(), endedAt: null, subCalls: [],
+  };
+  if (!Array.isArray(parentNode.subCalls)) parentNode.subCalls = [];
+  parentNode.subCalls.push(node);
+  if (settle) settleDispatch(node, d, event);
 }
 
 // ---- image attachment input: @/abs/path.png tokens in the message ----
@@ -1256,6 +1419,16 @@ export class ChatView extends Widget {
     };
     // interacting with a block = reading mode: stop following the stream
     this.view.follow = false;
+    // Nested code-dispatch fold: the subCallId is stable across re-derivations,
+    // so a click toggles that exact sub-call regardless of stream movement.
+    if (info.dispatchId != null) {
+      const dkey = `disp:${info.dispatchId}`;
+      if (this.expanded.has(dkey)) this.expanded.delete(dkey);
+      else this.expanded.add(dkey);
+      this.#rebuild();
+      reanchor(); nudge();
+      return true;
+    }
     if (node.kind === "assistant" && info.blockIdx !== null) {
       const b = node.blocks[info.blockIdx];
       if (b && (b.kind === "tool" || b.kind === "reasoning" || b.kind === "other" || b.kind === "text")) {
@@ -1303,7 +1476,7 @@ export class ChatView extends Widget {
     const lines = [];
     const lineMap = [];
     this.cardRanges = [];
-    const mark = (nodeIdx, blockIdx = null) => lineMap.push({ nodeIdx, blockIdx });
+    const mark = (nodeIdx, blockIdx = null, dispatchId = null) => lineMap.push(dispatchId != null ? { nodeIdx, blockIdx, dispatchId } : { nodeIdx, blockIdx });
     const markImg = (nodeIdx, imgIdx) => lineMap.push({ nodeIdx, imgIdx });
     // render only the tail of very long sessions; earlier nodes load via pagination
     const MAX_NODES = 150;
@@ -1327,7 +1500,15 @@ export class ChatView extends Widget {
           return ".";
         }).join("")
         : "";
-      const ckey = `${realIdx}|${w}|${expKey}|${blockKeys}|${this.thinkMode}|${this.bashMode}|${node.streaming ? "s" : "f"}|${themeName()}|${node.step ?? "-"}|${userPrefix()}|${node.turnMs ?? "-"}`;
+      // Expanded sub-dispatch folds must invalidate the render cache too (their
+      // callIds are stable, so the key is just the sorted list of expanded ids).
+      const dispKey = (() => {
+        if (node.kind !== "assistant" || !node.blocks) return "";
+        const ids = [];
+        forEachDispatch(node, (c) => { if (this.expanded.has(`disp:${c.callId}`)) ids.push(c.callId); });
+        return ids.sort().join(",");
+      })();
+      const ckey = `${realIdx}|${w}|${expKey}|${blockKeys}|${dispKey}|${this.thinkMode}|${this.bashMode}|${node.streaming ? "s" : "f"}|${themeName()}|${node.step ?? "-"}|${userPrefix()}|${node.turnMs ?? "-"}`;
       // Streaming nodes re-render every frame: their text grows without any
       // change to the cache key, so caching them freezes the live think/tool/text.
       // The LAST node re-renders too while a turn runs — its ticking 🕐 timer
@@ -1538,6 +1719,79 @@ export class ChatView extends Widget {
                   // explain the ambiguous state instead of a bare 无结果
                   lines.push([{ t: "  结果未保留：该工具调用的结果不在当前会话历史中（上下文压缩会修剪早期工具结果），并非执行失败或输出为空。", fg: K.FAINT }]);
                   mark(realIdx, bi);
+                }
+                // Nested code-dispatch sub-calls: a compact, independently
+                // foldable tree. Default folded (one summary line); clicking a
+                // header expands that sub-call in place without moving its kin.
+                const subCalls = Array.isArray(b.subCalls) ? b.subCalls : [];
+                if (subCalls.length) {
+                  lines.push([{ t: `  ─ 子调度 ${countDispatch(b)} 项`, fg: K.FAINT }]);
+                  mark(realIdx, bi);
+                  const budget = { nodes: 0, lines: 0 };
+                  const renderDispatches = (children, depth) => {
+                    if (depth > DISPATCH_MAX_DEPTH) return;
+                    for (const c of children) {
+                      if (budget.nodes >= DISPATCH_MAX_NODES || budget.lines >= DISPATCH_RENDER_LINES) {
+                        lines.push([{ t: "  …子调度过多（已截断）", fg: K.FAINT }]);
+                        mark(realIdx, bi);
+                        return;
+                      }
+                      budget.nodes++;
+                      const dkey = `disp:${c.callId}`;
+                      const dOpen = this.expanded.has(dkey);
+                      const indent = "  ".repeat(Math.min(depth, DISPATCH_MAX_DEPTH) + 1);
+                      const running = c.result == null && c.endedAt == null;
+                      const glyph = dOpen ? "▾" : "▸";
+                      const status = running ? "⏳" : c.isError ? "✗" : "✓";
+                      let timing = "";
+                      if (c.startedAt !== undefined && c.endedAt !== undefined) {
+                        timing = ` 已完成,耗时 ${fmtDuration(c.endedAt - c.startedAt)}`;
+                      }
+                      lines.push([
+                        { t: indent + glyph + " ", fg: K.ACCENT },
+                        { t: c.name ?? "subtool", fg: K.TXT, bold: true },
+                        { t: ` ${status}`, fg: running ? K.WARN : c.isError ? K.ERR : K.OK },
+                        { t: timing, fg: K.DIM },
+                        { t: dOpen ? " [b 折叠]" : " [b 展开]", fg: K.FAINT },
+                      ]);
+                      mark(realIdx, bi, c.callId);
+                      budget.lines++;
+                      if (!dOpen) {
+                        const summary = toolSummary(c);
+                        if (summary) {
+                          lines.push([{ t: indent + "  " + truncate(summary, Math.max(8, w - 4 - strWidth(indent + "  "))), fg: K.FAINT }]);
+                          mark(realIdx, bi, c.callId);
+                          budget.lines++;
+                        }
+                      } else {
+                        if (c.args) {
+                          for (const ln of jsonPreview(c.args, w, true)) {
+                            lines.push([{ t: indent + "  " }, ...ln.map((g) => ({ ...g }))]);
+                            mark(realIdx, bi, c.callId);
+                            budget.lines++;
+                          }
+                        }
+                        if (c.result != null && c.result !== "") {
+                          lines.push([{ t: indent + "  结果:", fg: K.DIM, underline: true }]);
+                          mark(realIdx, bi, c.callId);
+                          budget.lines++;
+                          const rl = c.result.split("\n");
+                          for (const r of rl.slice(0, 20)) {
+                            lines.push([{ t: indent + "  " + truncate(r, Math.max(8, w - 4 - strWidth(indent + "  "))), fg: K.DIM }]);
+                            mark(realIdx, bi, c.callId);
+                            budget.lines++;
+                          }
+                          if (rl.length > 20) {
+                            lines.push([{ t: indent + `  …共 ${rl.length} 行`, fg: K.FAINT }]);
+                            mark(realIdx, bi, c.callId);
+                            budget.lines++;
+                          }
+                        }
+                        renderDispatches(c.subCalls ?? [], depth + 1);
+                      }
+                    }
+                  };
+                  renderDispatches(subCalls, 0);
                 }
               }
               sep();
@@ -1940,13 +2194,14 @@ function truncateText(s, n) {
 export class QuestionPopup extends Popup {
   constructor({ app, frame }) {
     const questions = frame.questions ?? [];
-    const w = Math.max(12, Math.min(72, app.screen.w - 2));
-    const h = Math.max(5, Math.min(Math.max(5, app.screen.h - 2), questions.length * 5 + 8));
+    const planReview = questions.length === 1 && questions[0]?.intent?.kind === "plan-review";
+    const w = Math.max(12, Math.min(planReview ? 88 : 72, app.screen.w - 2));
+    const h = Math.max(5, Math.min(Math.max(5, app.screen.h - 2), planReview ? app.screen.h - 2 : questions.length * 5 + 8));
     super({
       x: Math.max(0, Math.floor((app.screen.w - w) / 2)), y: Math.max(0, Math.floor((app.screen.h - h) / 2)),
-      w, h, title: "❓ 需要你的回答",
+      w, h, title: planReview ? "✎ 计划审阅" : "❓ 需要你的回答",
       lines: ["", ...questions.map((q) => q.question ?? q.id)],
-      buttons: [
+      buttons: planReview ? [] : [
         { label: "回答…", action: "custom" },
         { label: "跳过", action: "cancel" },
       ],
@@ -1954,6 +2209,7 @@ export class QuestionPopup extends Popup {
     this.app = app;
     this.frame = frame;
     this.questions = questions;
+    this.planReview = planReview;
     this.questionIdx = 0;
     this.drafts = questions.map(() => ({ selected: [], custom: "", skipped: false }));
     this.selIdx = 0;
@@ -1980,14 +2236,15 @@ export class QuestionPopup extends Popup {
     let ly = this.y + 1;
     screen.text(this.x + 2, ly++, truncate(`▎ ${q.header ?? `问题 ${this.questionIdx + 1}/${this.questions.length}`}`, this.w - 4), { fg: K.ACCENT, bold: true });
     screen.text(this.x + 2, ly++, truncate(q.question ?? "", this.w - 4), { fg: K.TXT });
+    if (this.planReview) screen.text(this.x + 2, ly++, "Enter 执行计划 · ↓ 继续规划 · Esc 取消审阅", { fg: K.FAINT });
+    const opts = q.options ?? [];
     if (q.detail) {
       const detailLines = String(q.detail).split("\n");
-      for (const detail of detailLines) {
-        if (ly >= this.y + this.h - 3) break;
-        screen.text(this.x + 2, ly++, truncate(detail, this.w - 4), { fg: K.DIM });
-      }
+      const optionRows = opts.reduce((n, option) => n + (option.description ? 2 : 1), 0);
+      const room = Math.max(1, this.y + this.h - 3 - ly - optionRows);
+      for (const detail of detailLines.slice(0, room)) screen.text(this.x + 2, ly++, truncate(detail, this.w - 4), { fg: K.DIM });
+      if (detailLines.length > room && ly < this.y + this.h - 3) screen.text(this.x + 2, ly++, `…另有 ${detailLines.length - room} 行计划正文`, { fg: K.FAINT });
     }
-    const opts = q.options ?? [];
     for (let i = 0; i < opts.length && ly < this.y + this.h - 3; i++) {
       const chosen = draft.selected.includes(opts[i].label);
       const cursor = this.selIdx === i;
@@ -2013,7 +2270,7 @@ export class QuestionPopup extends Popup {
   onMouse(ev) {
     if (ev.kind === "press" && ev.button === 0) {
       const q = this.questions[this.questionIdx];
-      let ly = this.y + 3 + (q?.detail ? String(q.detail).split("\n").length : 0);
+      let ly = this.y + 3 + (this.planReview ? 1 : 0) + (q?.detail ? String(q.detail).split("\n").length : 0);
       for (let i = 0; i < (q?.options?.length ?? 0); i++) {
         if (ev.y === ly || (q.options[i].description && ev.y === ly + 1)) {
           this.selIdx = i; this.#choose(i);
@@ -2135,6 +2392,8 @@ export class App {
     this.toastUntil = 0;
     this.jobs = [];
     this.jobsBySession = new Map(); // sessionId → latest session/jobs snapshot
+    this.projectionsBySession = new Map();
+    this.queueBySession = new Map();
     this.ctrlCUntil = null;         // NORMAL-mode double-Ctrl+C exit window
     this.lastSec = 0;               // status-bar clock second pulse
     this.focused = null;
@@ -2413,6 +2672,7 @@ export class App {
       case "session/title":
       case "session/subscribed":
       case "session/queue":
+        if (frame.type === "session/queue" && frame.sessionId) this.queueBySession.set(frame.sessionId, frame.items ?? []);
         if (this.chat.sessionId === frame.sessionId) {
           if (frame.type === "session/queue") this.queueItems = frame.items ?? [];
           this.chat.onFrame(frame);
@@ -2427,13 +2687,19 @@ export class App {
         this.setJobs(frame.jobs ?? [], frame.sessionId ?? null);
         if (this.chat.sessionId === frame.sessionId) this.chat.onFrame(frame);
         break;
-      case "session/projection":
+      case "session/projection": {
+        if (frame.sessionId) {
+          const cached = { ...(this.projectionsBySession.get(frame.sessionId) ?? {}) };
+          cached[frame.key] = frame.value;
+          this.projectionsBySession.set(frame.sessionId, cached);
+        }
         if (frame.sessionId && frame.sessionId !== this.currentSession) break;
         this.projections[frame.key] = frame.value;
         if (frame.key === "tokenUsage") this.tokenUsage = frame.value;
         // the todo block's height depends on the todos projection → reflow
         if (frame.key === "todos") this.chat.inputChanged();
         break;
+      }
       case "approval/resolved":
       case "question/resolved":
         this.#dismissPrompt(frame);
@@ -2734,11 +3000,11 @@ export class App {
   async openSession(sessionId) {
     const epoch = ++this.sessionEpoch;
     this.currentSession = sessionId;
-    this.projections = {};
-    this.tokenUsage = null;
+    this.projections = { ...(this.projectionsBySession.get(sessionId) ?? {}) };
+    this.tokenUsage = this.projections.tokenUsage ?? null;
     this.currentModel = null;
     this.feedbackMap = new Map();
-    this.queueItems = [];
+    this.queueItems = this.queueBySession.get(sessionId) ?? [];
     // apply the buffered jobs snapshot; if this session's connect-time
     // baseline was never seen, reconnect the mux to re-fetch it (the host
     // re-pushes the full snapshot on every fresh mux connection)

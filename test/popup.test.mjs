@@ -36,6 +36,16 @@ test("question Escape sends a real cancellation envelope", async () => {
   assert.deepEqual(calls[0], ["cancel", "q"]);
 });
 
+test("plan review gets a dedicated surface and explicit approve action", async () => {
+  const { app, calls } = appHarness();
+  const popup = new QuestionPopup({ app, frame: { rpcId: "plan", sessionId: "s", questions: [{ id: "plan-review", header: "Review", question: "Approve?", detail: "# Plan\n- one\n- two", intent: { kind: "plan-review", approve: "Approve" }, options: [{ label: "Approve" }, { label: "Keep planning" }] }] } });
+  assert.equal(popup.planReview, true);
+  assert.equal(popup.title, "✎ 计划审阅");
+  popup.onKey({ type: "key", name: "enter" });
+  await Promise.resolve();
+  assert.deepEqual(calls[0][2].answer.answers[0].selected, ["Approve"]);
+});
+
 test("multi-select toggles independent options before submit", async () => {
   const { app, calls } = appHarness();
   const popup = new QuestionPopup({ app, frame: { rpcId: "q", sessionId: "s", questions: [{ id: "x", question: "Choose", multiSelect: true, options: [{ label: "A" }, { label: "B" }] }] } });

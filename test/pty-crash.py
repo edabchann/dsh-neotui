@@ -3,12 +3,30 @@
 # wheel sequences, resize the pty (SIGWINCH), and capture everything.
 import os, pty, time, signal, fcntl, termios, struct, sys
 
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TESTHOME = os.path.join(REPO, ".testhome")
+RAW = os.path.join(REPO, "test", "pty-crash.raw")
+
 env = dict(os.environ)
-env["DSH_HOME"] = "/home/edabchann/dsh/tui/.testhome"
+env["DSH_HOME"] = TESTHOME
+
+# Keep the checked-in profile self-contained: dsh resolves bundle names from
+# the profile directory, so expose both local packages through node_modules.
+# Symlinks are recreated idempotently and never require a global npm install.
+profile_modules = os.path.join(TESTHOME, "profiles", "tui", "node_modules")
+os.makedirs(profile_modules, exist_ok=True)
+for name, target in (("dsh-neotui-app", os.path.join(REPO, "app")), ("dsh-neotui", REPO)):
+    link = os.path.join(profile_modules, name)
+    if os.path.lexists(link) and not os.path.islink(link):
+        raise RuntimeError(f"PTY fixture path is not a symlink: {link}")
+    if os.path.islink(link) and os.path.realpath(link) != os.path.realpath(target):
+        os.unlink(link)
+    if not os.path.lexists(link):
+        os.symlink(target, link, target_is_directory=True)
 
 pid, fd = pty.fork()
 if pid == 0:
-    os.chdir("/home/edabchann/dsh/tui")
+    os.chdir(REPO)
     os.execvpe("dsh", ["dsh", "--profile", "tui", "--attach", "http://127.0.0.1:3080"], env)
 
 def set_size(rows, cols):
@@ -52,7 +70,7 @@ try:
 except ProcessLookupError:
     pass
 raw = b"".join(out).decode("utf-8", "replace")
-open("/home/edabchann/dsh/tui/test/pty-crash.raw", "wb").write(b"".join(out))
+open(RAW, "wb").write(b"".join(out))
 print("captured", len(raw), "bytes")
 print("fatal:", "fatal" in raw, "| TypeError:", "TypeError" in raw, "| RangeError:", "RangeError" in raw)
 import re

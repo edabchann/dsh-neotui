@@ -1512,12 +1512,24 @@ test("rapid session switch ignores a late older history response", async () => {
   assert.notEqual(app.chat.title, "A title");
 });
 
-test("session projection from a background session is ignored", () => {
+test("background projection is cached without polluting the active session", async () => {
   const app = headlessApp();
   app.currentSession = app.chat.sessionId = "B";
   app.projections = { goal: { goal: { objective: "B" } } };
   app.injectFrame({ type: "session/projection", sessionId: "A", key: "goal", value: { goal: { objective: "A" } } });
   assert.equal(app.goalText, "B");
+  await app.openSession("A");
+  assert.equal(app.goalText, "A", "cached projection restored immediately on switch");
+});
+
+test("background queue snapshot is restored when its session opens", async () => {
+  const app = headlessApp();
+  const items = [{ id: "m1", placement: "queued", message: { content: [{ type: "text", text: "later" }] } }];
+  app.currentSession = app.chat.sessionId = "B";
+  app.injectFrame({ type: "session/queue", sessionId: "A", items });
+  assert.equal(app.queueItems.length, 0);
+  await app.openSession("A");
+  assert.equal(app.queueItems, items);
 });
 
 test("prompt requests queue instead of replacing the active approval", () => {
@@ -1653,4 +1665,134 @@ test("settings panel: 默认展开/折叠 namespace toggles and applies fold def
   assert.equal(app.chat.bashMode, "expanded", "applied live");
   assert.equal(app.chat.todosVisible, false, "todos default applied live");
   saveTuiConfig({ foldDefaults: { think: true, bash: false, todos: true } }); // restore
+});
+
+// ---- nested tool/code-dispatch (run_code sub-tool calls) ----
+let dseq = 90000;
+function dev(type, data, time = dseq) {
+  return { event: { type, seq: dseq++, time, data } };
+}
+function dispatchTool(nodes, callId) {
+  return nodes.flatMap((n) => n.blocks ?? []).find((b) => b.kind === "tool" && b.callId === callId);
+}
+
+test("code-dispatch events build a nested subCalls tree under the root tool", () => {
+  const events = [
+    dev("tool/call", { callId: "run1", name: "run_code", arguments: "{}" }, 1000),
+    dev("tool/code-dispatch-start", { rootCallId: "run1", parentCallId: "run1", subCallId: "run1:code:1", name: "bash", arguments: { command: "ls" } }, 2000),
+    dev("tool/code-dispatch", { rootCallId: "run1", parentCallId: "run1", subCallId: "run1:code:1", name: "bash", arguments: { command: "ls" }, isError: false, content: [{ type: "text", text: "a.txt" }] }, 3000),
+    dev("tool/code-dispatch-start", { rootCallId: "run1", parentCallId: "run1:code:1", subCallId: "run1:code:1:read:1", name: "read", arguments: { file_path: "a.txt" } }, 4000),
+    dev("tool/code-dispatch", { rootCallId: "run1", parentCallId: "run1:code:1", subCallId: "run1:code:1:read:1", name: "read", arguments: { file_path: "a.txt" }, isError: false, content: [{ type: "text", text: "hello" }] }, 5000),
+    dev("tool/result", { message: { source: { callId: "run1" }, content: [{ type: "text", text: "done" }] } }, 6000),
+  ];
+  const nodes = nodeForEvents(events, () => {});
+  const tool = dispatchTool(nodes, "run1");
+  assert.ok(tool, "root tool present");
+  assert.equal(tool.subCalls.length, 1);
+  const bash = tool.subCalls[0];
+  assert.equal(bash.callId, "run1:code:1");
+  assert.equal(bash.name, "bash");
+  assert.equal(bash.result, "a.txt");
+  assert.equal(bash.args, '{"command":"ls"}', "object arguments stringified for jsonPreview");
+  assert.equal(bash.subCalls.length, 1, "nested child attached");
+  const read = bash.subCalls[0];
+  assert.equal(read.callId, "run1:code:1:read:1");
+  assert.equal(read.result, "hello");
+  assert.equal(read.isError, false);
+});
+
+test("code-dispatch sub-calls render folded by default and click toggles", () => {
+  const events = [
+    dev("tool/call", { callId: "run1", name: "run_code", arguments: "{}" }, 1000),
+    dev("tool/code-dispatch-start", { rootCallId: "run1", parentCallId: "run1", subCallId: "run1:code:1", name: "lsTool", arguments: { command: "ls notes" } }, 2000),
+    dev("tool/code-dispatch", { rootCallId: "run1", parentCallId: "run1", subCallId: "run1:code:1", name: "lsTool", arguments: { command: "ls notes" }, isError: false, content: [{ type: "text", text: "demo.txt" }] }, 3000),
+    dev("tool/result", { message: { source: { callId: "run1" }, content: [{ type: "text", text: "done" }] } }, 4000),
+  ];
+  const nodes = nodeForEvents(events, () => {});
+  const { chat, lines } = render(nodes);
+  let text = lines.join("\n");
+  const y = lines.findIndex((l) => l.includes("lsTool"));
+  assert.ok(y >= 0, "dispatch header rendered");
+  assert.ok(lines[y].includes("▸"), "folded glyph by default");
+  assert.ok(lines[y].includes("[b 展开]"), "expand hint present");
+  assert.ok(text.includes("子调度 1 项"), "sub-dispatch section label present");
+  assert.ok(!text.includes('"command"'), "args hidden while folded");
+  assert.ok(!text.includes("demo.txt"), "result hidden while folded");
+  // click the header to expand
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y: y + 1 });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y: y + 1 });
+  text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
+  assert.ok(text.includes('"command"'), "args rendered after expand");
+  assert.ok(text.includes("demo.txt"), "result rendered after expand");
+  assert.ok(chat.expanded.has("disp:run1:code:1"), "dispatch expanded");
+  // click again to collapse
+  const y2 = chat.lines.map((l) => l.map((g) => g.t).join("")).findIndex((l) => l.includes("lsTool"));
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y: y2 + 1 });
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y: y2 + 1 });
+  assert.ok(!chat.expanded.has("disp:run1:code:1"), "dispatch collapsed again");
+});
+
+test("code-dispatch error result renders a failure glyph", () => {
+  const events = [
+    dev("tool/call", { callId: "run1", name: "run_code", arguments: "{}" }, 1000),
+    dev("tool/code-dispatch-start", { rootCallId: "run1", parentCallId: "run1", subCallId: "run1:code:1", name: "readTool", arguments: { file_path: "x" } }, 2000),
+    dev("tool/code-dispatch", { rootCallId: "run1", parentCallId: "run1", subCallId: "run1:code:1", name: "readTool", arguments: { file_path: "x" }, isError: true, content: [{ type: "text", text: "ENOENT" }] }, 3000),
+    dev("tool/result", { message: { source: { callId: "run1" }, content: [{ type: "text", text: "done" }] } }, 4000),
+  ];
+  const nodes = nodeForEvents(events, () => {});
+  const { lines } = render(nodes);
+  const header = lines.find((l) => l.includes("readTool"));
+  assert.ok(header?.includes("✗"), "error glyph on the failed sub-call");
+});
+
+test("code-dispatch settle without a start event still creates the sub-call", () => {
+  const events = [
+    dev("tool/call", { callId: "run1", name: "run_code", arguments: "{}" }, 1000),
+    dev("tool/code-dispatch", { rootCallId: "run1", parentCallId: "run1", subCallId: "run1:code:9", name: "bash", arguments: { command: "ls" }, isError: false, content: [{ type: "text", text: "ok" }] }, 2000),
+  ];
+  const nodes = nodeForEvents(events, () => {});
+  const tool = dispatchTool(nodes, "run1");
+  assert.equal(tool.subCalls.length, 1);
+  assert.equal(tool.subCalls[0].callId, "run1:code:9");
+  assert.equal(tool.subCalls[0].result, "ok");
+  assert.equal(tool.subCalls[0].isError, false);
+});
+
+test("code-dispatch depth is capped at DISPATCH_MAX_DEPTH", () => {
+  const events = [dev("tool/call", { callId: "run1", name: "run_code", arguments: "{}" }, 1000)];
+  const N = 24; // > 16
+  for (let i = 1; i <= N; i++) {
+    const parent = i === 1 ? "run1" : `run1:code:${i - 1}`;
+    events.push(dev("tool/code-dispatch-start", { rootCallId: "run1", parentCallId: parent, subCallId: `run1:code:${i}`, name: "bash", arguments: {} }, 1000 + i));
+  }
+  const nodes = nodeForEvents(events, () => {});
+  const tool = dispatchTool(nodes, "run1");
+  const depthOf = (node, d = 0) => (node.subCalls?.length ? Math.max(...node.subCalls.map((c) => depthOf(c, d + 1))) : d);
+  assert.equal(depthOf(tool), 16, "tree depth never exceeds the cap");
+});
+
+test("code-dispatch node count is capped at DISPATCH_MAX_NODES", () => {
+  const events = [dev("tool/call", { callId: "run1", name: "run_code", arguments: "{}" }, 1000)];
+  const N = 200; // > 128
+  for (let i = 1; i <= N; i++) {
+    events.push(dev("tool/code-dispatch-start", { rootCallId: "run1", parentCallId: "run1", subCallId: `run1:code:${i}`, name: "bash", arguments: {} }, 1000 + i));
+  }
+  const nodes = nodeForEvents(events, () => {});
+  const tool = dispatchTool(nodes, "run1");
+  assert.equal(tool.subCalls.length, 128, "capped at DISPATCH_MAX_NODES");
+});
+
+test("code-dispatch rejects self and ancestor cycles", () => {
+  const events = [
+    dev("tool/call", { callId: "run1", name: "run_code", arguments: "{}" }, 1000),
+    dev("tool/code-dispatch-start", { rootCallId: "run1", parentCallId: "run1", subCallId: "run1:code:1", name: "bash", arguments: {} }, 2000),
+    // self-loop: subCallId === parentCallId
+    dev("tool/code-dispatch-start", { rootCallId: "run1", parentCallId: "run1:code:1", subCallId: "run1:code:1", name: "bash", arguments: {} }, 3000),
+    // ancestor cycle: subCallId is the root's callId
+    dev("tool/code-dispatch-start", { rootCallId: "run1", parentCallId: "run1:code:1", subCallId: "run1", name: "bash", arguments: {} }, 4000),
+  ];
+  const nodes = nodeForEvents(events, () => {});
+  const tool = dispatchTool(nodes, "run1");
+  assert.equal(tool.subCalls.length, 1, "only the valid child exists");
+  assert.equal(tool.subCalls[0].subCalls.length, 0, "cycle children rejected");
 });
