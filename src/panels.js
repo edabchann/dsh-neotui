@@ -1712,8 +1712,11 @@ export class GoalPanel extends Popup {
   async #call(method, payload) {
     if (this.busy) return;
     this.busy = true; this.rebuild(); this.app.redraw();
-    try { await this.app.api.call(method, { sessionId: this.app.currentSession, ...payload }); this.app.toast("目标已更新，等待同步"); }
-    catch (e) { this.app.toast(`目标操作失败: ${e.message}`); }
+    try { await this.app.api.call(method, { sessionId: this.app.currentSession, ...payload }); this.app.toast("目标已更新，正在同步…"); }
+    catch (e) {
+      const conflict = e?.code === "goal-revision-conflict" || /revision|conflict|stale/i.test(e?.message ?? "");
+      this.app.toast(conflict ? "目标已被其他客户端更新，请关闭后重新打开" : `目标操作失败: ${e.message}`);
+    }
     finally { this.busy = false; this.rebuild(); this.app.redraw(); }
   }
   #confirm(message, method) {
@@ -2536,8 +2539,16 @@ export class ModelPanel extends Widget {
       this.draftRoute = null;
       this.savedSnapshot = JSON.stringify(this.providers);
       if (this.defaultModel) {
-        const def = await this.app.api.call("settings.mutate", { ns: "agent-default-model", ops: [{ op: "set", path: [], value: this.defaultModel }], expectedRevision: this.defaultModelRevision });
-        this.defaultModelRevision = def?.revision ?? this.defaultModelRevision;
+        const profile = this.providers[this.defaultModel.provider];
+        if (!profile || !(profile.models ?? []).some((model) => model.id === this.defaultModel.model)) {
+          this.app.toast("供应商已保存；默认 Agent 模型引用已失效，请选择一个现有模型后重试"); return false;
+        }
+        try {
+          const def = await this.app.api.call("settings.mutate", { ns: "agent-default-model", ops: [{ op: "set", path: [], value: this.defaultModel }], expectedRevision: this.defaultModelRevision });
+          this.defaultModelRevision = def?.revision ?? this.defaultModelRevision;
+        } catch (e) {
+          this.app.toast(`供应商已保存；默认 Agent 模型保存失败: ${e.message}`); return false;
+        }
       }
       this.app.toast(`已保存 ${Object.keys(this.providers).length} 个供应商及默认模型参数`);
       return true;

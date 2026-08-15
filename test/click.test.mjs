@@ -715,6 +715,16 @@ test("INSERT mode exits only via Esc (clicks never switch the mode)", () => {
   assert.equal(app.focused, app.chat, "Esc exits INSERT");
 });
 
+test("queue inbox entries stay in queue UI while next-step steering enters transcript", () => {
+  const events = [
+    { event: { type: "agent/inbox/spliced", time: 1, data: { target: "next-turn", start: 0, inserted: [{ id: "q", source: { kind: "user" }, content: [{ type: "text", text: "queued" }] }] } } },
+    { event: { type: "agent/inbox/spliced", time: 2, data: { target: "next-step", start: 0, inserted: [{ id: "s", source: { kind: "user" }, content: [{ type: "text", text: "steered" }] }] } } },
+  ];
+  const nodes = nodeForEvents(events, () => {});
+  assert.equal(nodes.filter((n) => n.kind === "steering").length, 1);
+  assert.equal(nodes.find((n) => n.kind === "steering")?.text, "steered");
+});
+
 test("the global deep-diving timer exists before any tool call", () => {
   const { chat } = render([
     { kind: "turn-progress", turn: 1, startedAt: Date.now() - 30000, streaming: true },
@@ -1051,6 +1061,18 @@ test("ModelPanel: Esc leaves level by level and unsaved form edits ask 保存/�
   assert.ok(app.overlay?.buttons?.length === 3, "← also asks about unsaved changes");
   await app.overlay.onAction({ label: "取消", action: "cancel" });
   assert.equal(panel.mode, "form", "← cancelled stayed on the form");
+});
+
+test("a new turn closes a stale deep-diving timer instead of running two", () => {
+  const nodes = nodeForEvents([
+    { event: { type: "turn/start", time: 1000, data: { turn: 1 } } },
+    { event: { type: "turn/start", time: 5000, data: { turn: 2 } } },
+    { event: { type: "turn/end", time: 9000, data: { turn: 2, reason: { kind: "completed" } } } },
+  ], () => {});
+  const timers = nodes.filter((n) => n.kind === "turn-progress");
+  assert.equal(timers.filter((n) => n.streaming).length, 0);
+  assert.equal(timers[0].incomplete, true);
+  assert.equal(timers[1].endedAt, 9000);
 });
 
 test("finalized think blocks keep their start time and turns carry their total", () => {
@@ -1593,6 +1615,14 @@ test("the todo box freezes its height once todos appear (no idle reflow)", () =>
   chat.todosVisible = false;
   assert.equal(chat.todoHeight(), 1, "Shift+T minimizes instead of hiding it");
   assert.equal(app.footerHeight(), 3, "footer always 3 rows (no job-driven reflow)");
+});
+
+test("completed goal does not keep the bottom goal dock resident", () => {
+  const app = headlessApp();
+  app.projections.goal = { goal: { id: "g", revision: 2, objective: "done", phase: "completed" } };
+  assert.equal(app.chat.todoHeight(), 0);
+  app.projections.goal.goal.phase = "active";
+  assert.equal(app.chat.todoHeight(), 1);
 });
 
 test("footer avoids duplicate goal/subagent highlight chips", () => {

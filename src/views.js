@@ -326,12 +326,19 @@ function applyEvent(nodes, event, view, log, state = null) {
         st.turn = d.turn ?? st.turn;
         // One global turn marker is independent of whether the model has begun
         // reasoning or invoked any tool, so the deep-diving clock never blinks.
+        const stale = [...nodes].reverse().find((n) => n.kind === "turn-progress" && n.streaming);
+        if (stale) { stale.streaming = false; stale.endedAt = st.turnStart; stale.incomplete = true; }
         nodes.push({ kind: "turn-progress", turn: d.turn, startedAt: st.turnStart, streaming: true });
         break;
       }
       case "turn/end": {
         const end = event.time ?? Date.now();
-        const progress = [...nodes].reverse().find((n) => n.kind === "turn-progress" && n.turn === (d.turn ?? st.turn));
+        const turn = d.turn ?? st.turn;
+        let progress = [...nodes].reverse().find((n) => n.kind === "turn-progress" && n.turn === turn && n.streaming);
+        // A paged window or reconnect may contain turn/end without its start;
+        // never leave a stale prior timer running, and synthesize a bounded
+        // completed marker only when the end event carries usable timing.
+        if (!progress) progress = [...nodes].reverse().find((n) => n.kind === "turn-progress" && n.streaming);
         if (progress) { progress.streaming = false; progress.endedAt = end; progress.reason = d.reason; }
         const node = [...nodes].reverse().find((n) => n.kind === "assistant");
         if (node && st.turnStart !== undefined) node.turnMs = Math.max(0, end - st.turnStart);
@@ -390,7 +397,9 @@ function applyEvent(nodes, event, view, log, state = null) {
         for (const message of d.inserted ?? []) {
           if (message.source?.kind !== "user") continue;
           const text = partsToText(message.content);
-          if (text != null) nodes.push({ kind: "steering", text, id: message.id, source: message.source });
+          // next-turn entries belong to the transient queue dock, not the
+          // durable transcript. Only next-step is actual steering history.
+          if (text != null && d.target === "next-step") nodes.push({ kind: "steering", text, id: message.id, source: message.source });
         }
         break;
       }
@@ -1063,7 +1072,8 @@ export class ChatView extends Widget {
    *  the count reflows the whole layout every time (the idle 2-line shifts). */
   todoHeight() {
     const todos = this.app.todos;
-    const goal = this.app.goalData?.goal ?? this.app.goalData;
+    const rawGoal = this.app.goalData?.goal ?? this.app.goalData;
+    const goal = rawGoal && !["complete", "completed", "cleared"].includes(rawGoal.phase) ? rawGoal : null;
     const subagent = this.app.projections.subagent;
     let h = goal ? 1 : 0;
     if (subagent) h++;
@@ -1551,12 +1561,12 @@ export class ChatView extends Widget {
         case "system": lines.push([{ t: truncate(node.text, w - 2), fg: K.WARN }]); mark(realIdx); break;
         case "turn-progress": {
           const elapsed = (node.endedAt ?? Date.now()) - node.startedAt;
-          lines.push([{ t: node.streaming ? `  ◷ Deep diving · 已经进行 ${fmtDuration(elapsed)}` : `  ◷ Deep diving · 总耗时 ${fmtDuration(elapsed)}`, fg: node.streaming ? T.WARN : K.DIM, bold: node.streaming }]);
+          lines.push([{ t: node.streaming ? `  ◷ Deep diving · 已经进行 ${fmtDuration(elapsed)}` : node.incomplete ? "  ◷ Deep diving · 上一回合计时已恢复" : `  ◷ Deep diving · 总耗时 ${fmtDuration(elapsed)}`, fg: node.streaming ? T.WARN : K.DIM, bold: node.streaming }]);
           mark(realIdx); break;
         }
         case "retry": lines.push([{ t: `  ↻ ${node.status === "started" ? "正在重试" : `准备重试${node.delayMs ? `（${fmtDuration(node.delayMs)} 后）` : ""}`}：${truncate(node.text, w - 20)}`, fg: K.WARN, bold: node.status === "started" }]); mark(realIdx); break;
         case "command": lines.push([{ t: `  ${node.status === "running" ? "…" : node.status === "error" ? "✗" : "✓"} ${node.text}${node.detail ? ` — ${truncate(node.detail, w - strWidth(node.text) - 10)}` : ""}`, fg: node.status === "error" ? K.ERR : node.status === "success" ? K.OK : K.DIM }]); mark(realIdx); break;
-        case "steering": lines.push([{ t: "  ↪ 运行中追加 > ", fg: K.ACCENT, bold: true }, { t: truncate(node.text, w - 18), fg: K.TXT }]); mark(realIdx); break;
+        case "steering": lines.push([{ t: "  ↪ 已追加到当前回合 > ", fg: K.ACCENT, bold: true }, { t: truncate(node.text, w - 22), fg: K.TXT }]); mark(realIdx); break;
         case "turn-error": lines.push([{ t: `  ✗ ${node.text}${node.code ? ` (${node.code})` : ""}`, fg: K.ERR, bold: true }]); mark(realIdx); break;
         case "turn-max-tokens": lines.push([{ t: `  ⚠ ${node.text}`, fg: T.WARN, bold: true }]); mark(realIdx); break;
         case "goal-round":
@@ -1982,7 +1992,8 @@ export class ChatView extends Widget {
     const th = this.todoHeight();
     if (th === 0) return;
     const todos = this.app.todos ?? [];
-    const goal = this.app.goalData?.goal ?? this.app.goalData;
+    const rawGoal = this.app.goalData?.goal ?? this.app.goalData;
+    const goal = rawGoal && !["complete", "completed", "cleared"].includes(rawGoal.phase) ? rawGoal : null;
     const subagent = this.app.projections.subagent;
     const y = this.input.y - th - 1;
     screen.fillRect(this.x, y, this.x + this.w - 1, y + th - 1, " ", { bg: T.THINKBG });
@@ -2620,7 +2631,7 @@ export class App {
       if (this.chat.sessionId) this.chat.pollTail();
       // session.list is expensive (~100ms); refresh the sidebar every ~5s, not
       // on every streaming poll.
-      if (ticks++ % 10 === 0) this.refreshSessions();
+      if (ticks++ % 10 === 0) { this.refreshSessions(); this.refreshSubagentStats(); }
       const delay = this.chat.pollSlow ? 2000 : (this.chat.running ? 500 : 1500);
       this.pollTimer = setTimeout(tick, delay);
     };
