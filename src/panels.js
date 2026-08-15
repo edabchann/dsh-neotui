@@ -7,7 +7,7 @@ import { renderMd, C } from "./md.js";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, basename, extname } from "node:path";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, spawnSync, execFileSync } from "node:child_process";
 
 import { T, cycleTheme, themeName } from "./theme.js";
 import { loadTuiConfig, saveTuiConfig, userPrefix, userName, foldDefaults } from "./config.js";
@@ -1260,6 +1260,12 @@ export class ImagePopup extends Popup {
         const res = await this.app.api.call("session.attachment", { sessionId: this.sessionId, attachmentId: this.ref.attachmentId });
         this.data = Buffer.from(res.data ?? "", "base64"); attachment = res.attachment;
       }
+      // Kitty's `a=T` payload is raw RGBA/RGB unless `f=100` is used for PNG.
+      // Normalize clipboard JPEG/WebP/GIF to PNG before transmission; sending
+      // compressed JPEG bytes as raw pixels caused terminal parser failures.
+      if (kittyCapable() && attachment.mediaType !== "image/png") {
+        try { const converted = spawnSyncSafeBuffer("magick", ["-", "png:-"], this.data, 5000); if (converted?.length) { this.data = converted; attachment = { ...attachment, mediaType: "image/png" }; } } catch {}
+      }
       this.title = this.galleryTitle();
       this.lines = [[{ t: `${attachment.mediaType} · ${attachment.width ? `${attachment.width}×${attachment.height} · ` : ""}${Math.round(this.data.length / 1024)}KB`, fg: K.DIM }]];
       if (this.refs.length > 1) this.lines.push([{ t: "←/→ 切换图片", fg: K.FAINT }]);
@@ -1317,11 +1323,16 @@ export class ImagePopup extends Popup {
     const b64 = this.data.toString("base64");
     const chunks = [];
     for (let i = 0; i < b64.length; i += 4096) chunks.push(b64.slice(i, i + 4096));
-    const payload = chunks.map((c, i) => `\x1b_Ga=${i === 0 ? "T" : "f"},m=${i === chunks.length - 1 ? 0 : 1};${c}\x1b\\`).join("");
-    // place at popup position with column/row fit
-    const place = `\x1b_Ga=p,s=${w},v=${h},c=${w},r=${h},q=2;${this.imageKey}\x1b\\`;
+    const payload = chunks.map((c, i) => `\x1b_Ga=${i === 0 ? "T" : "f"},f=100,q=2,m=${i === chunks.length - 1 ? 0 : 1};${c}\x1b\\`).join("");
+    // place the transmitted PNG by image id; s/v are pixel dimensions and
+    // must not be confused with terminal columns/rows.
+    const place = `\x1b_Ga=p,c=${w},r=${h},q=2;${this.imageKey}\x1b\\`;
     return payload + place;
   }
+}
+
+function spawnSyncSafeBuffer(cmd, args, input, timeoutMs) {
+  try { const r = spawnSync(cmd, args, { input, timeout: timeoutMs, stdio: ["pipe", "pipe", "ignore"], maxBuffer: 32 * 1024 * 1024 }); return r.status === 0 ? r.stdout : null; } catch { return null; }
 }
 
 function spawnSyncSafe(cmd, args, timeoutMs) {
