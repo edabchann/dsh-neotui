@@ -1226,17 +1226,25 @@ export class ImagePopup extends Popup {
     this.imageKey = "";
     this.kittySentKey = "";
     this.kittyId = Math.floor(Math.random() * 2147483646) + 1;
+    this.kittyIds = new Set([this.kittyId]);
     this.pixelWidth = ref?.width ?? null;
     this.pixelHeight = ref?.height ?? null;
     this.load();
   }
+  #deleteKittyImage() {
+    if (this.kittyId && this.app.term?.output) this.app.term.output.write(`\x1b_Ga=d,d=i,i=${this.kittyId},q=2\x1b\\`);
+  }
   #show(idx) {
+    // Remove the current placement before allocating/transmitting the next
+    // image; otherwise the first gallery item remains welded underneath.
+    this.#deleteKittyImage();
     this.index = (idx + this.refs.length) % this.refs.length;
     this.ref = this.refs[this.index];
     this.data = null;
     this.chafaTmp = null;
     this.kittySentKey = "";
     this.kittyId = Math.floor(Math.random() * 2147483646) + 1;
+    this.kittyIds.add(this.kittyId);
     this.lines = [[{ t: "加载中…", fg: K.DIM }]];
     this.app.redraw();
     this.load();
@@ -1260,7 +1268,10 @@ export class ImagePopup extends Popup {
     return super.onMouse(ev);
   }
   closePreview() {
-    if (this.kittyId && this.app.term?.output) this.app.term.output.write(`\x1b_Ga=d,d=i,i=${this.kittyId},q=2\x1b\\`);
+    this.#deleteKittyImage();
+    // Defensive cleanup for every id allocated while browsing this gallery.
+    // Some terminals may process a switch/delete out of order under load.
+    if (this.app.term?.output) for (const id of this.kittyIds) this.app.term.output.write(`\x1b_Ga=d,d=i,i=${id},q=2\x1b\\`);
     if (this.returnTo) {
       this.returnTo.sel = Math.max(0, Math.min(this.index, this.returnTo.items().length - 1));
       this.app.overlay = this.returnTo;
