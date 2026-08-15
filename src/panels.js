@@ -1977,7 +1977,7 @@ export class ModelPanel extends Widget {
           formLines.push([{ t: `       ${truncate(it.sub, w - 8)}`, fg: K.FAINT, bg: T.BG2 }]);
         }
       }
-      formLines.push([{ t: isSub ? "  ↑/↓ 移动 · Enter 编辑或执行 · Esc 返回" : "  ↑/↓ 换供应商 · →/Tab 进表单(再按下移) · ← 上移/回列表 · Enter 编辑或执行 · Esc 退出", fg: K.FAINT }]);
+      formLines.push([{ t: isSub ? "  ↑/↓ 移动 · Enter 编辑或执行 · Esc 返回" : "  ↑/↓ 移动 · → 进入选项 · ← 返回列表 · Enter 编辑或执行 · Esc 退出", fg: K.FAINT }]);
     }
     this.formView.setLines(formLines);
   }
@@ -2243,39 +2243,30 @@ export class ModelPanel extends Widget {
       return false;
     }
     if (ev.name === "escape") { this.editing = null; return false; } // App falls back to chat mode
-    // ↑/↓ ALWAYS walk the provider column (the list is the primary axis —
-    // UCAS and ＋ 添加供应商 are both reachable by the arrow keys alone)
+    // dual-focus navigation: ↑/↓ move the cursor INSIDE the focused region —
+    // the provider column in list focus, the option rows in form focus.
+    // → enters the form, ← returns to the list.
     if (ev.name === "up" || (ev.name === "char" && ev.key === "k" && !ev.ctrl)) {
-      this.sel = Math.max(0, this.sel - 1);
-      this.mode = "list";
+      if (this.mode === "list") this.sel = Math.max(0, this.sel - 1);
+      else this.formIdx = Math.max(0, this.formIdx - 1);
       this.#rebuild();
       this.app.redraw();
       return true;
     }
     if (ev.name === "down" || (ev.name === "char" && ev.key === "j" && !ev.ctrl)) {
-      this.sel = Math.min(this.routes.length, this.sel + 1);
-      this.mode = "list";
+      if (this.mode === "list") this.sel = Math.min(this.routes.length, this.sel + 1);
+      else this.formIdx = Math.min(Math.max(0, this.formItems.length - 1), this.formIdx + 1);
       this.#rebuild();
       this.app.redraw();
       return true;
     }
-    // →/Tab: into the form, then down its rows; ←/Shift+Tab: up the form,
-    // and at the top back to the provider list
     if (ev.name === "right" || (ev.name === "char" && ev.key === "l" && !ev.ctrl) || ev.name === "tab") {
-      if (this.#route() != null) {
-        if (this.mode === "form") this.formIdx = Math.min(Math.max(0, this.formItems.length - 1), this.formIdx + 1);
-        else this.mode = "form";
-        this.#rebuild();
-      }
+      if (this.#route() != null && this.mode !== "form") { this.mode = "form"; this.#rebuild(); }
       this.app.redraw();
       return true;
     }
     if (ev.name === "left" || (ev.name === "char" && ev.key === "h" && !ev.ctrl) || ev.name === "backtab") {
-      if (this.mode === "form") {
-        if (this.formIdx > 0) this.formIdx--;
-        else this.mode = "list";
-        this.#rebuild();
-      }
+      if (this.mode === "form") { this.mode = "list"; this.#rebuild(); }
       this.app.redraw();
       return true;
     }
