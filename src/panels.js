@@ -1213,14 +1213,8 @@ export class ImagePopup extends Popup {
       x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2),
       w, h, title: `🖼 ${truncate(ref?.name ?? "image", 50)}`,
       lines: [[{ t: "加载中…", fg: K.DIM }]],
-      buttons: [
-        { label: "打开查看器", action: "viewer" },
-        { label: "关闭", action: "close" },
-      ],
-      onAction: (btn) => {
-        if (btn.action === "close" || btn.action === "__cancel__") app.closeOverlay();
-        else if (btn.action === "viewer") this.openExternal();
-      },
+      buttons: [],
+      onAction: () => app.closeOverlay(),
     });
     this.app = app;
     this.refs = (refs && refs.length > 0) ? refs : [ref];
@@ -1253,8 +1247,9 @@ export class ImagePopup extends Popup {
     if (ev.type === "key" && ev.name === "left" && this.refs.length > 1) { this.#show(this.index - 1); return true; }
     if (ev.type === "key" && ev.name === "right" && this.refs.length > 1) { this.#show(this.index + 1); return true; }
     if (ev.type === "key" && ev.name === "enter") { this.openExternal(); return true; }
+    if (ev.type === "key" && ev.name === "escape") { this.app.closeOverlay(); return true; }
     if (ev.type === "key" && ev.name === "char" && ev.key === "y") { this.copyImage(); return true; }
-    return super.onKey(ev);
+    return true;
   }
   onMouse(ev) {
     if (ev.kind === "press" && ev.button === 0) { const now = Date.now(); if (this.lastClickAt && now - this.lastClickAt < 400) { this.openExternal(); this.lastClickAt = 0; } else this.lastClickAt = now; return true; }
@@ -1282,8 +1277,7 @@ export class ImagePopup extends Popup {
         try { const converted = spawnSyncSafeBuffer("magick", ["-", "png:-"], this.data, 5000); if (converted?.length) { this.data = converted; attachment = { ...attachment, mediaType: "image/png" }; } } catch {}
       }
       this.title = this.galleryTitle();
-      this.lines = [[{ t: `${attachment.mediaType} · ${attachment.width ? `${attachment.width}×${attachment.height} · ` : ""}${Math.round(this.data.length / 1024)}KB`, fg: K.DIM }]];
-      if (this.refs.length > 1) this.lines.push([{ t: "←/→ 切换图片", fg: K.FAINT }]);
+      this.lines = [[{ t: `${attachment.mediaType} · ${attachment.width ? `${attachment.width}×${attachment.height} · ` : ""}${Math.round(this.data.length / 1024)}KB`, fg: K.DIM }], [{ t: `Enter/双击 默认程序 · y 复制 · Esc 关闭${this.refs.length > 1 ? " · ←/→ 切换" : ""}`, fg: K.FAINT }]];
       this.renderImage();
     } catch (e) {
       this.lines = [[{ t: `加载失败: ${e.message}`, fg: K.ERR }]];
@@ -1334,7 +1328,7 @@ export class ImagePopup extends Popup {
   kittyTransmit() {
     // kitty graphics protocol: transmit + place. Returns ANSI or "".
     if (!this.data || !kittyCapable()) return "";
-    const w = Math.min(70, this.w - 4), h = Math.max(4, this.h - 5);
+    const w = Math.min(70, this.w - 4), h = Math.max(4, this.h - 6);
     // Screen redraws every second for clocks/timers. Transmit once per loaded
     // image instead of streaming the full base64 payload on every frame.
     if (this.kittySentKey === this.imageKey) return "";
@@ -1343,8 +1337,11 @@ export class ImagePopup extends Popup {
     const chunks = [];
     for (let i = 0; i < b64.length; i += 4096) chunks.push(b64.slice(i, i + 4096));
     const payload = chunks.map((c, i) => `\x1b_Ga=${i === 0 ? "T" : "f"},f=100,i=${this.kittyId},q=2,m=${i === chunks.length - 1 ? 0 : 1};${c}\x1b\\`).join("");
+    // Kitty places at the current cursor. Screen.render() leaves the cursor at
+    // an arbitrary diff cell, so explicitly move to the popup image viewport.
+    const move = `\x1b[${this.y + 4};${this.x + 3}H`;
     const place = `\x1b_Ga=p,i=${this.kittyId},c=${w},r=${h},q=2\x1b\\`;
-    return payload + place;
+    return payload + move + place;
   }
 }
 

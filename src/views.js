@@ -4135,8 +4135,10 @@ export class App {
     // Native terminal caret: a blinking vertical bar (text-editor style) at
     // the focused input's cursor cell; hidden everywhere else.
     const cell = this.focused?.cursorCell;
-    if (cell) tail = `\x1b[?25h\x1b[${cell.y + 1};${cell.x + 1}H` + tail;
-    else tail = "\x1b[?25l" + tail;
+    // Graphics must be placed before restoring the text caret; Kitty placement
+    // uses the current cursor as its top-left anchor.
+    if (cell) tail = tail + `\x1b[?25h\x1b[${cell.y + 1};${cell.x + 1}H`;
+    else tail = tail + "\x1b[?25l";
     this.term.output.write(out + tail);
   }
 
