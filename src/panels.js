@@ -1833,6 +1833,8 @@ export class ModelPanel extends Widget {
     this.modelsSel = -1;   // selected model row (shows its subfields)
     this.draftRoute = null; // the un-saved new provider's route (shows the rename field)
     this.editing = null;   // { label, commit } while the inline editor is open
+    this.sub = null;       // the 模型管理 sub-buffer ({ cursor })
+    this.subItems = [];
     this.scanMode = false;
     this.scanItems = [];
     this.scanSel = new Set();
@@ -1875,6 +1877,22 @@ export class ModelPanel extends Widget {
     items.push({ kind: "field", key: "displayName", label: "显示名", value: p.displayName ?? "" });
     items.push({ kind: "field", key: "baseURL", label: "baseURL", value: p.baseURL ?? "" });
     items.push({ kind: "field", key: "apiKeyEnv", label: "apiKeyEnv", value: p.apiKeyEnv ?? "", note: "环境变量名（密钥不落盘）" });
+    // models are NOT flat here: one 模型管理 entry summarizing the first
+    // five, which opens its own sub-buffer (scan on top, model form below)
+    const models = p.models ?? [];
+    const names = models.slice(0, 5).map((m) => m.id || "（未命名）").join(" · ");
+    items.push({ kind: "button", label: "模型管理", sub: names + (models.length > 5 ? " · …" : ""), action: () => this.#openModels() });
+    items.push({ kind: "button", label: "💾 保存配置", action: () => this.#save() });
+    items.push({ kind: "button", label: "🗑 删除供应商", action: () => this.#deleteProvider() });
+    return items;
+  }
+  /** The 模型管理 sub-buffer: scan first, then the model-info form rows. */
+  #subItems() {
+    const route = this.#route();
+    if (route == null) return [];
+    const p = this.#profile(route);
+    const items = [];
+    items.push({ kind: "button", label: "🔄 自动扫描可用模型（读 /models 端点）", action: () => this.#scan() });
     const models = p.models ?? [];
     for (let mi = 0; mi < models.length; mi++) {
       const m = models[mi];
@@ -1888,11 +1906,14 @@ export class ModelPanel extends Widget {
     }
     items.push({ kind: "button", label: "＋ 添加模型", action: () => this.#addModel() });
     items.push({ kind: "button", label: "🗑 删除选中模型", action: () => this.#deleteModel() });
-    items.push({ kind: "button", label: "🔄 自动扫描模型（读 /models 端点）", action: () => this.#scan() });
     items.push({ kind: "button", label: "◉ 设为当前会话模型（选中模型）", action: () => this.#setDefaultModel() });
-    items.push({ kind: "button", label: "💾 保存配置", action: () => this.#save() });
-    items.push({ kind: "button", label: "🗑 删除供应商", action: () => this.#deleteProvider() });
     return items;
+  }
+  #openModels() {
+    this.sub = { cursor: 0 };
+    this.modelsSel = -1;
+    this.#rebuild();
+    this.app.redraw();
   }
   #rebuild() {
     // left list: the cursor is ALWAYS visible (● on the selected provider),
@@ -1930,11 +1951,16 @@ export class ModelPanel extends Widget {
       formLines.push([{ t: "  Enter 添加选中 · Esc 取消扫描", fg: K.FAINT }]);
       this.formItems = [];
     } else {
-      this.formItems = this.#formRows();
+      const isSub = this.sub != null;
+      const items = isSub ? this.#subItems() : this.#formRows();
+      if (isSub) this.subItems = items;
+      else this.formItems = items;
       const w = Math.max(30, this.formView.w - 4);
-      for (let i = 0; i < this.formItems.length; i++) {
-        const it = this.formItems[i];
-        const cur = this.mode === "form" && i === this.formIdx;
+      const cursor = isSub ? this.sub.cursor : this.formIdx;
+      if (isSub) formLines.push([{ t: `  模型管理 — ${truncate(this.#profile(route).displayName || route, 30)}  (Esc 返回)`, fg: K.ACCENT, bold: true }]);
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        const cur = i === cursor;
         let t;
         if (it.kind === "field") {
           const v = it.value === "" || it.value == null ? "（空）" : String(it.value);
@@ -1946,8 +1972,12 @@ export class ModelPanel extends Widget {
           t = ` ${cur ? "▸" : " "} ${it.label}`;
         }
         formLines.push([{ t: truncate(t, w), fg: cur ? T.SELFG : T.TXT, bg: cur ? T.MENUSEL : T.BG2 }]);
+        // the 模型管理 preview: an indented, non-focusable summary line
+        if (!isSub && it.kind === "button" && it.sub) {
+          formLines.push([{ t: `       ${truncate(it.sub, w - 8)}`, fg: K.FAINT, bg: T.BG2 }]);
+        }
       }
-      formLines.push([{ t: "  ↑/↓ 换供应商 · →/Tab 进表单(再按下移) · ← 上移/回列表 · Enter 编辑或执行 · Esc 退出", fg: K.FAINT }]);
+      formLines.push([{ t: isSub ? "  ↑/↓ 移动 · Enter 编辑或执行 · Esc 返回" : "  ↑/↓ 换供应商 · →/Tab 进表单(再按下移) · ← 上移/回列表 · Enter 编辑或执行 · Esc 退出", fg: K.FAINT }]);
     }
     this.formView.setLines(formLines);
   }
@@ -1999,8 +2029,10 @@ export class ModelPanel extends Widget {
       this.app.redraw();
       return;
     }
-    // form
-    const it = this.formItems[this.formIdx];
+    // form (or the 模型管理 sub-buffer — same item kinds, different source)
+    const items = this.sub != null ? this.subItems : this.formItems;
+    const idx = this.sub != null ? this.sub.cursor : this.formIdx;
+    const it = items[idx];
     if (!it) return;
     const route = this.#route();
     const p = this.#profile(route);
@@ -2194,6 +2226,22 @@ export class ModelPanel extends Widget {
       if (ev.name === "enter") { this.#scanCommit(); return true; }
       return false;
     }
+    if (this.sub != null) {
+      // inside the 模型管理 sub-buffer: ↑/↓ walk its rows; Esc returns
+      if (ev.name === "escape") { this.sub = null; this.#rebuild(); return true; }
+      if (ev.name === "up" || (ev.name === "char" && ev.key === "k" && !ev.ctrl)) {
+        this.sub.cursor = Math.max(0, this.sub.cursor - 1);
+        this.app.redraw();
+        return true;
+      }
+      if (ev.name === "down" || (ev.name === "char" && ev.key === "j" && !ev.ctrl)) {
+        this.sub.cursor = Math.min(Math.max(0, this.#subItems().length - 1), this.sub.cursor + 1);
+        this.app.redraw();
+        return true;
+      }
+      if (ev.name === "enter") { this.#activateItem(); return true; }
+      return false;
+    }
     if (ev.name === "escape") { this.editing = null; return false; } // App falls back to chat mode
     // ↑/↓ ALWAYS walk the provider column (the list is the primary axis —
     // UCAS and ＋ 添加供应商 are both reachable by the arrow keys alone)
@@ -2257,6 +2305,12 @@ export class ModelPanel extends Widget {
       return false;
     }
     const idx = ev.y - this.formView.y + this.formView.scrollY;
+    if (this.sub != null) {
+      // the sub-buffer's title row is visual-only; rows below it are items
+      const itemIdx = idx - 1;
+      if (itemIdx >= 0 && itemIdx < this.#subItems().length) { this.sub.cursor = itemIdx; this.#activateItem(); return true; }
+      return false;
+    }
     if (idx >= 0 && idx < this.formItems.length) { this.formIdx = idx; this.mode = "form"; this.#activateItem(); return true; }
     return false;
   }

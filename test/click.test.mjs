@@ -755,11 +755,15 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
   assert.equal(mutate[1].ns, "llm-pi-ai");
   assert.equal(mutate[1].expectedRevision, 3);
   assert.equal(mutate[1].ops[0].value["新供应商"].displayName, "My GW");
-  // the auto-scan reads the /models endpoint and adds the picked models
+  // the 模型管理 entry opens a sub-buffer; its FIRST row is the auto-scan
+  panel.formIdx = panel.formItems.findIndex((it) => it.kind === "button" && it.label === "模型管理");
+  panel.onKey({ type: "key", name: "enter" });
+  assert.ok(panel.sub != null, "模型管理 sub-buffer opened");
+  assert.equal(panel.subItems[0].label.includes("自动扫描"), true, "scan is the first sub-buffer row");
   const realFetch = globalThis.fetch;
   globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ data: [{ id: "m1" }, { id: "m2" }] }) });
   try {
-    panel.formIdx = panel.formItems.findIndex((it) => it.kind === "button" && it.label.includes("自动扫描"));
+    panel.sub.cursor = 0;
     panel.onKey({ type: "key", name: "enter" });
     await new Promise((r) => setTimeout(r, 30));
     assert.equal(panel.scanMode, true, "scan mode entered");
@@ -767,6 +771,9 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
     panel.onKey({ type: "key", name: "enter" }); // add the selected scan results
     const ids = (panel.providers["新供应商"].models ?? []).map((m) => m.id);
     assert.deepEqual(ids, ["m1", "m2"], "scanned models added");
+    // Esc closes the sub-buffer back to the provider form
+    panel.onKey({ type: "key", name: "escape" });
+    assert.equal(panel.sub, null, "Esc returned from the sub-buffer");
   } finally {
     globalThis.fetch = realFetch;
   }
