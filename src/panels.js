@@ -223,11 +223,34 @@ export function buildPermissionPicker(app) {
   });
 }
 
+export class ArchivePanel extends Popup {
+  constructor(app) {
+    const w = Math.min(90, app.screen.w - 4), h = Math.min(28, app.screen.h - 4);
+    super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h, title: "归档会话（只读）", lines: [], buttons: [], scrollable: true });
+    this.app = app; this.sel = 0; this.rebuild();
+  }
+  items() { const ids = new Set(this.app.archivedSessionIds ?? []); return (this.app.sessions ?? []).filter((s) => ids.has(s.sessionId)); }
+  rebuild() {
+    const items = this.items(); this.sel = Math.min(this.sel, Math.max(0, items.length - 1));
+    this.lines = [[{ t: " ↑↓选择 · Enter打开历史 · y复制ID · e导出日志 · Esc关闭", fg: K.DIM }], ...(items.length ? items.map((s, i) => [{ t: ` ${i === this.sel ? "▸" : " "} ${truncate(s.projections?.values?.title ?? s.sessionId, this.w - 28)}  ${new Date(s.updatedAt).toLocaleString()}`, fg: i === this.sel ? K.ACCENT : K.TXT, bg: i === this.sel ? T.MENUSEL : -1 }]) : [[{ t: " 没有归档会话", fg: K.FAINT }]])];
+  }
+  onKey(ev) {
+    if (ev.type !== "key") return false; const items = this.items(), item = items[this.sel];
+    if (ev.name === "escape") { this.app.closeOverlay(); return true; }
+    if (ev.name === "up" || (ev.name === "char" && ev.key === "k")) { this.sel = Math.max(0, this.sel - 1); this.rebuild(); return true; }
+    if (ev.name === "down" || (ev.name === "char" && ev.key === "j")) { this.sel = Math.min(items.length - 1, this.sel + 1); this.rebuild(); return true; }
+    if (ev.name === "enter" && item) { this.app.closeOverlay(); this.app.openSession(item.sessionId); return true; }
+    if (ev.name === "char" && ev.key === "y" && item) { this.app.copyText(item.sessionId); return true; }
+    if (ev.name === "char" && ev.key === "e" && item) { this.app.exportSession(item); return true; }
+    return super.onKey(ev);
+  }
+}
+
 export class PresetPanel extends Popup {
   constructor(app) {
     const w = Math.min(92, app.screen.w - 4), h = Math.min(28, app.screen.h - 4);
     super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h, title: "Agent 预设管理", lines: [], buttons: [], scrollable: true });
-    this.app = app; this.items = []; this.sel = 0; this.detail = null; this.meta = {}; this.load();
+    this.app = app; this.items = []; this.sel = 0; this.detail = null; this.meta = {}; this.loadingId = null; this.load();
   }
   async load() {
     try { const r = await this.app.api.call("agentPreset.list"); this.items = (r.presets ?? []).filter((p) => !p.broken); this.meta = r; await this.read(); }
@@ -236,14 +259,16 @@ export class PresetPanel extends Popup {
   }
   async read() {
     const item = this.items[this.sel]; if (!item) { this.lines = [[{ t: "没有预设", fg: K.FAINT }]]; return; }
-    try { this.detail = await this.app.api.call("agentPreset.read", { agentPreset: item.id }); }
-    catch (e) { this.detail = { content: `读取失败: ${e.message}` }; }
-    this.rebuild();
+    const id = item.id; this.loadingId = id; this.scrollY = 0; this.lines = [[{ t: ` 正在读取 ${id}…`, fg: K.FAINT }]]; this.app.redraw();
+    try { const detail = await this.app.api.call("agentPreset.read", { agentPreset: id }); if (this.loadingId !== id) return; this.detail = detail; }
+    catch (e) { if (this.loadingId !== id) return; this.detail = { content: `读取失败: ${e.message}` }; }
+    this.loadingId = null; this.rebuild();
   }
   rebuild() {
     const item = this.items[this.sel], detail = this.detail; if (!item) return;
     this.title = `Agent 预设管理 · ${item.id}`;
-    this.lines = [[{ t: " ↑↓选择 · Enter刷新 · c复制 · o打开目录 · x删除用户预设 · Esc关闭", fg: K.DIM }], [{ t: ` ${item.id} · ${detail?.trust ?? item.trust ?? "?"}${item.isDefault ? " · 默认" : ""}`, fg: K.ACCENT, bold: true }], [{ t: ` ${detail?.description ?? item.description ?? ""}`, fg: K.FAINT }], [{ t: "" }], ...String(detail?.content ?? "").split("\n").map((line) => [{ t: " " + truncate(line, this.w - 4), fg: K.TXT }])];
+    const trust = detail?.trust ?? item.trust ?? "?";
+    this.lines = [[{ t: " ↑↓选择 · PgUp/PgDn滚动 · Enter刷新 · c复制 · o打开目录 · x删除 · Esc关闭", fg: K.DIM }], [{ t: ` ${item.id} · ${trust === "system" ? "内置/只读" : "用户/可管理"}${item.isDefault ? " · 默认" : ""}`, fg: trust === "system" ? K.FAINT : K.ACCENT, bold: true }], [{ t: ` ${detail?.description ?? item.description ?? ""}`, fg: K.FAINT }], [{ t: "" }], ...String(detail?.content ?? "").split("\n").map((line) => [{ t: " " + truncate(line, this.w - 4), fg: K.TXT }])];
   }
   #copy() {
     if (!this.meta.authorable) { this.app.toast("当前部署不允许创建用户预设"); return; }
@@ -288,6 +313,7 @@ export function buildCommandPalette(app) {
     { label: "任务列表", hint: "j", action: () => app.showJobs(), keywords: "jobs tasks" },
     { label: "目标状态", hint: "g", action: () => app.showGoal(), keywords: "goal objective" },
     { label: "刷新会话列表", action: () => app.refreshSessions(), keywords: "refresh reload" },
+    { label: "查看归档会话", action: () => { app.overlay = new ArchivePanel(app); app.redraw(); }, keywords: "archive archived sessions history" },
     { label: "打开原始配置文件", action: async () => { try { const r = await app.api.call("settings.openDocument"); app.toast(r.opened ? "已在系统编辑器打开配置" : `配置文件: ${r.path}`); } catch (e) { app.toast(`打开配置失败: ${e.message}`); } }, keywords: "settings config raw document" },
     { label: "切换主题", action: () => { cycleTheme(); app.toast(`主题: ${themeName()}`); }, keywords: "theme color" },
     { label: "复制当前会话 ID", action: () => app.copyText(app.currentSession ?? ""), keywords: "copy id" },
@@ -509,7 +535,8 @@ export class DirPicker extends Widget {
     const w = Math.min(60, app.screen.w - 4), h = Math.min(20, app.screen.h - 4);
     super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h });
     this.app = app;
-    this.path = startPath ?? process.cwd();
+    this.path = startPath;
+    this.parentPath = null;
     this.onPick = onPick;
     this.onCancel = onCancel;
     this.entries = [];
@@ -517,22 +544,22 @@ export class DirPicker extends Widget {
     this.scroll = 0;
     this.load();
   }
-  load() {
+  async load() {
     try {
-      this.entries = readdirSync(this.path, { withFileTypes: true })
-        .filter((d) => d.isDirectory() && !d.name.startsWith("."))
-        .map((d) => d.name)
-        .sort((a, b) => a.localeCompare(b));
-    } catch { this.entries = []; }
-    this.sel = 0;
-    this.scroll = 0;
+      const listing = await this.app.api.call("host.listDirectory", this.path ? { path: this.path } : {});
+      this.path = listing.path;
+      this.parentPath = listing.crumbs?.length > 1 ? listing.crumbs[listing.crumbs.length - 2].path : null;
+      this.entries = (listing.entries ?? []).filter((entry) => !entry.hidden);
+      this.truncated = !!listing.truncated;
+    } catch (e) { this.entries = []; this.app.toast(`目录读取失败: ${e.message}`); }
+    this.sel = 0; this.scroll = 0; this.app.redraw();
   }
-  #items() { return ["✓ 选择此目录", "+ 新建子目录…", "..", ...this.entries]; }
+  #items() { return [{ kind: "pick", name: "✓ 选择此目录" }, { kind: "create", name: "+ 新建子目录…" }, ...(this.parentPath ? [{ kind: "parent", name: "..", path: this.parentPath }] : []), ...this.entries.map((entry) => ({ kind: "dir", name: entry.name, path: entry.path }))]; }
   #createDirectory() {
     const popup = new EditPopup(this.app, { title: `在 ${truncate(this.path, 38)} 新建目录`, value: "", placeholder: "目录名", onCommit: async (name) => {
       this.app.overlay = this;
       if (!name.trim() || name.includes("/") || name.includes("\\")) { this.app.toast("请输入不含路径分隔符的目录名"); return; }
-      try { await this.app.api.call("host.createDirectory", { path: this.path, name: name.trim() }); this.load(); this.app.toast(`已创建 ${name.trim()}`); }
+      try { await this.app.api.call("host.createDirectory", { path: this.path, name: name.trim() }); await this.load(); this.app.toast(`已创建 ${name.trim()}`); }
       catch (e) { this.app.toast(`创建目录失败: ${e.message}`); }
       this.app.redraw();
     } });
@@ -553,8 +580,8 @@ export class DirPicker extends Widget {
       const y = this.y + 2 + i;
       if (it === undefined) { screen.hline(this.x + 1, this.x + this.w - 2, y, " ", { bg: T.BG2 }); continue; }
       const sel = idx === this.sel;
-      const label = it === "✓ 选择此目录" ? it : it === "+ 新建子目录…" ? it : it === ".." ? ".. （上级目录）" : "▸ " + it + "/";
-      const fg = it === "✓ 选择此目录" ? K.OK : it === "+ 新建子目录…" ? K.ACCENT : it === ".." ? K.DIM : K.TXT;
+      const label = it.kind === "pick" ? it.name : it.kind === "create" ? it.name : it.kind === "parent" ? ".. （上级目录）" : "▸ " + it.name + "/";
+      const fg = it.kind === "pick" ? K.OK : it.kind === "create" ? K.ACCENT : it.kind === "parent" ? K.DIM : K.TXT;
       screen.fillRect(this.x + 1, y, this.x + this.w - 2, y, " ", { bg: sel ? T.MENUSEL : T.BG2 });
       screen.text(this.x + 2, y, truncate(label, this.w - 4), { fg: sel ? 0xffffff : fg, bg: sel ? T.MENUSEL : T.BG2, attrs: sel ? 1 : 0 });
     }
@@ -568,20 +595,19 @@ export class DirPicker extends Widget {
       case "down": this.sel = Math.min(items.length - 1, this.sel + 1); return true;
       case "enter": {
         const it = items[this.sel];
-        if (it === "✓ 选择此目录") { this.onPick?.(this.path); return true; }
-        if (it === "+ 新建子目录…") { this.#createDirectory(); return true; }
-        if (it === "..") { this.path = dirname(this.path); this.load(); return true; }
-        this.path = join(this.path, it); this.load(); return true;
+        if (it.kind === "pick") { this.onPick?.(this.path); return true; }
+        if (it.kind === "create") { this.#createDirectory(); return true; }
+        this.path = it.path; this.load(); return true;
       }
-      case "backspace": this.path = dirname(this.path); this.load(); return true;
+      case "backspace": if (this.parentPath) { this.path = this.parentPath; this.load(); } return true;
       case "char":
         if (ev.key === "j" && !ev.ctrl) { this.sel = Math.min(items.length - 1, this.sel + 1); return true; }
         if (ev.key === "k" && !ev.ctrl) { this.sel = Math.max(0, this.sel - 1); return true; }
-        if (ev.key === "h" && !ev.ctrl) { this.path = dirname(this.path); this.load(); return true; }
+        if (ev.key === "h" && !ev.ctrl) { if (this.parentPath) { this.path = this.parentPath; this.load(); } return true; }
         if (ev.key === "l" && !ev.ctrl) {
           const it = items[this.sel];
-          if (it === "+ 新建子目录…") this.#createDirectory();
-          else if (it && it !== "✓ 选择此目录" && it !== "..") { this.path = join(this.path, it); this.load(); }
+          if (it?.kind === "create") this.#createDirectory();
+          else if (it?.path) { this.path = it.path; this.load(); }
           return true;
         }
         return false;
@@ -595,10 +621,9 @@ export class DirPicker extends Widget {
       const items = this.#items();
       if (idx >= 0 && idx < items.length) {
         const it = items[idx];
-        if (it === "✓ 选择此目录") { this.onPick?.(this.path); return true; }
-        if (it === "+ 新建子目录…") { this.#createDirectory(); return true; }
-        if (it === "..") { this.path = dirname(this.path); this.load(); return true; }
-        this.path = join(this.path, it); this.load(); return true;
+        if (it.kind === "pick") { this.onPick?.(this.path); return true; }
+        if (it.kind === "create") { this.#createDirectory(); return true; }
+        this.path = it.path; this.load(); return true;
       }
       return true;
     }
@@ -2306,8 +2331,9 @@ export class ModelPanel extends Widget {
         items.push({ kind: "field", key: `model.${mi}.name`, label: "  模型名", value: m.name ?? "" });
         items.push({ kind: "field", key: `model.${mi}.contextWindow`, label: "  上下文窗口", value: m.contextWindow ?? "", numeric: true });
         items.push({ kind: "field", key: `model.${mi}.maxTokens`, label: "  最大输出", value: m.maxTokens ?? "", numeric: true });
-        items.push({ kind: "field", key: `model.${mi}.reasoningEfforts`, label: "  思考强度映射", value: m.reasoningEfforts === false ? "false" : JSON.stringify(m.reasoningEfforts ?? {}), json: true, note: 'JSON，例如 {"off":null,"high":"high"}' });
-        items.push({ kind: "field", key: `model.${mi}.input`, label: "  输入模态", value: JSON.stringify(m.input ?? ["text"]), json: true, note: 'JSON，例如 ["text","image"]' });
+        items.push({ kind: "choice", key: `model.${mi}.reasoningEnabled`, label: "  启用思考强度", value: m.reasoningEfforts === false ? "否" : "是", cycle: ["是", "否"] });
+        for (const level of ["off", "minimal", "low", "medium", "high", "xhigh"]) items.push({ kind: "field", key: `model.${mi}.reasoning.${level}`, label: `    ${level}`, value: m.reasoningEfforts === false ? "" : (m.reasoningEfforts?.[level] ?? (level === "off" && Object.hasOwn(m.reasoningEfforts ?? {}, level) ? "null" : "")), note: level === "off" ? "null 表示关闭" : "留空=不提供" });
+        for (const modality of ["text", "image", "audio"]) items.push({ kind: "choice", key: `model.${mi}.input.${modality}`, label: `  输入 ${modality}`, value: (m.input ?? ["text"]).includes(modality) ? "✓" : "·", cycle: ["✓", "·"] });
       }
     }
     items.push({ kind: "button", label: "＋ 添加模型", action: () => this.#addModel() });
@@ -2370,7 +2396,7 @@ export class ModelPanel extends Widget {
         const it = items[i];
         const cur = i === cursor;
         let t;
-        if (it.kind === "field") {
+        if (it.kind === "field" || it.kind === "choice") {
           const v = it.value === "" || it.value == null ? "（空）" : String(it.value);
           t = ` ${cur ? "▸" : " "} ${it.label}: ${truncate(v, w - strWidth(it.label) - 6)}${it.note ? `  [${it.note}]` : ""}`;
         } else if (it.kind === "key") {
@@ -2533,11 +2559,14 @@ export class ModelPanel extends Widget {
             const [, mi, field] = it.key.split("."); p.models[Number(mi)][field] = n;
           } else p[it.key] = n;
         } else if (it.key.startsWith("model.")) {
-          const [, mi, field] = it.key.split(".");
-          if (it.json) {
-            try { p.models[Number(mi)][field] = text.trim() === "false" ? false : JSON.parse(text); }
-            catch { this.app.toast("请输入有效 JSON"); return; }
-          } else p.models[Number(mi)][field] = text;
+          const [, mi, field, detail] = it.key.split(".");
+          const model = p.models[Number(mi)];
+          if (field === "reasoning") {
+            if (model.reasoningEfforts === false) model.reasoningEfforts = {};
+            const value = text.trim();
+            if (!value) delete model.reasoningEfforts[detail];
+            else model.reasoningEfforts[detail] = value === "null" ? null : value;
+          } else model[field] = text;
         } else {
           if (it.key === "api" && !API_PROTOCOLS.includes(text.trim())) this.app.toast(`注意:${text.trim() || "空"} 不是已知协议,保存时可能被拒绝`);
           if (it.key === "__defaultReasoningEffort") {
@@ -2547,6 +2576,12 @@ export class ModelPanel extends Widget {
         }
       }, it.completions);
       return;
+    }
+    if (it.kind === "choice") {
+      const [, mi, field, detail] = it.key.split("."); const model = p.models[Number(mi)];
+      if (field === "reasoningEnabled") model.reasoningEfforts = it.value === "是" ? false : {};
+      else if (field === "input") { const set = new Set(model.input ?? ["text"]); set.has(detail) ? set.delete(detail) : set.add(detail); model.input = [...set]; }
+      this.#rebuild(); this.app.redraw(); return;
     }
     if (it.kind === "model") {
       this.modelsSel = this.modelsSel === it.idx ? -1 : it.idx;

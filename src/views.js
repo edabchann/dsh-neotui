@@ -2725,7 +2725,8 @@ export class App {
       if (seq !== this.refreshSessionsSeq) return;
       this.sessions = [...list.items].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
       this.workspaceItems = workspaces.items ?? [];
-      this.sidebar.setData(this.workspaceItems, this.sessions, workspaces.archivedSessionIds ?? [], this.currentSession);
+      this.archivedSessionIds = workspaces.archivedSessionIds ?? [];
+      this.sidebar.setData(this.workspaceItems, this.sessions, this.archivedSessionIds, this.currentSession);
       this.redraw();
     } catch (e) {
       this.toast(`会话列表加载失败: ${e.message}`);
