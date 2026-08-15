@@ -3696,6 +3696,14 @@ export class App {
       }
       return;
     }
+    // Bracketed paste is its own event, not a key event. Handle it before the
+    // key-only router; nesting this branch below `ev.type === "key"` made image
+    // paste permanently unreachable.
+    if (ev.type === "paste" && this.focused === this.chat.input) {
+      if (!this.chat.pasteClipboardImage()) this.chat.input.onKey(ev);
+      this.redraw();
+      return;
+    }
     // global keys
     if (ev.type === "key") {
       // INSERT mode: Esc exits, everything else goes to the input for editing.
@@ -3712,11 +3720,6 @@ export class App {
           this.toast(this.chat.running ? "已退出输入；Ctrl+C 可中断当前回合" : "已退出输入（i 重新进入）");
         } else if (ev.ctrl && ev.key === "o") {
           this.overlay = new FilePicker(this, { startPath: process.cwd(), onPick: (path) => { this.overlay = null; if (IMAGE_EXT.test(path)) this.chat.input.insert(` @${path} `); else this.toast("当前 Host prompt 协议只支持文本和图片；该文件暂不能作为附件发送"); this.redraw(); }, onCancel: () => { this.overlay = null; this.redraw(); } });
-        } else if (ev.type === "paste") {
-          // Terminals normally deliver Ctrl+Shift+V as bracketed paste, without
-          // modifier metadata. Probe the image clipboard first; fall back to
-          // the pasted text when it contains no supported image.
-          if (!this.chat.pasteClipboardImage()) this.chat.input.onKey(ev);
         } else if (ev.ctrl && ev.shift && ev.key === "v") {
           if (!this.chat.pasteClipboardImage()) this.chat.input.onKey(ev);
         } else {

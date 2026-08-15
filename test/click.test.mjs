@@ -525,6 +525,14 @@ test("Ctrl+L expands/collapses the input past the 6-line cap", () => {
   assert.ok(input.height() <= 6, "back to the 6-line cap");
 });
 
+test("App routes bracketed paste to image clipboard before text input", () => {
+  const app = headlessApp(); app.focus(app.chat.input); let probes = 0;
+  app.chat.pasteClipboardImage = () => { probes++; return true; };
+  app.onEvent({ type: "paste", text: "clipboard fallback text" });
+  assert.equal(probes, 1, "image clipboard probe reached outside key-only router");
+  assert.equal(app.chat.input.value, "", "handled image paste does not insert clipboard text");
+});
+
 test("end-to-end: a bracketed paste through the term reaches the two-stage input", async () => {
   const { PassThrough } = await import("node:stream");
   const { Term } = await import("../src/term.js");
@@ -533,6 +541,7 @@ test("end-to-end: a bracketed paste through the term reaches the two-stage input
   app.term = term;
   term.start();
   app.focus(app.chat.input);
+  app.chat.pasteClipboardImage = () => false;
   const big = Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n");
   term.input.write("\x1b[200~" + big + "\x1b[201~");
   await new Promise((r) => setTimeout(r, 40));
