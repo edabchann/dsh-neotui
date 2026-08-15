@@ -760,6 +760,11 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
   panel.onKey({ type: "key", name: "enter" });
   assert.ok(panel.sub != null, "模型管理 sub-buffer opened");
   assert.equal(panel.subItems[0].label.includes("自动扫描"), true, "scan is the first sub-buffer row");
+  // the sub-buffer cursor moves AND the rendered highlight follows it
+  panel.onKey({ type: "key", name: "down" });
+  assert.equal(panel.sub.cursor, 1, "sub cursor moved");
+  const row = panel.formView.lines[1 + panel.sub.cursor].map((g) => g.t).join("");
+  assert.ok(row.includes("▸"), `rendered highlight follows the sub cursor: ${row}`);
   const realFetch = globalThis.fetch;
   globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ data: [{ id: "m1" }, { id: "m2" }] }) });
   try {

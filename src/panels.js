@@ -2215,11 +2215,12 @@ export class ModelPanel extends Widget {
     }
     if (this.scanMode) {
       if (ev.name === "escape") { this.scanMode = false; this.#rebuild(); return true; }
-      if (ev.name === "up") { this.scanCursor = Math.max(0, this.scanCursor - 1); this.app.redraw(); return true; }
-      if (ev.name === "down") { this.scanCursor = Math.min(this.scanItems.length - 1, this.scanCursor + 1); this.app.redraw(); return true; }
+      if (ev.name === "up") { this.scanCursor = Math.max(0, this.scanCursor - 1); this.#rebuild(); this.app.redraw(); return true; }
+      if (ev.name === "down") { this.scanCursor = Math.min(this.scanItems.length - 1, this.scanCursor + 1); this.#rebuild(); this.app.redraw(); return true; }
       if (ev.name === "char" && ev.key === " " && !ev.ctrl) {
         const m = this.scanItems[this.scanCursor];
         if (m) { if (this.scanSel.has(m.id)) this.scanSel.delete(m.id); else this.scanSel.add(m.id); }
+        this.#rebuild();
         this.app.redraw();
         return true;
       }
@@ -2231,11 +2232,13 @@ export class ModelPanel extends Widget {
       if (ev.name === "escape") { this.sub = null; this.#rebuild(); return true; }
       if (ev.name === "up" || (ev.name === "char" && ev.key === "k" && !ev.ctrl)) {
         this.sub.cursor = Math.max(0, this.sub.cursor - 1);
+        this.#rebuild();
         this.app.redraw();
         return true;
       }
       if (ev.name === "down" || (ev.name === "char" && ev.key === "j" && !ev.ctrl)) {
         this.sub.cursor = Math.min(Math.max(0, this.#subItems().length - 1), this.sub.cursor + 1);
+        this.#rebuild();
         this.app.redraw();
         return true;
       }
