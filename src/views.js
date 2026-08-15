@@ -1289,11 +1289,8 @@ export class ChatView extends Widget {
     image.local = false;
     this.clipboardImages.push(image);
     this.attachments.push(image);
-    this.input.insertAtomic(` [🖼 ${image.name}] `, image.id);
-    this.app.toast(`已粘贴图片 ${image.name} · ${Math.round(image.bytes / 1024)}KB（Enter 发送）`);
-    // Open the same Kitty-capable preview surface used by transcript images.
-    const ref = { mediaType: image.mediaType, data: image.data, name: image.name };
-    this.app.openImage(ref, { all: [ref], index: 0 });
+    this.inputChanged();
+    this.app.toast(`已添加图片 ${image.name} · ${Math.round(image.bytes / 1024)}KB（NORMAL Ctrl+O 管理）`);
     return true;
   }
 
@@ -1315,8 +1312,6 @@ export class ChatView extends Widget {
     for (const e of errors) this.app.toast(`图片读取失败: ${e}`);
     const clipParts = this.clipboardImages.map(({ mediaType, data, name }) => ({ type: "image", mediaType, data, name }));
     const clipboardCount = clipParts.length;
-    // Visual placeholder belongs to the editor only, never to model content.
-    for (const p of parts) if (p.type === "text") p.text = p.text.replace(/\s*\[🖼 clipboard-[^\]]+\]\s*/g, " ");
     parts.push(...clipParts);
     this.app.log(`[chat] prompt → ${this.sessionId.slice(0, 8)}: ${truncate(trimmed, 60)}${images.length + clipboardCount ? ` (+${images.length + clipboardCount} 图)` : ""}`);
     this.app.api.call("session.prompt", {
@@ -1562,10 +1557,11 @@ export class ChatView extends Widget {
     this.cardRanges = [];
     const mark = (nodeIdx, blockIdx = null, dispatchId = null) => lineMap.push(dispatchId != null ? { nodeIdx, blockIdx, dispatchId } : { nodeIdx, blockIdx });
     const markImg = (nodeIdx, imgIdx) => lineMap.push({ nodeIdx, imgIdx });
-    // render only the tail of very long sessions; earlier nodes load via pagination
-    const MAX_NODES = 150;
-    const skipCount = Math.max(0, this.nodes.length - MAX_NODES);
-    const nodes = skipCount > 0 ? this.nodes.slice(skipCount) : this.nodes;
+    // session.history already pages the dataset. Never tail-slice the loaded
+    // nodes here: that made prepended pages immediately disappear again and
+    // created a permanent visual ceiling around the newest 150 nodes.
+    const skipCount = 0;
+    const nodes = this.nodes;
     lines.push([{ t: truncate(this.title || this.sessionId?.slice(0, 8) || "", w - 2), fg: K.DIM }]);
     mark(-1);
     if (this.hasMore) { lines.push([{ t: "▲ 更早的记录", fg: K.FAINT }]); mark(-1); }
@@ -3519,6 +3515,18 @@ export class App {
     this.switchPermission(next);
   }
 
+  showFilePicker() {
+    this.overlay = new FilePicker(this, { startPath: process.cwd(), onPick: (path) => {
+      this.overlay = null;
+      if (IMAGE_EXT.test(path)) {
+        try { const ext = IMAGE_EXT.exec(path)[1].toLowerCase(); const mediaType = MEDIA_TYPES[ext]; const data = readFileSync(path, "base64"); const item = { id: `file-${Date.now()}`, path, local: true, name: path.split("/").pop(), mediaType, data, bytes: Buffer.byteLength(data, "base64") }; this.chat.clipboardImages.push(item); this.chat.attachments.push(item); this.chat.inputChanged(); this.toast(`已添加 ${item.name}`); }
+        catch (e) { this.toast(`文件读取失败: ${e.message}`); }
+      } else this.toast("当前 Host prompt 协议只支持文本和图片；该文件暂不能作为附件发送");
+      this.focus(this.chat.input); this.redraw();
+    }, onCancel: () => { this.overlay = null; this.focus(this.chat.input); this.redraw(); } });
+    this.focus(this.overlay); this.redraw();
+  }
+
   openImage(ref, opts = {}) {
     this.overlay = new ImagePopup({ app: this, ref, sessionId: this.currentSession, refs: opts.all, index: opts.index ?? 0 });
     this.redraw();
@@ -3752,10 +3760,8 @@ export class App {
           // so ordinary Vim muscle memory cannot accidentally stop a long turn.
           this.focus(this.chat);
           this.toast(this.chat.running ? "已退出输入；Ctrl+C 可中断当前回合" : "已退出输入（i 重新进入）");
-        } else if (ev.ctrl && ev.key === "o" && this.chat.attachments.length) {
-          this.overlay = new AttachmentPanel(this); this.focus(this.overlay);
         } else if (ev.ctrl && ev.key === "o") {
-          this.overlay = new FilePicker(this, { startPath: process.cwd(), onPick: (path) => { this.overlay = null; if (IMAGE_EXT.test(path)) this.chat.input.insert(` @${path} `); else this.toast("当前 Host prompt 协议只支持文本和图片；该文件暂不能作为附件发送"); this.redraw(); }, onCancel: () => { this.overlay = null; this.redraw(); } });
+          this.showFilePicker();
         } else if (ev.ctrl && ev.shift && ev.key === "v") {
           if (!this.chat.pasteClipboardImage()) this.chat.input.onKey(ev);
         } else {
@@ -3798,6 +3804,7 @@ export class App {
         return;
       }
       if (ev.ctrl && ev.key === "n") { this.focus(this.chat); this.redraw(); return; }
+      if (ev.ctrl && ev.key === "o") { this.overlay = new AttachmentPanel(this); this.focus(this.overlay); this.redraw(); return; }
       if (ev.ctrl && ev.key === "b") { this.toggleSidebar(); return; }
       if (ev.ctrl && ev.key === "p") { this.overlay = new ControlPanel(this, { startPage: 1 }); this.redraw(); return; }
       if (ev.ctrl && ev.key === "m") { this.overlay = buildModelPicker(this); this.redraw(); return; }
