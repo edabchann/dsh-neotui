@@ -738,8 +738,24 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
   assert.ok(panel.routes.includes("新供应商"), "draft route created");
   assert.equal(panel.mode, "form");
   const fieldIdx = (label) => panel.formItems.findIndex((it) => it.kind === "field" && it.label === label);
-  // the api field is editable too
-  assert.ok(fieldIdx("协议 api") >= 0, "api field present");
+  // the api protocol field is a CHOICE: Tab cycles the options in the form
+  // (web <select> semantics) and Enter opens the autocomplete edit buffer
+  const apiItem = panel.formItems[fieldIdx("协议 api")];
+  assert.deepEqual(apiItem.completions, ["openai-completions", "openai-responses", "anthropic-messages"], "all protocol choices offered");
+  assert.ok(apiItem.cycle?.length >= 3, "tab-cycle options present");
+  panel.formIdx = fieldIdx("协议 api");
+  panel.onKey({ type: "key", name: "tab" });
+  assert.equal(panel.providers["新供应商"].api, "openai-responses", "Tab cycles to the next protocol");
+  panel.onKey({ type: "key", name: "tab" });
+  assert.equal(panel.providers["新供应商"].api, "anthropic-messages", "Tab cycles again");
+  panel.onKey({ type: "key", name: "tab" });
+  assert.equal(panel.providers["新供应商"].api, "openai-completions", "Tab wraps around");
+  // the apiKeyEnv text field is gone: the API 密钥 row shows a status dot and
+  // the reference, never the value (the web's credential posture)
+  assert.equal(panel.formItems.findIndex((it) => it.kind === "field" && it.label === "apiKeyEnv"), -1, "no raw apiKeyEnv text field");
+  const keyRow = panel.formItems.find((it) => it.kind === "key");
+  assert.ok(keyRow, "API 密钥 row present");
+  assert.ok(keyRow.ref.endsWith("_API_KEY"), `draft derives the web-convention reference: ${keyRow.ref}`);
   // edit fields through the standalone centered edit buffer
   for (const [label, value] of [["显示名", "My GW"], ["baseURL", "https://gw/v1"], ["协议 api", "anthropic-messages"]]) {
     panel.formIdx = fieldIdx(label);
@@ -826,6 +842,201 @@ test("ModelPanel navigation: ↑/↓ move within the focused region, →/← swi
   assert.equal(panel.mode, "list", "← returned to the provider list");
   panel.onKey({ type: "key", name: "right" });
   assert.equal(panel.mode, "form", "→ re-entered the form");
+});
+
+test("ModelPanel: the api protocol popup autocompletes and tab-selects every candidate", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  app.api.call = async (m) => (m === "settings.describe"
+    ? { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { gw: { displayName: "GW", api: "openai-completions", baseURL: "https://gw/v1" } } } }], writable: true }
+    : {});
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.onKey({ type: "key", name: "enter" }); // open the provider form
+  const fieldIdx = (label) => panel.formItems.findIndex((it) => it.kind === "field" && it.label === label);
+  panel.formIdx = fieldIdx("协议 api");
+  panel.onKey({ type: "key", name: "enter" });
+  let popup = app.overlay;
+  assert.ok(popup?.input, "autocomplete popup opened");
+  assert.deepEqual(popup.completions, ["openai-completions", "openai-responses", "anthropic-messages"]);
+  const hintText = popup.lines.map((l) => (Array.isArray(l) ? l.map((g) => g.t).join("") : String(l))).join("\n");
+  assert.ok(hintText.includes("候选协议"), "all possible options listed as hints");
+  assert.ok(hintText.includes("✓openai-completions"), "current value marked in the hint line");
+  // Tab inside the popup selects the next candidate (tab选取)
+  popup.onKey({ type: "key", name: "tab" });
+  assert.equal(popup.input.value, "openai-responses", "popup Tab selected the next protocol");
+  popup.onKey({ type: "key", name: "tab" });
+  assert.equal(popup.input.value, "anthropic-messages", "popup Tab cycles further");
+  popup.onKey({ type: "key", name: "tab" });
+  assert.equal(popup.input.value, "openai-completions", "popup Tab wraps around");
+  // a typed prefix completes on Tab (自动补全)
+  popup.input.setValue("open");
+  popup.onKey({ type: "key", name: "tab" });
+  assert.equal(popup.input.value, "openai-completions", "Tab completed the typed prefix");
+  // Esc cancels without writing
+  popup.onKey({ type: "key", name: "escape" });
+  assert.equal(app.overlay, null, "popup cancelled");
+  assert.equal(panel.providers.gw.api, "openai-completions", "cancel left the value alone");
+  // a committed completion lands on the profile
+  panel.onKey({ type: "key", name: "enter" });
+  popup = app.overlay;
+  popup.onKey({ type: "key", name: "tab" }); // openai-completions → openai-responses
+  popup.onKey({ type: "key", name: "enter" });
+  assert.equal(panel.providers.gw.api, "openai-responses", "committed completion written");
+});
+
+test("ModelPanel: the API key row is a masked, web-synced credential edit", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (m, p) => {
+    calls.push([m, p]);
+    if (m === "settings.describe") return {
+      namespaces: [{ ns: "llm-pi-ai", revision: 2, value: { providers: { ucas: { displayName: "UCAS", apiKeyEnv: "UCAS_API_KEY", baseURL: "https://x/v1" } } } }],
+      writable: true,
+    };
+    if (m === "credentials.describe") return { credentials: { UCAS_API_KEY: { configured: true, writable: true } } };
+    if (m === "credentials.set") return {};
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  assert.deepEqual(panel.keyStatus, { UCAS_API_KEY: { configured: true, writable: true } }, "key status joined at load");
+  panel.onKey({ type: "key", name: "enter" }); // open the form
+  const keyRow = panel.formItems.find((it) => it.kind === "key");
+  assert.ok(keyRow, "API 密钥 row present");
+  assert.equal(keyRow.ref, "UCAS_API_KEY");
+  const rowText = panel.formView.lines.map((l) => l.map((g) => g.t).join("")).find((t) => t.includes("API 密钥"));
+  assert.ok(rowText.includes("● 已配置"), `configured dot rendered: ${rowText}`);
+  assert.ok(rowText.includes("(UCAS_API_KEY)"), "reference shown, value never");
+  assert.ok(!rowText.includes("secret"), "no stored value leaks into the row");
+  // Enter opens a MASKED editor that always starts empty (keep = no change)
+  panel.formIdx = panel.formItems.indexOf(keyRow);
+  panel.onKey({ type: "key", name: "enter" });
+  let popup = app.overlay;
+  assert.ok(popup?.input, "key editor opened");
+  assert.equal(popup.masked, true, "popup is masked");
+  assert.equal(popup.input.masked, true, "input renders bullets");
+  assert.equal(popup.input.value, "", "editor always opens empty (web parity)");
+  // typing stays masked in the preview: bullets, never the secret (route text
+  // through popup.onKey so the preview re-layouts on every edit)
+  popup.onKey({ type: "text", text: "sk-test-123" });
+  const preview = popup.lines.map((l) => (Array.isArray(l) ? l.map((g) => g.t).join("") : String(l))).join("\n");
+  assert.ok(preview.includes("••••"), `masked preview bullets: ${preview}`);
+  assert.ok(!preview.includes("sk-test-123"), "the secret never appears in the preview");
+  assert.ok(preview.includes("11 字符"), "character count shown");
+  // committing a value writes through credentials.set, one way
+  popup.onKey({ type: "key", name: "enter" });
+  await new Promise((r) => setTimeout(r, 10));
+  const setCall = calls.find(([m]) => m === "credentials.set");
+  assert.ok(setCall, "credentials.set called");
+  assert.deepEqual(setCall[1], { ref: "UCAS_API_KEY", value: "sk-test-123" });
+  assert.equal(app.overlay, null, "popup closed");
+  // an empty commit keeps the existing key (no set call)
+  panel.formIdx = panel.formItems.indexOf(panel.formItems.find((it) => it.kind === "key"));
+  panel.onKey({ type: "key", name: "enter" });
+  popup = app.overlay;
+  const setCount = calls.filter(([m]) => m === "credentials.set").length;
+  popup.onKey({ type: "key", name: "enter" });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(calls.filter(([m]) => m === "credentials.set").length, setCount, "empty commit keeps the key");
+  assert.match(app.toastMsg, /保持原值/);
+  // invalid input (NAME=value env line) is refused before the wire
+  panel.onKey({ type: "key", name: "enter" });
+  popup = app.overlay;
+  popup.input.onKey({ type: "text", text: "FOO=bar" });
+  popup.onKey({ type: "key", name: "enter" });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(calls.filter(([m]) => m === "credentials.set").length, setCount, "invalid key refused");
+  assert.match(app.toastMsg, /NAME=value/);
+  // a provider without apiKeyEnv derives the web's v1 reference and records it
+  app.api.call = async (m) => (m === "settings.describe"
+    ? { namespaces: [{ ns: "llm-pi-ai", revision: 3, value: { providers: { "my-gw": { displayName: "My GW", baseURL: "https://gw/v1" } } } }], writable: true }
+    : {});
+  await panel.load();
+  const derived = panel.formItems.find((it) => it.kind === "key");
+  assert.equal(derived.ref, "MY_GW_API_KEY", "derived reference follows the web convention");
+  assert.ok(panel.formView.lines.map((l) => l.map((g) => g.t).join("")).find((t) => t.includes("○ 未配置")), "missing dot rendered");
+});
+
+test("ModelPanel: Esc leaves level by level and unsaved form edits ask 保存/不保存/取消", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (m, p) => {
+    calls.push([m, p]);
+    if (m === "settings.describe") return {
+      namespaces: [{ ns: "llm-pi-ai", revision: 5, value: { providers: { a: { displayName: "A" }, b: { displayName: "B" } } } }],
+      writable: true,
+    };
+    if (m === "settings.mutate") return { revision: 6 };
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.onKey({ type: "key", name: "enter" }); // open provider a's form
+  // a CLEAN form: Esc goes straight back to the list, no dialog
+  panel.onKey({ type: "key", name: "escape" });
+  assert.equal(panel.mode, "list", "clean Esc returned to the provider list");
+  assert.ok(!app.overlay, "no prompt when clean");
+  // Esc at the LIST level exits the page (returns false → upper window)
+  assert.equal(panel.onKey({ type: "key", name: "escape" }), false, "list-level Esc exits the page");
+  // edit a field → dirty
+  panel.onKey({ type: "key", name: "enter" });
+  const fieldIdx = (label) => panel.formItems.findIndex((it) => it.kind === "field" && it.label === label);
+  panel.formIdx = fieldIdx("显示名");
+  panel.onKey({ type: "key", name: "enter" });
+  let popup = app.overlay;
+  popup.input.onKey({ type: "key", name: "end" });
+  popup.input.onKey({ type: "text", text: "2" });
+  popup.onKey({ type: "key", name: "enter" });
+  assert.equal(panel.providers.a.displayName, "A2", "edit applied");
+  assert.notEqual(panel.savedSnapshot, JSON.stringify(panel.providers), "panel is dirty");
+  // Esc now asks instead of leaving
+  panel.onKey({ type: "key", name: "escape" });
+  popup = app.overlay;
+  assert.ok(popup && popup.buttons.length === 3, "unsaved-changes prompt opened");
+  assert.deepEqual(popup.buttons.map((b) => b.label), ["💾 保存并返回", "不保存", "取消"]);
+  assert.equal(panel.mode, "form", "still on the form while the prompt is open");
+  // 取消: stay, edits intact
+  await popup.onAction({ label: "取消", action: "cancel" });
+  assert.equal(panel.mode, "form", "cancel stayed on the form");
+  assert.equal(panel.providers.a.displayName, "A2", "cancel kept the edits");
+  // 不保存: revert and return to the list
+  panel.onKey({ type: "key", name: "escape" });
+  popup = app.overlay;
+  await popup.onAction({ label: "不保存", action: "discard" });
+  assert.equal(panel.mode, "list", "discard returned to the list");
+  assert.equal(panel.providers.a.displayName, "A", "discard reverted the edit");
+  assert.equal(calls.filter(([m]) => m === "settings.mutate").length, 0, "discard never saved");
+  // 保存并返回: persist then return
+  panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = fieldIdx("显示名");
+  panel.onKey({ type: "key", name: "enter" });
+  popup = app.overlay;
+  popup.input.onKey({ type: "key", name: "end" });
+  popup.input.onKey({ type: "text", text: "3" });
+  popup.onKey({ type: "key", name: "enter" });
+  panel.onKey({ type: "key", name: "escape" });
+  popup = app.overlay;
+  await popup.onAction({ label: "💾 保存并返回", action: "save" });
+  const mutate = calls.filter(([m]) => m === "settings.mutate").at(-1);
+  assert.ok(mutate, "save ran through settings.mutate");
+  assert.equal(mutate[1].ops[0].value.a.displayName, "A3", "saved value persisted");
+  assert.equal(panel.mode, "list", "save returned to the list");
+  assert.equal(panel.savedSnapshot, JSON.stringify(panel.providers), "clean after save");
+  // ← leaves through the same ask-first path
+  panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = fieldIdx("显示名");
+  panel.onKey({ type: "key", name: "enter" });
+  popup = app.overlay;
+  popup.input.onKey({ type: "key", name: "end" });
+  popup.input.onKey({ type: "text", text: "4" });
+  popup.onKey({ type: "key", name: "enter" });
+  panel.onKey({ type: "key", name: "left" });
+  assert.ok(app.overlay?.buttons?.length === 3, "← also asks about unsaved changes");
+  await app.overlay.onAction({ label: "取消", action: "cancel" });
+  assert.equal(panel.mode, "form", "← cancelled stayed on the form");
 });
 
 test("finalized think blocks keep their start time and turns carry their total", () => {

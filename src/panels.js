@@ -1822,7 +1822,7 @@ export class SettingsPanel extends Widget {
  *  a visible caret, full key isolation from NORMAL/INSERT routing, and paste
  *  support — Enter commits, Esc cancels. */
 export class EditPopup extends Popup {
-  constructor(app, { title, value, onCommit }) {
+  constructor(app, { title, value, onCommit, completions, masked, statusHint, placeholder }) {
     const w = Math.min(80, app.screen.w - 8);
     const h = Math.min(16, app.screen.h - 6);
     super({
@@ -1834,10 +1834,15 @@ export class EditPopup extends Popup {
     });
     this.app = app;
     this.onCommit = onCommit;
+    this.completions = completions ?? null; // candidate strings for Tab 补全
+    this.masked = masked ?? false;          // secret value: never echo it
+    this.statusHint = statusHint ?? null;
     this.input = new Input({
       x: this.x + 2, y: this.y + h - 2, w: w - 4, h: 1,
-      multi: true, maxLines: 4, app,
-      prompt: "> ", placeholder: "输入值…（Ctrl+Shift+V 粘贴,Enter 确定,Esc 取消）",
+      multi: true, maxLines: 4, app, masked: this.masked,
+      prompt: "> ", placeholder: placeholder ?? (completions?.length
+        ? "Tab 补全候选 · Enter 确定 · Esc 取消 · Ctrl+Shift+V 粘贴"
+        : "输入值…（Ctrl+Shift+V 粘贴,Enter 确定,Esc 取消）"),
     });
     // the cursor starts at the END of the existing value: typing appends and
     // edits in place instead of wiping the original (modify, not replace)
@@ -1846,10 +1851,30 @@ export class EditPopup extends Popup {
   }
   #layout() {
     const lines = [];
-    lines.push([{ t: " 当前值预览:", fg: K.DIM, underline: true }]);
-    const v = this.input.value;
-    if (v === "") lines.push([{ t: "（空）", fg: K.FAINT }]);
-    else for (const ln of v.split("\n").slice(0, 6)) lines.push([{ t: " " + truncate(ln, this.w - 6), fg: K.TXT }]);
+    if (this.statusHint) lines.push([{ t: " " + this.statusHint, fg: K.DIM }]);
+    if (this.masked) {
+      lines.push([{ t: " 已输入:", fg: K.DIM, underline: true }]);
+      const n = Array.from(this.input.value).length;
+      lines.push(n === 0
+        ? [{ t: "（未输入 — 留空保持现有密钥不变）", fg: K.FAINT }]
+        : [{ t: " " + "•".repeat(Math.min(n, 40)) + (n > 40 ? "…" : ""), fg: K.TXT }, { t: `（${n} 字符）`, fg: K.FAINT }]);
+    } else {
+      lines.push([{ t: " 当前值预览:", fg: K.DIM, underline: true }]);
+      const v = this.input.value;
+      if (v === "") lines.push([{ t: "（空）", fg: K.FAINT }]);
+      else for (const ln of v.split("\n").slice(0, 6)) lines.push([{ t: " " + truncate(ln, this.w - 6), fg: K.TXT }]);
+    }
+    if (this.completions?.length) {
+      // every possible option is shown as a hint; the one matching the typed
+      // prefix lights up, the exact current value is marked ✓
+      const v = this.input.value.trim();
+      const segs = [{ t: " 候选协议: ", fg: K.DIM }];
+      this.completions.forEach((c, i) => {
+        if (i > 0) segs.push({ t: " · ", fg: K.FAINT });
+        segs.push({ t: c === v ? `✓${c}` : c, fg: c === v ? K.OK : (v !== "" && c.startsWith(v) ? K.ACCENT : K.DIM), bold: c === v });
+      });
+      lines.push(segs);
+    }
     lines.push([{ t: "" }]);
     this.lines = lines;
   }
@@ -1859,6 +1884,23 @@ export class EditPopup extends Popup {
   }
   onKey(ev) {
     if (ev.type === "key" && ev.name === "escape") { this.app.closeOverlay(); this.app.focus(this.app.chat); return true; }
+    if (ev.type === "key" && ev.name === "tab" && this.completions?.length) {
+      // Tab 选取/补全: an exact current value cycles to the next candidate,
+      // anything else completes to the first prefix match
+      const v = this.input.value.trim();
+      const all = this.completions;
+      const i = all.indexOf(v);
+      if (i >= 0) {
+        this.input.setValue(all[(i + 1) % all.length]);
+      } else {
+        const m = all.find((c) => c.startsWith(v));
+        if (m) this.input.setValue(m);
+        else this.app.toast("没有匹配的候选协议");
+      }
+      this.#layout();
+      this.app.redraw();
+      return true;
+    }
     if (ev.type === "key" && ev.name === "enter") {
       const v = this.input.value;
       this.app.closeOverlay();
@@ -1877,6 +1919,18 @@ export class EditPopup extends Popup {
   }
 }
 
+/** The wire protocols the pi-ai adapter accepts, most-reached first — the
+ *  same union the web settings page reads out of the namespace schema, so the
+ *  choices offered here cannot drift from the ones the host validates. */
+const API_PROTOCOLS = ["openai-completions", "openai-responses", "anthropic-messages"];
+/** Credential reference names must be POSIX shell identifiers. */
+const KEY_REF_OK = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** The web settings page's v1 convention: a provider route's key lives under
+ *  `<ROUTE_UPPER>_API_KEY`, and the profile records that as apiKeyEnv. */
+function deriveKeyRef(provider) {
+  return `${provider.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`;
+}
+
 export class ModelPanel extends Widget {
   constructor(app) {
     super({ x: 30, y: 0, w: app.screen.w - 30, h: app.screen.h - 1 });
@@ -1888,7 +1942,7 @@ export class ModelPanel extends Widget {
     this.sel = 0;          // list cursor (routes.length = the ＋ 添加供应商 row)
     this.mode = "list";    // list | form
     this.formIdx = 0;      // form item cursor
-    this.formItems = [];   // {kind:"field"|"model"|"button", ...}
+    this.formItems = [];   // {kind:"field"|"model"|"button"|"key", ...}
     this.modelsSel = -1;   // selected model row (shows its subfields)
     this.draftRoute = null; // the un-saved new provider's route (shows the rename field)
     this.editing = null;   // { label, commit } while the inline editor is open
@@ -1899,6 +1953,8 @@ export class ModelPanel extends Widget {
     this.scanSel = new Set();
     this.scanCursor = 0;
     this.scanning = false;
+    this.savedSnapshot = "{}"; // JSON of the last saved/loaded providers (dirty check)
+    this.keyStatus = {};       // ref → {configured, writable, source} from credentials.describe
     const listW = 26;
     this.listView = new ScrollView({ x: this.x + 1, y: this.y + 1, w: listW, h: this.h - 2, showScrollbar: true });
     this.formView = new ScrollView({ x: this.x + listW + 1, y: this.y + 1, w: this.w - listW - 2, h: this.h - 2, showScrollbar: true });
@@ -1917,10 +1973,31 @@ export class ModelPanel extends Widget {
       this.revision = ns?.revision ?? 0;
       this.routes = Object.keys(this.providers);
     } catch (e) { this.app.toast(`模型配置加载失败: ${e.message}`); }
+    this.savedSnapshot = JSON.stringify(this.providers);
+    await this.#refreshKeys();
     this.loaded = true;
     this.modelsSel = -1;
     this.#rebuild();
     this.app.redraw();
+  }
+  /** One batched credentials.describe over every referenced key, exactly like
+   *  the web page's store join. Reads are structurally value-free: only the
+   *  configured/source/writable view ever reaches this panel. */
+  async #refreshKeys() {
+    try {
+      // only well-formed references can cross the wire (the describe payload
+      // validates each name); an ill-formed derived ref is skipped here and
+      // reported by the row's edit guard instead
+      const refs = [...new Set(this.routes.map((r) => this.#keyRef(r)).filter((ref) => KEY_REF_OK.test(ref)))];
+      if (refs.length === 0) { this.keyStatus = {}; return; }
+      const res = await this.app.api.call("credentials.describe", { refs });
+      this.keyStatus = res?.credentials ?? {};
+    } catch (e) { this.keyStatus = {}; }
+  }
+  /** The credential reference a profile names, or the web's derived default. */
+  #keyRef(route) {
+    const p = this.#profile(route);
+    return (p.apiKeyEnv && p.apiKeyEnv.length > 0) ? p.apiKeyEnv : deriveKeyRef(route);
   }
   #route() { return this.routes[this.sel] ?? null; }
   #profile(route) { return route == null ? null : this.providers[route] ?? {}; }
@@ -1932,9 +2009,22 @@ export class ModelPanel extends Widget {
     // the route key only appears for a brand-new draft (rename once)
     if (this.draftRoute === route) items.push({ kind: "field", key: "route", label: "路由名", value: route });
     items.push({ kind: "field", key: "displayName", label: "显示名", value: p.displayName ?? "" });
-    items.push({ kind: "field", key: "api", label: "协议 api", value: p.api ?? "openai-completions" });
+    // the api protocol is a CHOICE in the web UI (a select over the namespace
+    // schema's union), so here Tab cycles the options in the form and Enter
+    // opens an edit buffer with every candidate shown as an autocomplete hint
+    const api = p.api ?? "openai-completions";
+    items.push({
+      kind: "field", key: "api", label: "协议 api", value: api,
+      cycle: API_PROTOCOLS.includes(api) ? API_PROTOCOLS : [api, ...API_PROTOCOLS],
+      completions: API_PROTOCOLS, note: "Tab 切换 · Enter 输入",
+    });
     items.push({ kind: "field", key: "baseURL", label: "baseURL", value: p.baseURL ?? "" });
-    items.push({ kind: "field", key: "apiKeyEnv", label: "apiKeyEnv", value: p.apiKeyEnv ?? "", note: "环境变量名（密钥不落盘）" });
+    // the api key: web-synced handling — the stored value is NEVER shown
+    // (credentials.describe is structurally value-free), only its status dot;
+    // Enter opens a masked, always-empty editor and a typed key travels one
+    // way through credentials.set under the profile's reference
+    const keyRef = this.#keyRef(route);
+    items.push({ kind: "key", key: "apiKeyEnv", label: "API 密钥", ref: keyRef, action: () => this.#editKey(route, keyRef) });
     // models are NOT flat here: one 模型管理 entry summarizing the first
     // five, which opens its own sub-buffer (scan on top, model form below)
     const models = p.models ?? [];
@@ -1996,6 +2086,7 @@ export class ModelPanel extends Widget {
     if (route == null) {
       formLines.push([{ t: "  左侧 ↑/↓ 选择供应商,Enter 打开编辑", fg: K.FAINT }]);
       formLines.push([{ t: "  把光标移到底部的“＋ 添加供应商”回车即可新建", fg: K.FAINT }]);
+      formLines.push([{ t: "  Esc 退出供应商配置", fg: K.FAINT }]);
       this.formItems = [];
     } else if (this.scanMode) {
       formLines.push([{ t: `  扫描 ${truncate(this.#profile(route).baseURL ?? "", 44)} — 空格勾选,Enter 添加,↑/↓ 移动`, fg: K.ACCENT, bold: true }]);
@@ -2023,6 +2114,12 @@ export class ModelPanel extends Widget {
         if (it.kind === "field") {
           const v = it.value === "" || it.value == null ? "（空）" : String(it.value);
           t = ` ${cur ? "▸" : " "} ${it.label}: ${truncate(v, w - strWidth(it.label) - 6)}${it.note ? `  [${it.note}]` : ""}`;
+        } else if (it.kind === "key") {
+          // status dot + reference, NEVER the value (web-synced posture)
+          const st = this.keyStatus?.[it.ref];
+          const status = st?.configured ? "● 已配置" : "○ 未配置";
+          const ro = st && st.writable === false ? " [只读]" : "";
+          t = ` ${cur ? "▸" : " "} ${it.label}: ${status}${ro} (${it.ref})`;
         } else if (it.kind === "model") {
           const extras = [it.ctx != null ? `ctx ${it.ctx}` : "", it.max != null ? `max ${it.max}` : ""].filter(Boolean).join(" ");
           t = ` ${cur ? "▸" : " "} 模型 ${truncate(it.id || "（未命名）", 24)}  ${truncate(it.name || "", 20)}  ${truncate(extras, 24)}`;
@@ -2035,7 +2132,9 @@ export class ModelPanel extends Widget {
           formLines.push([{ t: `       ${truncate(it.sub, w - 8)}`, fg: K.FAINT, bg: T.BG2 }]);
         }
       }
-      formLines.push([{ t: isSub ? "  ↑/↓ 移动 · Enter 编辑或执行 · Esc 返回" : "  ↑/↓ 移动 · → 进入选项 · ← 返回列表 · Enter 编辑或执行 · Esc 退出", fg: K.FAINT }]);
+      formLines.push([{ t: isSub
+        ? "  ↑/↓ 移动 · Enter 编辑或执行 · Esc 返回供应商"
+        : "  ↑/↓ 移动 · → 进入选项 · ← 返回列表 · Enter 编辑或执行 · Tab 切换选项 · Esc 返回列表", fg: K.FAINT }]);
     }
     this.formView.setLines(formLines);
   }
@@ -2047,34 +2146,88 @@ export class ModelPanel extends Widget {
     this.listView.render(screen);
     this.formView.render(screen);
   }
-  #startEdit(label, value, commit) {
+  #startEdit(label, value, commit, completions) {
     // a REAL standalone edit buffer in the middle of the window: own caret,
     // isolated from NORMAL/INSERT routing, paste supported
     const popup = new EditPopup(this.app, {
       title: `编辑 ${label}`,
       value,
+      completions,
       onCommit: (text) => { commit(text); this.#rebuild(); this.app.redraw(); },
     });
     this.app.overlay = popup;
     this.app.focus(popup.input);
     this.app.redraw();
   }
-  #activateItem() {
-    if (this.mode === "list") {
-      if (this.sel === this.routes.length) {
-        // ＋ 添加供应商
-        let name = "新供应商", i = 2;
-        while (this.providers[name] !== undefined) name = `新供应商${i++}`;
-        this.providers[name] = { displayName: "", api: "openai-completions", baseURL: "", apiKeyEnv: "", models: [] };
-        this.draftRoute = name;
-        this.routes = Object.keys(this.providers);
-        this.sel = this.routes.indexOf(name);
-        this.mode = "form";
-        this.formIdx = 0;
+  /** The web's apiKey judgement, mirrored: empty is fine (keep), whitespace-only
+   *  and `NAME=value` / quoted forms fail, and the charset is printable ASCII. */
+  #keyFailure(draft) {
+    if (draft.length === 0) return null;
+    const value = draft.trim();
+    if (value.length === 0) return "密钥不能只是空白";
+    if (/^[A-Z][A-Z0-9_]*=[^=]/.test(value)) return "密钥不能是 NAME=value 形式的环境变量行";
+    if ((value[0] === '"' || value[0] === "'" || value[0] === "`") && value.length > 1 && value.endsWith(value[0])) return "密钥不要带引号";
+    if (!/^[\x21-\x7E]+$/.test(value)) return "密钥只能包含可打印 ASCII 字符";
+    return null;
+  }
+  /** Edit the API key value the web-synced way: a masked, always-empty editor
+   *  (the stored value is never read back), a non-empty commit travels one way
+   *  through credentials.set under the profile's reference, an empty commit
+   *  keeps the existing key. */
+  #editKey(route, ref) {
+    if (!KEY_REF_OK.test(ref)) {
+      this.app.toast(`路由名 "${route}" 无法派生合法的密钥引用名,请先把路由名改成字母数字(如 my-gateway)`);
+      return;
+    }
+    const st = this.keyStatus?.[ref];
+    const popup = new EditPopup(this.app, {
+      title: `设置 API 密钥 — ${ref}`,
+      value: "",
+      masked: true,
+      statusHint: st?.configured ? "已有密钥 · 留空保持原值不变,输入新值则覆盖" : "尚未配置密钥 · 输入新值保存",
+      placeholder: "输入新密钥…（留空=保持原值,Enter 确定,Esc 取消）",
+      onCommit: async (text) => {
+        const failure = this.#keyFailure(text);
+        if (failure) { this.app.toast(failure); this.#rebuild(); this.app.redraw(); return; }
+        const v = text.trim();
+        if (v === "") { this.app.toast("未输入新密钥,保持原值不变"); this.#rebuild(); this.app.redraw(); return; }
+        try {
+          await this.app.api.call("credentials.set", { ref, value: v });
+          this.app.toast(`密钥已写入 ${ref}`);
+          const p = this.#profile(route);
+          if (!p.apiKeyEnv) {
+            // the web create flow records the derived reference in the profile;
+            // persist it with the provider save
+            p.apiKeyEnv = ref;
+            this.app.toast(`已记录 apiKeyEnv · 点💾保存配置使供应商生效`);
+          }
+          await this.#refreshKeys();
+        } catch (e) { this.app.toast(`密钥写入失败: ${e.message}`); }
         this.#rebuild();
         this.app.redraw();
-        return;
-      }
+      },
+    });
+    this.app.overlay = popup;
+    this.app.focus(popup.input);
+    this.app.redraw();
+  }
+  #addProvider() {
+    let name = "新供应商", i = 2;
+    while (this.providers[name] !== undefined) name = `新供应商${i++}`;
+    this.providers[name] = { displayName: "", api: "openai-completions", baseURL: "", apiKeyEnv: "", models: [] };
+    this.draftRoute = name;
+    this.routes = Object.keys(this.providers);
+    this.sel = this.routes.indexOf(name);
+    this.mode = "form";
+    this.formIdx = 0;
+    this.sub = null;
+    this.modelsSel = -1;
+    this.#rebuild();
+    this.app.redraw();
+  }
+  #activateItem() {
+    if (this.mode === "list") {
+      if (this.sel === this.routes.length) { this.#addProvider(); return; }
       this.mode = "form";
       this.formIdx = 0;
       this.modelsSel = -1;
@@ -2090,14 +2243,9 @@ export class ModelPanel extends Widget {
     const route = this.#route();
     const p = this.#profile(route);
     if (it.kind === "field") {
-      if (it.cycle) {
-        // cycle through the allowed api values
-        const next = it.cycle[(it.cycle.indexOf(it.value) + 1) % it.cycle.length];
-        p[it.key] = next;
-        this.#rebuild();
-        this.app.redraw();
-        return;
-      }
+      // Enter always opens the standalone edit buffer; Tab (handled in onKey)
+      // cycles a field that declares cycle options, and the buffer itself
+      // offers every completion as an autocomplete hint
       this.#startEdit(it.label, it.value, (text) => {
         if (it.key === "route") {
           // renaming the route key
@@ -2118,9 +2266,12 @@ export class ModelPanel extends Widget {
           const [, mi, field] = it.key.split(".");
           p.models[Number(mi)][field] = text;
         } else {
+          if (it.key === "api" && !API_PROTOCOLS.includes(text.trim())) {
+            this.app.toast(`注意:${text.trim() || "空"} 不是已知协议,保存时可能被拒绝`);
+          }
           p[it.key] = text;
         }
-      });
+      }, it.completions);
       return;
     }
     if (it.kind === "model") {
@@ -2129,7 +2280,7 @@ export class ModelPanel extends Widget {
       this.app.redraw();
       return;
     }
-    if (it.kind === "button") {
+    if (it.kind === "button" || it.kind === "key") {
       it.action();
       this.app.redraw();
       return;
@@ -2175,8 +2326,58 @@ export class ModelPanel extends Widget {
       });
       this.revision = res?.revision ?? this.revision;
       this.draftRoute = null;
+      this.savedSnapshot = JSON.stringify(this.providers);
       this.app.toast(`已保存 ${Object.keys(this.providers).length} 个供应商`);
-    } catch (e) { this.app.toast(`保存失败: ${e.message}`); }
+      return true;
+    } catch (e) { this.app.toast(`保存失败: ${e.message}`); return false; }
+  }
+  #dirty() { return JSON.stringify(this.providers) !== this.savedSnapshot; }
+  /** Throw away the in-memory edits and restore the last saved/loaded state. */
+  #discard() {
+    this.providers = JSON.parse(this.savedSnapshot);
+    this.routes = Object.keys(this.providers);
+    this.draftRoute = null;
+    this.modelsSel = -1;
+    this.sub = null;
+    this.sel = Math.min(this.sel, this.routes.length - 1);
+    this.#rebuild();
+    this.app.redraw();
+  }
+  /** Leave the provider form for another level. With unsaved changes this asks
+   *  保存/不保存/取消 first; a failed save keeps the user on the form. */
+  #leaveForm(after) {
+    if (!this.#dirty()) { after(); return; }
+    const w = Math.min(64, this.app.screen.w - 8);
+    const popup = new Popup({
+      x: Math.floor((this.app.screen.w - w) / 2), y: Math.floor((this.app.screen.h - 10) / 2),
+      w, h: 10, title: "未保存的修改",
+      lines: [
+        [{ t: " 供应商配置有未保存的修改。", fg: K.TXT }],
+        [{ t: " 返回供应商选择之前,要保存吗?", fg: K.TXT }],
+      ],
+      buttons: [
+        { label: "💾 保存并返回", action: "save" },
+        { label: "不保存", action: "discard" },
+        { label: "取消", action: "cancel" },
+      ],
+      onAction: async (btn) => {
+        this.app.closeOverlay();
+        this.app.focus(this.app.chat);
+        if (btn?.action === "cancel") return;      // stay on the form
+        if (btn?.action === "save") {
+          const ok = await this.#save();
+          if (!ok) return;                          // save failed: stay (toast shown)
+        } else if (btn?.action === "discard") {
+          this.#discard();
+        } else {
+          return;                                   // Esc = __cancel__
+        }
+        after();
+      },
+    });
+    this.app.overlay = popup;
+    this.app.focus(popup);
+    this.app.redraw();
   }
   async #deleteProvider() {
     const route = this.#route();
@@ -2291,7 +2492,16 @@ export class ModelPanel extends Widget {
       if (ev.name === "enter") { this.#activateItem(); return true; }
       return false;
     }
-    if (ev.name === "escape") { return false; } // App falls back to chat mode
+    // Esc returns ONLY to the upper window, level by level: scan → the
+    // 模型管理 sub-buffer → the provider form → the provider list; from the
+    // list it exits the page. Leaving the form with unsaved edits asks first.
+    if (ev.name === "escape") {
+      if (this.mode === "form") {
+        this.#leaveForm(() => { this.mode = "list"; this.sub = null; this.#rebuild(); this.app.redraw(); });
+        return true;
+      }
+      return false; // list level: App falls back to the upper window (chat/settings)
+    }
     // dual-focus navigation: ↑/↓ move the cursor INSIDE the focused region —
     // the provider column in list focus, the option rows in form focus.
     // → enters the form, ← returns to the list.
@@ -2309,13 +2519,31 @@ export class ModelPanel extends Widget {
       this.app.redraw();
       return true;
     }
+    // Tab in the form cycles a field that declares cycle options (the api
+    // protocol: tab-selection like the web's <select>); on any other field it
+    // walks to the next form item. Otherwise (list focus) it behaves like →.
+    if (ev.name === "tab" && this.mode === "form" && this.sub == null) {
+      const it = this.formItems[this.formIdx];
+      if (it?.cycle?.length) {
+        const cur = String(it.value ?? "");
+        const idx = it.cycle.indexOf(cur);
+        this.#profile(this.#route())[it.key] = it.cycle[(idx + 1) % it.cycle.length];
+      } else if (this.formItems.length > 0) {
+        this.formIdx = Math.min(this.formItems.length - 1, this.formIdx + 1);
+      }
+      this.#rebuild();
+      this.app.redraw();
+      return true;
+    }
     if (ev.name === "right" || (ev.name === "char" && ev.key === "l" && !ev.ctrl) || ev.name === "tab") {
       if (this.#route() != null && this.mode !== "form") { this.mode = "form"; this.#rebuild(); }
       this.app.redraw();
       return true;
     }
     if (ev.name === "left" || (ev.name === "char" && ev.key === "h" && !ev.ctrl) || ev.name === "backtab") {
-      if (this.mode === "form") { this.mode = "list"; this.#rebuild(); }
+      if (this.mode === "form") {
+        this.#leaveForm(() => { this.mode = "list"; this.sub = null; this.#rebuild(); this.app.redraw(); });
+      }
       this.app.redraw();
       return true;
     }
@@ -2328,8 +2556,30 @@ export class ModelPanel extends Widget {
     if (ev.kind !== "press" || ev.button !== 0) return false;
     if (ev.x < this.x + 26) {
       const idx = ev.y - this.listView.y + this.listView.scrollY;
-      // one click = select AND open (same as Enter)
-      if (idx >= 0 && idx <= this.routes.length) { this.sel = idx; this.#activateItem(); return true; }
+      if (idx >= 0 && idx <= this.routes.length) {
+        // one click = select AND open (same as Enter). Switching away from a
+        // form with unsaved edits asks first, like every other exit path.
+        if (this.mode === "form") {
+          if (idx === this.sel) return true; // already editing this provider
+          if (idx === this.routes.length) {
+            this.#leaveForm(() => this.#addProvider());
+          } else {
+            this.#leaveForm(() => {
+              this.sel = idx;
+              this.mode = "form";
+              this.formIdx = 0;
+              this.modelsSel = -1;
+              this.sub = null;
+              this.#rebuild();
+              this.app.redraw();
+            });
+          }
+          return true;
+        }
+        this.sel = idx;
+        this.#activateItem();
+        return true;
+      }
       return false;
     }
     if (this.scanMode) {

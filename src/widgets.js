@@ -268,6 +268,7 @@ export class Input extends Widget {
     this.allowEmptyEnter = opts.allowEmptyEnter ?? false;
     this.history = [];
     this.histIdx = -1;
+    this.masked = opts.masked ?? false;  // secret fields render •••• instead of the value
   }
   #cps() { return Array.from(this.value); }            // code points
   /** Visual rows for multi-line input: logical lines wrapped at the width. */
@@ -420,7 +421,8 @@ export class Input extends Widget {
       let start = 0;
       while (cx - start >= inner) start += Math.max(1, Math.floor(inner / 2));
       const visible = truncate(Array.from(this.value).slice(start).join(""), inner);
-      screen.text(this.x + promptW, this.y, visible, { fg: this.fg, bg: this.bg });
+      const drawn = this.masked ? "•".repeat(Array.from(visible).length) : visible;
+      screen.text(this.x + promptW, this.y, drawn, { fg: this.fg, bg: this.bg });
       this.cursorCell = { x: this.x + promptW + Math.min(inner, Math.max(0, cx - start)), y: this.y };
       return;
     }
@@ -439,11 +441,12 @@ export class Input extends Widget {
     for (let ri = start; ri < Math.min(rows.length, start + h); ri++) {
       const r = rows[ri];
       const y = this.y + (ri - start);
+      const drawn = this.masked ? "•".repeat(Array.from(r.text).length) : r.text;
       if (ri === 0) {
         screen.text(this.x, y, this.prompt, { fg: T.ACCENT, bg: this.bg });
-        screen.text(this.x + strWidth(this.prompt), y, r.text, { fg: this.fg, bg: this.bg });
+        screen.text(this.x + strWidth(this.prompt), y, drawn, { fg: this.fg, bg: this.bg });
       } else {
-        screen.text(this.x + 1, y, r.text, { fg: this.fg, bg: this.bg });
+        screen.text(this.x + 1, y, drawn, { fg: this.fg, bg: this.bg });
       }
     }
     // drag-selection highlight: invert the selected columns per wrapped row
