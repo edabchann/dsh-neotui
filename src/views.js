@@ -2415,6 +2415,7 @@ export class App {
     this.toastUntil = 0;
     this.jobs = [];
     this.jobsBySession = new Map(); // sessionId → latest session/jobs snapshot
+    this.subagentStatsBySession = new Map();
     this.projectionsBySession = new Map();
     this.queueBySession = new Map();
     this.ctrlCUntil = null;         // NORMAL-mode double-Ctrl+C exit window
@@ -3045,6 +3046,7 @@ export class App {
     if (epoch !== this.sessionEpoch || sessionId !== this.currentSession) return;
     this.loadFeedback(sessionId, epoch);
     this.updateModel(sessionId, epoch);
+    this.refreshSubagentStats(sessionId);
     this.redraw();
   }
 
@@ -3141,7 +3143,17 @@ export class App {
     else this.toast("先打开一个会话");
   }
 
-  showJobs() { this.overlay = new JobsPanel(this); this.redraw(); }
+  showJobs() { this.overlay = new JobsPanel(this); this.refreshSubagentStats(); this.redraw(); }
+  async refreshSubagentStats(sessionId = this.currentSession) {
+    if (!sessionId) return;
+    try {
+      const res = await this.api.call("subagent.list", { parentSessionId: sessionId });
+      const entries = (res.entries ?? res.items ?? []).filter((entry) => entry.kind !== "diagnostic");
+      const stats = { running: entries.filter((entry) => entry.activity === "running").length, completed: entries.filter((entry) => entry.activity === "inactive").length, total: entries.length };
+      this.subagentStatsBySession.set(sessionId, stats);
+      if (sessionId === this.currentSession) this.redraw();
+    } catch {}
+  }
   showQueue() { this.overlay = new QueuePanel(this); this.redraw(); }
   showGoal() { this.overlay = buildGoalPopup(this); this.redraw(); }
   showModePicker() { this.overlay = buildModePicker(this); this.redraw(); }
@@ -3867,12 +3879,14 @@ export class App {
       const row2 = { left: [], right: [] };
       const sub = this.projections.subagent;
       const subTiming = this.projections.subagentTiming;
+      const subStats = this.subagentStatsBySession.get(this.currentSession) ?? { running: subTiming?.active ? 1 : 0, completed: 0 };
       row2.left.push({
         t: ` ${running > 0 ? `${running} 个后台任务运行中` : "没有后台任务运行"} `,
         fg: running > 0 ? T.WARN : T.FAINT, bg: T.STATUSBG,
       });
       row2.left.push({ t: ` ${done}已完成${failed > 0 ? ` ${failed}失败` : ""} `, fg: done > 0 ? T.OK : T.FAINT, bg: T.STATUSBG });
-      if (sub) row2.left.push({ t: ` 🛰 ${truncate(sub.label ?? sub.mode ?? "子代理", 20)}${subTiming?.active ? " 运行中" : ""} `, fg: T.PURPLE, bg: T.STATUSBG, bold: !!subTiming?.active });
+      row2.left.push({ t: ` ${subStats.running > 0 ? `${subStats.running} 个子代理运行中` : "没有子代理运行"} ${subStats.completed}已完成 `, fg: subStats.running > 0 ? T.PURPLE : T.FAINT, bg: T.STATUSBG, bold: subStats.running > 0 });
+      if (sub) row2.left.push({ t: ` 🛰 ${truncate(sub.label ?? sub.mode ?? "子代理", 20)} `, fg: T.PURPLE, bg: T.STATUSBG });
       row2.right.push({ t: " Ctrl+J 任务/子代理 ", fg: T.DIM, bg: T.STATUSBG });
       rows.push(row2);
     }

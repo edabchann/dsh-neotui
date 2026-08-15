@@ -1438,9 +1438,11 @@ export class ControlPanel extends Widget {
 export class JobsPanel extends Popup {
   constructor(app) {
     const jobs = app.jobs ?? [];
+    const w = Math.max(30, Math.min(110, app.screen.w - 4));
+    const h = Math.max(10, Math.min(34, app.screen.h - 4));
     super({
-      x: 5, y: 3, w: Math.min(84, app.screen.w - 8), h: Math.min(Math.max(jobs.length + 5, 7), 24),
-      title: "后台任务（Ctrl+J 查看详情）", lines: [],
+      x: Math.max(0, Math.floor((app.screen.w - w) / 2)), y: Math.max(0, Math.floor((app.screen.h - h) / 2)), w, h,
+      title: "后台活动（Ctrl+J）", lines: [],
       buttons: [{ label: "关闭(q)", action: "close" }],
       onAction: () => app.closeOverlay(),
       scrollable: true, // expanded details scroll instead of being clipped
@@ -1671,19 +1673,33 @@ export class QueuePanel extends Popup {
 
 export class GoalPanel extends Popup {
   constructor(app) {
-    super({ x: 4, y: 2, w: Math.max(24, Math.min(84, app.screen.w - 8)), h: Math.max(8, Math.min(26, app.screen.h - 4)), title: "目标与任务", lines: [], buttons: [], scrollable: true });
-    this.app = app; this.busy = false; this.rebuild();
+    super({ x: 4, y: 2, w: Math.max(24, Math.min(84, app.screen.w - 8)), h: Math.max(10, Math.min(28, app.screen.h - 4)), title: "目标与任务", lines: [], buttons: [], scrollable: true });
+    this.app = app; this.busy = false; this.actionSel = 0; this.actions = []; this.actionRows = []; this.rebuild();
   }
   get goal() { return this.app.goalData?.goal ?? this.app.goalData; }
   #ref() { const g = this.goal; return g?.id && g?.revision != null ? { id: g.id, revision: g.revision } : null; }
   rebuild() {
     const goal = this.goal, todos = this.app.todos ?? [], lines = [];
-    lines.push([{ t: goal ? " e 编辑目标 · m 修改轮次 · p 暂停/继续 · c 完成 · x 清除 · Esc关闭" : " n 创建目标 · Esc关闭", fg: this.busy ? K.WARN : K.DIM }]);
+    lines.push([{ t: " ↑↓ 选择操作 · Enter 打开 · Esc 关闭（完成/清除会再次确认）", fg: this.busy ? K.WARN : K.DIM }]);
     if (!goal) lines.push([{ t: " 当前会话没有目标", fg: K.FAINT }]);
     else {
       lines.push([{ t: ` 目标: ${goal.objective ?? goal}`, fg: K.TXT, bold: true }]);
       lines.push([{ t: ` 阶段: ${goal.phase ?? "active"} · 轮次 ${this.app.goalData?.roundsStarted ?? 0}/${goal.maxGoalRounds ?? "∞"} · 修订 ${goal.revision ?? "?"}`, fg: K.DIM }]);
       if (goal.blockedReason?.message) lines.push([{ t: ` 阻塞: ${goal.blockedReason.message}`, fg: K.ERR }]);
+    }
+    this.actions = goal ? [
+      { label: "编辑目标", run: () => this.#edit("objective") },
+      { label: "修改最大轮次", run: () => this.#edit("maxGoalRounds") },
+      { label: goal.phase === "active" ? "暂停自动继续" : "继续目标", run: () => this.#call(goal.phase === "active" ? "goal.pause" : "goal.resume", { ref: this.#ref() }) },
+      { label: "完成目标…", danger: true, run: () => this.#confirm("确认完成当前目标？", "goal.complete") },
+      { label: "清除目标…", danger: true, run: () => this.#confirm("确认清除当前目标？历史会保留 tombstone。", "goal.clear") },
+    ] : [{ label: "创建目标", run: () => this.#edit("objective") }];
+    this.actionSel = Math.min(this.actionSel, this.actions.length - 1);
+    lines.push([{ t: "" }, { t: " 操作", fg: K.ACCENT, bold: true }]);
+    this.actionRows = [];
+    for (let i = 0; i < this.actions.length; i++) {
+      const action = this.actions[i], selected = i === this.actionSel; this.actionRows[i] = lines.length;
+      lines.push([{ t: ` ${selected ? "▸" : " "} ${action.label}`, fg: action.danger ? K.ERR : selected ? T.SELFG : K.TXT, bg: selected ? T.MENUSEL : -1, bold: selected }]);
     }
     lines.push([{ t: "" }, { t: ` 任务清单（${todos.filter((t) => t.status === "completed").length}/${todos.length}）`, fg: K.ACCENT, bold: true }]);
     for (const todo of todos) {
@@ -1699,6 +1715,14 @@ export class GoalPanel extends Popup {
     try { await this.app.api.call(method, { sessionId: this.app.currentSession, ...payload }); this.app.toast("目标已更新，等待同步"); }
     catch (e) { this.app.toast(`目标操作失败: ${e.message}`); }
     finally { this.busy = false; this.rebuild(); this.app.redraw(); }
+  }
+  #confirm(message, method) {
+    const confirm = new Popup({ x: Math.max(0, this.x + 6), y: Math.max(0, this.y + 4), w: Math.max(24, Math.min(64, this.w - 12)), h: 7, title: "确认目标操作", lines: [[{ t: " " + message, fg: K.WARN }]], buttons: [{ label: "取消", action: "cancel" }, { label: "确认", action: "confirm" }], onAction: (button) => {
+      this.app.overlay = this;
+      if (button.action === "confirm") this.#call(method, { ref: this.#ref() });
+      else this.app.redraw();
+    } });
+    this.app.overlay = confirm; this.app.redraw();
   }
   #edit(field) {
     const goal = this.goal;
@@ -1724,14 +1748,19 @@ export class GoalPanel extends Popup {
   onKey(ev) {
     if (ev.type === "key") {
       if (ev.name === "escape") { this.app.closeOverlay(); return true; }
-      if (ev.name === "char" && ev.key === "n" && !this.goal) { this.#edit("objective"); return true; }
-      if (ev.name === "char" && ev.key === "e" && this.goal) { this.#edit("objective"); return true; }
-      if (ev.name === "char" && ev.key === "m" && this.goal) { this.#edit("maxGoalRounds"); return true; }
-      if (ev.name === "char" && ev.key === "p" && this.goal) { this.#call(this.goal.phase === "active" ? "goal.pause" : "goal.resume", { ref: this.#ref() }); return true; }
-      if (ev.name === "char" && ev.key === "c" && this.goal) { this.#call("goal.complete", { ref: this.#ref() }); return true; }
-      if (ev.name === "char" && ev.key === "x" && this.goal) { this.#call("goal.clear", { ref: this.#ref() }); return true; }
+      if (ev.name === "up") { this.actionSel = Math.max(0, this.actionSel - 1); this.rebuild(); return true; }
+      if (ev.name === "down") { this.actionSel = Math.min(this.actions.length - 1, this.actionSel + 1); this.rebuild(); return true; }
+      if (ev.name === "enter") { this.actions[this.actionSel]?.run(); return true; }
     }
     return super.onKey(ev);
+  }
+  onMouse(ev) {
+    if (ev.kind === "press" && ev.button === 0) {
+      const line = ev.y - this.y - 1 + this.scrollY;
+      const idx = this.actionRows.indexOf(line);
+      if (idx >= 0) { this.actionSel = idx; this.rebuild(); this.actions[idx]?.run(); return true; }
+    }
+    return super.onMouse(ev);
   }
 }
 

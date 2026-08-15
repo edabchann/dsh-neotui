@@ -546,7 +546,7 @@ test("Ctrl+C clears the input in insert mode and double-press exits in normal mo
 
 test("JobsPanel expanded detail shows the FULL command via wrapping + scrolling", () => {
   const app = fakeApp();
-  app.screen = { w: 100, h: 30 };
+  app.screen = { w: 70, h: 14 };
   const longCmd = "bash -c 'echo " + Array.from({ length: 40 }, (_, i) => `arg-${i}`).join(" ") + "'";
   // the real frame shape: the full command lives in `label`
   app.jobs = [{ status: "completed", kind: "bash", label: longCmd, startedAt: Date.now() - 3600000, finishedAt: Date.now() }];
@@ -1595,6 +1595,15 @@ test("footer avoids duplicate goal/subagent highlight chips", () => {
   assert.ok(row2.includes("worker") && row2.includes("任务/子代理"), row2);
 });
 
+test("footer reports task and subagent counts independently", () => {
+  const app = headlessApp(); app.currentSession = "s"; app.jobs = [];
+  app.subagentStatsBySession.set("s", { running: 0, completed: 11, total: 11 });
+  app.renderFrame();
+  const text = [...(app.status.rows[2]?.left ?? []), ...(app.status.rows[2]?.right ?? [])].map((s) => s.t).join(" ");
+  assert.ok(text.includes("没有后台任务运行"), text);
+  assert.ok(text.includes("没有子代理运行 11已完成"), text);
+});
+
 test("footer jobs row says 没有任务正在后台运行 when none run", () => {
   const app = headlessApp();
   app.jobs = [{ status: "completed", kind: "goal", label: "done" }];
@@ -1613,6 +1622,8 @@ test("JobsPanel: title, Enter/→ expand, ←/h collapse, q close", () => {
   ];
   const panel = new JobsPanel(app);
   assert.ok(panel.title.includes("后台活动"), panel.title);
+  assert.equal(panel.x, Math.floor((app.screen.w - panel.w) / 2), "panel centered horizontally");
+  assert.ok(panel.w >= 90 && panel.h >= 20, "activity panel uses the available central buffer");
   assert.equal(panel.expanded.size, 0);
   assert.equal(panel.lines.filter((l) => l.some((g) => g.t.includes("结果:"))).length, 0, "detail hidden before expand");
   // Enter expands the selected job
@@ -1637,12 +1648,12 @@ test("GoalPanel exposes CAS-backed edit and lifecycle actions", async () => {
   app.projections.goal = { goal: { id: "g", revision: 3, objective: "old", phase: "active", maxGoalRounds: 4 }, roundsStarted: 1 };
   const calls = []; app.api.call = async (method, payload) => { calls.push([method, payload]); return { ref: { id: "g", revision: 4 } }; };
   const panel = new GoalPanel(app);
-  panel.onKey({ type: "key", name: "char", key: "p", ctrl: false });
+  panel.actionSel = 2; panel.onKey({ type: "key", name: "enter" });
   await Promise.resolve(); await Promise.resolve();
   assert.deepEqual(calls[0], ["goal.pause", { sessionId: "s", ref: { id: "g", revision: 3 } }]);
-  panel.onKey({ type: "key", name: "char", key: "c", ctrl: false });
-  await Promise.resolve(); await Promise.resolve();
-  assert.equal(calls[1][0], "goal.complete");
+  panel.actionSel = 3; panel.onKey({ type: "key", name: "enter" });
+  assert.ok(app.overlay?.title?.includes("确认"), "complete opens confirmation buffer");
+  assert.equal(calls.length, 1, "destructive action not sent before confirmation");
 });
 
 test("JobsPanel shares one buffer with subagents via Tab and arrows", async () => {
