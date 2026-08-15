@@ -3823,7 +3823,7 @@ export class App {
         return;
       }
       if (ev.ctrl && ev.key === "g") { this.showGoal(); return; }
-      if (ev.ctrl && ev.key === "f") { this.findInConversation(); return; }
+      if (ev.ctrl && ev.key === "f") { this.startSearch(); return; }
       if (ev.ctrl && ev.key === "s") { this.setMode("settings"); return; }
       if (ev.ctrl && ev.key === "a") { this.setMode("subagent"); return; }
       if (ev.ctrl && ev.key === "k") { this.setMode("skills"); return; }
@@ -3877,27 +3877,20 @@ export class App {
   startSearch() {
     this.searchActive = true;
     this.searchInput.setValue("");
+    this.searchResults = this.sessions.map((s) => ({ sessionId:s.sessionId, title:s.projections?.values?.title ?? s.sessionId.slice(0,8), snippet:s.cwd ?? "" }));
     this.focus(this.searchInput);
   }
 
   #refreshSearch() {
-    const query = this.searchInput.value.trim();
-    const seq = ++this.searchSeq;
+    const query = this.searchInput.value.trim().toLowerCase();
     this.searchSelected = 0;
-    if (query) {
-      this.api.call("session.search", { query }).then(({ items }) => {
-        if (seq !== this.searchSeq || this.searchInput.value.trim() !== query) return;
-        this.searchResults = items ?? [];
-        this.redraw();
-      }).catch((e) => {
-        if (seq === this.searchSeq) this.toast(`搜索失败: ${e.message}`);
-      });
-    } else this.searchResults = null;
+    const fuzzy = (text) => { let i=0; for(const ch of String(text).toLowerCase()) if(ch===query[i]) i++; return i===query.length; };
+    this.searchResults = this.sessions.filter((s) => !query || fuzzy(`${s.projections?.values?.title ?? ""} ${s.cwd ?? ""} ${s.sessionId}`)).map((s) => ({ sessionId:s.sessionId, title:s.projections?.values?.title ?? s.sessionId.slice(0,8), snippet:s.cwd ?? "" }));
   }
 
   #onSearchKey(ev) {
     const input = this.searchInput;
-    if (ev.type === "key" && ev.name === "escape") { this.searchActive = false; this.searchResults = null; this.focus(this.sidebar); this.refreshSessions(); return; }
+    if (ev.type === "key" && ((ev.name === "escape") || (ev.ctrl && (ev.key === "/" || ev.key === "_")))) { this.searchActive = false; this.searchResults = null; this.focus(this.sidebar); this.refreshSessions(); return; }
     if (ev.type === "key" && ev.name === "up" && this.searchResults?.length) { this.searchSelected = Math.max(0, this.searchSelected - 1); return; }
     if (ev.type === "key" && ev.name === "down" && this.searchResults?.length) { this.searchSelected = Math.min(this.searchResults.length - 1, this.searchSelected + 1); return; }
     if (ev.type === "key" && ev.name === "enter") {

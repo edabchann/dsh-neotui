@@ -1383,7 +1383,12 @@ export class ImagePopup extends Popup {
     // Kitty places at the current cursor. Screen.render() leaves the cursor at
     // an arbitrary diff cell, so explicitly move to the popup image viewport.
     const move = `\x1b[${this.y + 4};${this.x + 3}H`;
-    const place = `\x1b_Ga=p,i=${this.kittyId},c=${w},r=${h},q=2\x1b\\`;
+    // Supplying both c and r stretches the raster to that exact cell box.
+    // Supply only the limiting dimension so Kitty/WezTerm preserves aspect.
+    const sourceAspect = this.pixelWidth && this.pixelHeight ? this.pixelWidth / this.pixelHeight : 1;
+    const boxAspect = w / Math.max(1, h * 2);
+    const fit = sourceAspect >= boxAspect ? `c=${w}` : `r=${h}`;
+    const place = `\x1b_Ga=p,i=${this.kittyId},${fit},q=2\x1b\\`;
     return payload + move + place;
   }
 }
@@ -1415,10 +1420,9 @@ export class ControlPanel extends Widget {
     const h = Math.min(24, app.screen.h - 4);
     super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h });
     this.app = app;
-    this.pages = ["快捷键", "命令", "设置"];
+    this.pages = ["快捷键", "命令", "设置", "插件"];
     this.page = startPage;
-    this.subPages = ["常规", "插件"];
-    this.subPage = 0;
+    this.pluginQuery = ""; this.pluginFilter = false;
     this.sel = 0;
     this.scroll = 0;
     this.commands = DEFAULT_COMMANDS;
@@ -1446,19 +1450,19 @@ export class ControlPanel extends Widget {
   }
   shortcutItems() {
     return [
-      ["t", "思考块 展开/折叠", () => this.app.chat.onKey({ type: "key", name: "char", key: "t", text: "t", ctrl: false, alt: false, shift: false })],
-      ["b", "工具块 展开/折叠", () => this.app.chat.onKey({ type: "key", name: "char", key: "b", text: "b", ctrl: false, alt: false, shift: false })],
-      ["i", "进入输入", () => this.app.focus(this.app.chat.input)],
-      ["Esc", "退出输入", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); }],
-      ["/", "搜索会话", () => { this.app.closeOverlay(); this.app.startSearch(); }],
+      ["NORMAL · t", "思考块 展开/折叠", () => this.app.chat.onKey({ type: "key", name: "char", key: "t", text: "t", ctrl: false, alt: false, shift: false })],
+      ["NORMAL · b", "工具块 展开/折叠", () => this.app.chat.onKey({ type: "key", name: "char", key: "b", text: "b", ctrl: false, alt: false, shift: false })],
+      ["NORMAL · i", "进入输入", () => this.app.focus(this.app.chat.input)],
+      ["INSERT · Esc", "退出输入", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); }],
+      ["NORMAL · /", "筛选会话", () => { this.app.closeOverlay(); this.app.startSearch(); }],
       ["n", "新建会话", () => this.app.newSession()],
       ["g g", "滚动到顶", () => { this.app.closeOverlay(); this.app.chat.view.scrollY = 0; }],
       ["G", "滚动到底", () => { this.app.closeOverlay(); this.app.chat.view.scrollY = this.app.chat.view.maxScroll(); }],
       ["[", "上一提问的终点", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); this.app.chat.onKey({ type: "key", name: "char", key: "[", text: "[", ctrl: false, alt: false, shift: false }); }],
       ["]", "下一提问的终点", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); this.app.chat.onKey({ type: "key", name: "char", key: "]", text: "]", ctrl: false, alt: false, shift: false }); }],
-      ["Ctrl+L", "输入栏 展开/折叠", () => { this.app.closeOverlay(); this.app.focus(this.app.chat.input); this.app.chat.input.onKey({ type: "key", name: "char", key: "l", text: "l", ctrl: true, alt: false, shift: false }); }],
-      ["Ctrl+Shift+C", "复制输入栏选区", () => { this.app.closeOverlay(); this.app.chat.input.onKey({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: true }); }],
-      ["Ctrl+P", "控制面板", () => { this.page = 1; this.sel = 0; this.app.redraw(); }],
+      ["INSERT · Ctrl+L", "输入栏 展开/折叠", () => { this.app.closeOverlay(); this.app.focus(this.app.chat.input); this.app.chat.input.onKey({ type: "key", name: "char", key: "l", text: "l", ctrl: true, alt: false, shift: false }); }],
+      ["INSERT · Ctrl+Shift+C", "复制输入栏选区", () => { this.app.closeOverlay(); this.app.chat.input.onKey({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: true }); }],
+      ["NORMAL · Ctrl+P", "控制面板", () => { this.page = 1; this.sel = 0; this.app.redraw(); }],
       ["Ctrl+M", "切换模型", () => { this.app.overlay = buildModelPicker(this.app); }],
       ["Ctrl+T", "轨迹视图", () => { this.app.closeOverlay(); this.app.setMode("trajectory"); }],
       ["Shift+Tab", "主页 对话/轨迹 切换", () => { this.app.closeOverlay(); this.app.toggleChatTrajectory(); }],
@@ -1487,8 +1491,7 @@ export class ControlPanel extends Widget {
         },
       ]);
     }
-    // 设置 page with sub-pages
-    if (this.subPage === 0) {
+    if (this.page === 2) {
       return [
         ["模型管理（含思考强度）", "切换模型并选择思考强度", () => { this.app.overlay = buildModelPicker(this.app); }],
         ["模式（Agent 预设）", "标准 / PTC / 极简 / 创造", () => { this.app.overlay = buildModePicker(this.app); this.app.redraw(); }],
@@ -1501,7 +1504,8 @@ export class ControlPanel extends Widget {
       ];
     }
     if (this.plugins) {
-      return this.plugins.map((pl) => [`${pl.enabled ? "●" : "○"} ${pl.moduleName}`, pl.fiberPhase ?? "", null]);
+      const q=this.pluginQuery.toLowerCase();
+      return this.plugins.filter((pl)=>!q||`${pl.moduleName} ${pl.fiberPhase??""}`.toLowerCase().includes(q)).map((pl) => [`${pl.enabled ? "●" : "○"} ${pl.moduleName}`, pl.fiberPhase ?? "", null]);
     }
     return [[this.pluginError ?? "插件清单加载中…", "", null]];
   }
@@ -1515,18 +1519,7 @@ export class ControlPanel extends Widget {
       s.text(tx, this.y, ` ${name} `, { fg: sel ? T.SELFG : T.DIM, bg: sel ? T.ACCENT : -1, attrs: sel ? 1 : 0 });
       tx += strWidth(` ${name} `);
     });
-    // sub-page tabs when on 设置
-    if (this.page === 2) {
-      let sx = this.x + 2 + strWidth(" 快捷键   命令   设置 ");
-      this.subPages.forEach((name, i) => {
-        const sel = i === this.subPage;
-        s.text(sx, this.y, ` ${name} `, { fg: sel ? T.BOLD : T.FAINT, bg: sel ? T.MENUSEL : -1, attrs: sel ? 1 : 0 });
-        sx += strWidth(` ${name} `);
-      });
-      s.text(this.x + this.w - 24, this.y, "Shift+Tab 次级", { fg: T.FAINT });
-    } else {
-      s.text(this.x + this.w - 18, this.y, "Tab/←→ 翻页", { fg: T.FAINT });
-    }
+    s.text(this.x + this.w - 18, this.y, "Tab/←→ 翻页", { fg: T.FAINT });
     const items = this.items();
     if (this.sel >= items.length) this.sel = Math.max(0, items.length - 1);
     const visible = Math.max(1, this.h - 3);
@@ -1543,10 +1536,14 @@ export class ControlPanel extends Widget {
       s.text(this.x + 2, this.y + 2 + i, truncate(label, this.w - 34), { fg: sel ? T.BOLD : (this.page === 0 ? T.ACCENT : T.TXT), bg: sel ? T.MENUSEL : T.PANEL, attrs: sel ? 1 : 0 });
       if (it[1]) s.text(this.x + this.w - 30, this.y + 2 + i, truncate(it[1], 28), { fg: T.FAINT, bg: sel ? T.MENUSEL : T.PANEL });
     }
-    s.text(this.x + 2, this.y + this.h - 1, "↑↓ 选择 · Enter 执行 · Esc 关闭", { fg: T.FAINT });
+    s.text(this.x + 2, this.y + this.h - 1, this.page===3?`/ 筛选插件 · Ctrl+/ 清除 · ↑↓ 选择 · Esc 关闭${this.pluginQuery?` · ${this.pluginQuery}`:""}`:"↑↓ 选择 · Enter 执行 · Esc 关闭", { fg: T.FAINT });
   }
   onKey(ev) {
+    if(this.page===3&&this.pluginFilter){if(ev.type==="text"){this.pluginQuery+=ev.text;this.sel=0;return true;}if(ev.type==="key"&&ev.name==="backspace"){this.pluginQuery=this.pluginQuery.slice(0,-1);this.sel=0;return true;}if(ev.type==="key"&&ev.name==="enter"){this.pluginFilter=false;return true;}if(ev.type==="key"&&ev.ctrl&&(ev.key==="/"||ev.key==="_")){this.pluginFilter=false;this.pluginQuery="";return true;}}
+    if(this.page===3&&ev.type==="text"&&ev.text==="/"){this.pluginFilter=true;this.pluginQuery="";return true;}
     if (ev.type !== "key") return false;
+    if(this.page===3&&ev.name==="char"&&ev.key==="/"){this.pluginFilter=true;this.pluginQuery="";return true;}
+    if(this.page===3&&ev.ctrl&&(ev.key==="/"||ev.key==="_")){this.pluginQuery="";return true;}
     if (ev.name === "escape") { this.app.closeOverlay(); return true; }
     if (ev.name === "tab" || ev.name === "right") {
       this.page = (this.page + 1) % this.pages.length;
@@ -1554,18 +1551,7 @@ export class ControlPanel extends Widget {
       this.app.redraw();
       return true;
     }
-    if (ev.name === "backtab" || ev.name === "left") {
-      if (this.page === 2) {
-        this.subPage = (this.subPage + 1) % this.subPages.length;
-        this.sel = 0;
-        this.app.redraw();
-      } else {
-        this.page = (this.page + this.pages.length - 1) % this.pages.length;
-        this.sel = 0;
-        this.app.redraw();
-      }
-      return true;
-    }
+    if (ev.name === "backtab" || ev.name === "left") { this.page = (this.page + this.pages.length - 1) % this.pages.length; this.sel = 0; this.app.redraw(); return true; }
     if (ev.name === "pgup" || ev.name === "home") { this.sel = 0; this.app.redraw(); return true; }
     if (ev.name === "pgdn" || ev.name === "end") { this.sel = this.items().length - 1; this.app.redraw(); return true; }
     if (ev.name === "up") { this.sel = Math.max(0, this.sel - 1); this.app.redraw(); return true; }
