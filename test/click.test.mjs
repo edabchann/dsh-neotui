@@ -1675,7 +1675,9 @@ test("task dock is visually framed and distinct from transcript text", () => {
   const header = rows.findIndex((row) => row.includes("TASKS"));
   assert.ok(header >= 0, "task dock has an explicit section heading");
   assert.ok(rows[header].includes("─"), "heading sits on a divider");
-  assert.ok(rows.slice(header + 1).some((row) => row.includes("|") && row.includes("fix the timer")), "task items live inside framed dock");
+  assert.ok(rows[header].includes("┌") && rows[header].includes("┐"), "task header uses code-block corners");
+  assert.ok(rows.slice(header + 1).some((row) => row.includes("│") && row.includes("fix the timer")), "task items use code-block vertical geometry");
+  assert.ok(rows.slice(header + 1).some((row) => row.includes("└") && row.includes("┘")), "task footer uses code-block corners");
 });
 
 test("completed goal does not keep the bottom goal dock resident", () => {

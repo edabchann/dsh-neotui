@@ -2020,32 +2020,25 @@ export class ChatView extends Widget {
     const active = todos.filter((t) => t.status === "in_progress").length;
     const progress = todos.length ? ` · ${done}/${todos.length} 完成${active ? ` · ${active} 进行中` : ""}` : "";
     const title = ` ${this.todosVisible ? "▾" : "▸"} TASKS${progress} · Shift+T ${this.todosVisible ? "最小化" : "展开"} `;
+    const inner = Math.max(2, this.w - 2); // identical geometry to markdown code boxes
+    const header = truncate(title, inner - 2);
+    const left = Math.max(1, inner - strWidth(header) - 1);
     screen.fillRect(this.x, row, this.x + this.w - 1, y + th - 1, " ", { bg: T.PANEL });
-    screen.hline(this.x, this.x + this.w - 1, row, "─", { fg: T.BORDER2, bg: T.PANEL });
-    screen.put(this.x, row, "╭", { fg: T.BORDER2, bg: T.PANEL });
-    screen.put(this.x + this.w - 1, row, "╮", { fg: T.BORDER2, bg: T.PANEL });
-    screen.text(this.x + 2, row, truncate(title, this.w - 4), { fg: T.ACCENT, bg: T.PANEL, bold: true });
+    screen.text(this.x, row, "┌" + "─".repeat(left) + header + "─".repeat(Math.max(0, inner - left - strWidth(header))) + "┐", { fg: T.BORDER2, bg: T.PANEL, bold: true });
     if (!this.todosVisible) {
-      screen.hline(this.x, this.x + this.w - 1, row + 1, "─", { fg: T.BORDER2, bg: T.PANEL });
-      screen.put(this.x, row + 1, "╰", { fg: T.BORDER2, bg: T.PANEL });
-      screen.put(this.x + this.w - 1, row + 1, "╯", { fg: T.BORDER2, bg: T.PANEL });
+      screen.text(this.x, row + 1, "└" + "─".repeat(inner) + "┘", { fg: T.BORDER2, bg: T.PANEL });
       return;
     }
     row++;
     const bottom = y + th - 1;
-    // Match code-card geometry: ASCII verticals are reliably one terminal cell
-    // even under ambiguous-width CJK fonts; rounded Unicode stays at corners.
-    screen.vline(this.x, row, bottom - 1, "|", { fg: T.BORDER, bg: T.PANEL });
-    screen.vline(this.x + this.w - 1, row, bottom - 1, "|", { fg: T.BORDER, bg: T.PANEL });
-    for (let i = 0; i < Math.min(todos.length, bottom - row); i++) {
+    for (let i = 0; i < bottom - row; i++) {
       const t = todos[i];
-      const icon = t.status === "completed" ? "✓" : t.status === "in_progress" ? "◉" : "○";
-      const color = t.status === "completed" ? T.FAINT : t.status === "in_progress" ? T.WARN : T.DIM;
-      screen.text(this.x + 2, row + i, `${icon} ${truncate(t.content ?? String(t), this.w - 6)}`, { fg: color, bg: T.PANEL, bold: t.status === "in_progress" });
+      const body = t ? `${t.status === "completed" ? "✓" : t.status === "in_progress" ? "◉" : "○"} ${t.content ?? String(t)}` : "";
+      const shown = truncate(body, Math.max(1, inner - 2));
+      const color = t?.status === "completed" ? T.FAINT : t?.status === "in_progress" ? T.WARN : T.DIM;
+      screen.text(this.x, row + i, "│ " + shown + " ".repeat(Math.max(0, inner - 2 - strWidth(shown))) + " │", { fg: color, bg: T.PANEL, bold: t?.status === "in_progress" });
     }
-    screen.hline(this.x, this.x + this.w - 1, bottom, "─", { fg: T.BORDER2, bg: T.PANEL });
-    screen.put(this.x, bottom, "╰", { fg: T.BORDER2, bg: T.PANEL });
-    screen.put(this.x + this.w - 1, bottom, "╯", { fg: T.BORDER2, bg: T.PANEL });
+    screen.text(this.x, bottom, "└" + "─".repeat(inner) + "┘", { fg: T.BORDER2, bg: T.PANEL });
   }
 
   onMouse(ev) {

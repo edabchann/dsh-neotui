@@ -1767,7 +1767,7 @@ export class GoalPanel extends Popup {
   rebuild() {
     const goal = this.goal, todos = this.app.todos ?? [], lines = [];
     lines.push([{ t: " ↑↓ 选择操作 · Enter 打开 · Esc 关闭（完成/清除会再次确认）", fg: this.busy ? K.WARN : K.DIM }]);
-    if (!goal) lines.push([{ t: " 当前会话没有目标", fg: K.FAINT }]);
+    if (!goal) lines.push([{ t: " 当前没有自动持续目标。它用于需要跨多轮自动推进的长期任务；普通对话无需创建。", fg: K.FAINT }]);
     else {
       lines.push([{ t: ` 目标: ${goal.objective ?? goal}`, fg: K.TXT, bold: true }]);
       lines.push([{ t: ` 阶段: ${goal.phase ?? "active"} · 轮次 ${this.app.goalData?.roundsStarted ?? 0}/${goal.maxGoalRounds ?? "∞"} · 修订 ${goal.revision ?? "?"}`, fg: K.DIM }]);
@@ -1779,7 +1779,7 @@ export class GoalPanel extends Popup {
       { label: goal.phase === "active" ? "暂停自动继续" : "继续目标", run: () => this.#call(goal.phase === "active" ? "goal.pause" : "goal.resume", { ref: this.#ref() }) },
       { label: "完成目标…", danger: true, run: () => this.#confirm("确认完成当前目标？", "goal.complete") },
       { label: "清除目标…", danger: true, run: () => this.#confirm("确认清除当前目标？历史会保留 tombstone。", "goal.clear") },
-    ] : [{ label: "创建目标", run: () => this.#edit("objective") }];
+    ] : [{ label: "创建自动持续目标…", run: () => this.#edit("objective") }];
     this.actionSel = Math.min(this.actionSel, this.actions.length - 1);
     lines.push([{ t: "" }, { t: " 操作", fg: K.ACCENT, bold: true }]);
     this.actionRows = [];
@@ -1818,7 +1818,7 @@ export class GoalPanel extends Popup {
     const creating = !goal;
     const value = field === "maxGoalRounds" ? String(goal?.maxGoalRounds ?? "") : String(goal?.objective ?? "");
     const popup = new EditPopup(this.app, {
-      title: creating ? "创建目标" : field === "maxGoalRounds" ? "修改最大轮次" : "编辑目标",
+      title: creating ? "创建自动持续目标（长期任务）" : field === "maxGoalRounds" ? "修改最大轮次" : "编辑目标",
       value,
       placeholder: field === "maxGoalRounds" ? "正整数，留空保持不变" : "输入目标…",
       onCommit: (text) => {
