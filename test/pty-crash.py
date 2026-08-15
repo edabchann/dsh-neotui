@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Real-pty reproduction: boot attach mode, click a session, scroll with SGR
 # wheel sequences, resize the pty (SIGWINCH), and capture everything.
-import os, pty, time, signal, fcntl, termios, struct, sys
+import os, pty, time, signal, fcntl, termios, struct, sys, json
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTHOME = os.path.join(REPO, ".testhome")
@@ -9,6 +9,24 @@ RAW = os.path.join(REPO, "test", "pty-crash.raw")
 
 env = dict(os.environ)
 env["DSH_HOME"] = TESTHOME
+
+# Repair the ignored PTY profile fixture from source truth on every run. This
+# prevents an old local fixture name (`dsh-tui-app`) from masking resolution.
+profile_dir = os.path.join(TESTHOME, "profiles", "tui")
+os.makedirs(profile_dir, exist_ok=True)
+profile_package = os.path.join(profile_dir, "package.json")
+profile_data = {
+    "name": "dsh-profile-tui", "private": True, "dependencies": {},
+    "dsh": {"profile": {"bundles": ["@deepseek-ai/dsh-base", "dsh-neotui-app"]}},
+}
+with open(profile_package, "w", encoding="utf-8") as stream:
+    json.dump(profile_data, stream, indent=2)
+    stream.write("\n")
+for filename, content in (("cordis.yml", "[]\n"), ("cordis.patch.yml", "[]\n"), ("pnpm-workspace.yaml", "packages: []\n")):
+    path = os.path.join(profile_dir, filename)
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(content)
 
 # Keep the checked-in profile self-contained: dsh resolves bundle names from
 # the profile directory, so expose both local packages through node_modules.
