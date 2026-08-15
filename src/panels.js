@@ -633,6 +633,19 @@ export class DirPicker extends Widget {
   }
 }
 
+export class FilePicker extends Widget {
+  constructor(app, { startPath, onPick, onCancel }) {
+    const w = Math.min(76, app.screen.w - 4), h = Math.min(24, app.screen.h - 4); super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h });
+    this.app = app; this.path = startPath ?? process.cwd(); this.onPick = onPick; this.onCancel = onCancel; this.entries = []; this.sel = 0; this.scroll = 0; this.load();
+  }
+  load() { try { this.entries = readdirSync(this.path, { withFileTypes: true }).filter((e) => !e.name.startsWith(".")).sort((a,b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name)); } catch (e) { this.entries = []; this.app.toast(`读取失败: ${e.message}`); } this.sel = 0; this.scroll = 0; this.app.redraw(); }
+  items() { return [{ name: "..", dir: true }, ...this.entries.map((e) => ({ name: e.name, dir: e.isDirectory() }))]; }
+  activate() { const it = this.items()[this.sel]; if (!it) return; const path = it.name === ".." ? dirname(this.path) : join(this.path, it.name); if (it.dir) { this.path = path; this.load(); } else this.onPick?.(path); }
+  render(s) { s.fillRect(this.x,this.y,this.x+this.w-1,this.y+this.h-1," ",{bg:T.BG2}); s.box(this.x,this.y,this.x+this.w-1,this.y+this.h-1,{fg:K.ACCENT,bg:T.BG2},"Yazi 风格文件选择"); s.text(this.x+2,this.y+1,truncate(this.path,this.w-4),{fg:K.DIM,bg:T.BG2}); const items=this.items(), n=this.h-4; if(this.sel<this.scroll)this.scroll=this.sel; if(this.sel>=this.scroll+n)this.scroll=this.sel-n+1; for(let i=0;i<n;i++){const idx=this.scroll+i,it=items[idx];if(!it)continue;const on=idx===this.sel,y=this.y+2+i;s.fillRect(this.x+1,y,this.x+this.w-2,y," ",{bg:on?T.MENUSEL:T.BG2});s.text(this.x+2,y,`${it.dir?"▸":"·"} ${truncate(it.name,this.w-7)}${it.dir?"/":""}`,{fg:on?T.SELFG:it.dir?K.ACCENT:K.TXT,bg:on?T.MENUSEL:T.BG2});} s.text(this.x+2,this.y+this.h-1,"↑↓/jk 选择 · Enter/l 打开 · h上级 · Esc取消",{fg:K.FAINT,bg:T.BG2}); }
+  onKey(ev){if(ev.type!=="key")return false;const n=this.items().length;if(ev.name==="escape"){this.onCancel?.();return true;}if(ev.name==="up"||(ev.name==="char"&&ev.key==="k")){this.sel=Math.max(0,this.sel-1);return true;}if(ev.name==="down"||(ev.name==="char"&&ev.key==="j")){this.sel=Math.min(n-1,this.sel+1);return true;}if(ev.name==="enter"||(ev.name==="char"&&ev.key==="l")){this.activate();return true;}if(ev.name==="backspace"||(ev.name==="char"&&ev.key==="h")){this.path=dirname(this.path);this.load();return true;}return false;}
+  onMouse(ev){if(ev.kind==="press"&&ev.button===0){const idx=this.scroll+ev.y-this.y-2;if(idx>=0&&idx<this.items().length){this.sel=idx;this.activate();}return true;}if(ev.kind==="wheel-up"){this.sel=Math.max(0,this.sel-1);return true;}if(ev.kind==="wheel-down"){this.sel=Math.min(this.items().length-1,this.sel+1);return true;}return false;}
+}
+
 // ---- Trajectory view ----
 
 export class TrajectoryPanel extends Widget {

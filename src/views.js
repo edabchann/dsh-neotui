@@ -11,7 +11,7 @@ import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefa
 export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
-  modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker,
+  modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker, FilePicker,
   ImagePopup, kittyCapable, buildGoalPopup, GoalPanel, SettingsPanel, SubagentPanel,
   SkillsPanel, ControlPanel, JobsPanel, QueuePanel, ModelPanel, fmtMs,
 } from "./panels.js";
@@ -3710,6 +3710,8 @@ export class App {
           // so ordinary Vim muscle memory cannot accidentally stop a long turn.
           this.focus(this.chat);
           this.toast(this.chat.running ? "已退出输入；Ctrl+C 可中断当前回合" : "已退出输入（i 重新进入）");
+        } else if (ev.ctrl && ev.key === "o") {
+          this.overlay = new FilePicker(this, { startPath: process.cwd(), onPick: (path) => { this.overlay = null; if (IMAGE_EXT.test(path)) this.chat.input.insert(` @${path} `); else this.toast("当前 Host prompt 协议只支持文本和图片；该文件暂不能作为附件发送"); this.redraw(); }, onCancel: () => { this.overlay = null; this.redraw(); } });
         } else if (ev.type === "paste") {
           // Terminals normally deliver Ctrl+Shift+V as bracketed paste, without
           // modifier metadata. Probe the image clipboard first; fall back to
