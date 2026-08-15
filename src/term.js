@@ -48,6 +48,7 @@ export class Term {
     this.input.on("data", this.dataHandler);
     const o = this.output;
     o.write("\x1b[?1049h"); // alt screen
+    if (this.kitty) o.write("\x1b_Ga=d,d=A,q=2\x1b\\"); // clear stale placements from a crashed/restarted run
     o.write("\x1b[?25l");   // hide cursor (shown only over the focused input)
     o.write("\x1b[5 q");    // DECSCUSR: blinking vertical bar caret
     o.write("\x1b[?1000h"); // mouse: clicks
@@ -65,6 +66,9 @@ export class Term {
     if (!this.started) return;
     this.started = false;
     const o = this.output;
+    // Delete every Kitty image before leaving the alternate screen; otherwise
+    // placements survive /restart and overlay the newly started TUI.
+    if (this.kitty) o.write("\x1b_Ga=d,d=A,q=2\x1b\\");
     o.write("\x1b[?7h\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0 q\x1b[?1049l");
     if (this.kitty) o.write("\x1b[<u");
     process.off("SIGWINCH", this.resizeHandler);

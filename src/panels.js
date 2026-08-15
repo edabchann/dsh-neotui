@@ -1225,6 +1225,8 @@ export class ImagePopup extends Popup {
     this.imageKey = "";
     this.kittySentKey = "";
     this.kittyId = Math.floor(Math.random() * 2147483646) + 1;
+    this.pixelWidth = ref?.width ?? null;
+    this.pixelHeight = ref?.height ?? null;
     this.load();
   }
   #show(idx) {
@@ -1280,6 +1282,11 @@ export class ImagePopup extends Popup {
       if (kittyCapable() && attachment.mediaType !== "image/png") {
         try { const converted = spawnSyncSafeBuffer("magick", ["-", "png:-"], this.data, 5000); if (converted?.length) { this.data = converted; attachment = { ...attachment, mediaType: "image/png" }; } } catch {}
       }
+      this.pixelWidth = attachment.width ?? this.pixelWidth;
+      this.pixelHeight = attachment.height ?? this.pixelHeight;
+      if ((!this.pixelWidth || !this.pixelHeight) && this.data) {
+        try { const identify = spawnSyncSafe("magick", ["identify", "-format", "%w %h", "-"], 4000, this.data); const [pw, ph] = String(identify ?? "").trim().split(/\s+/).map(Number); if (pw > 0 && ph > 0) { this.pixelWidth = pw; this.pixelHeight = ph; } } catch {}
+      }
       this.title = this.galleryTitle();
       this.lines = [[{ t: `${attachment.mediaType} · ${attachment.width ? `${attachment.width}×${attachment.height} · ` : ""}${Math.round(this.data.length / 1024)}KB`, fg: K.DIM }], [{ t: `Enter/双击 默认程序 · y 复制 · Esc 关闭${this.refs.length > 1 ? " · ←/→ 切换" : ""}`, fg: K.FAINT }]];
       this.renderImage();
@@ -1332,7 +1339,12 @@ export class ImagePopup extends Popup {
   kittyTransmit() {
     // kitty graphics protocol: transmit + place. Returns ANSI or "".
     if (!this.data || !kittyCapable() || this.app.term?.kitty === false) return "";
-    const w = Math.min(70, this.w - 4), h = Math.max(4, this.h - 6);
+    const maxW = Math.min(70, this.w - 6), maxH = Math.max(4, this.h - 7);
+    // Terminal cells are roughly twice as tall as wide. Fit by source aspect
+    // ratio so a portrait screenshot cannot spill over the popup/TUI.
+    const aspect = this.pixelWidth && this.pixelHeight ? this.pixelWidth / this.pixelHeight : 1;
+    let w = maxW, h = Math.max(1, Math.round(w / Math.max(0.05, aspect) / 2));
+    if (h > maxH) { h = maxH; w = Math.max(1, Math.min(maxW, Math.round(h * aspect * 2))); }
     // Screen redraws every second for clocks/timers. Transmit once per loaded
     // image instead of streaming the full base64 payload on every frame.
     if (this.kittySentKey === this.imageKey) return "";
@@ -1358,9 +1370,9 @@ function spawnSyncSafeBuffer(cmd, args, input, timeoutMs) {
   try { const r = spawnSync(cmd, args, { input, timeout: timeoutMs, stdio: ["pipe", "pipe", "ignore"], maxBuffer: 32 * 1024 * 1024 }); return r.status === 0 ? r.stdout : null; } catch { return null; }
 }
 
-function spawnSyncSafe(cmd, args, timeoutMs) {
+function spawnSyncSafe(cmd, args, timeoutMs, input = null) {
   try {
-    return execFileSync(cmd, args, { timeout: timeoutMs, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    return execFileSync(cmd, args, { input, timeout: timeoutMs, encoding: "utf8", stdio: [input ? "pipe" : "ignore", "pipe", "ignore"] });
   } catch { return null; }
 }
 
