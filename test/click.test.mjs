@@ -1090,17 +1090,17 @@ test("footer shows effective session time, start time, and a live clock", () => 
   assert.ok(/\d{2}:\d{2}:\d{2}/.test(text1), `live clock present: ${text1.slice(0, 80)}`);
 });
 
-test("ESC interrupts a running turn with ONE press, from insert or normal", async () => {
+test("Esc exits input without interrupting; normal-mode Esc may interrupt", async () => {
   const app = headlessApp();
   const calls = [];
   app.api.call = async (m, p) => { calls.push([m, p]); return { items: [] }; };
   app.currentSession = "s1";
   app.chat.running = true;
-  // INSERT mode: one ESC = interrupt + leave insert
+  // INSERT mode: one ESC only leaves input; it never cancels work.
   app.focus(app.chat.input);
   app.onEvent({ type: "key", name: "escape" });
-  assert.deepEqual(calls.at(-1), ["session.cancel", { sessionId: "s1" }], "cancel sent");
-  assert.equal(app.focused, app.chat, "esc also left insert mode");
+  assert.equal(calls.length, 0, "no accidental cancel from editor Esc");
+  assert.equal(app.focused, app.chat, "esc left insert mode");
   // NORMAL mode, idle: no cancel call
   app.chat.running = false;
   calls.length = 0;

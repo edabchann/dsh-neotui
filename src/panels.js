@@ -1567,6 +1567,42 @@ export class JobsPanel extends Popup {
   }
 }
 
+export class QueuePanel extends Popup {
+  constructor(app) {
+    const items = app.queueItems ?? [];
+    const w = Math.max(24, Math.min(84, app.screen.w - 4));
+    const h = Math.max(7, Math.min(24, app.screen.h - 4));
+    super({ x: Math.max(0, Math.floor((app.screen.w - w) / 2)), y: Math.max(0, Math.floor((app.screen.h - h) / 2)), w, h, title: "消息队列", lines: [], buttons: [{ label: "关闭", action: "close" }], onAction: () => app.closeOverlay(), scrollable: true });
+    this.app = app; this.items = items; this.sel = 0; this.rebuild();
+  }
+  rebuild() {
+    const lines = [[{ t: " ↑↓选择 · s 立即 steering · d 删除 · Esc关闭", fg: K.DIM }]];
+    for (let i = 0; i < this.items.length; i++) {
+      const item = this.items[i];
+      const text = partsText(item.message?.content).replace(/\s+/g, " ");
+      lines.push([{ t: `${i === this.sel ? "▸" : " "} ${item.placement === "queued" ? "⏳" : item.placement === "steering" ? "↪" : "ℹ"} ${truncate(text || item.id, this.w - 8)}`, fg: i === this.sel ? T.SELFG : K.TXT, bg: i === this.sel ? T.MENUSEL : -1 }]);
+    }
+    if (!this.items.length) lines.push([{ t: " （队列为空）", fg: K.FAINT }]);
+    this.lines = lines;
+  }
+  async #mutate(kind) {
+    const item = this.items[this.sel];
+    if (!item || item.placement === "context") { this.app.toast("该条目不可修改"); return; }
+    try { await this.app.api.call("session.updateQueue", { sessionId: this.app.currentSession, itemId: item.id, action: { kind } }); }
+    catch (e) { this.app.toast(`队列操作失败: ${e.message}`); }
+  }
+  onKey(ev) {
+    if (ev.type === "key") {
+      if (ev.name === "escape") { this.app.closeOverlay(); return true; }
+      if (ev.name === "up") { this.sel = Math.max(0, this.sel - 1); this.rebuild(); return true; }
+      if (ev.name === "down") { this.sel = Math.min(this.items.length - 1, this.sel + 1); this.rebuild(); return true; }
+      if (ev.name === "char" && ev.key === "s" && !ev.ctrl) { this.#mutate("steer"); return true; }
+      if (ev.name === "char" && ev.key === "d" && !ev.ctrl) { this.#mutate("remove"); return true; }
+    }
+    return super.onKey(ev);
+  }
+}
+
 export function buildGoalPopup(app) {
   const goal = app.goalData?.goal ?? app.goalData;
   const todos = app.todos ?? [];

@@ -5,13 +5,13 @@ import { truncate, strWidth, bars, fmtDuration, fmtClock, fmtDateTime } from "./
 import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
-import { userPrefix, saveTuiConfig, loadTuiConfig, userName, foldDefaults } from "./config.js";
-export { userPrefix, saveTuiConfig, loadTuiConfig, userName, foldDefaults } from "./config.js";
+import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
+export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
   modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker,
   ImagePopup, kittyCapable, buildGoalPopup, SettingsPanel, SubagentPanel,
-  SkillsPanel, ControlPanel, JobsPanel, ModelPanel, fmtMs,
+  SkillsPanel, ControlPanel, JobsPanel, QueuePanel, ModelPanel, fmtMs,
 } from "./panels.js";
 
 import { T, themeName, cycleTheme } from "./theme.js";
@@ -21,7 +21,7 @@ const K = new Proxy({}, { get(_k, key) { return T[key]; } });
 // ---- Tool card renderers (host-computed view models) ----
 
 function renderToolCard(view, width, expanded) {
-  const card = view?.view ?? {};
+  const card = view?.card ? view : (view?.view ?? {});
   const lines = [];
   const title = truncate(card.title ?? card.name ?? "tool", width - 4);
   lines.push([
@@ -115,7 +115,11 @@ function renderToolCard(view, width, expanded) {
       break;
     }
     default: {
-      // generic card: dump text-like fields
+      // generic card: preserve presenter-authored content (plan review and
+      // rich generic tool results) before falling back to text-like fields.
+      for (const block of card.content ?? []) {
+        if (block?.type === "text" && block.text) pushText("  ", block.text);
+      }
       for (const key of ["output", "text", "stdout", "stderr", "result", "detail", "message", "summary"]) {
         if (card[key] !== undefined) {
           pushText(`  ${key}: `, card[key]);
@@ -302,6 +306,9 @@ function applyEvent(nodes, event, view, log, state = null) {
         }
         if (block) {
           block.result = text ?? JSON.stringify(d).slice(0, 400);
+          if (view?.view !== undefined) block.resultView = view.view;
+          block.isError = d.message?.content?.some?.((p) => p?.isError === true) || !!d.error;
+          block.error = d.error;
           block.endedAt = event.time ?? Date.now();
         }
         break;
@@ -323,12 +330,21 @@ function applyEvent(nodes, event, view, log, state = null) {
         const reason = d.reason?.kind;
         if (reason === "error") nodes.push({ kind: "turn-error", text: d.reason?.error?.message ?? "模型请求失败", code: d.reason?.error?.code });
         else if (reason === "max-tokens") nodes.push({ kind: "turn-max-tokens", text: "已达到本轮最大输出 token 限制" });
-        else if (reason === "cancelled" || reason === "interrupted") nodes.push({ kind: "system", text: "■ 本轮已停止" });
+        else if (["cancelled", "interrupted", "aborted"].includes(reason)) {
+          for (const assistant of nodes) for (const block of assistant.kind === "assistant" ? assistant.blocks ?? [] : []) if (block.kind === "tool" && block.result == null) block.stopped = true;
+          nodes.push({ kind: "system", text: "■ 本轮已停止" });
+        } else if (reason === "blocked") nodes.push({ kind: "system", text: "⚠ 本轮已阻塞" });
         st.turnStart = null;
         break;
       }
       case "llm/retry": {
-        nodes.push({ kind: "system", text: `↻ 模型请求失败，准备重试${d.delayMs ? `（${fmtDuration(d.delayMs)} 后）` : ""}${d.error?.message ? `：${d.error.message}` : ""}` });
+        nodes.push({ kind: "retry", turn: d.turn, attempt: d.attempt, status: "scheduled", text: d.failure?.message ?? d.error?.message ?? "模型请求失败", delayMs: d.delayMs });
+        break;
+      }
+      case "llm/retry-started": {
+        const retry = [...nodes].reverse().find((n) => n.kind === "retry" && (d.turn == null || n.turn === d.turn));
+        if (retry) retry.status = "started";
+        else nodes.push({ kind: "retry", turn: d.turn, attempt: d.attempt, status: "started", text: "模型请求正在重试" });
         break;
       }
       case "step/end": {
@@ -1060,7 +1076,7 @@ export class ChatView extends Widget {
     this.app.log(`[chat] prompt → ${this.sessionId.slice(0, 8)}: ${truncate(trimmed, 60)}${images.length ? ` (+${images.length} 图)` : ""}`);
     this.app.api.call("session.prompt", {
       sessionId: this.sessionId,
-      mode: "queue",
+      mode: this.running ? busyEnter() : "queue",
       content: parts.filter((p) => p.type === "image" || (p.text ?? "").trim() !== ""),
       clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     }).then((res) => {
@@ -1355,6 +1371,7 @@ export class ChatView extends Widget {
           lines.push([{ t: node.streaming ? `  ◷ Deep diving · 已经进行 ${fmtDuration(elapsed)}` : `  ◷ Deep diving · 总耗时 ${fmtDuration(elapsed)}`, fg: node.streaming ? T.WARN : K.DIM, bold: node.streaming }]);
           mark(realIdx); break;
         }
+        case "retry": lines.push([{ t: `  ↻ ${node.status === "started" ? "正在重试" : `准备重试${node.delayMs ? `（${fmtDuration(node.delayMs)} 后）` : ""}`}：${truncate(node.text, w - 20)}`, fg: K.WARN, bold: node.status === "started" }]); mark(realIdx); break;
         case "command": lines.push([{ t: `  ${node.status === "running" ? "…" : node.status === "error" ? "✗" : "✓"} ${node.text}${node.detail ? ` — ${truncate(node.detail, w - strWidth(node.text) - 10)}` : ""}`, fg: node.status === "error" ? K.ERR : node.status === "success" ? K.OK : K.DIM }]); mark(realIdx); break;
         case "steering": lines.push([{ t: "  ↪ 运行中追加 > ", fg: K.ACCENT, bold: true }, { t: truncate(node.text, w - 18), fg: K.TXT }]); mark(realIdx); break;
         case "turn-error": lines.push([{ t: `  ✗ ${node.text}${node.code ? ` (${node.code})` : ""}`, fg: K.ERR, bold: true }]); mark(realIdx); break;
@@ -1459,7 +1476,9 @@ export class ChatView extends Widget {
             } else if (b.kind === "tool") {
               const key = `${realIdx}:${bi}`;
               const open = this.expanded.has(key) || (this.bashMode !== "collapsed" && !this.collapsedBlocks.has(key));
-              const exitCode = b.view?.view?.exitCode;
+              const cardView = b.resultView ?? b.view;
+              const exitCode = cardView?.exitCode;
+              const signal = cardView?.signal;
               // A tool only TICKS while its turn is live. A finalized turn
               // whose result never matched (orphan) must freeze at 无结果 —
               // otherwise the timer runs forever ("timing chaos").
@@ -1472,10 +1491,11 @@ export class ChatView extends Widget {
               const orphan = b.result == null && !b.done && !node.streaming;
               // An orphan renders neutral (◌, TOOLBG), never the red ✗ of a
               // failed exit code.
-              const failed = !orphan && exitCode !== undefined && exitCode !== 0;
-              const status = running ? "TOOLBG" : failed ? "TOOLERR" : "TOOLOK";
-              const glyph = running ? "⏳" : failed ? "✗" : orphan ? "◌" : "✓";
-              const card = b.view ? renderToolCard(b.view, w, open) : [];
+              const stopped = !running && (b.stopped || signal === "SIGTERM" || signal === "SIGINT");
+              const failed = !orphan && !stopped && (b.isError || signal || (exitCode !== undefined && exitCode !== 0));
+              const status = running ? "TOOLBG" : failed ? "TOOLERR" : stopped ? "TOOLBG" : "TOOLOK";
+              const glyph = running ? "⏳" : failed ? "✗" : stopped ? "⏸" : orphan ? "◌" : "✓";
+              const card = cardView ? renderToolCard(cardView, w, open) : [];
               beginCard(status);
               let timing = "";
               if (running) {
@@ -1484,7 +1504,7 @@ export class ChatView extends Widget {
                 // orphan note: the tool's own end timestamp was pruned WITH
                 // its result, so endedAt here is the step-end stamp — the
                 // duration is an upper bound, shown as ≤.
-                timing = ` ${failed ? "失败" : orphan ? "结果未保留" : "已完成"},耗时 ${orphan ? "≤" : ""}${fmtDuration(b.endedAt - b.startedAt)}`;
+                timing = ` ${failed ? "失败" : stopped ? "已停止" : orphan ? "结果未保留" : "已完成"},耗时 ${orphan ? "≤" : ""}${fmtDuration(b.endedAt - b.startedAt)}`;
               } else if (orphan) {
                 timing = " 结果未保留";
               }
@@ -1897,6 +1917,8 @@ function toolSummary(b) {
       return String(b.args).slice(0, 120);
     }
   }
+  if (b.resultView?.title) return b.resultView.title;
+  if (b.view?.title) return b.view.title;
   if (b.view?.view?.title) return b.view.view.title;
   return null;
 }
@@ -2822,6 +2844,7 @@ export class App {
   }
 
   showJobs() { this.overlay = new JobsPanel(this); this.redraw(); }
+  showQueue() { this.overlay = new QueuePanel(this); this.redraw(); }
   showGoal() { this.overlay = buildGoalPopup(this); this.redraw(); }
   showModePicker() { this.overlay = buildModePicker(this); this.redraw(); }
   showPermissionPicker() { this.overlay = buildPermissionPicker(this); this.redraw(); }
@@ -3182,9 +3205,10 @@ export class App {
         if (this.focused !== this.chat.input) this.focus(this.sidebar); // INSERT exits only via Esc
         if (this.sidebar.onMouse(ev)) this.redraw();
       } else if (this.chat.input.inside(ev.x, ev.y)) {
-        // mouse SELECTION in the input works regardless of mode; typing stays
-        // gated behind i / Esc (vim-style)
+        // A direct click follows ordinary editor expectations and enters input;
+        // keyboard-only users can still use the optional i/Esc Vim flow.
         if (ev.kind === "press" && ev.button === 0) {
+          this.focus(this.chat.input);
           this.inputDrag = true;
           if (this.chat.input.onMouse(ev)) this.redraw();
         } else if (ev.kind === "release" && ev.button === 0) {
@@ -3192,8 +3216,6 @@ export class App {
           if (this.chat.input.onMouse(ev)) this.redraw();
         } else if (this.focused === this.chat.input) {
           if (this.chat.input.onMouse(ev)) this.redraw();
-        } else if (ev.kind === "press") {
-          this.toast("按 i 进入输入（vim 式）");
         }
       } else if (this.chat.inside(ev.x, ev.y)) {
         if (this.focused !== this.chat.input) this.focus(this.chat); // INSERT exits only via Esc
@@ -3213,11 +3235,10 @@ export class App {
           // Esc closes the open / command candidate bar first, then exits
           // insert — Esc is the ONLY way out of insert mode.
           if (this.chat.input.cmdOpen) { this.chat.input.cmdOpen = false; this.redraw(); return; }
-          // one ESC press: interrupt a running turn AND leave insert —
-          // otherwise the key just exits insert (vim muscle memory).
-          const interrupted = this.#interruptIfRunning();
+          // Esc only exits editing. Cancellation is an explicit Ctrl+C action,
+          // so ordinary Vim muscle memory cannot accidentally stop a long turn.
           this.focus(this.chat);
-          if (!interrupted) this.toast("已退出输入（i 重新进入）");
+          this.toast(this.chat.running ? "已退出输入；Ctrl+C 可中断当前回合" : "已退出输入（i 重新进入）");
         } else {
           this.chat.input.onKey(ev);
         }
@@ -3270,6 +3291,13 @@ export class App {
       if (ev.ctrl && ev.key === "t") { this.setMode("trajectory"); return; }
       if (ev.ctrl && ev.key === "e") { this.quickJumpStep(); return; }
       if (ev.ctrl && ev.key === "j") { this.showJobs(); return; }
+      if (ev.ctrl && ev.key === "u") { this.showQueue(); return; }
+      if (ev.ctrl && ev.key === "y") {
+        const next = busyEnter() === "queue" ? "steer" : "queue";
+        saveTuiConfig({ busyEnter: next });
+        this.toast(`运行中 Enter：${next === "steer" ? "追加到当前回合" : "加入队列"}`);
+        return;
+      }
       if (ev.ctrl && ev.key === "g") { this.showGoal(); return; }
       if (ev.ctrl && ev.key === "f") { this.findInConversation(); return; }
       if (ev.ctrl && ev.key === "s") { this.setMode("settings"); return; }
@@ -3462,7 +3490,7 @@ export class App {
     const badge = perm && preset ? `${permName(perm)}/${modeName(preset)}`
       : perm ? permName(perm) : preset ? modeName(preset) : "未选会话";
     row0.left.push({ t: ` ${badge} `, fg: T.SELFG, bg: T.ACCENT, bold: true });
-    if (this.queueItems.length) row0.left.push({ t: ` ⏳队列 ${this.queueItems.length} `, fg: T.SELFG, bg: T.WARN, bold: true });
+    if (this.queueItems.length) row0.left.push({ t: ` ⏳队列 ${this.queueItems.length} (Ctrl+U) `, fg: T.SELFG, bg: T.WARN, bold: true });
     if (this.sidebarVisible) row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });
     else row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });
     if (cur?.running) row0.left.push({ t: " ●运行 ", fg: T.OK, bg: T.STATUSBG });

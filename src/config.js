@@ -65,6 +65,10 @@ export function userPrefix() {
 
 /** Fold defaults (settings → 默认展开/折叠): think/tool blocks and the
  *  todo list, with the shipped defaults when nothing is configured. */
+export function busyEnter() {
+  return loadTuiConfig().busyEnter === "steer" ? "steer" : "queue";
+}
+
 export function foldDefaults() {
   const fd = loadTuiConfig().foldDefaults ?? {};
   return {
