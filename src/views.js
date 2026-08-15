@@ -3648,11 +3648,10 @@ export class App {
       const before = this.overlay;
       if (ev.type === "key" || ev.type === "text") this.overlay.onKey(ev);
       else if (ev.type === "mouse") {
-        // a press outside the modal closes it (Esc equivalent) and never
-        // leaks through to the pane underneath.
+        // Buffers are modal: outside clicks are swallowed, never treated as
+        // implicit Escape. Every Buffer exits only through its advertised key
+        // or explicit in-buffer action.
         if (ev.kind === "press" && ev.button === 0 && !this.overlay.inside(ev.x, ev.y)) {
-          if (typeof this.overlay.onCancel === "function") this.overlay.onCancel();
-          else if (typeof this.overlay.onAction === "function") this.overlay.onAction({ label: "__cancel__", action: "__cancel__" }, -1);
           this.swallowRelease = true;
         } else {
           this.overlay.onMouse(ev);
