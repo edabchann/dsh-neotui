@@ -2967,20 +2967,17 @@ export class App {
 
   /** Yazi-style folder picker → workspace.create. */
   addWorkspace() {
-    this.overlay = new DirPicker(this, {
-      startPath: undefined,
-      onPick: async (path) => {
-        this.overlay = null;
-        try {
-          await this.api.call("workspace.create", { path });
-          await this.refreshSessions();
-          this.toast(`已添加工作区: ${path}`);
-        } catch (e) { this.toast(`添加失败: ${e.message}`); }
+    const session = this.sessions.find((s) => s.sessionId === this.currentSession);
+    const picker = new UploadPicker(this, {
+      startPath: session?.cwd ?? process.cwd(), selectDirectories: true,
+      onPickDirectory: async (path) => {
+        try { await this.api.call("workspace.create", { path }); await this.refreshSessions(); this.overlay = null; this.focus(this.chat); this.toast(`已添加工作区: ${path}`); }
+        catch (e) { this.overlay = picker; this.focus(picker); this.toast(`添加失败: ${e.message}`); }
         this.redraw();
       },
-      onCancel: () => { this.overlay = null; this.redraw(); },
+      onCancel: () => { this.overlay = null; this.focus(this.chat); this.redraw(); },
     });
-    this.redraw();
+    this.overlay = picker; this.focus(picker); this.redraw();
   }
 
   renameSession(s) {

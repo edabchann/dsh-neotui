@@ -49,10 +49,10 @@ class YnPopup extends Popup {
 }
 
 export class UploadPicker extends Widget {
-  constructor(app, { startPath, onUpload, onCancel }) {
+  constructor(app, { startPath, onUpload, onCancel, selectDirectories = false, onPickDirectory = null }) {
     const w = Math.min(app.screen.w - 4, 120), h = Math.min(app.screen.h - 4, 34);
     super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h });
-    this.app = app; this.path = startPath; this.onUpload = onUpload; this.onCancel = onCancel;
+    this.app = app; this.path = startPath; this.onUpload = onUpload; this.onCancel = onCancel; this.selectDirectories = selectDirectories; this.onPickDirectory = onPickDirectory;
     this.all = []; this.sel = 0; this.selected = new Map(); this.filter = ''; this.filterInput = null; this.showHidden = false; this.pathPopup = null; this.imagePreview = null;
     this.load();
   }
@@ -76,9 +76,18 @@ export class UploadPicker extends Widget {
   enterDir() { const it = this.current(); if (it?.dir) this.changePath(it.path); }
   toggle() {
     const it = this.current(); if (!it) return;
+    if (this.selectDirectories) {
+      if (!it.dir) { this.app.toast('只能选择文件夹'); return; }
+      this.confirmDirectory(it.path); return;
+    }
     if (it.dir) { this.app.toast('不可选择文件夹'); return; }
     if (this.selected.has(it.path)) this.selected.delete(it.path); else this.selected.set(it.path, it);
     this.app.redraw();
+  }
+  confirmDirectory(path) {
+    const back=this;
+    this.app.overlay=new YnPopup({x:this.x+8,y:this.y+5,w:this.w-16,h:8,title:'添加新工作区？',lines:[`是否将以下目录添加为新工作区：`,path],buttons:[{label:'确定 (y)',action:'yes'},{label:'取消 (n)',action:'no'}],onAction(b){if(b.action==='yes')back.onPickDirectory?.(path);back.app.overlay=back;back.app.focus(back);back.app.redraw();}});
+    this.app.focus(this.app.overlay);
   }
   confirmUpload() {
     if (!this.selected.size) { this.app.toast('请先按 Space 选择文件'); return; }
@@ -146,7 +155,9 @@ export class UploadPicker extends Widget {
     this.preview(this.current(), r - 2, h).forEach((x, i) => s.text(this.x + 5 + l + m, y0 + i, truncate(x, r - 2), { fg: T.DIM, bg: T.BG2 }));
     const foot = this.filterInput
       ? `筛选中 · Ctrl+/ 清除并退出 · Enter 固定结果 · ←/→ 切换目录`
-      : `↑↓ 选择 · ←/→ 目录 · Space 多选 · Enter 上传 · / 筛选 · Ctrl+F 路径 · Ctrl+. 隐藏项 · Ctrl+/ 清筛选 · Esc 取消`;
+      : this.selectDirectories
+        ? `↑↓ 选择 · ←/→ 目录 · Space 选择工作区 · / 筛选 · Ctrl+F 路径 · Ctrl+. 隐藏项 · Esc 取消`
+        : `↑↓ 选择 · ←/→ 目录 · Space 多选 · Enter 上传 · / 筛选 · Ctrl+F 路径 · Ctrl+. 隐藏项 · Ctrl+/ 清筛选 · Esc 取消`;
     const footX = this.filterInput ? this.x + 3 + this.filterInput.w : this.x + 2;
     s.text(footX, this.y + this.h - 2, truncate(foot, this.x + this.w - 2 - footX), { fg: T.FAINT, bg: T.BG2 }); if (this.filterInput) this.filterInput.render(s);
   }
