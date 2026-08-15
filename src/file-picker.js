@@ -2,7 +2,8 @@ import { Widget, Input, Popup } from './widgets.js';
 import { truncate } from './text.js';
 import { T } from './theme.js';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { dirname, join, basename } from 'node:path';
+import { dirname, join, basename, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
 
 // nvim-web-devicons/yazi-style Nerd Font glyphs (private-use, one terminal cell).
@@ -27,8 +28,14 @@ function fileKind(path, dir) {
   } catch {}
   return 'file';
 }
-function directoryRows(path) {
-  return readdirSync(path, { withFileTypes: true }).filter((e) => !e.name.startsWith('.')).map((e) => {
+function expandPath(input) {
+  let value = String(input ?? '').trim();
+  value = value.replace(/^~(?=\/|$)/, homedir());
+  value = value.replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (_, a, b) => process.env[a || b] ?? '');
+  return resolve(value);
+}
+function directoryRows(path, hidden = false) {
+  return readdirSync(path, { withFileTypes: true }).filter((e) => hidden || !e.name.startsWith('.')).map((e) => {
     const full = join(path, e.name), dir = e.isDirectory();
     return { name: e.name, path: full, dir, kind: fileKind(full, dir) };
   }).sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name));
@@ -46,11 +53,11 @@ export class UploadPicker extends Widget {
     const w = Math.min(app.screen.w - 4, 120), h = Math.min(app.screen.h - 4, 34);
     super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h });
     this.app = app; this.path = startPath; this.onUpload = onUpload; this.onCancel = onCancel;
-    this.all = []; this.sel = 0; this.selected = new Map(); this.filter = ''; this.filterInput = null;
+    this.all = []; this.sel = 0; this.selected = new Map(); this.filter = ''; this.filterInput = null; this.showHidden = false; this.pathPopup = null; this.imagePreview = null;
     this.load();
   }
   load(selectName = null) {
-    try { this.all = directoryRows(this.path); } catch (e) { this.all = []; this.app.toast(`读取失败: ${e.message}`); }
+    try { this.all = directoryRows(this.path, this.showHidden); } catch (e) { this.all = []; this.app.toast(`读取失败: ${e.message}`); }
     this.sel = selectName ? Math.max(0, this.all.findIndex((x) => x.name === selectName)) : 0;
     this.app.redraw();
   }
@@ -84,12 +91,18 @@ export class UploadPicker extends Widget {
     this.app.focus(this.filterInput);
   }
   editPath() {
-    const input = new Input({ x: this.x + 2, y: this.y + 2, w: this.w - 4, h: 1, prompt: '路径: ', allowEmptyEnter: true, onEnter: (v) => { this.app.renameInput = null; this.app.overlay = this; this.app.focus(this); if (v.trim()) this.changePath(v.trim()); } });
-    input.setValue(this.path); this.app.overlay = new Popup({ x: this.x + 2, y: this.y + 1, w: this.w - 4, h: 5, title: '编辑绝对路径 · Enter 确定 · Esc 取消', lines: [], buttons: [] }); this.app.renameInput = input; this.app.focus(input);
+    const parent = this;
+    const popup = new Popup({ x: this.x + 6, y: this.y + 3, w: this.w - 12, h: 5, title: '编辑路径 · 支持 ~ / $HOME · Enter 确定 · Esc 取消', lines: [], buttons: [] });
+    const input = new Input({ x: popup.x + 2, y: popup.y + 2, w: popup.w - 4, h: 1, prompt: '路径: ', allowEmptyEnter: true, onEnter: (v) => { parent.pathPopup = null; parent.app.overlay = parent; parent.app.focus(parent); if (v.trim()) parent.changePath(expandPath(v)); } });
+    input.setValue(this.path, { select: false });
+    popup.input = input;
+    popup.render = (screen) => { Popup.prototype.render.call(popup, screen); input.render(screen); };
+    popup.onKey = (ev) => { if (ev.type === 'key' && ev.name === 'escape') { parent.pathPopup = null; parent.app.overlay = parent; parent.app.focus(parent); parent.app.redraw(); return true; } return input.onKey(ev); };
+    this.pathPopup = popup; this.app.overlay = popup; this.app.focus(input); this.app.redraw();
   }
   preview(it, width, height) {
     if (!it) return ['（空）'];
-    if (it.dir) { try { return directoryRows(it.path).slice(0, height).map((x) => `${ICON[x.kind]} ${x.name}`); } catch { return ['无法读取目录']; } }
+    if (it.dir) { try { return directoryRows(it.path, this.showHidden).slice(0, height).map((x) => `${ICON[x.kind]} ${x.name}`); } catch { return ['无法读取目录']; } }
     try {
       if (it.kind === 'text') return readFileSync(it.path, 'utf8').split('\n').slice(0, height).map((x) => truncate(x, width));
       if (it.kind === 'pdf') { const text = execFileSync('pdftotext', ['-f', '1', '-l', '2', it.path, '-'], { encoding: 'utf8', timeout: 3000 }); return text.split('\n').filter(Boolean).slice(0, height).map((x) => truncate(x, width)); }
@@ -97,19 +110,35 @@ export class UploadPicker extends Widget {
       if (it.kind === 'image') {
         let info = '';
         try { info = execFileSync('magick', ['identify', '-format', '%m · %wx%h', it.path], { encoding: 'utf8', timeout: 2000 }); } catch {}
-        // chafa is optional; use symbols when available, otherwise detailed metadata.
-        try { const out = execFileSync('chafa', ['--format', 'symbols', '--size', `${Math.max(8, width - 1)}x${Math.max(4, height - 3)}`, it.path], { encoding: 'utf8', timeout: 3000 }); return [info, `${st.size} bytes`, ...out.split('\n').slice(0, height - 2)]; } catch { return [`${ICON.image} ${it.name}`, info || '图片', `${st.size} bytes`, '当前环境无 chafa；选择后可用 Kitty 预览']; }
+        // The right pane reserves cells for a real Kitty placement. Metadata is
+        // still drawn underneath for non-Kitty terminals.
+        this.imagePreview = { path: it.path, key: `${it.path}:${st.mtimeMs}`, width, height: Math.max(4, height - 3), pixelInfo: info };
+        return [info, `${st.size} bytes`, this.app.term?.kitty ? 'Kitty 图片预览' : '终端不支持 Kitty；显示图片信息'];
       }
       return [`${ICON[it.kind]} ${it.name}`, `${st.size} bytes`, '无文本预览'];
     } catch (e) { return [`预览失败: ${e.message}`]; }
   }
   centeredStart(count, height) { return Math.max(0, Math.min(Math.max(0, count - height), this.sel - Math.floor(height / 2))); }
+  kittyTransmit() {
+    const p=this.imagePreview;
+    if(!p||!this.app.term?.kitty)return '';
+    if(this.kittyShownKey===p.key)return '';
+    if(this.kittyId&&this.app.term?.output)this.app.term.output.write(`\x1b_Ga=d,d=i,i=${this.kittyId},q=2\x1b\\`);
+    this.kittyId=Math.floor(Math.random()*2147483646)+1;this.kittyShownKey=p.key;
+    let data;try{data=readFileSync(p.path);if(!/\.png$/i.test(p.path)){const r=spawnSync('magick',['-','png:-'],{input:data,maxBuffer:32*1024*1024});if(r.status===0)data=r.stdout;}}catch{return '';}
+    const b64=data.toString('base64'),chunks=[];for(let i=0;i<b64.length;i+=4096)chunks.push(b64.slice(i,i+4096));
+    const payload=chunks.map((c,i)=>i===0?`\x1b_Ga=t,f=100,i=${this.kittyId},q=2,m=${chunks.length===1?0:1};${c}\x1b\\`:`\x1b_Gm=${i===chunks.length-1?0:1};${c}\x1b\\`).join('');
+    const inner=this.w-4,l=Math.floor(inner*.25),m=Math.floor(inner*.38),x=this.x+5+l+m,y=this.y+4;
+    return payload+`\x1b[${y};${x}H\x1b_Ga=p,i=${this.kittyId},c=${Math.max(4,p.width)},r=${Math.max(3,p.height)},q=2\x1b\\`;
+  }
+  clearKitty(){if(this.kittyId&&this.app.term?.output)this.app.term.output.write(`\x1b_Ga=d,d=i,i=${this.kittyId},q=2\x1b\\`);this.kittyId=null;this.kittyShownKey=null;if(this.app.screen)this.app.screen.prev=null;}
   render(s) {
+    this.imagePreview=null;
     s.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, ' ', { bg: T.BG2 });
     s.box(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, { fg: T.ACCENT, bg: T.BG2 }, `${truncate(this.path, this.w - 22)}  Ctrl+F 编辑路径`);
     const inner = this.w - 4, l = Math.floor(inner * .25), m = Math.floor(inner * .38), r = inner - l - m - 2, y0 = this.y + 1, h = this.h - 3;
     s.vline(this.x + 2 + l, y0, y0 + h - 1, '│', { fg: T.BORDER2, bg: T.BG2 }); s.vline(this.x + 3 + l + m, y0, y0 + h - 1, '│', { fg: T.BORDER2, bg: T.BG2 });
-    let parent = []; try { parent = directoryRows(dirname(this.path)); } catch {}
+    let parent = []; try { parent = directoryRows(dirname(this.path), this.showHidden); } catch {}
     const parentIdx = parent.findIndex((x) => x.path === this.path), parentStart = Math.max(0, Math.min(Math.max(0, parent.length - h), parentIdx - Math.floor(h / 2)));
     parent.slice(parentStart, parentStart + h).forEach((x, i) => { const on = x.path === this.path, y = y0 + i; if (on) s.fillRect(this.x + 1, y, this.x + 1 + l, y, ' ', { bg: T.MENUSEL }); s.text(this.x + 2, y, truncate(`${ICON[x.kind]} ${x.name}`, l - 1), { fg: on ? T.SELFG : T.DIM, bg: on ? T.MENUSEL : T.BG2 }); });
     const its = this.items(), start = this.centeredStart(its.length, h);
@@ -124,10 +153,11 @@ export class UploadPicker extends Widget {
     if (text === '/') { this.startFilter(); return true; }
     if (ev.type !== 'key') return false;
     if (ev.ctrl && ev.key === 'f') { this.editPath(); return true; }
+    if (ev.ctrl && ev.key === '.') { const name=this.current()?.name; this.showHidden=!this.showHidden; this.load(name); this.app.toast(this.showHidden?'已显示隐藏文件':'已隐藏隐藏文件'); return true; }
     if (ev.ctrl && ev.key === '/') { this.filter = ''; this.load(); return true; }
-    if (ev.name === 'escape') { this.onCancel?.(); return true; }
-    if (ev.name === 'up') { this.sel = Math.max(0, this.sel - 1); return true; }
-    if (ev.name === 'down') { this.sel = Math.min(this.items().length - 1, this.sel + 1); return true; }
+    if (ev.name === 'escape') { this.clearKitty(); this.onCancel?.(); return true; }
+    if (ev.name === 'up') { this.clearKitty(); this.sel = Math.max(0, this.sel - 1); return true; }
+    if (ev.name === 'down') { this.clearKitty(); this.sel = Math.min(this.items().length - 1, this.sel + 1); return true; }
     if (ev.name === 'left') { this.goParent(); return true; }
     if (ev.name === 'right') { this.enterDir(); return true; }
     if (ev.name === 'enter') { this.confirmUpload(); return true; }
