@@ -6,6 +6,7 @@ import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
+import { UploadPicker } from "./file-picker.js";
 import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
 export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
 import {
@@ -3516,14 +3517,15 @@ export class App {
   }
 
   showFilePicker() {
-    this.overlay = new FilePicker(this, { startPath: process.cwd(), onPick: (path) => {
-      this.overlay = null;
-      if (IMAGE_EXT.test(path)) {
-        try { const ext = IMAGE_EXT.exec(path)[1].toLowerCase(); const mediaType = MEDIA_TYPES[ext]; const data = readFileSync(path, "base64"); const item = { id: `file-${Date.now()}`, path, local: true, name: path.split("/").pop(), mediaType, data, bytes: Buffer.byteLength(data, "base64") }; this.chat.clipboardImages.push(item); this.chat.attachments.push(item); this.chat.inputChanged(); this.toast(`已添加 ${item.name}`); }
-        catch (e) { this.toast(`文件读取失败: ${e.message}`); }
-      } else this.toast("当前 Host prompt 协议只支持文本和图片；该文件暂不能作为附件发送");
-      this.focus(this.chat.input); this.redraw();
-    }, onCancel: () => { this.overlay = null; this.focus(this.chat.input); this.redraw(); } });
+    const session = this.sessions.find((s) => s.sessionId === this.currentSession);
+    this.overlay = new UploadPicker(this, { startPath: session?.cwd ?? process.cwd(), onUpload: (files) => {
+      let added = 0;
+      for (const file of files) {
+        if (!IMAGE_EXT.test(file.path)) { this.toast(`Host 当前仅接受图片附件；已跳过 ${file.name}`); continue; }
+        try { const ext = IMAGE_EXT.exec(file.path)[1].toLowerCase(); const mediaType = MEDIA_TYPES[ext]; const data = readFileSync(file.path, "base64"); const item = { id: `file-${Date.now()}-${added}`, path:file.path, local:true, name:file.name, mediaType, data, bytes:Buffer.byteLength(data,"base64") }; this.chat.clipboardImages.push(item); this.chat.attachments.push(item); added++; } catch(e){ this.toast(`文件读取失败: ${file.name}: ${e.message}`); }
+      }
+      this.chat.inputChanged(); if (added) this.toast(`已添加 ${added} 个图片附件`);
+    }, onCancel: () => { this.overlay=null; this.focus(this.chat.input); this.redraw(); } });
     this.focus(this.overlay); this.redraw();
   }
 

@@ -6,7 +6,7 @@ import { strWidth, truncate, pad } from "./text.js";
 import { renderMd, C } from "./md.js";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, basename, extname } from "node:path";
+import { join, basename, extname, dirname } from "node:path";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 
 import { T, cycleTheme, themeName } from "./theme.js";
@@ -1328,7 +1328,8 @@ export class ImagePopup extends Popup {
     // non-kitty: try chafa for an in-terminal preview
     if (this.tryChafa()) return;
     this.lines = [
-      [{ t: "终端不支持图形协议；使用「打开查看器」按钮，或安装 chafa 获得字符预览", fg: K.DIM }],
+      [{ t: `${this.ref?.mediaType ?? "image"} · ${this.pixelWidth && this.pixelHeight ? `${this.pixelWidth}×${this.pixelHeight} · ` : ""}${Math.round((this.data?.length ?? 0) / 1024)}KB`, fg: K.TXT }],
+      [{ t: "终端不支持 Kitty 图形协议；Enter 用默认程序打开 · y 复制 · Esc 返回", fg: K.DIM }],
     ];
   }
   tryChafa() {
