@@ -1224,7 +1224,18 @@ export class ImagePopup extends Popup {
   onKey(ev) {
     if (ev.type === "key" && ev.name === "left" && this.refs.length > 1) { this.#show(this.index - 1); return true; }
     if (ev.type === "key" && ev.name === "right" && this.refs.length > 1) { this.#show(this.index + 1); return true; }
+    if (ev.type === "key" && ev.name === "enter") { this.openExternal(); return true; }
+    if (ev.type === "key" && ev.name === "char" && ev.key === "y") { this.copyImage(); return true; }
     return super.onKey(ev);
+  }
+  onMouse(ev) {
+    if (ev.kind === "press" && ev.button === 0) { const now = Date.now(); if (this.lastClickAt && now - this.lastClickAt < 400) { this.openExternal(); this.lastClickAt = 0; } else this.lastClickAt = now; return true; }
+    if (ev.kind === "press" && ev.button === 2) { this.app.openMenu([{ label: "打开系统查看器", action: () => this.openExternal() }, { label: "复制图片", action: () => this.copyImage() }], ev); return true; }
+    return super.onMouse(ev);
+  }
+  copyImage() {
+    try { const child = spawn("wl-copy", ["--type", this.ref?.mediaType ?? "image/png"], { stdio: ["pipe", "ignore", "ignore"] }); child.stdin.end(this.data); this.app.toast("图片已复制到剪贴板"); }
+    catch (e) { this.app.toast(`复制图片失败: ${e.message}`); }
   }
   async load() {
     try {

@@ -105,11 +105,15 @@ console.log("term.js decoder tests:");
 }
 {
   const { events } = harness("\x1b[200~paste me\x1b[201~");
-  check("bracketed paste passes text", events[0], { type: "text", text: "paste me" });
+  check("bracketed paste passes text", events[0], { type: "paste", text: "paste me" });
 }
 {
   const { events } = harness("\x1b[200~paste me\x1b[201~");
-  check("bracketed paste passes text", events[0], { type: "text", text: "paste me" });
+  check("bracketed paste passes text", events[0], { type: "paste", text: "paste me" });
+}
+{
+  const { events } = harness("[<32;68;35M[<0;70;35m[99;5u");
+  check("orphan restart control tails discarded", events.length, 0);
 }
 {
   const { events } = harness("\x1b[97;5u", true);
@@ -202,7 +206,7 @@ setTimeout(() => {
             input2.write("hree\x1b[20");
             input2.write("1~tail");
             setTimeout(() => {
-              check("chunked bracketed paste = one text event", events2[0], { type: "text", text: "line one\nline two\nline three" });
+              check("chunked bracketed paste = one text event", events2[0], { type: "paste", text: "line one\nline two\nline three" });
               check("text after paste parses normally", events2[1], { type: "text", text: "tail" });
               term2.stop();
               stopAll();

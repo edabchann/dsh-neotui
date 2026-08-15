@@ -1270,7 +1270,7 @@ export class ChatView extends Widget {
     try { image = clipboardImageFromWayland(); } catch (e) { this.app.toast(`读取图片剪贴板失败: ${e.message}`); return false; }
     if (!image) { this.app.toast("剪贴板中没有 PNG/JPEG/WebP/GIF 图片"); return false; }
     this.clipboardImages.push(image);
-    this.input.insert(` [图片 ${this.clipboardImages.length}:${image.name}] `);
+    this.input.insert(` [🖼 ${image.name}] `);
     this.app.toast(`已粘贴图片 ${image.name} · ${Math.round(image.bytes / 1024)}KB（Ctrl+Enter/Enter 发送）`);
     // Open the same Kitty-capable preview surface used by transcript images.
     const path = join(tmpdir(), image.name); try { writeFileSync(path, Buffer.from(image.data, "base64")); this.app.openImage({ mediaType: image.mediaType, data: image.data, name: image.name, path }, { all: [{ mediaType: image.mediaType, data: image.data, name: image.name, path }], index: 0 }); } catch {}
@@ -1296,7 +1296,7 @@ export class ChatView extends Widget {
     const clipParts = this.clipboardImages.map(({ mediaType, data, name }) => ({ type: "image", mediaType, data, name }));
     const clipboardCount = clipParts.length;
     // Visual placeholder belongs to the editor only, never to model content.
-    for (const p of parts) if (p.type === "text") p.text = p.text.replace(/\s*\[图片 \d+:clipboard-[^\]]+\]\s*/g, " ");
+    for (const p of parts) if (p.type === "text") p.text = p.text.replace(/\s*\[🖼 clipboard-[^\]]+\]\s*/g, " ");
     parts.push(...clipParts);
     this.app.log(`[chat] prompt → ${this.sessionId.slice(0, 8)}: ${truncate(trimmed, 60)}${images.length + clipboardCount ? ` (+${images.length + clipboardCount} 图)` : ""}`);
     this.app.api.call("session.prompt", {
@@ -2207,7 +2207,7 @@ export class ChatView extends Widget {
   }
 
   onKey(ev) {
-    if (ev.type === "text") {
+    if (ev.type === "text" || ev.type === "paste") {
       this.app.focus(this.input);
       this.input.insert(ev.text);
       return true;
@@ -2758,6 +2758,8 @@ export class App {
     const resumeId = process.env.DSH_TUI_RESUME_SESSION;
     if (resumeId && this.sessions.some((s) => s.sessionId === resumeId)) {
       await this.openSession(resumeId);
+      const scroll = Number(process.env.DSH_TUI_RESUME_SCROLL);
+      if (Number.isFinite(scroll)) { this.chat.view.follow = process.env.DSH_TUI_RESUME_FOLLOW === "1"; this.chat.view.scrollY = this.chat.view.follow ? this.chat.view.maxScroll() : Math.max(0, Math.min(this.chat.view.maxScroll(), scroll)); }
     } else if (!this.currentSession) {
       // Open on a blank session at the launch directory (reusing an existing
       // draft when available) so the blank-session homepage shows immediately
@@ -2935,7 +2937,7 @@ export class App {
   /** Yazi-style folder picker → workspace.create. */
   addWorkspace() {
     this.overlay = new DirPicker(this, {
-      startPath: process.cwd(),
+      startPath: undefined,
       onPick: async (path) => {
         this.overlay = null;
         try {
@@ -3364,7 +3366,7 @@ export class App {
       const argv = process.argv.slice(1);
       // hand the CURRENT session to the new instance so it reopens it instead
       // of minting a fresh blank session (the "strange new session" in 未分组)
-      const env = { ...process.env, DSH_TUI_RESUME_SESSION: this.currentSession ?? "" };
+      const env = { ...process.env, DSH_TUI_RESUME_SESSION: this.currentSession ?? "", DSH_TUI_RESUME_SCROLL: String(this.chat?.view?.scrollY ?? 0), DSH_TUI_RESUME_FOLLOW: this.chat?.view?.follow ? "1" : "0" };
       const child = spawn("sh", ["-c", 'sleep 1; exec "$@"', "sh", ...argv], { detached: true, stdio: "inherit", env });
       child.unref();
     } catch (e) {
@@ -3708,6 +3710,11 @@ export class App {
           // so ordinary Vim muscle memory cannot accidentally stop a long turn.
           this.focus(this.chat);
           this.toast(this.chat.running ? "已退出输入；Ctrl+C 可中断当前回合" : "已退出输入（i 重新进入）");
+        } else if (ev.type === "paste") {
+          // Terminals normally deliver Ctrl+Shift+V as bracketed paste, without
+          // modifier metadata. Probe the image clipboard first; fall back to
+          // the pasted text when it contains no supported image.
+          if (!this.chat.pasteClipboardImage()) this.chat.input.onKey(ev);
         } else if (ev.ctrl && ev.shift && ev.key === "v") {
           if (!this.chat.pasteClipboardImage()) this.chat.input.onKey(ev);
         } else {
@@ -3788,7 +3795,7 @@ export class App {
     }
     // nvim-style normal mode: single chars are shortcuts (chat first, then the
     // focused pane). Multi-char text (paste/IME) still types into the input.
-    if (ev.type === "text" && this.focused !== this.chat.input) {
+    if ((ev.type === "text" || ev.type === "paste") && this.focused !== this.chat.input) {
       if (this.searchActive) {
         this.searchInput.onKey(ev);
         this.#refreshSearch();

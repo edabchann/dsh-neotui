@@ -573,7 +573,7 @@ export class Input extends Widget {
     return true;
   }
   onKey(ev) {
-    if (ev.type === "text") { return this.#paste(ev.text ?? ""); }
+    if (ev.type === "text" || ev.type === "paste") { return this.#paste(ev.text ?? ""); }
     if (ev.type !== "key") return false;
     switch (ev.name) {
       case "backspace":

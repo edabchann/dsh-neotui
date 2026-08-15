@@ -134,12 +134,20 @@ export class Term {
         }
         this.pasteBuf += buf.slice(i, end);
         this.pasting = false;
-        this.#emit({ type: "text", text: this.pasteBuf });
+        this.#emit({ type: "paste", text: this.pasteBuf });
         this.pasteBuf = "";
         i = end + PASTE_END.length;
         continue;
       }
       const ch = buf[i];
+      // Restart handoff recovery: a terminal can split ESC from the remainder
+      // of an SGR mouse/kitty reply while the old process is relinquishing the
+      // tty. The new process must discard these orphaned control tails rather
+      // than insert them as user text.
+      if (ch === "[" && (buf.startsWith("[<", i) || /^\[\d+(?:;\d+)*[uMm]/.test(buf.slice(i)))) {
+        const tail = /^(?:\[<\d+;\d+;\d+[Mm]|\[\d+(?:;\d+)*u)/.exec(buf.slice(i));
+        if (tail) { i += tail[0].length; continue; }
+      }
       if (ch === "\x1b") {
         // escape sequence
         const next = buf[i + 1];
@@ -294,7 +302,7 @@ export class Term {
       if (n === 200) { this.pasting = true; this.pasteBuf = ""; return; } // bracketed paste START
       if (n === 201) { // bracketed paste END (normally consumed by the collector)
         this.pasting = false;
-        if (this.pasteBuf !== "") this.#emit({ type: "text", text: this.pasteBuf });
+        if (this.pasteBuf !== "") this.#emit({ type: "paste", text: this.pasteBuf });
         this.pasteBuf = "";
         return;
       }
