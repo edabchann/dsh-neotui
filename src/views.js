@@ -1077,10 +1077,11 @@ export class ChatView extends Widget {
     const subagent = this.app.projections.subagent;
     let h = goal ? 1 : 0;
     if (subagent) h++;
-    if (!todos || todos.length === 0) return h + (this.todoSeen ? 1 : 0);
+    if (!todos || todos.length === 0) return h + (this.todoSeen ? 2 : 0);
     this.todoSeen = true;
-    // Web parity: folded means a one-row minimized strip, never disappearance.
-    return h + (this.todosVisible ? 7 : 1);
+    // The task dock owns a framed header and footer. Folded keeps the framed
+    // two-row strip visible rather than blending one text row into transcript.
+    return h + (this.todosVisible ? 8 : 2);
   }
 
   inputChanged() {
@@ -1996,26 +1997,37 @@ export class ChatView extends Widget {
     const goal = rawGoal && !["complete", "completed", "cleared"].includes(rawGoal.phase) ? rawGoal : null;
     const subagent = this.app.projections.subagent;
     const y = this.input.y - th - 1;
-    screen.fillRect(this.x, y, this.x + this.w - 1, y + th - 1, " ", { bg: T.THINKBG });
+    screen.fillRect(this.x, y, this.x + this.w - 1, y + th - 1, " ", { bg: T.STATUSBG });
     let row = y;
-    if (goal) screen.text(this.x, row++, ` 🎯 ${goal.phase ?? "active"} · ${truncate(goal.objective ?? "目标", this.w - 18)}${goal.maxGoalRounds ? ` · ${goal.roundsStarted ?? 0}/${goal.maxGoalRounds}轮` : ""}`, { fg: T.WARN, bold: true });
+    if (goal) screen.text(this.x, row++, ` 🎯 ${goal.phase ?? "active"} · ${truncate(goal.objective ?? "目标", this.w - 18)}${goal.maxGoalRounds ? ` · ${goal.roundsStarted ?? 0}/${goal.maxGoalRounds}轮` : ""}`, { fg: T.WARN, bg: T.STATUSBG, bold: true });
     if (subagent) {
       const timing = this.app.projections.subagentTiming;
       const ms = (timing?.settledMs ?? 0) + (timing?.active ? Math.max(0, Date.now() - timing.active.since) : 0);
-      screen.text(this.x, row++, ` 🛰 子代理 · ${subagent.label ?? subagent.mode}${ms ? ` · ${fmtDuration(ms)}` : ""}`, { fg: T.PURPLE, bold: true });
+      screen.text(this.x, row++, ` 🛰 子代理 · ${subagent.label ?? subagent.mode}${ms ? ` · ${fmtDuration(ms)}` : ""}`, { fg: T.PURPLE, bg: T.STATUSBG, bold: true });
     }
+    if (!(todos.length || this.todoSeen)) return;
     const done = todos.filter((t) => t.status === "completed").length;
     const active = todos.filter((t) => t.status === "in_progress").length;
     const progress = todos.length ? ` · ${done}/${todos.length} 完成${active ? ` · ${active} 进行中` : ""}` : "";
-    if (todos.length || this.todoSeen) screen.text(this.x, row, ` ${this.todosVisible ? "▾" : "▸"} 任务清单${progress}（Shift+T ${this.todosVisible ? "最小化" : "展开"}）`, { fg: K.FAINT });
-    if (!this.todosVisible) return;
+    const title = ` ${this.todosVisible ? "▾" : "▸"} TASKS${progress} · Shift+T ${this.todosVisible ? "最小化" : "展开"} `;
+    screen.fillRect(this.x, row, this.x + this.w - 1, y + th - 1, " ", { bg: T.PANEL });
+    screen.hline(this.x, this.x + this.w - 1, row, "─", { fg: T.BORDER2, bg: T.PANEL });
+    screen.text(this.x + 2, row, truncate(title, this.w - 4), { fg: T.ACCENT, bg: T.PANEL, bold: true });
+    if (!this.todosVisible) {
+      screen.hline(this.x, this.x + this.w - 1, row + 1, "─", { fg: T.BORDER2, bg: T.PANEL });
+      return;
+    }
     row++;
-    for (let i = 0; i < Math.min(todos.length, y + th - row); i++) {
+    const bottom = y + th - 1;
+    screen.vline(this.x, row, bottom - 1, "│", { fg: T.BORDER, bg: T.PANEL });
+    screen.vline(this.x + this.w - 1, row, bottom - 1, "│", { fg: T.BORDER, bg: T.PANEL });
+    for (let i = 0; i < Math.min(todos.length, bottom - row); i++) {
       const t = todos[i];
       const icon = t.status === "completed" ? "✓" : t.status === "in_progress" ? "◉" : "○";
       const color = t.status === "completed" ? T.FAINT : t.status === "in_progress" ? T.WARN : T.DIM;
-      screen.text(this.x + 2, row + i, `${icon} ${truncate(t.content ?? String(t), this.w - 6)}`, { fg: color });
+      screen.text(this.x + 2, row + i, `${icon} ${truncate(t.content ?? String(t), this.w - 6)}`, { fg: color, bg: T.PANEL, bold: t.status === "in_progress" });
     }
+    screen.hline(this.x, this.x + this.w - 1, bottom, "─", { fg: T.BORDER2, bg: T.PANEL });
   }
 
   onMouse(ev) {

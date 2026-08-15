@@ -1602,19 +1602,30 @@ test("the todo box freezes its height once todos appear (no idle reflow)", () =>
   const chat = app.chat;
   assert.equal(chat.todoHeight(), 0, "empty before any todos");
   app.projections.todos = [{ content: "a", status: "in_progress" }];
-  assert.equal(chat.todoHeight(), 7, "fixed max once seen");
+  assert.equal(chat.todoHeight(), 8, "fixed framed max once seen");
   app.projections.todos = [
     { content: "a", status: "completed" },
     { content: "b", status: "in_progress" },
     { content: "c", status: "in_progress" },
   ];
-  assert.equal(chat.todoHeight(), 7, "still 7 while the list changes");
+  assert.equal(chat.todoHeight(), 8, "still 8 while the list changes");
   app.projections.todos = [];
-  assert.equal(chat.todoHeight(), 1, "empty list keeps a minimized strip after first appearance");
+  assert.equal(chat.todoHeight(), 2, "empty list keeps a framed minimized strip after first appearance");
   app.projections.todos = [{ content: "a", status: "in_progress" }];
   chat.todosVisible = false;
-  assert.equal(chat.todoHeight(), 1, "Shift+T minimizes instead of hiding it");
+  assert.equal(chat.todoHeight(), 2, "Shift+T minimizes to a framed strip instead of hiding it");
   assert.equal(app.footerHeight(), 3, "footer always 3 rows (no job-driven reflow)");
+});
+
+test("task dock is visually framed and distinct from transcript text", () => {
+  const app = headlessApp();
+  app.projections.todos = [{ content: "fix the timer", status: "in_progress" }];
+  app.layout(); app.chat.render(app.screen);
+  const rows = app.screen.cells.map((row) => row.map((cell) => cell.ch || " ").join(""));
+  const header = rows.findIndex((row) => row.includes("TASKS"));
+  assert.ok(header >= 0, "task dock has an explicit section heading");
+  assert.ok(rows[header].includes("─"), "heading sits on a divider");
+  assert.ok(rows.slice(header + 1).some((row) => row.includes("│") && row.includes("fix the timer")), "task items live inside framed dock");
 });
 
 test("completed goal does not keep the bottom goal dock resident", () => {
