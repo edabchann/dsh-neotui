@@ -2050,7 +2050,7 @@ export class ChatView extends Widget {
 
   #renderAttachments(screen) {
     if (!this.attachments.length) return;
-    const text = this.attachments.map((a) => `${a.mediaType?.startsWith("image/") ? "▣" : "◇"} ${a.name}`).join("  ·  ");
+    const text = this.attachments.map((a) => `${a.mediaType?.startsWith("image/") ? "󰋩" : "󰈔"} ${a.name}`).join("  ·  ");
     const y = Math.max(this.view.y, this.input.y - 1);
     screen.fillRect(this.x, y, this.x + this.w - 1, y, " ", { bg: T.BG2 });
     screen.text(this.x + 1, y, truncate(text, Math.max(1, this.w - 25)), { fg: T.PURPLE, bg: T.BG2, bold: true });
