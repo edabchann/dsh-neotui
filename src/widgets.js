@@ -258,6 +258,7 @@ export class Input extends Widget {
     this.app = opts.app ?? null;
     this.pendingPaste = null;          // large-paste stage 1: held-back clipboard text
     this.pasteMark = null;             // code-point span of the immutable "[已复制…]" token
+    this.atomicMarks = [];             // other immutable spans, e.g. staged attachments
     this.selStart = null;              // drag-selection [start, end) code-point span
     this.selEnd = null;
     this.commands = opts.commands ?? []; // / command candidates: [{name, desc}]
@@ -332,6 +333,16 @@ export class Input extends Widget {
     this.#updateCmds();
     this.onChange?.();
   }
+  insertAtomic(text, id = null) {
+    const at = this.selectAll ? 0 : this.cursor;
+    this.insert(text);
+    this.atomicMarks.push({ start: at, end: at + Array.from(text).length, id });
+    this.#snapCursor(1);
+  }
+  removeAtomic(id) {
+    const m = this.atomicMarks.find((x) => x.id === id); if (!m) return false;
+    this.#edit(m.start, m.end, ""); return true;
+  }
   insert(text) {
     const at = this.selectAll ? 0 : this.cursor;
     if (this.selectAll) {
@@ -365,6 +376,9 @@ export class Input extends Widget {
     this.selStart = this.selEnd = null; // edits consume the selection
     const cps = this.#cps();
     const t = Array.from(text);
+    const atomic = this.atomicMarks.find((x) => to > x.start && from < x.end);
+    if (atomic) { from = Math.min(from, atomic.start); to = Math.max(to, atomic.end); this.atomicMarks = this.atomicMarks.filter((x) => x !== atomic); }
+    for (const mark of this.atomicMarks) { if (to <= mark.start) { const delta = Array.from(text).length - (to - from); mark.start += delta; mark.end += delta; } }
     const m = this.pasteMark;
     if (m && to > m.start && from < m.end) {
       // the edit touches the token: apply it over the whole token span
@@ -532,7 +546,8 @@ export class Input extends Widget {
    *  hops to its end, and clicks/moves snap to the nearest boundary.
    *  dir: -1 = leftward movement → start, +1 = rightward → end, 0 = nearest. */
   #snapCursor(dir = 0) {
-    const m = this.pasteMark;
+    const marks = [...this.atomicMarks, ...(this.pasteMark ? [this.pasteMark] : [])];
+    const m = marks.find((x) => this.cursor > x.start && this.cursor < x.end);
     if (!m) return;
     if (this.cursor > m.start && this.cursor < m.end) {
       if (dir < 0) this.cursor = m.start;

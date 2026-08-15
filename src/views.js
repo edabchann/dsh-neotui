@@ -10,7 +10,7 @@ import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefa
 export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
-  modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker, FilePicker,
+  modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker, FilePicker, AttachmentPanel,
   ImagePopup, kittyCapable, buildGoalPopup, GoalPanel, SettingsPanel, SubagentPanel,
   SkillsPanel, ControlPanel, JobsPanel, QueuePanel, ModelPanel, fmtMs,
 } from "./panels.js";
@@ -942,6 +942,7 @@ export class ChatView extends Widget {
     this.selFocus = null;
     this.selectionMode = "character";
     this.clipboardImages = [];
+    this.attachments = [];
     this.stepState = { step: null }; // step/start tracking for the mux merge path
   }
 
@@ -1116,11 +1117,11 @@ export class ChatView extends Widget {
   inputChanged() {
     // Multi-line input grew/shrunk → reflow view vs input, keep the tail visible.
     // Every fixed bottom surface must be deducted from the transcript viewport.
-    const th = this.todoHeight(), dh = this.divingHeight();
-    const ih = Math.min(this.input.height(), Math.max(1, this.h - th - dh - 2));
+    const th = this.todoHeight(), dh = this.divingHeight(), ah = this.attachments.length ? 1 : 0;
+    const ih = Math.min(this.input.height(), Math.max(1, this.h - th - dh - ah - 2));
     const prevIh = this.input.h;
     this.input.h = ih;
-    this.view.h = Math.max(1, this.h - ih - th - dh - 1);
+    this.view.h = Math.max(1, this.h - ih - th - dh - ah - 1);
     this.input.y = this.y + this.h - ih;
     if (ih !== prevIh) this.app.layout();
     this.app.redraw();
@@ -1128,10 +1129,10 @@ export class ChatView extends Widget {
 
   resize(x, y, w, h) {
     this.x = x; this.y = y; this.w = w; this.h = h;
-    const th = this.todoHeight(), dh = this.divingHeight();
-    const ih = Math.min(this.input.height(), Math.max(1, h - th - dh - 2));
+    const th = this.todoHeight(), dh = this.divingHeight(), ah = this.attachments.length ? 1 : 0;
+    const ih = Math.min(this.input.height(), Math.max(1, h - th - dh - ah - 2));
     this.input.h = ih;
-    this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = Math.max(1, h - ih - th - dh - 1);
+    this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = Math.max(1, h - ih - th - dh - ah - 1);
     this.input.x = x; this.input.y = y + h - ih; this.input.w = w;
     this.cache.clear();
     this.#rebuild();
@@ -1173,19 +1174,23 @@ export class ChatView extends Widget {
   }
 
   async loadOlder(onDone = null) {
-    if (!this.hasMore || this.loadingOlder || this.minSeq == null) { if (onDone) queueMicrotask(onDone); return; }
+    if (!this.hasMore || this.loadingOlder || this.minSeq == null) { if (!this.hasMore) this.app.toast("已加载到会话开头"); if (onDone) queueMicrotask(onDone); return; }
     const sessionId = this.sessionId;
     const epoch = this.app.sessionEpoch;
     this.loadingOlder = true;
+    const oldTop = this.view.scrollY;
+    const oldLength = this.lines.length;
     this.app.setStatus("加载更早记录…");
     try {
       const hist = await this.app.api.call("session.history", { sessionId, beforeSeq: this.minSeq, maxMessages: 20 });
       if (this.sessionId !== sessionId || this.app.sessionEpoch !== epoch) { this.loadingOlder = false; return; }
       if (hist.events.length === 0) { this.hasMore = false; }
       else {
-        const before = this.lines.length;
+        const previousMinSeq = this.minSeq;
         this.minSeq = hist.events[0]?.event?.seq ?? this.minSeq;
-        this.hasMore = hist.hasMore;
+        // A malformed/stale page that does not move the cursor must not leave
+        // the UI claiming that more history can be loaded forever.
+        this.hasMore = hist.hasMore && this.minSeq < previousMinSeq;
         this.#noteEarliest(hist.events);
         const more = nodeForEvents(hist.events, this.app.log);
         this.nodes = [...more, ...this.nodes];
@@ -1195,6 +1200,11 @@ export class ChatView extends Widget {
     }
     this.loadingOlder = false;
     this.#rebuild();
+    // Prepending history must preserve the previously visible logical row.
+    // Without this compensation the viewport remains at numeric row 0 and the
+    // newly loaded page appears not to load at all.
+    const addedLines = Math.max(0, this.lines.length - oldLength);
+    if (addedLines > 0) { this.view.follow = false; this.view.anchorLock = null; this.view.scrollY = Math.min(this.view.maxScroll(), oldTop + addedLines); }
     // Always break the history-load Promise continuation before navigation.
     // This also prevents a synchronous API test double from building an
     // unbounded PromiseRejectCallback chain.
@@ -1275,8 +1285,11 @@ export class ChatView extends Widget {
     let image;
     try { image = clipboardImageFromWayland(); } catch (e) { this.app.toast(`读取图片剪贴板失败: ${e.message}`); return false; }
     if (!image) { this.app.toast("剪贴板中没有 PNG/JPEG/WebP/GIF 图片"); return false; }
+    image.id = `clip-${Date.now()}-${this.attachments.length}`;
+    image.local = false;
     this.clipboardImages.push(image);
-    this.input.insert(` [🖼 ${image.name}] `);
+    this.attachments.push(image);
+    this.input.insertAtomic(` [🖼 ${image.name}] `, image.id);
     this.app.toast(`已粘贴图片 ${image.name} · ${Math.round(image.bytes / 1024)}KB（Enter 发送）`);
     // Open the same Kitty-capable preview surface used by transcript images.
     const ref = { mediaType: image.mediaType, data: image.data, name: image.name };
@@ -1313,6 +1326,7 @@ export class ChatView extends Widget {
       clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     }).then((res) => {
       this.clipboardImages = [];
+      this.attachments = [];
       if (res.command?.text) this.app.toast(res.command.text);
     }).catch((e) => this.app.toast(`发送失败: ${e.message}`));
   }
@@ -2032,8 +2046,18 @@ export class ChatView extends Widget {
       }
     }
     this.#renderTodos(screen);
+    this.#renderAttachments(screen);
     this.input.render(screen);
     this.#renderCmdBar(screen);
+  }
+
+  #renderAttachments(screen) {
+    if (!this.attachments.length) return;
+    const text = this.attachments.map((a) => `${a.mediaType?.startsWith("image/") ? "🖼" : "📎"} ${a.name}`).join("  ·  ");
+    const y = Math.max(this.view.y, this.input.y - 1);
+    screen.fillRect(this.x, y, this.x + this.w - 1, y, " ", { bg: T.BG2 });
+    screen.text(this.x + 1, y, truncate(text, Math.max(1, this.w - 25)), { fg: T.PURPLE, bg: T.BG2, bold: true });
+    screen.text(Math.max(this.x + 1, this.x + this.w - 22), y, "Ctrl+O 附件管理器", { fg: K.FAINT, bg: T.BG2 });
   }
 
   /** / command candidate bar above the input (↑/↓ cycle, Tab completes). */
@@ -2126,7 +2150,7 @@ export class ChatView extends Widget {
         const id = this.welcomeModes[ev.y];
         if (id) { this.app.selectPreset(id); return true; }
       }
-      if (ev.kind === "wheel-up" && this.view.scrollY === 0 && this.hasMore) { this.loadOlder(); return true; }
+      if (ev.kind === "wheel-up" && this.view.scrollY <= 3 && this.hasMore) { void this.loadOlder(); return true; }
       if (ev.kind === "press" && ev.button === 0) {
         this.pressY = ev.y - this.view.y + this.view.scrollY;
         // LOCK the hit identity at press time: the stream keeps growing
@@ -2225,7 +2249,10 @@ export class ChatView extends Widget {
     switch (ev.name) {
       case "up": return this.view.scroll(-3);
       case "down": return this.view.scroll(3);
-      case "pgup": if (this.view.scrollY === 0) { this.loadOlder(); return true; } return this.view.scroll(-this.view.h);
+      case "pgup": {
+        if (this.view.scrollY <= this.view.h) { void this.loadOlder(); return true; }
+        return this.view.scroll(-this.view.h);
+      }
       case "pgdn": return this.view.scroll(this.view.h);
     }
     if (ev.name === "char" && ev.key === "g" && !ev.ctrl && !ev.alt && !ev.shift) {
@@ -3725,6 +3752,8 @@ export class App {
           // so ordinary Vim muscle memory cannot accidentally stop a long turn.
           this.focus(this.chat);
           this.toast(this.chat.running ? "已退出输入；Ctrl+C 可中断当前回合" : "已退出输入（i 重新进入）");
+        } else if (ev.ctrl && ev.key === "o" && this.chat.attachments.length) {
+          this.overlay = new AttachmentPanel(this); this.focus(this.overlay);
         } else if (ev.ctrl && ev.key === "o") {
           this.overlay = new FilePicker(this, { startPath: process.cwd(), onPick: (path) => { this.overlay = null; if (IMAGE_EXT.test(path)) this.chat.input.insert(` @${path} `); else this.toast("当前 Host prompt 协议只支持文本和图片；该文件暂不能作为附件发送"); this.redraw(); }, onCancel: () => { this.overlay = null; this.redraw(); } });
         } else if (ev.ctrl && ev.shift && ev.key === "v") {
