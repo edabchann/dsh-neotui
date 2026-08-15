@@ -2,8 +2,7 @@
 import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
 import { truncate, strWidth, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth } from "./text.js";
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
@@ -1271,9 +1270,11 @@ export class ChatView extends Widget {
     if (!image) { this.app.toast("剪贴板中没有 PNG/JPEG/WebP/GIF 图片"); return false; }
     this.clipboardImages.push(image);
     this.input.insert(` [🖼 ${image.name}] `);
-    this.app.toast(`已粘贴图片 ${image.name} · ${Math.round(image.bytes / 1024)}KB（Ctrl+Enter/Enter 发送）`);
-    // Open the same Kitty-capable preview surface used by transcript images.
-    const path = join(tmpdir(), image.name); try { writeFileSync(path, Buffer.from(image.data, "base64")); this.app.openImage({ mediaType: image.mediaType, data: image.data, name: image.name, path }, { all: [{ mediaType: image.mediaType, data: image.data, name: image.name, path }], index: 0 }); } catch {}
+    this.app.toast(`已粘贴图片 ${image.name} · ${Math.round(image.bytes / 1024)}KB（Enter 发送；发送后点图片预览）`);
+    // Keep the compose-time image staged and represented by a stable token.
+    // Do not open/transmit a Kitty popup from inside the paste input callback:
+    // several terminal emulators reject graphics writes while resolving their
+    // own bracketed-paste promise, producing PromiseRejectCall recursion.
     return true;
   }
 

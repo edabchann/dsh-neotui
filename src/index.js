@@ -4,6 +4,7 @@ import { Term, detectKitty } from "./term.js";
 import { Screen } from "./screen.js";
 import { Api } from "./api.js";
 import { App } from "./views.js";
+import { mkdirSync, appendFileSync } from "node:fs";
 
 /**
  * Launch the interactive TUI over the current stdin/stdout.
@@ -35,6 +36,15 @@ export function launchTui(opts = {}) {
   term.start();
   process.on("SIGINT", () => app.stop());
   process.on("SIGTERM", () => app.stop());
+  const crashLog = (kind, value) => {
+    try {
+      const root = process.env.DSH_HOME ?? `${process.env.HOME ?? "."}/.dsh`;
+      mkdirSync(root, { recursive: true });
+      appendFileSync(`${root}/tui-error.log`, `${new Date().toISOString()} ${kind}\n${value?.stack ?? value}\n`);
+    } catch {}
+  };
+  process.on("unhandledRejection", (reason) => crashLog("unhandledRejection", reason));
+  process.on("uncaughtExceptionMonitor", (error) => crashLog("uncaughtException", error));
   (async () => {
     try {
       if (opts.getBase) api.base = await opts.getBase();
