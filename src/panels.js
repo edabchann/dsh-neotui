@@ -639,7 +639,7 @@ export class AttachmentPanel extends Widget {
   close(){this.app.overlay=null;this.app.focus(this.app.chat.input);this.app.chat.inputChanged();this.app.redraw();}
   openItem(external=false){const a=this.items()[this.sel];if(!a)return;if(external){if(!a.path){this.app.toast("这不是本地文件，无法用默认程序定位");return;}try{const cmd=process.platform==="darwin"?"open":"xdg-open";spawn(cmd,[a.path],{detached:true,stdio:"ignore"}).unref();}catch(e){this.app.toast(`打开失败: ${e.message}`);}return;}if(a.mediaType?.startsWith("image/"))this.app.openImage(a,{all:this.items(),index:this.sel,returnTo:this});else this.app.toast(a.path?`文件: ${a.path}`:"这不是本地文件");}
   remove(){const a=this.items()[this.sel];if(!a)return;this.app.chat.attachments.splice(this.sel,1);this.app.chat.clipboardImages=this.app.chat.clipboardImages.filter(x=>x.id!==a.id);this.sel=Math.max(0,Math.min(this.sel,this.items().length-1));this.app.chat.inputChanged();this.app.redraw();}
-  render(s){s.fillRect(this.x,this.y,this.x+this.w-1,this.y+this.h-1," ",{bg:T.BG2});s.box(this.x,this.y,this.x+this.w-1,this.y+this.h-1,{fg:K.ACCENT,bg:T.BG2},"附件管理器");const items=this.items();for(let i=0;i<Math.min(items.length,this.h-3);i++){const a=items[i],on=i===this.sel,y=this.y+1+i;s.fillRect(this.x+1,y,this.x+this.w-2,y," ",{bg:on?T.MENUSEL:T.BG2});s.text(this.x+2,y,truncate(`${a.mediaType?.startsWith("image/")?"🖼":"📎"} ${a.name}`,this.w-6),{fg:on?T.SELFG:K.TXT,bg:on?T.MENUSEL:T.BG2});}if(!items.length)s.text(this.x+2,this.y+2,"暂无附件",{fg:K.FAINT,bg:T.BG2});s.text(this.x+2,this.y+this.h-1,"Enter 查看 · Shift+Enter/双击 默认程序 · dd 移除 · Esc 退出",{fg:K.FAINT,bg:T.BG2});}
+  render(s){s.fillRect(this.x,this.y,this.x+this.w-1,this.y+this.h-1," ",{bg:T.BG2});s.box(this.x,this.y,this.x+this.w-1,this.y+this.h-1,{fg:K.ACCENT,bg:T.BG2},"附件管理器");const items=this.items();for(let i=0;i<Math.min(items.length,this.h-3);i++){const a=items[i],on=i===this.sel,y=this.y+1+i;s.fillRect(this.x+1,y,this.x+this.w-2,y," ",{bg:on?T.MENUSEL:T.BG2});s.text(this.x+2,y,truncate(`${a.mediaType?.startsWith("image/")?"▣":"◇"} ${a.name}`,this.w-6),{fg:on?T.SELFG:K.TXT,bg:on?T.MENUSEL:T.BG2});}if(!items.length)s.text(this.x+2,this.y+2,"暂无附件",{fg:K.FAINT,bg:T.BG2});s.text(this.x+2,this.y+this.h-1,"Enter 查看 · Shift+Enter/双击 默认程序 · dd 移除 · Esc 退出",{fg:K.FAINT,bg:T.BG2});}
   onKey(ev){if(ev.type!=="key")return false;if(ev.name==="escape"){this.close();return true;}if(ev.name==="up"||(ev.name==="char"&&ev.key==="k")){this.sel=Math.max(0,this.sel-1);return true;}if(ev.name==="down"||(ev.name==="char"&&ev.key==="j")){this.sel=Math.min(this.items().length-1,this.sel+1);return true;}if(ev.name==="enter"){this.openItem(!!ev.shift);return true;}if(ev.name==="char"&&ev.key==="d"){if(this.dArmed){this.dArmed=false;this.remove();}else{this.dArmed=true;this.app.toast("再按 d 删除附件");}return true;}this.dArmed=false;return false;}
   onMouse(ev){if(ev.kind==="press"&&ev.button===0){const i=ev.y-this.y-1;if(i>=0&&i<this.items().length){const now=Date.now();this.sel=i;if(this.lastClick&&now-this.lastClick<400)this.openItem(true);this.lastClick=now;}return true;}return false;}
 }
@@ -1211,7 +1211,7 @@ export class ImagePopup extends Popup {
     const w = Math.min(80, app.screen.w - 4), h = Math.min(24, app.screen.h - 4);
     super({
       x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2),
-      w, h, title: `🖼 ${truncate(ref?.name ?? "image", 50)}`,
+      w, h, title: `▣ ${truncate(ref?.name ?? "image", 50)}`,
       lines: [[{ t: "加载中…", fg: K.DIM }]],
       buttons: [],
       onAction: () => this.closePreview(),
@@ -1255,7 +1255,7 @@ export class ImagePopup extends Popup {
   galleryTitle() {
     const nm = this.ref?.name ?? "image";
     const dims = this.ref?.width ? ` · ${this.ref.width}×${this.ref.height}` : "";
-    return `🖼 ${truncate(nm, 40)}${this.refs.length > 1 ? ` (${this.index + 1}/${this.refs.length})` : ""}${dims}`;
+    return `▣ ${truncate(nm, 40)}${this.refs.length > 1 ? ` (${this.index + 1}/${this.refs.length})` : ""}${dims}`;
   }
   onKey(ev) {
     if (ev.type === "key" && ev.name === "left" && this.refs.length > 1) { this.#show(this.index - 1); return true; }

@@ -81,7 +81,7 @@ function parseInline(text, base = {}) {
       const m = /^!\[([^\]]*)\]\(([^)\s]+)\)/.exec(text.slice(i));
       if (m) {
         flush();
-        push(`🖼 ${m[1] || "image"}`, { fg: C.img, link: m[2] });
+        push(`▣ ${m[1] || "image"}`, { fg: C.img, link: m[2] });
         i += m[0].length;
         continue;
       }

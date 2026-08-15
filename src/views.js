@@ -1682,7 +1682,7 @@ export class ChatView extends Widget {
           if (node.images) {
             for (let ii = 0; ii < node.images.length; ii++) {
               const img = node.images[ii];
-              lines.push([{ t: "  🖼 " + truncate(img.name ?? img.attachmentId ?? "image", w - 12) + (img.width ? ` (${img.width}×${img.height})` : "") + " — 点击查看", fg: T.PURPLE }]);
+              lines.push([{ t: "  ▣ " + truncate(img.name ?? img.attachmentId ?? "image", w - 12) + (img.width ? ` (${img.width}×${img.height})` : "") + " — 点击查看", fg: T.PURPLE }]);
               markImg(realIdx, ii);
             }
           }
@@ -1916,7 +1916,7 @@ export class ChatView extends Widget {
             for (let ii = 0; ii < node.images.length; ii++) {
               const img = node.images[ii];
               beginCard("CARD");
-              lines.push([{ t: "  🖼 " + truncate(img.name ?? img.attachmentId ?? "image", w - 12) + (img.width ? ` (${img.width}×${img.height})` : "") + " — 点击查看", fg: T.PURPLE }]);
+              lines.push([{ t: "  ▣ " + truncate(img.name ?? img.attachmentId ?? "image", w - 12) + (img.width ? ` (${img.width}×${img.height})` : "") + " — 点击查看", fg: T.PURPLE }]);
               markImg(realIdx, ii);
               sep();
             }
@@ -2049,7 +2049,7 @@ export class ChatView extends Widget {
 
   #renderAttachments(screen) {
     if (!this.attachments.length) return;
-    const text = this.attachments.map((a) => `${a.mediaType?.startsWith("image/") ? "🖼" : "📎"} ${a.name}`).join("  ·  ");
+    const text = this.attachments.map((a) => `${a.mediaType?.startsWith("image/") ? "▣" : "◇"} ${a.name}`).join("  ·  ");
     const y = Math.max(this.view.y, this.input.y - 1);
     screen.fillRect(this.x, y, this.x + this.w - 1, y, " ", { bg: T.BG2 });
     screen.text(this.x + 1, y, truncate(text, Math.max(1, this.w - 25)), { fg: T.PURPLE, bg: T.BG2, bold: true });
