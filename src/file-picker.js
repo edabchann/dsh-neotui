@@ -87,7 +87,7 @@ export class UploadPicker extends Widget {
     this.app.focus(this.app.overlay);
   }
   startFilter() {
-    this.filterInput = new Input({ x: this.x + 2, y: this.y + this.h - 2, w: this.w - 4, h: 1, prompt: '/', onChange: () => { if (this.filterInput) { this.filter = this.filterInput.value; this.sel = 0; this.app.redraw(); } }, onEnter: (value) => { this.filter = value; this.filterInput = null; this.sel = Math.min(this.sel, Math.max(0, this.items().length - 1)); this.app.focus(this); this.app.redraw(); } });
+    this.filterInput = new Input({ x: this.x + 2, y: this.y + this.h - 2, w: Math.min(38, Math.max(18, Math.floor(this.w * .35))), h: 1, prompt: '/', onChange: () => { if (this.filterInput) { this.filter = this.filterInput.value; this.sel = 0; this.app.redraw(); } }, onEnter: (value) => { this.filter = value; this.filterInput = null; this.sel = Math.min(this.sel, Math.max(0, this.items().length - 1)); this.app.focus(this); this.app.redraw(); } });
     this.app.focus(this.filterInput);
   }
   editPath() {
@@ -144,7 +144,11 @@ export class UploadPicker extends Widget {
     const its = this.items(), start = this.centeredStart(its.length, h);
     its.slice(start, start + h).forEach((x, i) => { const idx = start + i, on = idx === this.sel, chosen = this.selected.has(x.path), y = y0 + i; s.fillRect(this.x + 3 + l, y, this.x + 2 + l + m, y, ' ', { bg: on ? T.MENUSEL : T.BG2 }); s.text(this.x + 4 + l, y, truncate(`${chosen ? '->' : '  '} ${ICON[x.kind]} ${x.name}`, m - 2), { fg: on ? T.SELFG : chosen ? T.OK : T.TXT, bg: on ? T.MENUSEL : T.BG2 }); });
     this.preview(this.current(), r - 2, h).forEach((x, i) => s.text(this.x + 5 + l + m, y0 + i, truncate(x, r - 2), { fg: T.DIM, bg: T.BG2 }));
-    const foot = this.filterInput ? `/${this.filterInput.value}` : '↑↓ 选择 · ←→ 目录 · Space 多选 · Enter 上传 · / 筛选 · Esc 取消'; s.text(this.x + 2, this.y + this.h - 2, truncate(foot, this.w - 4), { fg: T.FAINT, bg: T.BG2 }); if (this.filterInput) this.filterInput.render(s);
+    const foot = this.filterInput
+      ? `筛选中 · Ctrl+/ 清除并退出 · Enter 固定结果 · ←/→ 切换目录`
+      : `↑↓ 选择 · ←/→ 目录 · Space 多选 · Enter 上传 · / 筛选 · Ctrl+F 路径 · Ctrl+. 隐藏项 · Ctrl+/ 清筛选 · Esc 取消`;
+    const footX = this.filterInput ? this.x + 3 + this.filterInput.w : this.x + 2;
+    s.text(footX, this.y + this.h - 2, truncate(foot, this.x + this.w - 2 - footX), { fg: T.FAINT, bg: T.BG2 }); if (this.filterInput) this.filterInput.render(s);
   }
   onKey(ev) {
     if (this.filterInput) {
