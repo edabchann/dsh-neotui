@@ -51,8 +51,7 @@ export class Term {
     o.write("\x1b[?25l");   // hide cursor (shown only over the focused input)
     o.write("\x1b[5 q");    // DECSCUSR: blinking vertical bar caret
     o.write("\x1b[?1000h"); // mouse: clicks
-    o.write("\x1b[?1002h"); // mouse: drag
-    o.write("\x1b[?1003h"); // mouse: all motion
+    o.write("\x1b[?1002h"); // mouse: drag (not all-motion; terminal Shift-drag stays available for native selection)
     o.write("\x1b[?1006h"); // SGR extended coordinates
     o.write("\x1b[?2004h"); // bracketed paste
     o.write("\x1b[?7l");    // no autowrap (we clip ourselves)
@@ -66,7 +65,7 @@ export class Term {
     if (!this.started) return;
     this.started = false;
     const o = this.output;
-    o.write("\x1b[?7h\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0 q\x1b[?1049l");
+    o.write("\x1b[?7h\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0 q\x1b[?1049l");
     if (this.kitty) o.write("\x1b[<u");
     process.off("SIGWINCH", this.resizeHandler);
     this.input.off("data", this.dataHandler);

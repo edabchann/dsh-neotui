@@ -1077,10 +1077,8 @@ export class ChatView extends Widget {
    *  the count reflows the whole layout every time (the idle 2-line shifts). */
   todoHeight() {
     const todos = this.app.todos;
-    const rawGoal = this.app.goalData?.goal ?? this.app.goalData;
-    const goal = rawGoal && !["complete", "completed", "cleared"].includes(rawGoal.phase) ? rawGoal : null;
     const subagent = this.app.projections.subagent;
-    let h = goal ? 1 : 0;
+    let h = 0;
     if (subagent) h++;
     if (!todos || todos.length === 0) return h + (this.todoSeen ? 2 : 0);
     this.todoSeen = true;
@@ -2008,13 +2006,10 @@ export class ChatView extends Widget {
     const th = this.todoHeight();
     if (th === 0) return;
     const todos = this.app.todos ?? [];
-    const rawGoal = this.app.goalData?.goal ?? this.app.goalData;
-    const goal = rawGoal && !["complete", "completed", "cleared"].includes(rawGoal.phase) ? rawGoal : null;
     const subagent = this.app.projections.subagent;
     const y = this.input.y - th - 1;
     screen.fillRect(this.x, y, this.x + this.w - 1, y + th - 1, " ", { bg: T.STATUSBG });
     let row = y;
-    if (goal) screen.text(this.x, row++, ` 🎯 ${goal.phase ?? "active"} · ${truncate(goal.objective ?? "目标", this.w - 18)}${goal.maxGoalRounds ? ` · ${goal.roundsStarted ?? 0}/${goal.maxGoalRounds}轮` : ""}`, { fg: T.WARN, bg: T.STATUSBG, bold: true });
     if (subagent) {
       const timing = this.app.projections.subagentTiming;
       const ms = (timing?.settledMs ?? 0) + (timing?.active ? Math.max(0, Date.now() - timing.active.since) : 0);
@@ -2038,8 +2033,10 @@ export class ChatView extends Widget {
     }
     row++;
     const bottom = y + th - 1;
-    screen.vline(this.x, row, bottom - 1, "│", { fg: T.BORDER, bg: T.PANEL });
-    screen.vline(this.x + this.w - 1, row, bottom - 1, "│", { fg: T.BORDER, bg: T.PANEL });
+    // Match code-card geometry: ASCII verticals are reliably one terminal cell
+    // even under ambiguous-width CJK fonts; rounded Unicode stays at corners.
+    screen.vline(this.x, row, bottom - 1, "|", { fg: T.BORDER, bg: T.PANEL });
+    screen.vline(this.x + this.w - 1, row, bottom - 1, "|", { fg: T.BORDER, bg: T.PANEL });
     for (let i = 0; i < Math.min(todos.length, bottom - row); i++) {
       const t = todos[i];
       const icon = t.status === "completed" ? "✓" : t.status === "in_progress" ? "◉" : "○";
@@ -2082,7 +2079,9 @@ export class ChatView extends Widget {
       }
       if (ev.kind === "drag" && ev.button === 0 && this.pressY !== null) {
         const y = ev.y - this.view.y + this.view.scrollY;
-        if (Math.abs(y - this.pressY) >= 1) {
+        if (Math.abs(y - this.pressY) >= 1 || Math.abs(ev.x - (this.pressX ?? ev.x)) >= 1) {
+          // Selection remains line-oriented, but horizontal motion on one line
+          // must still enter selection mode instead of toggling that block.
           this.selStart = Math.min(this.pressY, y);
           this.selEnd = Math.max(this.pressY, y);
           this.app.redraw();
@@ -2181,9 +2180,16 @@ export class ChatView extends Widget {
     }
     if (ev.name === "char" && ev.key === "t" && !ev.ctrl && !ev.alt) {
       if (ev.shift) {
+        const wasPinned = this.view.follow || this.view.scrollY >= this.view.maxScroll();
+        const oldMax = this.view.maxScroll();
         this.todosVisible = !this.todosVisible;
         this.app.toast(this.todosVisible ? "任务块：已展开（Shift+T 最小化）" : "任务块：已最小化（Shift+T 展开）");
         this.inputChanged();
+        // Re-anchor immediately: tail readers stay at the tail; readers higher
+        // in history keep the same visible transcript row without a manual nudge.
+        if (wasPinned) { this.view.scrollY = this.view.maxScroll(); this.view.follow = true; }
+        else this.view.scrollY = Math.max(0, Math.min(this.view.maxScroll(), this.view.scrollY + (this.view.maxScroll() - oldMax)));
+        this.app.redraw();
         return true;
       }
       this.thinkMode = this.thinkMode === "collapsed" ? "expanded" : "collapsed";
@@ -2812,6 +2818,7 @@ export class App {
       { label: "复制会话 ID", action: () => this.copyText(s.sessionId) },
       { label: "分叉会话", action: () => this.forkSession(s) },
       { label: "导出日志 (zip)", action: () => this.exportSession(s) },
+      { label: "归档会话…", action: () => this.archiveSession(s) },
       { label: "新建会话", action: () => this.newSession() },
     ], ev);
   }
@@ -2903,6 +2910,15 @@ export class App {
     this.renameInput = null;
     this.focus(this.chat);
     this.redraw();
+  }
+
+  archiveSession(session) {
+    this.closeOverlay();
+    const popup = new Popup({ x: Math.max(1, Math.floor(this.screen.w / 2) - 30), y: Math.max(1, Math.floor(this.screen.h / 2) - 3), w: Math.min(60, this.screen.w - 2), h: 7, title: "归档会话", lines: [[{ t: " 会话将从工作区和未分组列表隐藏；日志不会删除。", fg: T.TXT }]], buttons: [{ label: "取消", action: "cancel" }, { label: "确认归档", action: "archive" }], onAction: (btn) => {
+      if (btn.action !== "archive") { this.closeOverlay(); return; }
+      this.api.call("workspace.archiveSession", { sessionId: session.sessionId }).then(() => { this.closeOverlay(); this.toast("会话已归档"); this.refreshSessions(); }).catch((e) => this.toast(`归档失败: ${e.message}`));
+    } });
+    this.overlay = popup; this.focus(popup); this.redraw();
   }
 
   deleteWorkspace(group) {
@@ -3866,6 +3882,10 @@ export class App {
     const badge = perm && preset ? `${permName(perm)}/${modeName(preset)}`
       : perm ? permName(perm) : preset ? modeName(preset) : "未选会话";
     row0.left.push({ t: ` ${badge} `, fg: T.SELFG, bg: T.ACCENT, bold: true });
+    const rawGoal = this.goalData?.goal ?? this.goalData;
+    if (rawGoal && !["complete", "completed", "cleared"].includes(rawGoal.phase)) {
+      row0.left.push({ t: ` 🎯 ${truncate(rawGoal.objective ?? "目标", 14)} · Ctrl+G `, fg: T.SELFG, bg: T.WARN, bold: true });
+    }
     if (this.queueItems.length) row0.left.push({ t: ` ⏳队列 ${this.queueItems.length} (Ctrl+U) `, fg: T.SELFG, bg: T.WARN, bold: true });
     if (this.sidebarVisible) row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });
     else row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });

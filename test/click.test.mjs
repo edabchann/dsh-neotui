@@ -349,6 +349,15 @@ test("the sidebar divider drags to resize the session pane", () => {
   assert.equal(app.focused, app.chat, "click routing restored after the drag");
 });
 
+test("session archive requires confirmation and calls workspace API", async () => {
+  const app = headlessApp(); const calls = [];
+  app.api.call = async (method, payload) => { calls.push([method, payload]); return { archivedSessionIds: ["s"] }; };
+  app.archiveSession({ sessionId: "s" });
+  assert.ok(app.overlay?.title?.includes("归档")); app.overlay.onAction({ action: "archive" });
+  await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(calls[0], ["workspace.archiveSession", { sessionId: "s" }]);
+});
+
 test("workspace deletion requires confirmation and preserves files by contract", async () => {
   const app = headlessApp();
   const calls = []; app.api.call = async (method, payload) => { calls.push([method, payload]); return { deleted: true }; };
@@ -418,6 +427,15 @@ test("the full paste reflows the input layout (no status-bar overlap)", () => {
   chat.input.onKey({ type: "text", text: big });  // stage 2 full content
   assert.equal(chat.input.h, 6, "input grew to the 6-line cap");
   assert.equal(chat.view.h + chat.input.h + chat.todoHeight() + 1, chat.h, "layout rows add up (no overlap into the footer)");
+});
+
+test("single-line horizontal drag selects transcript instead of toggling block", () => {
+  const { app, chat } = render([{ kind: "user", text: "select this line", id: "u" }]);
+  chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y: chat.view.y });
+  chat.onMouse({ type: "mouse", kind: "drag", button: 0, x: 12, y: chat.view.y });
+  assert.notEqual(chat.selStart, null);
+  chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 12, y: chat.view.y });
+  assert.equal(typeof app.copied, "string", "horizontal drag completed the selection/copy path");
 });
 
 test("the input supports drag-selection and Ctrl+Shift+C copy", () => {
@@ -1640,6 +1658,15 @@ test("fixed bottom docks reduce transcript viewport and keep its tail reachable"
   assert.equal(app.chat.view.scrollY, Math.max(0, app.chat.view.lines.length - app.chat.view.h));
 });
 
+test("Shift+T immediately reanchors a pinned transcript tail", () => {
+  const app = headlessApp(); const chat = app.chat;
+  app.projections.todos = [{ content: "task", status: "in_progress" }]; chat.todoSeen = true;
+  chat.view.lines = Array.from({ length: 60 }, (_, i) => [{ t: `line ${i}` }]); app.layout();
+  chat.view.scrollY = chat.view.maxScroll(); chat.view.follow = true;
+  chat.onKey({ type: "key", name: "char", key: "t", shift: true, ctrl: false, alt: false });
+  assert.equal(chat.view.scrollY, chat.view.maxScroll(), "tail moved with dock in same key event");
+});
+
 test("task dock is visually framed and distinct from transcript text", () => {
   const app = headlessApp();
   app.projections.todos = [{ content: "fix the timer", status: "in_progress" }];
@@ -1648,7 +1675,7 @@ test("task dock is visually framed and distinct from transcript text", () => {
   const header = rows.findIndex((row) => row.includes("TASKS"));
   assert.ok(header >= 0, "task dock has an explicit section heading");
   assert.ok(rows[header].includes("─"), "heading sits on a divider");
-  assert.ok(rows.slice(header + 1).some((row) => row.includes("│") && row.includes("fix the timer")), "task items live inside framed dock");
+  assert.ok(rows.slice(header + 1).some((row) => row.includes("|") && row.includes("fix the timer")), "task items live inside framed dock");
 });
 
 test("completed goal does not keep the bottom goal dock resident", () => {
@@ -1656,10 +1683,10 @@ test("completed goal does not keep the bottom goal dock resident", () => {
   app.projections.goal = { goal: { id: "g", revision: 2, objective: "done", phase: "completed" } };
   assert.equal(app.chat.todoHeight(), 0);
   app.projections.goal.goal.phase = "active";
-  assert.equal(app.chat.todoHeight(), 1);
+  assert.equal(app.chat.todoHeight(), 0, "active goal lives in footer summary, not bottom dock");
 });
 
-test("footer avoids duplicate goal/subagent highlight chips", () => {
+test("footer shows one compact goal summary and no subagent duplicate", () => {
   const app = headlessApp();
   app.projections.goal = { goal: { id: "g", revision: 1, objective: "ship it", phase: "active" } };
   app.projections.subagent = { label: "worker", mode: "continuable" };
@@ -1667,7 +1694,8 @@ test("footer avoids duplicate goal/subagent highlight chips", () => {
   app.renderFrame();
   const row0 = [...(app.status.rows[0]?.left ?? []), ...(app.status.rows[0]?.right ?? [])].map((s) => s.t).join(" ");
   const row2 = [...(app.status.rows[2]?.left ?? []), ...(app.status.rows[2]?.right ?? [])].map((s) => s.t).join(" ");
-  assert.ok(!row0.includes("ship it") && !row0.includes("worker"), row0);
+  assert.ok(row0.includes("ship it") && row0.includes("Ctrl+G") && !row0.includes("worker"), row0);
+  assert.equal((row0.match(/ship it/g) ?? []).length, 1, "one compact goal summary");
   assert.ok(row2.includes("worker") && row2.includes("任务/子代理"), row2);
 });
 

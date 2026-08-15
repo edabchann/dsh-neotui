@@ -223,6 +223,52 @@ export function buildPermissionPicker(app) {
   });
 }
 
+export class PresetPanel extends Popup {
+  constructor(app) {
+    const w = Math.min(92, app.screen.w - 4), h = Math.min(28, app.screen.h - 4);
+    super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h, title: "Agent 预设管理", lines: [], buttons: [], scrollable: true });
+    this.app = app; this.items = []; this.sel = 0; this.detail = null; this.meta = {}; this.load();
+  }
+  async load() {
+    try { const r = await this.app.api.call("agentPreset.list"); this.items = (r.presets ?? []).filter((p) => !p.broken); this.meta = r; await this.read(); }
+    catch (e) { this.lines = [[{ t: `加载失败: ${e.message}`, fg: K.ERR }]]; }
+    this.app.redraw();
+  }
+  async read() {
+    const item = this.items[this.sel]; if (!item) { this.lines = [[{ t: "没有预设", fg: K.FAINT }]]; return; }
+    try { this.detail = await this.app.api.call("agentPreset.read", { agentPreset: item.id }); }
+    catch (e) { this.detail = { content: `读取失败: ${e.message}` }; }
+    this.rebuild();
+  }
+  rebuild() {
+    const item = this.items[this.sel], detail = this.detail; if (!item) return;
+    this.title = `Agent 预设管理 · ${item.id}`;
+    this.lines = [[{ t: " ↑↓选择 · Enter刷新 · c复制 · o打开目录 · x删除用户预设 · Esc关闭", fg: K.DIM }], [{ t: ` ${item.id} · ${detail?.trust ?? item.trust ?? "?"}${item.isDefault ? " · 默认" : ""}`, fg: K.ACCENT, bold: true }], [{ t: ` ${detail?.description ?? item.description ?? ""}`, fg: K.FAINT }], [{ t: "" }], ...String(detail?.content ?? "").split("\n").map((line) => [{ t: " " + truncate(line, this.w - 4), fg: K.TXT }])];
+  }
+  #copy() {
+    if (!this.meta.authorable) { this.app.toast("当前部署不允许创建用户预设"); return; }
+    const from = this.items[this.sel]?.id;
+    const edit = new EditPopup(this.app, { title: `复制 ${from}`, value: `${from}-copy`, placeholder: "新预设 id", onCommit: async (id) => { this.app.overlay = this; try { await this.app.api.call("agentPreset.copy", { from, agentPreset: id.trim(), name: id.trim() }); this.app.toast("预设已复制"); await this.load(); } catch (e) { this.app.toast(`复制失败: ${e.message}`); } } });
+    this.app.overlay = edit; this.app.focus(edit.input); this.app.redraw();
+  }
+  async #open() { const id = this.items[this.sel]?.id; try { const r = await this.app.api.call("agentPreset.openDocument", { agentPreset: id }); this.app.toast(r.opened ? "已打开预设目录" : `预设目录: ${r.path}`); } catch (e) { this.app.toast(`打开失败: ${e.message}`); } }
+  #remove() {
+    const item = this.items[this.sel]; if (!item || item.trust === "system" || this.detail?.trust === "system") { this.app.toast("内置预设只读，不能删除"); return; }
+    const confirm = new Popup({ x: this.x + 8, y: this.y + 5, w: Math.max(28, this.w - 16), h: 7, title: "删除用户预设", lines: [[{ t: ` 确认删除 ${item.id}？`, fg: K.WARN }]], buttons: [{ label: "取消", action: "cancel" }, { label: "确认删除", action: "delete" }], onAction: async (btn) => { this.app.overlay = this; if (btn.action === "delete") { try { await this.app.api.call("agentPreset.remove", { agentPreset: item.id }); this.app.toast("预设已删除"); this.sel = Math.max(0, this.sel - 1); await this.load(); } catch (e) { this.app.toast(`删除失败: ${e.message}`); } } this.app.redraw(); } }); this.app.overlay = confirm; this.app.redraw();
+  }
+  onKey(ev) {
+    if (ev.type !== "key") return false;
+    if (ev.name === "escape") { this.app.closeOverlay(); return true; }
+    if (ev.name === "up" || (ev.name === "char" && ev.key === "k")) { this.sel = Math.max(0, this.sel - 1); this.read(); return true; }
+    if (ev.name === "down" || (ev.name === "char" && ev.key === "j")) { this.sel = Math.min(this.items.length - 1, this.sel + 1); this.read(); return true; }
+    if (ev.name === "enter") { this.read(); return true; }
+    if (ev.name === "char" && ev.key === "c") { this.#copy(); return true; }
+    if (ev.name === "char" && ev.key === "o") { this.#open(); return true; }
+    if (ev.name === "char" && ev.key === "x") { this.#remove(); return true; }
+    return super.onKey(ev);
+  }
+}
+
 // ---- Command palette ----
 
 export function buildCommandPalette(app) {
@@ -235,12 +281,14 @@ export function buildCommandPalette(app) {
     { label: "重命名当前会话", action: () => app.renameCurrent(), keywords: "rename title" },
     { label: "切换模型", hint: "m", action: () => { app.overlay = buildModelPicker(app); app.redraw(); }, keywords: "model provider llm" },
     { label: "模式（Agent 预设）", action: () => app.showModePicker(), keywords: "mode preset standard code minimal cordis" },
+    { label: "管理 Agent 预设", action: () => { app.overlay = new PresetPanel(app); app.redraw(); }, keywords: "preset inspect copy edit delete" },
     { label: "权限（沙箱 + 审批）", action: () => app.showPermissionPicker(), keywords: "permission sandbox read-only write full access" },
     { label: "工作区文件", hint: "w", action: () => app.setMode("workspace"), keywords: "workspace files tree" },
     { label: "轨迹视图", hint: "t", action: () => app.setMode("trajectory"), keywords: "trajectory timeline trace" },
     { label: "任务列表", hint: "j", action: () => app.showJobs(), keywords: "jobs tasks" },
     { label: "目标状态", hint: "g", action: () => app.showGoal(), keywords: "goal objective" },
     { label: "刷新会话列表", action: () => app.refreshSessions(), keywords: "refresh reload" },
+    { label: "打开原始配置文件", action: async () => { try { const r = await app.api.call("settings.openDocument"); app.toast(r.opened ? "已在系统编辑器打开配置" : `配置文件: ${r.path}`); } catch (e) { app.toast(`打开配置失败: ${e.message}`); } }, keywords: "settings config raw document" },
     { label: "切换主题", action: () => { cycleTheme(); app.toast(`主题: ${themeName()}`); }, keywords: "theme color" },
     { label: "复制当前会话 ID", action: () => app.copyText(app.currentSession ?? ""), keywords: "copy id" },
     { label: "退出", hint: "q", action: () => app.stop(), keywords: "quit exit" },
@@ -479,7 +527,17 @@ export class DirPicker extends Widget {
     this.sel = 0;
     this.scroll = 0;
   }
-  #items() { return ["✓ 选择此目录", "..", ...this.entries]; }
+  #items() { return ["✓ 选择此目录", "+ 新建子目录…", "..", ...this.entries]; }
+  #createDirectory() {
+    const popup = new EditPopup(this.app, { title: `在 ${truncate(this.path, 38)} 新建目录`, value: "", placeholder: "目录名", onCommit: async (name) => {
+      this.app.overlay = this;
+      if (!name.trim() || name.includes("/") || name.includes("\\")) { this.app.toast("请输入不含路径分隔符的目录名"); return; }
+      try { await this.app.api.call("host.createDirectory", { path: this.path, name: name.trim() }); this.load(); this.app.toast(`已创建 ${name.trim()}`); }
+      catch (e) { this.app.toast(`创建目录失败: ${e.message}`); }
+      this.app.redraw();
+    } });
+    this.app.overlay = popup; this.app.focus(popup.input); this.app.redraw();
+  }
   render(screen) {
     screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.BG2 });
     screen.box(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, { fg: K.ACCENT, bg: T.BG2 }, "选择文件夹");
@@ -495,8 +553,8 @@ export class DirPicker extends Widget {
       const y = this.y + 2 + i;
       if (it === undefined) { screen.hline(this.x + 1, this.x + this.w - 2, y, " ", { bg: T.BG2 }); continue; }
       const sel = idx === this.sel;
-      const label = it === "✓ 选择此目录" ? it : it === ".." ? ".. （上级目录）" : "▸ " + it + "/";
-      const fg = it === "✓ 选择此目录" ? K.OK : it === ".." ? K.DIM : K.TXT;
+      const label = it === "✓ 选择此目录" ? it : it === "+ 新建子目录…" ? it : it === ".." ? ".. （上级目录）" : "▸ " + it + "/";
+      const fg = it === "✓ 选择此目录" ? K.OK : it === "+ 新建子目录…" ? K.ACCENT : it === ".." ? K.DIM : K.TXT;
       screen.fillRect(this.x + 1, y, this.x + this.w - 2, y, " ", { bg: sel ? T.MENUSEL : T.BG2 });
       screen.text(this.x + 2, y, truncate(label, this.w - 4), { fg: sel ? 0xffffff : fg, bg: sel ? T.MENUSEL : T.BG2, attrs: sel ? 1 : 0 });
     }
@@ -511,6 +569,7 @@ export class DirPicker extends Widget {
       case "enter": {
         const it = items[this.sel];
         if (it === "✓ 选择此目录") { this.onPick?.(this.path); return true; }
+        if (it === "+ 新建子目录…") { this.#createDirectory(); return true; }
         if (it === "..") { this.path = dirname(this.path); this.load(); return true; }
         this.path = join(this.path, it); this.load(); return true;
       }
@@ -521,7 +580,8 @@ export class DirPicker extends Widget {
         if (ev.key === "h" && !ev.ctrl) { this.path = dirname(this.path); this.load(); return true; }
         if (ev.key === "l" && !ev.ctrl) {
           const it = items[this.sel];
-          if (it && it !== "✓ 选择此目录" && it !== "..") { this.path = join(this.path, it); this.load(); }
+          if (it === "+ 新建子目录…") this.#createDirectory();
+          else if (it && it !== "✓ 选择此目录" && it !== "..") { this.path = join(this.path, it); this.load(); }
           return true;
         }
         return false;
@@ -536,6 +596,7 @@ export class DirPicker extends Widget {
       if (idx >= 0 && idx < items.length) {
         const it = items[idx];
         if (it === "✓ 选择此目录") { this.onPick?.(this.path); return true; }
+        if (it === "+ 新建子目录…") { this.#createDirectory(); return true; }
         if (it === "..") { this.path = dirname(this.path); this.load(); return true; }
         this.path = join(this.path, it); this.load(); return true;
       }
@@ -2218,6 +2279,7 @@ export class ModelPanel extends Widget {
     // way through credentials.set under the profile's reference
     const keyRef = this.#keyRef(route);
     items.push({ kind: "key", key: "apiKeyEnv", label: "API 密钥", ref: keyRef, action: () => this.#editKey(route, keyRef) });
+    if (this.keyStatus?.[keyRef]?.configured) items.push({ kind: "button", label: "清除 API 密钥…", action: () => this.#clearKey(keyRef) });
     // models are NOT flat here: one 模型管理 entry summarizing the first
     // five, which opens its own sub-buffer (scan on top, model form below)
     const models = p.models ?? [];
@@ -2371,6 +2433,16 @@ export class ModelPanel extends Widget {
    *  (the stored value is never read back), a non-empty commit travels one way
    *  through credentials.set under the profile's reference, an empty commit
    *  keeps the existing key. */
+  #clearKey(ref) {
+    const confirm = new Popup({ x: Math.max(1, Math.floor(this.app.screen.w / 2) - 28), y: Math.max(1, Math.floor(this.app.screen.h / 2) - 3), w: Math.min(56, this.app.screen.w - 2), h: 7, title: "清除 API 密钥", lines: [[{ t: ` 确认从凭据存储中清除 ${ref}？`, fg: K.WARN }]], buttons: [{ label: "取消", action: "cancel" }, { label: "确认清除", action: "clear" }], onAction: async (btn) => {
+      this.app.overlay = this;
+      if (btn.action !== "clear") { this.app.redraw(); return; }
+      try { await this.app.api.call("credentials.unset", { ref }); this.app.toast(`已清除 ${ref}`); await this.#refreshKeys(); this.#rebuild(); }
+      catch (e) { this.app.toast(`清除密钥失败: ${e.message}`); }
+      this.app.redraw();
+    } });
+    this.app.overlay = confirm; this.app.redraw();
+  }
   #editKey(route, ref) {
     if (!KEY_REF_OK.test(ref)) {
       this.app.toast(`路由名 "${route}" 无法派生合法的密钥引用名,请先把路由名改成字母数字(如 my-gateway)`);
