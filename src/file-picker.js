@@ -87,7 +87,7 @@ export class UploadPicker extends Widget {
     this.app.focus(this.app.overlay);
   }
   startFilter() {
-    this.filterInput = new Input({ x: this.x + 2, y: this.y + this.h - 2, w: this.w - 4, h: 1, prompt: '/', onChange: () => { this.filter = this.filterInput.value; this.sel = 0; this.app.redraw(); }, onEnter: () => { this.filter = this.filterInput.value; this.filterInput = null; this.app.focus(this); this.app.redraw(); } });
+    this.filterInput = new Input({ x: this.x + 2, y: this.y + this.h - 2, w: this.w - 4, h: 1, prompt: '/', onChange: () => { if (this.filterInput) { this.filter = this.filterInput.value; this.sel = 0; this.app.redraw(); } }, onEnter: (value) => { this.filter = value; this.filterInput = null; this.sel = Math.min(this.sel, Math.max(0, this.items().length - 1)); this.app.focus(this); this.app.redraw(); } });
     this.app.focus(this.filterInput);
   }
   editPath() {
@@ -147,14 +147,19 @@ export class UploadPicker extends Widget {
     const foot = this.filterInput ? `/${this.filterInput.value}` : '↑↓ 选择 · ←→ 目录 · Space 多选 · Enter 上传 · / 筛选 · Esc 取消'; s.text(this.x + 2, this.y + this.h - 2, truncate(foot, this.w - 4), { fg: T.FAINT, bg: T.BG2 }); if (this.filterInput) this.filterInput.render(s);
   }
   onKey(ev) {
-    if (this.filterInput) { if (ev.type === 'key' && ev.ctrl && ev.key === '/') { this.filterInput = null; this.filter = ''; this.app.focus(this); return true; } return this.filterInput.onKey(ev); }
+    if (this.filterInput) {
+      if (ev.type === 'key' && ev.ctrl && (ev.key === '/' || ev.key === '_')) { this.filterInput = null; this.filter = ''; this.sel = 0; this.app.focus(this); this.app.redraw(); return true; }
+      if (ev.type === 'key' && ev.name === 'left') { this.filter = this.filterInput.value; this.filterInput = null; this.app.focus(this); this.goParent(); return true; }
+      if (ev.type === 'key' && ev.name === 'right') { this.filter = this.filterInput.value; this.filterInput = null; this.app.focus(this); this.enterDir(); return true; }
+      return this.filterInput.onKey(ev);
+    }
     const text = ev.type === 'text' ? ev.text : null;
     if (text === ' ') { this.toggle(); return true; }
     if (text === '/') { this.startFilter(); return true; }
     if (ev.type !== 'key') return false;
     if (ev.ctrl && ev.key === 'f') { this.editPath(); return true; }
     if (ev.ctrl && ev.key === '.') { const name=this.current()?.name; this.showHidden=!this.showHidden; this.load(name); this.app.toast(this.showHidden?'已显示隐藏文件':'已隐藏隐藏文件'); return true; }
-    if (ev.ctrl && ev.key === '/') { this.filter = ''; this.load(); return true; }
+    if (ev.ctrl && (ev.key === '/' || ev.key === '_')) { this.filter = ''; this.load(); return true; }
     if (ev.name === 'escape') { this.clearKitty(); this.onCancel?.(); return true; }
     if (ev.name === 'up') { this.clearKitty(); this.sel = Math.max(0, this.sel - 1); return true; }
     if (ev.name === 'down') { this.clearKitty(); this.sel = Math.min(this.items().length - 1, this.sel + 1); return true; }
