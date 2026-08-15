@@ -46,7 +46,7 @@ function toolNode(over = {}) {
 // (Tests pin bashMode to "expanded" — the shipped default is "collapsed" —
 // except the all-collapsed-mode tests, which override it explicitly.)
 function render(nodes) {
-  const app = fakeApp();
+  const app = fakeApp(); app.sessions = [];
   const chat = new ChatView({ app, x: 0, y: 1, w: 80, h: 24 });
   chat.nodes = nodes;
   chat.bashMode = "expanded";
@@ -347,6 +347,17 @@ test("the sidebar divider drags to resize the session pane", () => {
   // widened pane) routes to the chat
   app.onEvent({ type: "mouse", kind: "press", button: 0, x: 70, y: 10, ctrl: false, shift: false, alt: false, motion: false });
   assert.equal(app.focused, app.chat, "click routing restored after the drag");
+});
+
+test("workspace deletion requires confirmation and preserves files by contract", async () => {
+  const app = headlessApp();
+  const calls = []; app.api.call = async (method, payload) => { calls.push([method, payload]); return { deleted: true }; };
+  app.deleteWorkspace({ workspaceId: "ws1", title: "demo" });
+  assert.ok(app.overlay?.title?.includes("删除工作区"));
+  assert.ok(app.overlay.lines.flat().some((part) => part.t?.includes("文件和会话日志不会删除")));
+  app.overlay.onAction({ action: "delete" });
+  await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(calls[0], ["workspace.delete", { workspaceId: "ws1" }]);
 });
 
 test("sidebar excludes subagent child sessions from 未分组", () => {
@@ -732,8 +743,9 @@ test("the global deep-diving timer exists before any tool call", () => {
   ]);
   chat.running = true;
   chat.queueRebuild(); chat.flushRebuild();
-  const text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
-  assert.ok(text.includes("Deep diving · 已经进行"), text);
+  const screen = new Screen(80, 24); chat.resize(0, 0, 80, 23); chat.render(screen);
+  const text = screen.cells.map((row) => row.map((cell) => cell.ch || " ").join("")).join("\n");
+  assert.ok(text.replace(/\s+/g, "").includes("Deepdiving·已经进行"), text);
   assert.ok(!text.includes("总耗时"), "not finalized yet");
 });
 
@@ -1092,9 +1104,11 @@ test("finalized think blocks keep their start time and turns carry their total",
   assert.equal(assistant.turnMs, 8000, "turn duration attached to the final reply");
   assert.equal(progress.endedAt - progress.startedAt, 8000, "global turn timer froze at turn/end");
   const { chat } = render(nodes);
-  const text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
-  assert.ok(text.includes("已完成,耗时 7秒"), text);
-  assert.ok(text.includes("Deep diving · 总耗时 8秒"), "global turn trailer rendered");
+  const lineText = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
+  const screen = new Screen(80, 24); chat.resize(0, 0, 80, 23); chat.render(screen);
+  const dockText = screen.cells.map((row) => row.map((cell) => cell.ch || " ").join("")).join("\n");
+  assert.ok(lineText.includes("已完成,耗时 7秒"), lineText);
+  assert.ok(dockText.replace(/\s+/g, "").includes("Deepdiving·总耗时8秒"), "global turn status fixed at transcript bottom");
 });
 
 test("a tool result with a mismatched callId still lands via the fallback", () => {
@@ -1615,6 +1629,15 @@ test("the todo box freezes its height once todos appear (no idle reflow)", () =>
   chat.todosVisible = false;
   assert.equal(chat.todoHeight(), 2, "Shift+T minimizes to a framed strip instead of hiding it");
   assert.equal(app.footerHeight(), 3, "footer always 3 rows (no job-driven reflow)");
+});
+
+test("fixed bottom docks reduce transcript viewport and keep its tail reachable", () => {
+  const app = headlessApp(); app.chat.nodes = [{ kind: "turn-progress", startedAt: Date.now(), streaming: true }];
+  app.projections.todos = [{ content: "task", status: "in_progress" }];
+  app.chat.todoSeen = true; app.layout();
+  assert.equal(app.chat.view.y + app.chat.view.h, app.chat.input.y - app.chat.todoHeight() - app.chat.divingHeight() - 1);
+  app.chat.view.scrollY = app.chat.view.maxScroll();
+  assert.equal(app.chat.view.scrollY, Math.max(0, app.chat.view.lines.length - app.chat.view.h));
 });
 
 test("task dock is visually framed and distinct from transcript text", () => {

@@ -809,7 +809,10 @@ class SidebarTree extends Widget {
           { label: "折叠全部", action: () => { this.collapseAll(); this.app.redraw(); } },
           { label: "展开全部", action: () => { this.expandAll(); this.app.redraw(); } },
         ];
-        if (row.group.workspaceId) items.push({ label: "重命名工作区", action: () => this.app.renameWorkspace(row.group) });
+        if (row.group.workspaceId) {
+          items.push({ label: "重命名工作区", action: () => this.app.renameWorkspace(row.group) });
+          items.push({ label: "删除工作区…", action: () => this.app.deleteWorkspace(row.group) });
+        }
         this.app.openMenu(items, ev);
       } else {
         this.app.sessionMenu({ data: row.session }, ev);
@@ -940,10 +943,12 @@ export class ChatView extends Widget {
    *  full-window re-derivation uses, so a lone reasoning-delta appends to the
    *  existing block instead of wiping it (the old "shows then deleted" bug). */
   mergeEvents(entries) {
+    const beforeDiving = this.divingHeight();
     for (const { event, view } of entries) {
       applyEvent(this.nodes, event, view, this.app.log, this.stepState);
     }
     this.running = this.nodes.some((n) => (n.kind === "assistant" || n.kind === "turn-progress") && n.streaming);
+    if (beforeDiving !== this.divingHeight()) this.inputChanged();
     this.queueRebuild();
   }
 
@@ -1084,15 +1089,17 @@ export class ChatView extends Widget {
     return h + (this.todosVisible ? 8 : 2);
   }
 
+  divingNode() { return [...this.nodes].reverse().find((node) => node.kind === "turn-progress") ?? null; }
+  divingHeight() { return this.divingNode() ? 1 : 0; }
+
   inputChanged() {
     // Multi-line input grew/shrunk → reflow view vs input, keep the tail visible.
-    // The expanded (Ctrl+L) input may claim the whole window: clamp so the
-    // scroll view keeps at least one row.
-    const th = this.todoHeight();
-    const ih = Math.min(this.input.height(), Math.max(1, this.h - th - 2));
+    // Every fixed bottom surface must be deducted from the transcript viewport.
+    const th = this.todoHeight(), dh = this.divingHeight();
+    const ih = Math.min(this.input.height(), Math.max(1, this.h - th - dh - 2));
     const prevIh = this.input.h;
     this.input.h = ih;
-    this.view.h = this.h - ih - th - 1;
+    this.view.h = Math.max(1, this.h - ih - th - dh - 1);
     this.input.y = this.y + this.h - ih;
     if (ih !== prevIh) this.app.layout();
     this.app.redraw();
@@ -1100,10 +1107,10 @@ export class ChatView extends Widget {
 
   resize(x, y, w, h) {
     this.x = x; this.y = y; this.w = w; this.h = h;
-    const th = this.todoHeight();
-    const ih = Math.min(this.input.height(), Math.max(1, h - th - 2));
+    const th = this.todoHeight(), dh = this.divingHeight();
+    const ih = Math.min(this.input.height(), Math.max(1, h - th - dh - 2));
     this.input.h = ih;
-    this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = h - ih - th - 1;
+    this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = Math.max(1, h - ih - th - dh - 1);
     this.input.x = x; this.input.y = y + h - ih; this.input.w = w;
     this.cache.clear();
     this.#rebuild();
@@ -1136,6 +1143,7 @@ export class ChatView extends Widget {
     } catch (e) {
       this.nodes = [{ kind: "system", text: `加载失败: ${e.message}` }];
     }
+    this.inputChanged();
     this.#rebuild();
     // Jump to the LIVE tail (the newest content) on open — the view would
     // otherwise sit at the top showing the oldest turns.
@@ -1560,11 +1568,7 @@ export class ChatView extends Widget {
         switch (node.kind) {
         case "title": lines.push([{ t: "✦ " + truncate(node.text, w - 4), fg: K.DIM, italic: true }]); mark(realIdx); break;
         case "system": lines.push([{ t: truncate(node.text, w - 2), fg: K.WARN }]); mark(realIdx); break;
-        case "turn-progress": {
-          const elapsed = (node.endedAt ?? Date.now()) - node.startedAt;
-          lines.push([{ t: node.streaming ? `  ◷ Deep diving · 已经进行 ${fmtDuration(elapsed)}` : node.incomplete ? "  ◷ Deep diving · 上一回合计时已恢复" : `  ◷ Deep diving · 总耗时 ${fmtDuration(elapsed)}`, fg: node.streaming ? T.WARN : K.DIM, bold: node.streaming }]);
-          mark(realIdx); break;
-        }
+        case "turn-progress": break; // rendered as a fixed transcript-bottom status row
         case "retry": lines.push([{ t: `  ↻ ${node.status === "started" ? "正在重试" : `准备重试${node.delayMs ? `（${fmtDuration(node.delayMs)} 后）` : ""}`}：${truncate(node.text, w - 20)}`, fg: K.WARN, bold: node.status === "started" }]); mark(realIdx); break;
         case "command": lines.push([{ t: `  ${node.status === "running" ? "…" : node.status === "error" ? "✗" : "✓"} ${node.text}${node.detail ? ` — ${truncate(node.detail, w - strWidth(node.text) - 10)}` : ""}`, fg: node.status === "error" ? K.ERR : node.status === "success" ? K.OK : K.DIM }]); mark(realIdx); break;
         case "steering": lines.push([{ t: "  ↪ 已追加到当前回合 > ", fg: K.ACCENT, bold: true }, { t: truncate(node.text, w - 22), fg: K.TXT }]); mark(realIdx); break;
@@ -1960,6 +1964,7 @@ export class ChatView extends Widget {
       }
     }
     this.view.render(screen);
+    this.#renderDiving(screen);
     if (this.selStart !== null && this.selEnd !== null) {
       const y0 = Math.max(this.view.scrollY, this.selStart);
       const y1 = Math.min(this.view.scrollY + this.view.h - 1, this.selEnd);
@@ -1988,6 +1993,16 @@ export class ChatView extends Widget {
     }
   }
 
+  #renderDiving(screen) {
+    const node = this.divingNode();
+    if (!node) return;
+    const elapsed = Math.max(0, (node.endedAt ?? Date.now()) - node.startedAt);
+    const text = node.streaming ? ` ◷ Deep diving · 已经进行 ${fmtDuration(elapsed)}` : node.incomplete ? " ◷ Deep diving · 上一回合计时已恢复" : ` ◷ Deep diving · 总耗时 ${fmtDuration(elapsed)}`;
+    const y = this.view.y + this.view.h;
+    screen.fillRect(this.x, y, this.x + this.w - 1, y, " ", { bg: T.BG2 });
+    screen.text(this.x, y, truncate(text, this.w), { fg: node.streaming ? T.WARN : T.DIM, bg: T.BG2, bold: node.streaming });
+  }
+
   /** Collapsible todo block between the view and the input (Shift+T toggles). */
   #renderTodos(screen) {
     const th = this.todoHeight();
@@ -2012,9 +2027,13 @@ export class ChatView extends Widget {
     const title = ` ${this.todosVisible ? "▾" : "▸"} TASKS${progress} · Shift+T ${this.todosVisible ? "最小化" : "展开"} `;
     screen.fillRect(this.x, row, this.x + this.w - 1, y + th - 1, " ", { bg: T.PANEL });
     screen.hline(this.x, this.x + this.w - 1, row, "─", { fg: T.BORDER2, bg: T.PANEL });
+    screen.put(this.x, row, "╭", { fg: T.BORDER2, bg: T.PANEL });
+    screen.put(this.x + this.w - 1, row, "╮", { fg: T.BORDER2, bg: T.PANEL });
     screen.text(this.x + 2, row, truncate(title, this.w - 4), { fg: T.ACCENT, bg: T.PANEL, bold: true });
     if (!this.todosVisible) {
       screen.hline(this.x, this.x + this.w - 1, row + 1, "─", { fg: T.BORDER2, bg: T.PANEL });
+      screen.put(this.x, row + 1, "╰", { fg: T.BORDER2, bg: T.PANEL });
+      screen.put(this.x + this.w - 1, row + 1, "╯", { fg: T.BORDER2, bg: T.PANEL });
       return;
     }
     row++;
@@ -2028,6 +2047,8 @@ export class ChatView extends Widget {
       screen.text(this.x + 2, row + i, `${icon} ${truncate(t.content ?? String(t), this.w - 6)}`, { fg: color, bg: T.PANEL, bold: t.status === "in_progress" });
     }
     screen.hline(this.x, this.x + this.w - 1, bottom, "─", { fg: T.BORDER2, bg: T.PANEL });
+    screen.put(this.x, bottom, "╰", { fg: T.BORDER2, bg: T.PANEL });
+    screen.put(this.x + this.w - 1, bottom, "╯", { fg: T.BORDER2, bg: T.PANEL });
   }
 
   onMouse(ev) {
@@ -2748,8 +2769,9 @@ export class App {
         if (frame.sessionId && frame.sessionId !== this.currentSession) break;
         this.projections[frame.key] = frame.value;
         if (frame.key === "tokenUsage") this.tokenUsage = frame.value;
-        // the todo block's height depends on the todos projection → reflow
-        if (frame.key === "todos") this.chat.inputChanged();
+        // Every bottom dock projection can change the transcript viewport.
+        // Reflow immediately so the tail remains reachable above fixed docks.
+        if (["todos", "goal", "subagent"].includes(frame.key)) this.chat.inputChanged();
         break;
       }
       case "approval/resolved":
@@ -2881,6 +2903,25 @@ export class App {
     this.renameInput = null;
     this.focus(this.chat);
     this.redraw();
+  }
+
+  deleteWorkspace(group) {
+    this.closeOverlay();
+    const popup = new Popup({
+      x: Math.max(1, Math.floor(this.screen.w / 2) - 34), y: Math.max(1, Math.floor(this.screen.h / 2) - 4), w: Math.min(68, this.screen.w - 2), h: 8,
+      title: "删除工作区注册", lines: [
+        [{ t: ` 删除“${truncate(group.title, 42)}”？`, fg: T.WARN, bold: true }],
+        [{ t: " 仅移除 TUI/WebUI 中的工作区注册。", fg: T.TXT }],
+        [{ t: " 目录、用户文件和会话日志不会删除；会话将进入“未分组”。", fg: T.FAINT }],
+      ], buttons: [{ label: "取消", action: "cancel" }, { label: "确认删除", action: "delete" }],
+      onAction: (btn) => {
+        if (btn.action !== "delete") { this.closeOverlay(); return; }
+        this.api.call("workspace.delete", { workspaceId: group.workspaceId })
+          .then(() => { this.closeOverlay(); this.toast("工作区注册已删除，文件和会话均已保留"); this.refreshSessions(); })
+          .catch((e) => this.toast(`删除工作区失败: ${e.message}`));
+      },
+    });
+    this.overlay = popup; this.focus(popup); this.redraw();
   }
 
   renameWorkspace(group) {
