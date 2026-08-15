@@ -18,7 +18,7 @@
   ],
   "scripts": {
     "start": "node bin/dsh-tui.js",
-    "test": "node test/scripted.mjs"
+    "test": "node --test test/*.test.mjs"
   },
   "repository": {
     "type": "git",

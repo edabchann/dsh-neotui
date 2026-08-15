@@ -37,6 +37,54 @@ function renderToolCard(view, width, expanded) {
     }
   };
   switch (card.card) {
+    case "terminal": {
+      const cmd = card.command ?? title;
+      lines.push([{ t: `  ${card.cwd ? `${card.cwd} ` : ""}$ ${truncate(cmd, width - 8)}`, fg: K.ACCENT, code: true }]);
+      const output = String(card.output ?? "");
+      const rows = output.split("\n");
+      const cap = expanded ? 200 : 8;
+      for (const row of rows.slice(0, cap)) lines.push([{ t: "  " + truncate(row, width - 4), fg: K.TXT, code: true }]);
+      if (rows.length > cap) lines.push([{ t: `  …隐藏 ${rows.length - cap} 行（点击展开）`, fg: K.FAINT }]);
+      if (card.signal) lines.push([{ t: `  signal ${card.signal}`, fg: K.ERR, bold: true }]);
+      else if (card.exitCode != null) lines.push([{ t: `  exit ${card.exitCode}`, fg: card.exitCode === 0 ? K.OK : K.ERR, bold: card.exitCode !== 0 }]);
+      else if (card.running) lines.push([{ t: "  ● 运行中", fg: K.WARN }]);
+      break;
+    }
+    case "read": {
+      if (card.label) lines.push([{ t: `  ${truncate(card.label, width - 4)}${card.lang ? ` · ${card.lang}` : ""}`, fg: K.ACCENT, underline: true }]);
+      const rows = card.lines ?? [];
+      const cap = expanded ? 200 : 8;
+      for (const row of rows.slice(0, cap)) lines.push([{ t: `${String(row.number ?? "").padStart(5)} │ `, fg: K.FAINT }, { t: truncate(row.text ?? "", width - 10), fg: K.TXT, code: true }]);
+      if (rows.length > cap) lines.push([{ t: `  …隐藏 ${rows.length - cap} 行`, fg: K.FAINT }]);
+      if (card.totalLines != null) lines.push([{ t: `  显示 ${rows.length}/${card.totalLines} 行`, fg: K.DIM }]);
+      break;
+    }
+    case "search": {
+      if (card.kind === "paths") {
+        for (const path of (card.paths ?? []).slice(0, expanded ? 200 : 8)) lines.push([{ t: "  • " + truncate(path, width - 6), fg: K.TXT }]);
+      } else if (card.kind === "matches") {
+        for (const file of card.files ?? []) {
+          lines.push([{ t: "  " + truncate(file.path ?? "", width - 4), fg: K.ACCENT, underline: true }]);
+          for (const match of (file.matches ?? []).slice(0, expanded ? 100 : 4)) lines.push([{ t: `   ${match.lineNumber ?? "?"}: `, fg: K.FAINT }, { t: truncate(match.line ?? "", width - 10), fg: K.TXT }]);
+        }
+      }
+      lines.push([{ t: `  ${card.truncated ? `显示部分结果 / 共 ${card.total}` : `共 ${card.total ?? 0} 项`}`, fg: card.truncated ? K.WARN : K.DIM }]);
+      if (card.recovery) pushText("  恢复: ", card.recovery, K.ACCENT);
+      break;
+    }
+    case "web": {
+      if (card.kind === "fetch") {
+        lines.push([{ t: `  ${card.statusCode ?? "?"} ${truncate(card.url ?? "", width - 10)}`, fg: (card.statusCode ?? 500) < 400 ? K.OK : K.ERR, link: card.url }]);
+      } else {
+        if (card.answer) pushText("  ", card.answer);
+        for (const source of (card.sources ?? []).slice(0, expanded ? 30 : 6)) {
+          lines.push([{ t: "  ↗ ", fg: K.ACCENT }, { t: truncate(source.title ?? source.url ?? "来源", width - 6), fg: K.LINK, link: source.url }]);
+          if (source.snippet && expanded) lines.push([{ t: "    " + truncate(source.snippet, width - 6), fg: K.DIM }]);
+        }
+      }
+      if (card.truncated) lines.push([{ t: "  ⚠ 结果已截断", fg: K.WARN }]);
+      break;
+    }
     case "diff": {
       for (const d of card.diffs ?? []) {
         lines.push([{ t: "  " + truncate(d.path ?? "", width - 6), fg: K.ACCENT, underline: true }]);
@@ -127,14 +175,20 @@ function applyEvent(nodes, event, view, log, state = null) {
         break;
       }
       case "user/message": {
-        const text = partsToText(d.content ?? d.message?.content);
-        const images = partsToImages(d.content ?? d.message?.content);
-        const id = d.id ?? null;
-        // the turn timer starts HERE: the user message carries the turn start
-        // so the 🕐 ticker shows even before the first assistant chunk lands
-        const turnStartAt = st.turnStart ?? event.time ?? Date.now();
-        if (text !== null) nodes.push({ kind: "user", text, images, id, step: st.step, turnStartAt });
-        else if (images) nodes.push({ kind: "user", text: "", images, id, step: st.step, turnStartAt });
+        const message = d.message ?? d;
+        const content = d.content ?? message.content;
+        const text = partsToText(content);
+        const images = partsToImages(content);
+        const id = d.id ?? message.id ?? null;
+        const source = d.source ?? message.source ?? { kind: "user" };
+        // Only a direct human prompt starts a foreground turn timer. Injected
+        // context, goal rounds and subagent receipts are distinct transcript
+        // nodes and must never masquerade as the user's own speech.
+        const direct = source?.kind === "user";
+        const turnStartAt = direct ? (st.turnStart ?? event.time ?? Date.now()) : null;
+        const kind = direct ? "user" : source?.kind === "goal" ? "goal-round"
+          : (source?.kind === "subagent-report" || source?.kind === "subagent-settled") ? "subagent-receipt" : "context";
+        if (text !== null || images) nodes.push({ kind, text: text ?? "", images, id, source, step: st.step, turnStartAt });
         break;
       }
       case "assistant/message": {
@@ -254,14 +308,27 @@ function applyEvent(nodes, event, view, log, state = null) {
       }
       case "turn/start": {
         st.turnStart = event.time ?? Date.now();
+        st.turn = d.turn ?? st.turn;
+        // One global turn marker is independent of whether the model has begun
+        // reasoning or invoked any tool, so the deep-diving clock never blinks.
+        nodes.push({ kind: "turn-progress", turn: d.turn, startedAt: st.turnStart, streaming: true });
         break;
       }
       case "turn/end": {
-        const node = cur();
-        if (node?.kind === "assistant" && st.turnStart !== undefined) {
-          node.turnMs = Math.max(0, (event.time ?? Date.now()) - st.turnStart);
-        }
+        const end = event.time ?? Date.now();
+        const progress = [...nodes].reverse().find((n) => n.kind === "turn-progress" && n.turn === (d.turn ?? st.turn));
+        if (progress) { progress.streaming = false; progress.endedAt = end; progress.reason = d.reason; }
+        const node = [...nodes].reverse().find((n) => n.kind === "assistant");
+        if (node && st.turnStart !== undefined) node.turnMs = Math.max(0, end - st.turnStart);
+        const reason = d.reason?.kind;
+        if (reason === "error") nodes.push({ kind: "turn-error", text: d.reason?.error?.message ?? "模型请求失败", code: d.reason?.error?.code });
+        else if (reason === "max-tokens") nodes.push({ kind: "turn-max-tokens", text: "已达到本轮最大输出 token 限制" });
+        else if (reason === "cancelled" || reason === "interrupted") nodes.push({ kind: "system", text: "■ 本轮已停止" });
         st.turnStart = null;
+        break;
+      }
+      case "llm/retry": {
+        nodes.push({ kind: "system", text: `↻ 模型请求失败，准备重试${d.delayMs ? `（${fmtDuration(d.delayMs)} 后）` : ""}${d.error?.message ? `：${d.error.message}` : ""}` });
         break;
       }
       case "step/end": {
@@ -285,11 +352,28 @@ function applyEvent(nodes, event, view, log, state = null) {
         nodes.push({ kind: "system", text: "⟳ " + (d.message ?? d.reason ?? "上下文压缩") });
         break;
       }
+      case "command/run": {
+        nodes.push({ kind: "command", commandId: d.commandId, text: `/${d.name}${d.args ?? ""}`, status: "running" });
+        break;
+      }
+      case "command/done": {
+        const command = [...nodes].reverse().find((n) => n.kind === "command" && n.commandId === d.commandId);
+        if (command) { command.status = d.kind; command.detail = d.text; }
+        else nodes.push({ kind: "command", commandId: d.commandId, text: "命令", status: d.kind, detail: d.text });
+        break;
+      }
+      case "agent/inbox/spliced": {
+        for (const message of d.inserted ?? []) {
+          if (message.source?.kind !== "user") continue;
+          const text = partsToText(message.content);
+          if (text != null) nodes.push({ kind: "steering", text, id: message.id, source: message.source });
+        }
+        break;
+      }
       default: {
         // known benign control events: silently ignored
-        const KNOWN = new Set(["todo/write",
-          "agent/inbox/spliced", "request/header", "request/context", "permission/preset",
-          "sandbox/mode", "approval/policy", "session/title-llm-request", "command/done", "command/failed"]);
+        const KNOWN = new Set(["todo/write", "goal/change", "plan/mode", "request/header", "request/context", "permission/preset",
+          "sandbox/mode", "approval/policy", "session/title-llm-request", "session/end-seed"]);
         if (!KNOWN.has(event.type) && !SEEN_TYPES.has(event.type)) {
           SEEN_TYPES.add(event.type);
           log(`[chat] unknown event type: ${event.type}`);
@@ -645,6 +729,21 @@ export class ChatView extends Widget {
     this.stepState = { step: null }; // step/start tracking for the mux merge path
   }
 
+  /** Find the human-readable command/arguments paired to a pending approval. */
+  toolCommandForCall(callId) {
+    if (!callId) return null;
+    for (let ni = this.nodes.length - 1; ni >= 0; ni--) {
+      const block = this.nodes[ni]?.blocks?.find((b) => b.kind === "tool" && b.callId === callId);
+      if (!block) continue;
+      try {
+        const args = JSON.parse(block.args ?? "{}");
+        if (typeof args.command === "string") return args.command;
+        return JSON.stringify(args, null, 2);
+      } catch { return block.args ?? null; }
+    }
+    return null;
+  }
+
   /** Queue a rebuild; flushed on the next frame render (throttles streaming). */
   /** Merge freshly arrived events (mux frames) into the tail INCREMENTALLY —
    *  each event mutates this.nodes directly via the same applyEvent the
@@ -654,16 +753,19 @@ export class ChatView extends Widget {
     for (const { event, view } of entries) {
       applyEvent(this.nodes, event, view, this.app.log, this.stepState);
     }
-    this.running = this.nodes.some((n) => n.kind === "assistant" && n.streaming);
+    this.running = this.nodes.some((n) => (n.kind === "assistant" || n.kind === "turn-progress") && n.streaming);
     this.queueRebuild();
   }
 
   /** Poll the tail of the open session (mux live path is unreliable). */
   async pollTail() {
     if (!this.sessionId || this.polling) return;
+    const sessionId = this.sessionId;
+    const epoch = this.app.sessionEpoch;
     this.polling = true;
     try {
-      const hist = await this.app.api.call("session.history", { sessionId: this.sessionId, maxMessages: 1 });
+      const hist = await this.app.api.call("session.history", { sessionId, maxMessages: 1 });
+      if (this.sessionId !== sessionId || this.app.sessionEpoch !== epoch) { this.polling = false; return; }
       const events = hist.events ?? [];
       const fresh = events.filter((e) => e.event.seq > (this.lastSeq ?? -1));
       if (fresh.length === 0) { this.polling = false; return; }
@@ -748,7 +850,7 @@ export class ChatView extends Widget {
         }
       }
     }
-    this.running = this.nodes.some((n) => n.kind === "assistant" && n.streaming);
+    this.running = this.nodes.some((n) => (n.kind === "assistant" || n.kind === "turn-progress") && n.streaming);
     this.queueRebuild();
     this.app.redraw();
   }
@@ -780,10 +882,14 @@ export class ChatView extends Widget {
    *  the count reflows the whole layout every time (the idle 2-line shifts). */
   todoHeight() {
     const todos = this.app.todos;
-    if (!this.todosVisible) return 0;
-    if (!todos || todos.length === 0) return this.todoSeen ? 7 : 0;
+    const goal = this.app.goalData?.goal ?? this.app.goalData;
+    const subagent = this.app.projections.subagent;
+    let h = goal ? 1 : 0;
+    if (subagent) h++;
+    if (!todos || todos.length === 0) return h + (this.todoSeen ? 1 : 0);
     this.todoSeen = true;
-    return 7; // fixed max height — short lists just show fewer rows
+    // Web parity: folded means a one-row minimized strip, never disappearance.
+    return h + (this.todosVisible ? 7 : 1);
   }
 
   inputChanged() {
@@ -811,7 +917,7 @@ export class ChatView extends Widget {
     this.#rebuild();
   }
 
-  async open(sessionId) {
+  async open(sessionId, epoch = this.app.sessionEpoch) {
     this.sessionId = sessionId;
     this.nodes = [];
     this.expanded.clear();
@@ -823,6 +929,7 @@ export class ChatView extends Widget {
     this.app.setStatus(`加载会话 ${sessionId.slice(0, 8)}…`);
     try {
       const hist = await this.app.api.call("session.history", { sessionId });
+      if (this.sessionId !== sessionId || this.app.sessionEpoch !== epoch) return;
       this.minSeq = hist.events[0]?.event?.seq ?? null;
       this.lastSeq = hist.events[hist.events.length - 1]?.event?.seq ?? null;
       this.lastSyncedSeq = -1;
@@ -846,10 +953,13 @@ export class ChatView extends Widget {
 
   async loadOlder(onDone = null) {
     if (!this.hasMore || this.loadingOlder || this.minSeq == null) { onDone?.(); return; }
+    const sessionId = this.sessionId;
+    const epoch = this.app.sessionEpoch;
     this.loadingOlder = true;
     this.app.setStatus("加载更早记录…");
     try {
-      const hist = await this.app.api.call("session.history", { sessionId: this.sessionId, beforeSeq: this.minSeq, maxMessages: 20 });
+      const hist = await this.app.api.call("session.history", { sessionId, beforeSeq: this.minSeq, maxMessages: 20 });
+      if (this.sessionId !== sessionId || this.app.sessionEpoch !== epoch) { this.loadingOlder = false; return; }
       if (hist.events.length === 0) { this.hasMore = false; }
       else {
         const before = this.lines.length;
@@ -1240,6 +1350,40 @@ export class ChatView extends Widget {
         switch (node.kind) {
         case "title": lines.push([{ t: "✦ " + truncate(node.text, w - 4), fg: K.DIM, italic: true }]); mark(realIdx); break;
         case "system": lines.push([{ t: truncate(node.text, w - 2), fg: K.WARN }]); mark(realIdx); break;
+        case "turn-progress": {
+          const elapsed = (node.endedAt ?? Date.now()) - node.startedAt;
+          lines.push([{ t: node.streaming ? `  ◷ Deep diving · 已经进行 ${fmtDuration(elapsed)}` : `  ◷ Deep diving · 总耗时 ${fmtDuration(elapsed)}`, fg: node.streaming ? T.WARN : K.DIM, bold: node.streaming }]);
+          mark(realIdx); break;
+        }
+        case "command": lines.push([{ t: `  ${node.status === "running" ? "…" : node.status === "error" ? "✗" : "✓"} ${node.text}${node.detail ? ` — ${truncate(node.detail, w - strWidth(node.text) - 10)}` : ""}`, fg: node.status === "error" ? K.ERR : node.status === "success" ? K.OK : K.DIM }]); mark(realIdx); break;
+        case "steering": lines.push([{ t: "  ↪ 运行中追加 > ", fg: K.ACCENT, bold: true }, { t: truncate(node.text, w - 18), fg: K.TXT }]); mark(realIdx); break;
+        case "turn-error": lines.push([{ t: `  ✗ ${node.text}${node.code ? ` (${node.code})` : ""}`, fg: K.ERR, bold: true }]); mark(realIdx); break;
+        case "turn-max-tokens": lines.push([{ t: `  ⚠ ${node.text}`, fg: T.WARN, bold: true }]); mark(realIdx); break;
+        case "goal-round":
+        case "subagent-receipt":
+        case "context": {
+          const isExp = this.expanded.has(realIdx);
+          const text = node.text ?? "";
+          const summary = node.source?.summary;
+          const label = node.kind === "goal-round" ? `🎯 目标续轮 ${node.source?.round ?? ""}`
+            : node.kind === "subagent-receipt" ? (node.source?.kind === "subagent-settled" ? "🛰 子代理状态" : "🛰 子代理回执")
+            : `ℹ 上下文 · ${node.source?.kind ?? "注入"}`;
+          beginCard(node.kind === "goal-round" ? "THINKBG" : "CARD");
+          lines.push([{ t: `  ${label}${summary ? ` — ${truncate(summary, w - strWidth(label) - 8)}` : ""}`, fg: node.kind === "subagent-receipt" ? T.PURPLE : K.DIM, bold: true }]);
+          mark(realIdx);
+          if (node.source?.form !== "notice" || isExp) {
+            for (const ln of renderMd(isExp ? text : truncateText(text, 600), Math.max(10, w - 4))) {
+              lines.push([{ t: "  " }, ...ln]); mark(realIdx);
+            }
+          } else if (text && !summary) {
+            lines.push([{ t: "  " + truncate(text.replace(/\s+/g, " "), w - 4), fg: K.FAINT }]); mark(realIdx);
+          }
+          if (text.length > 600 || node.source?.form === "notice") {
+            lines.push([{ t: isExp ? "  [点击折叠]" : "  [点击展开]", fg: K.FAINT }]); mark(realIdx);
+          }
+          sep();
+          break;
+        }
         case "user": {
           const isExp = this.expanded.has(realIdx);
           const text = node.text ?? "";
@@ -1267,13 +1411,6 @@ export class ChatView extends Widget {
               lines.push([{ t: "  🖼 " + truncate(img.name ?? img.attachmentId ?? "image", w - 12) + (img.width ? ` (${img.width}×${img.height})` : "") + " — 点击查看", fg: T.PURPLE }]);
               markImg(realIdx, ii);
             }
-          }
-          // the turn timer starts at the QUESTION: while the reply is still
-          // in the request/queue phase (no assistant node yet), the ticker
-          // lives under the user message — web-style deep-dive from t=0.
-          if (this.running && realIdx === this.nodes.length - 1 && node.turnStartAt != null) {
-            lines.push([{ t: `  🕐 本轮进行中…已经过 ${fmtDuration(Date.now() - node.turnStartAt)}`, fg: T.WARN, bold: true }]);
-            mark(realIdx);
           }
           sep();
           break;
@@ -1393,15 +1530,15 @@ export class ChatView extends Widget {
               beginCard("CARD");
               // FORMAL text output is NOT collapsible — the user's message
               // content must stay readable; only think/tool blocks fold.
-              // The 🐳 marker distinguishes formal output from 💭 think and
-              // ▸ tool blocks at a glance. Code blocks inside render as boxes
-              // with a [复制] button.
+              // A neutral assistant glyph identifies model output without
+              // pretending every provider/model has the DeepSeek whale brand.
+              // Code blocks inside render as boxes with a [复制] button.
               const key = `${realIdx}:${bi}`;
               const text = b.text ?? "";
               const mdW = Math.max(10, w - 6 - strWidth(stepTag));
               const sink = { codeBlocks: [] };
               const md = renderMd(text, mdW, sink);
-              const whale = { t: "  🐳", fg: K.ACCENT, bold: true };
+              const assistantMark = { t: "  ◆", fg: K.ACCENT, bold: true };
               const step = { t: stepTag || " ", fg: K.FAINT };
               if (md.length > 0) {
                 // When the message STARTS with a code box, the whale+step
@@ -1410,16 +1547,16 @@ export class ChatView extends Widget {
                 // shifted right by the marker).
                 const firstIsBoxTop = md[0].some((g) => g.copyCode);
                 if (firstIsBoxTop) {
-                  lines.push([whale, step]);
+                  lines.push([assistantMark, step]);
                   mark(realIdx, bi);
                   for (const ln of md) { lines.push([{ t: "  " }, ...ln]); mark(realIdx, bi); }
                 } else {
-                  lines.push([whale, step, ...md[0]]);
+                  lines.push([assistantMark, step, ...md[0]]);
                   mark(realIdx, bi);
                   for (const ln of md.slice(1)) { lines.push([{ t: "  " }, ...ln]); mark(realIdx, bi); }
                 }
               } else {
-                lines.push([whale, step]);
+                lines.push([assistantMark, step]);
                 mark(realIdx, bi);
               }
               sep();
@@ -1433,15 +1570,6 @@ export class ChatView extends Widget {
               markImg(realIdx, ii);
               sep();
             }
-          }
-          // the turn's FINAL reply carries the whole turn duration
-          if (node.turnMs != null) {
-            lines.push([{ t: `  🕐 本轮回答总耗时 ${fmtDuration(node.turnMs)}`, fg: T.WARN, bold: true }]);
-            mark(realIdx);
-          } else if (node.streaming && node.turnStartAt != null && realIdx === this.nodes.length - 1) {
-            // deep-dive style live timer: the running turn ticks in real time
-            lines.push([{ t: `  🕐 本轮进行中…已经过 ${fmtDuration(Date.now() - node.turnStartAt)}`, fg: T.WARN, bold: true }]);
-            mark(realIdx);
           }
           break;
         }
@@ -1578,14 +1706,28 @@ export class ChatView extends Widget {
     const th = this.todoHeight();
     if (th === 0) return;
     const todos = this.app.todos ?? [];
+    const goal = this.app.goalData?.goal ?? this.app.goalData;
+    const subagent = this.app.projections.subagent;
     const y = this.input.y - th - 1;
     screen.fillRect(this.x, y, this.x + this.w - 1, y + th - 1, " ", { bg: T.THINKBG });
-    screen.text(this.x, y, " ☐ 任务清单（Shift+T 折叠）", { fg: K.FAINT });
-    for (let i = 0; i < Math.min(todos.length, th - 1); i++) {
+    let row = y;
+    if (goal) screen.text(this.x, row++, ` 🎯 ${goal.phase ?? "active"} · ${truncate(goal.objective ?? "目标", this.w - 18)}${goal.maxGoalRounds ? ` · ${goal.roundsStarted ?? 0}/${goal.maxGoalRounds}轮` : ""}`, { fg: T.WARN, bold: true });
+    if (subagent) {
+      const timing = this.app.projections.subagentTiming;
+      const ms = (timing?.settledMs ?? 0) + (timing?.active ? Math.max(0, Date.now() - timing.active.since) : 0);
+      screen.text(this.x, row++, ` 🛰 子代理 · ${subagent.label ?? subagent.mode}${ms ? ` · ${fmtDuration(ms)}` : ""}`, { fg: T.PURPLE, bold: true });
+    }
+    const done = todos.filter((t) => t.status === "completed").length;
+    const active = todos.filter((t) => t.status === "in_progress").length;
+    const progress = todos.length ? ` · ${done}/${todos.length} 完成${active ? ` · ${active} 进行中` : ""}` : "";
+    if (todos.length || this.todoSeen) screen.text(this.x, row, ` ${this.todosVisible ? "▾" : "▸"} 任务清单${progress}（Shift+T ${this.todosVisible ? "最小化" : "展开"}）`, { fg: K.FAINT });
+    if (!this.todosVisible) return;
+    row++;
+    for (let i = 0; i < Math.min(todos.length, y + th - row); i++) {
       const t = todos[i];
       const icon = t.status === "completed" ? "✓" : t.status === "in_progress" ? "◉" : "○";
       const color = t.status === "completed" ? T.FAINT : t.status === "in_progress" ? T.WARN : T.DIM;
-      screen.text(this.x + 2, y + 1 + i, `${icon} ${truncate(t.content ?? String(t), this.w - 6)}`, { fg: color });
+      screen.text(this.x + 2, row + i, `${icon} ${truncate(t.content ?? String(t), this.w - 6)}`, { fg: color });
     }
   }
 
@@ -1693,13 +1835,13 @@ export class ChatView extends Widget {
       case "pgup": if (this.view.scrollY === 0) { this.loadOlder(); return true; } return this.view.scroll(-this.view.h);
       case "pgdn": return this.view.scroll(this.view.h);
     }
-    if (ev.name === "char" && ev.key === "g" && !ev.ctrl && !ev.shift) {
+    if (ev.name === "char" && ev.key === "g" && !ev.ctrl && !ev.alt && !ev.shift) {
       if (this.gKey) { this.gKey = false; this.view.anchorLock = null; this.view.follow = false; this.view.scrollY = 0; return true; }
       this.gKey = true;
       this.app.toast("再按 g 回顶");
       return true;
     }
-    if (ev.name === "char" && ev.key === "g" && ev.shift) { this.view.anchorLock = null; this.view.follow = true; this.view.scrollY = this.view.maxScroll(); return true; }
+    if (ev.name === "char" && ev.key === "g" && ev.shift && !ev.alt) { this.view.anchorLock = null; this.view.follow = true; this.view.scrollY = this.view.maxScroll(); return true; }
     // [ / ] — jump to the end of the previous / next user question. Guarded by
     // focus so the sidebar's session-move [ ] keys keep working there.
     if (ev.name === "char" && (ev.key === "[" || ev.key === "]") && !ev.ctrl && !ev.shift && this.app.focused === this) {
@@ -1707,9 +1849,9 @@ export class ChatView extends Widget {
     }
     if (ev.name === "escape" && this.app.searchQuery) { this.app.searchQuery = null; this.queueRebuild(); return true; }
     if (ev.name === "escape" && this.selStart !== null) { this.selStart = this.selEnd = null; this.app.redraw(); return true; }
-    if (ev.name === "char" && ev.key === "i" && !ev.ctrl) { this.app.focus(this.input); return true; }
-    if (ev.name === "char" && ev.key === "/" && !ev.ctrl) { this.app.startSearch(); return true; }
-    if (ev.name === "char" && ev.key === "b" && !ev.ctrl) {
+    if (ev.name === "char" && ev.key === "i" && !ev.ctrl && !ev.alt) { this.app.focus(this.input); return true; }
+    if (ev.name === "char" && ev.key === "/" && !ev.ctrl && !ev.alt) { this.app.startSearch(); return true; }
+    if (ev.name === "char" && ev.key === "b" && !ev.ctrl && !ev.alt) {
       this.bashMode = this.bashMode === "collapsed" ? "expanded" : "collapsed";
       this.expanded.clear();
       this.collapsedBlocks.clear();
@@ -1717,10 +1859,10 @@ export class ChatView extends Widget {
       this.queueRebuild();
       return true;
     }
-    if (ev.name === "char" && ev.key === "t" && !ev.ctrl) {
+    if (ev.name === "char" && ev.key === "t" && !ev.ctrl && !ev.alt) {
       if (ev.shift) {
         this.todosVisible = !this.todosVisible;
-        this.app.toast(this.todosVisible ? "任务块：显示（Shift+T 折叠）" : "任务块：折叠（Shift+T 展开）");
+        this.app.toast(this.todosVisible ? "任务块：已展开（Shift+T 最小化）" : "任务块：已最小化（Shift+T 展开）");
         this.inputChanged();
         return true;
       }
@@ -1776,10 +1918,10 @@ function truncateText(s, n) {
 export class QuestionPopup extends Popup {
   constructor({ app, frame }) {
     const questions = frame.questions ?? [];
-    const w = Math.max(40, app.screen.w - 16);
-    const h = Math.min(app.screen.h - 4, questions.length * 5 + 8);
+    const w = Math.max(12, Math.min(72, app.screen.w - 2));
+    const h = Math.max(5, Math.min(Math.max(5, app.screen.h - 2), questions.length * 5 + 8));
     super({
-      x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2),
+      x: Math.max(0, Math.floor((app.screen.w - w) / 2)), y: Math.max(0, Math.floor((app.screen.h - h) / 2)),
       w, h, title: "❓ 需要你的回答",
       lines: ["", ...questions.map((q) => q.question ?? q.id)],
       buttons: [
@@ -1790,10 +1932,14 @@ export class QuestionPopup extends Popup {
     this.app = app;
     this.frame = frame;
     this.questions = questions;
-    this.selection = questions.map((q) => (q.multiSelect ? [] : []));
-    this.custom = "";
-    this.mode = "choose"; // choose | options | input
+    this.questionIdx = 0;
+    this.drafts = questions.map(() => ({ selected: [], custom: "", skipped: false }));
     this.selIdx = 0;
+    this.onAction = (btn) => {
+      if (btn.action === "cancel") this.#skipCurrent();
+      else if (btn.action === "custom") this.#continueCurrent();
+      else if (btn.action === "__cancel__") this.#cancel();
+    };
     this.#layout();
   }
 
@@ -1806,74 +1952,101 @@ export class QuestionPopup extends Popup {
 
   render(screen) {
     super.render(screen);
+    const q = this.questions[this.questionIdx];
+    if (!q) return;
+    const draft = this.drafts[this.questionIdx];
     let ly = this.y + 1;
-    for (const q of this.questions) {
-      screen.text(this.x + 2, ly, truncate(`▎ ${q.header ?? ""}`, this.w - 4), { fg: K.ACCENT, bold: true });
-      ly++;
-      screen.text(this.x + 2, ly, truncate(q.question ?? "", this.w - 4), { fg: K.TXT });
-      ly++;
-      const opts = q.options ?? [];
-      if (opts.length) {
-        for (let i = 0; i < opts.length && ly < this.y + this.h - 2; i++) {
-          const sel = this.selIdx === i;
-          const label = truncate(`  ${sel ? "●" : "○"} ${opts[i].label}`, this.w - 6);
-          screen.text(this.x + 2, ly, label, { fg: sel ? 0xffffff : K.TXT, bg: sel ? 0x3a4a5c : -1 });
-          ly++;
-        }
-      } else {
-        screen.text(this.x + 2, ly, "  (自由输入)", { fg: K.FAINT });
-        ly++;
-      }
-      ly++;
+    screen.text(this.x + 2, ly++, truncate(`▎ ${q.header ?? `问题 ${this.questionIdx + 1}/${this.questions.length}`}`, this.w - 4), { fg: K.ACCENT, bold: true });
+    screen.text(this.x + 2, ly++, truncate(q.question ?? "", this.w - 4), { fg: K.TXT });
+    if (q.detail) screen.text(this.x + 2, ly++, truncate(q.detail, this.w - 4), { fg: K.DIM });
+    const opts = q.options ?? [];
+    for (let i = 0; i < opts.length && ly < this.y + this.h - 3; i++) {
+      const chosen = draft.selected.includes(opts[i].label);
+      const cursor = this.selIdx === i;
+      const glyph = q.multiSelect ? (chosen ? "☑" : "☐") : (chosen ? "●" : "○");
+      screen.text(this.x + 2, ly++, truncate(` ${cursor ? "▸" : " "} ${glyph} ${opts[i].label}`, this.w - 6), { fg: cursor ? T.SELFG : K.TXT, bg: cursor ? T.MENUSEL : -1 });
+      if (opts[i].description && ly < this.y + this.h - 3) screen.text(this.x + 7, ly++, truncate(opts[i].description, this.w - 10), { fg: K.FAINT });
+    }
+    if (draft.custom) screen.text(this.x + 2, Math.min(ly, this.y + this.h - 3), truncate(`自定义: ${draft.custom}`, this.w - 4), { fg: K.ACCENT });
+  }
+
+  #choose(i) {
+    const q = this.questions[this.questionIdx];
+    const option = q?.options?.[i];
+    if (!option) return;
+    const draft = this.drafts[this.questionIdx];
+    if (q.multiSelect) {
+      draft.selected = draft.selected.includes(option.label) ? draft.selected.filter((v) => v !== option.label) : [...draft.selected, option.label];
+    } else {
+      draft.selected = [option.label]; draft.custom = "";
     }
   }
 
   onMouse(ev) {
     if (ev.kind === "press" && ev.button === 0) {
-      let ly = this.y + 1;
-      for (const q of this.questions) {
-        ly += 2;
-        const opts = q.options ?? [];
-        for (let i = 0; i < opts.length; i++, ly++) {
-          if (ev.y === ly && ev.x >= this.x + 2 && ev.x < this.x + this.w - 2) {
-            this.selIdx = i;
-            this.answers = this.questions.map((qq, qi) => ({ id: qq.id, selected: qi === this.questions.indexOf(q) ? [opts[i].label] : [], custom: "" }));
-            this.#submit();
-            return true;
-          }
+      const q = this.questions[this.questionIdx];
+      let ly = this.y + 3 + (q?.detail ? 1 : 0);
+      for (let i = 0; i < (q?.options?.length ?? 0); i++) {
+        if (ev.y === ly || (q.options[i].description && ev.y === ly + 1)) {
+          this.selIdx = i; this.#choose(i);
+          if (!q.multiSelect) this.#continueCurrent();
+          return true;
         }
-        ly++;
+        ly += q.options[i].description ? 2 : 1;
       }
-      return super.onMouse(ev);
     }
     return super.onMouse(ev);
   }
 
   onKey(ev) {
-    if (ev.type === "text") { this.custom += ev.text; return true; }
+    const q = this.questions[this.questionIdx];
+    const draft = this.drafts[this.questionIdx];
+    if (ev.type === "text") { draft.custom += ev.text; draft.skipped = false; return true; }
     if (ev.type !== "key") return false;
-    switch (ev.name) {
-      case "up": this.selIdx = Math.max(0, this.selIdx - 1); return true;
-      case "down": this.selIdx++; return true;
-      case "enter": this.#submit(); return true;
-      case "escape": this.answers = null; this.#submit(); return true;
+    const count = q?.options?.length ?? 0;
+    if (ev.name === "up") { this.selIdx = Math.max(0, this.selIdx - 1); return true; }
+    if (ev.name === "down") { this.selIdx = Math.min(Math.max(0, count - 1), this.selIdx + 1); return true; }
+    if (ev.name === "char" && ev.key === " " && count) { this.#choose(this.selIdx); return true; }
+    if (ev.name === "backspace" && draft.custom) { draft.custom = Array.from(draft.custom).slice(0, -1).join(""); return true; }
+    if (ev.name === "enter") {
+      if (count && draft.selected.length === 0 && !draft.custom) this.#choose(this.selIdx);
+      this.#continueCurrent(); return true;
     }
-    return false;
+    if (ev.name === "escape") { this.#cancel(); return true; }
+    return super.onKey(ev);
+  }
+
+  #skipCurrent() {
+    this.drafts[this.questionIdx] = { selected: [], custom: "", skipped: true };
+    this.#advanceOrSubmit();
+  }
+
+  #continueCurrent() {
+    const d = this.drafts[this.questionIdx];
+    if (!d.skipped && d.selected.length === 0 && !d.custom.trim()) { this.app.toast("请先选择或输入答案，也可选择跳过"); return; }
+    this.#advanceOrSubmit();
+  }
+
+  #advanceOrSubmit() {
+    if (this.questionIdx < this.questions.length - 1) { this.questionIdx++; this.selIdx = 0; this.#layout(); this.app.redraw(); return; }
+    this.#submit();
+  }
+
+  #cancel() {
+    this.app.api.cancelResponse(this.frame.rpcId).catch((e) => this.app.toast(`取消失败: ${e.message}`));
+    if (typeof this.app.finishPrompt === "function") this.app.finishPrompt();
+    else this.app.closePopup();
   }
 
   #submit() {
-    const value = {
-      sessionId: this.frame.sessionId,
-      answer: {
-        answers: this.answers ?? this.questions.map((q) => {
-          const opts = q.options ?? [];
-          const sel = opts[this.selIdx] ? [opts[this.selIdx].label] : [];
-          return { id: q.id, selected: sel, custom: this.custom || undefined };
-        }),
-      },
-    };
-    this.app.api.respond(this.frame.rpcId, value).catch((e) => this.app.toast(`回答失败: ${e.message}`));
-    this.app.closePopup();
+    const answers = this.questions.map((q, i) => {
+      const d = this.drafts[i];
+      const custom = d.custom.trim();
+      return { id: q.id, selected: custom && !q.multiSelect ? [] : d.selected, ...(custom ? { custom } : {}) };
+    });
+    this.app.api.respond(this.frame.rpcId, { sessionId: this.frame.sessionId, answer: { answers } }).catch((e) => this.app.toast(`回答失败: ${e.message}`));
+    if (typeof this.app.finishPrompt === "function") this.app.finishPrompt();
+    else this.app.closePopup();
   }
 }
 
@@ -1881,29 +2054,39 @@ export class QuestionPopup extends Popup {
 
 export class ApprovalPopup extends Popup {
   constructor({ app, frame }) {
+    const maxW = Math.max(12, app.screen.w - 2);
+    const w = Math.min(72, maxW);
+    const command = app.chat?.toolCommandForCall?.(frame.callId) ?? null;
+    const lines = [
+      [{ t: ` ${frame.reason ?? `工具 ${frame.toolName ?? "tool"} 请求越权执行`}`, fg: K.WARN }],
+    ];
+    if (command) lines.push([{ t: " 将执行:", fg: K.DIM, underline: true }], ...String(command).split("\n").slice(0, 6).map((line) => [{ t: "  " + truncate(line, w - 4), fg: K.TXT }]));
     super({
-      x: Math.floor((app.screen.w - 56) / 2), y: Math.floor(app.screen.h / 2) - 3,
-      w: 56, h: 7, title: "⚠ 工具需要授权",
-      lines: ["", `  ${truncate(frame.toolName ?? "tool", 48)}` + (frame.reason ? ` — ${truncate(frame.reason, 30)}` : "")],
+      x: Math.max(0, Math.floor((app.screen.w - w) / 2)), y: Math.max(0, Math.floor(app.screen.h / 2) - 4),
+      w, h: Math.min(app.screen.h, command ? 10 : 7), title: "⚠ 工具需要授权",
+      lines,
       buttons: [
         { label: "允许一次", action: "allowed-once" },
         { label: "拒绝", action: "rejected" },
       ],
+      scrollable: true,
     });
     this.app = app;
     this.frame = frame;
-    this.btnIdx = 0;
+    this.btnIdx = 1; // fail-safe default: Enter rejects unless user chooses allow
+    this.onAction = (btn) => this.#answer(btn);
   }
-  onAction(btn) {
-    if (btn.action === "__cancel__") { this.app.closePopup(); return; }
+  #answer(btn) {
+    if (btn.action === "__cancel__") btn = this.buttons[1];
     const value = { sessionId: this.frame.sessionId, approvalId: this.frame.approvalId, outcome: btn.action };
     this.app.api.respond(this.frame.rpcId, value).catch((e) => this.app.toast(`审批失败: ${e.message}`));
-    this.app.closePopup();
+    if (typeof this.app.finishPrompt === "function") this.app.finishPrompt();
+    else this.app.closePopup();
   }
   onKey(ev) {
     if (ev.type !== "key") return false;
-    if (ev.name === "char" && (ev.key === "y" || ev.key === "Y") && !ev.ctrl) { this.onAction(this.buttons[0]); return true; }
-    if (ev.name === "char" && (ev.key === "n" || ev.key === "N") && !ev.ctrl) { this.onAction(this.buttons[1]); return true; }
+    if (ev.name === "char" && (ev.key === "y" || ev.key === "Y") && !ev.ctrl && !ev.alt) { this.#answer(this.buttons[0]); return true; }
+    if (ev.name === "char" && (ev.key === "n" || ev.key === "N") && !ev.ctrl && !ev.alt) { this.#answer(this.buttons[1]); return true; }
     return super.onKey(ev);
   }
 }
@@ -1917,6 +2100,8 @@ export class App {
     this.api = api;
     this.log = log ?? (() => {});
     this.popup = null;
+    this.activePrompt = null;
+    this.promptQueue = [];
     this.menu = null;
     this.toastMsg = null;
     this.toastUntil = 0;
@@ -1928,6 +2113,10 @@ export class App {
     this.provider = "";
     this.model = "";
     this.currentModel = null;   // session-scoped { provider, model, reasoningEffort }
+    this.sessionEpoch = 0;
+    this.refreshSessionsSeq = 0;
+    this.searchSeq = 0;
+    this.searchSelected = 0;
     this.connState = "connecting";
     this.tokenUsage = null;
     this.sessions = [];
@@ -1935,12 +2124,15 @@ export class App {
     this.searchActive = false;
     this.overlay = null;       // Picker / Popup / ImagePopup modal
     this.mode = "chat";        // chat | workspace | trajectory
-    this.sidebarVisible = true; // Ctrl+B hides the whole session pane (nvim-style)
+    this.sidebarWanted = true;
+    this.sidebarVisible = true; // auto-collapses on narrow terminals
+    this.tooSmall = false;
     this.sidebarWidth = 30;     // draggable divider: the session pane's column width
     this.draggingDivider = false;
     this.inputDrag = false;     // mouse drag-selection inside the input is active
     this.feedbackMap = new Map(); // messageId → {rating, version}
     this.searchQuery = null;      // active find-in-conversation term (highlight)
+    this.queueItems = [];
     this.findQuery = null;        // term being typed in the find picker
     this.projections = {};     // goal/todos/plan/sessionStats/contextPressure/…
     this.workspacePanel = null;
@@ -1967,10 +2159,13 @@ export class App {
   }
 
   layout() {
+    this.tooSmall = this.screen.w < 20 || this.screen.h < 6;
+    this.sidebarVisible = this.sidebarWanted && this.screen.w >= 50;
+    if (this.sidebarVisible) this.sidebarWidth = Math.max(14, Math.min(this.sidebarWidth, this.screen.w - 20));
     const x = this.sidebarVisible ? this.sidebarWidth : 0;
-    const w = this.screen.w - x;
-    const footerH = this.footerHeight();
-    const mainH = this.screen.h - 1 - footerH;
+    const w = Math.max(1, this.screen.w - x);
+    const footerH = Math.min(this.footerHeight(), Math.max(1, this.screen.h - 2));
+    const mainH = Math.max(1, this.screen.h - 1 - footerH);
     this.sidebar.x = 0; this.sidebar.y = 0; this.sidebar.w = this.sidebarWidth; this.sidebar.h = this.screen.h - 1;
     this.searchInput.w = this.sidebarWidth;
     this.chat.resize(x, 1, w, mainH);
@@ -2026,9 +2221,9 @@ export class App {
   }
 
   toggleSidebar() {
-    this.sidebarVisible = !this.sidebarVisible;
+    this.sidebarWanted = !this.sidebarWanted;
     this.layout();
-    this.toast(this.sidebarVisible ? "侧栏显示（Ctrl+B 隐藏）" : "侧栏隐藏（Ctrl+B 恢复）");
+    this.toast(this.sidebarVisible ? "侧栏显示（Ctrl+B 隐藏）" : (this.sidebarWanted ? "终端较窄，侧栏已自动隐藏" : "侧栏隐藏（Ctrl+B 恢复）"));
     if (this.sidebarVisible) this.focus(this.sidebar);
     else this.focus(this.chat);
     this.redraw();
@@ -2043,13 +2238,50 @@ export class App {
   openMenu(items, ev) {
     const w = Math.max(16, Math.min(40, ...items.map((i) => strWidth(i.label) + 6)));
     const h = items.length + 2;
-    const x = Math.min(ev.x, this.screen.w - w);
-    const y = Math.min(ev.y, this.screen.h - h - 1);
+    const x = Math.max(0, Math.min(ev.x, this.screen.w - w));
+    const y = Math.max(0, Math.min(ev.y, this.screen.h - h - 1));
     this.menu = new Menu({ x, y, w, h, items, onAction: (it) => { this.menu = null; if (it) it.action?.(); this.redraw(); } });
     this.redraw();
   }
 
   closePopup() { this.popup = null; this.redraw(); }
+
+  #promptKey(type, frame) {
+    return `${type}:${frame.__rpcId ?? frame.rpcId ?? frame.approvalId ?? frame.questions?.map((q) => q.id).join("|") ?? frame.sessionId}`;
+  }
+
+  #enqueuePrompt(type, frame) {
+    const key = this.#promptKey(type, frame);
+    if (this.activePrompt?.key === key || this.promptQueue.some((p) => p.key === key)) return;
+    this.promptQueue.push({ type, frame, key });
+    this.#showNextPrompt();
+  }
+
+  #showNextPrompt() {
+    if (this.activePrompt || this.popup) return;
+    const next = this.promptQueue.shift();
+    if (!next) return;
+    this.activePrompt = next;
+    const frame = { ...next.frame, rpcId: next.frame.__rpcId ?? next.frame.rpcId };
+    this.popup = next.type === "approval/requested" ? new ApprovalPopup({ app: this, frame }) : new QuestionPopup({ app: this, frame });
+    this.redraw();
+  }
+
+  finishPrompt() {
+    this.activePrompt = null;
+    this.popup = null;
+    this.#showNextPrompt();
+    this.redraw();
+  }
+
+  #dismissPrompt(frame) {
+    const rpcId = frame.questionRpcId ?? frame.__rpcId ?? frame.rpcId;
+    const approvalId = frame.approvalId;
+    const match = (p) => (rpcId && (p.frame.__rpcId ?? p.frame.rpcId) === rpcId) || (approvalId && p.frame.approvalId === approvalId);
+    if (this.activePrompt && match(this.activePrompt)) { this.activePrompt = null; this.popup = null; }
+    this.promptQueue = this.promptQueue.filter((p) => !match(p));
+    this.#showNextPrompt();
+  }
 
   toast(msg) {
     this.toastMsg = msg;
@@ -2121,11 +2353,13 @@ export class App {
   }
 
   async refreshSessions() {
+    const seq = ++this.refreshSessionsSeq;
     try {
       const [list, workspaces] = await Promise.all([
         this.api.call("session.list"),
         this.api.call("workspace.list").catch(() => ({ items: [], archivedSessionIds: [] })),
       ]);
+      if (seq !== this.refreshSessionsSeq) return;
       this.sessions = [...list.items].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
       this.workspaceItems = workspaces.items ?? [];
       this.sidebar.setData(this.workspaceItems, this.sessions, workspaces.archivedSessionIds ?? [], this.currentSession);
@@ -2142,12 +2376,9 @@ export class App {
   /** Public entry for frame injection (scripted tests, future RPC). */
   injectFrame(frame) {
     switch (frame.type) {
-      case "question/requested": {
-        this.popup = new QuestionPopup({ app: this, frame: { ...frame, rpcId: frame.__rpcId } });
-        break;
-      }
+      case "question/requested":
       case "approval/requested": {
-        this.popup = new ApprovalPopup({ app: this, frame: { ...frame, rpcId: frame.__rpcId } });
+        this.#enqueuePrompt(frame.type, frame);
         break;
       }
       case "session/event":
@@ -2155,6 +2386,7 @@ export class App {
       case "session/subscribed":
       case "session/queue":
         if (this.chat.sessionId === frame.sessionId) {
+          if (frame.type === "session/queue") this.queueItems = frame.items ?? [];
           this.chat.onFrame(frame);
         }
         // refresh list on title updates
@@ -2168,6 +2400,7 @@ export class App {
         if (this.chat.sessionId === frame.sessionId) this.chat.onFrame(frame);
         break;
       case "session/projection":
+        if (frame.sessionId && frame.sessionId !== this.currentSession) break;
         this.projections[frame.key] = frame.value;
         if (frame.key === "tokenUsage") this.tokenUsage = frame.value;
         // the todo block's height depends on the todos projection → reflow
@@ -2175,8 +2408,12 @@ export class App {
         break;
       case "approval/resolved":
       case "question/resolved":
+        this.#dismissPrompt(frame);
+        this.log(`[frame] ${frame.type}`);
+        break;
       case "stream/error":
         this.log(`[frame] ${frame.type}`);
+        this.toast(`实时流错误: ${frame.message ?? frame.error?.message ?? "未知错误"}`);
         break;
       default:
         this.log(`[frame] unknown: ${frame.type}`);
@@ -2187,6 +2424,11 @@ export class App {
   #onHostFrame(frame) {
     if (frame.type === "host/session-added" || frame.type === "host/session-removed") {
       this.refreshSessions();
+    } else if (frame.type === "host/session-status") {
+      const session = this.sessions.find((s) => s.sessionId === frame.sessionId);
+      if (session) session.running = frame.running;
+      if (frame.sessionId === this.currentSession) this.chat.running = frame.running || this.chat.nodes.some((n) => n.kind === "turn-progress" && n.streaming);
+      this.sidebar.setData(this.workspaceItems ?? [], this.sessions, [], this.currentSession);
     }
     this.redraw();
   }
@@ -2329,10 +2571,11 @@ export class App {
     } catch (e) { this.toast(`分叉失败: ${e.message}`); }
   }
 
-  async loadFeedback() {
-    if (!this.currentSession) return;
+  async loadFeedback(sessionId = this.currentSession, epoch = this.sessionEpoch) {
+    if (!sessionId) return;
     try {
-      const res = await this.api.rpcCall("messageFeedback/list", { request: { sessionId: this.currentSession } });
+      const res = await this.api.rpcCall("messageFeedback/list", { request: { sessionId } });
+      if (sessionId !== this.currentSession || epoch !== this.sessionEpoch) return;
       this.feedbackMap = new Map();
       for (const item of res?.value?.items ?? res?.items ?? []) this.feedbackMap.set(item.messageId, item);
     } catch { this.feedbackMap = new Map(); }
@@ -2461,7 +2704,13 @@ export class App {
   async newSession() { return this.newSessionIn(null); }
 
   async openSession(sessionId) {
+    const epoch = ++this.sessionEpoch;
     this.currentSession = sessionId;
+    this.projections = {};
+    this.tokenUsage = null;
+    this.currentModel = null;
+    this.feedbackMap = new Map();
+    this.queueItems = [];
     // apply the buffered jobs snapshot; if this session's connect-time
     // baseline was never seen, reconnect the mux to re-fetch it (the host
     // re-pushes the full snapshot on every fresh mux connection)
@@ -2472,17 +2721,19 @@ export class App {
     } else if (this.api.connected && typeof this.api.refreshMux === "function") {
       this.api.refreshMux();
     }
-    await this.chat.open(sessionId);
-    this.loadFeedback();
-    this.updateModel();
+    await this.chat.open(sessionId, epoch);
+    if (epoch !== this.sessionEpoch || sessionId !== this.currentSession) return;
+    this.loadFeedback(sessionId, epoch);
+    this.updateModel(sessionId, epoch);
     this.redraw();
   }
 
   /** Read the session's own model selection (provider/model/reasoning effort). */
-  async updateModel() {
-    if (!this.currentSession) { this.currentModel = null; return; }
+  async updateModel(sessionId = this.currentSession, epoch = this.sessionEpoch) {
+    if (!sessionId) { this.currentModel = null; return; }
     try {
-      const res = await this.api.call("session.models", { sessionId: this.currentSession });
+      const res = await this.api.call("session.models", { sessionId });
+      if (sessionId !== this.currentSession || epoch !== this.sessionEpoch) return;
       this.currentModel = res.current ?? null;
     } catch { this.currentModel = null; }
   }
@@ -2583,10 +2834,12 @@ export class App {
     this.closeOverlay();
     this.menu = null;
     this.popup = null;
+    this.activePrompt = null;
+    this.promptQueue = [];
     for (const p of [this.workspacePanel, this.trajectoryPanel, this.settingsPanel, this.modelPanel, this.subagentPanel, this.skillsPanel]) {
       if (p?.dispose) { try { p.dispose(); } catch {} }
     }
-    this.workspacePanel = this.trajectoryPanel = this.settingsPanel = this.subagentPanel = this.skillsPanel = null;
+    this.workspacePanel = this.trajectoryPanel = this.settingsPanel = this.modelPanel = this.subagentPanel = this.skillsPanel = null;
     this.chat.cache.clear();
     this.chat.nodes = [];
     this.chat.collapsedBlocks.clear();
@@ -2805,6 +3058,9 @@ export class App {
       this.swallowRelease = false;
       return; // a press just closed an overlay; eat its matching release
     }
+    // Motion/drag may occur between the closing press and its release under
+    // SGR 1003; retain the latch until that release instead of leaking through.
+    if (this.swallowRelease && ev.type === "mouse") return;
     this.swallowRelease = false;
     // The rename/workspace inline editor owns the keyboard while it is open,
     // so typed text reaches the input (the popup below only handles buttons).
@@ -3073,29 +3329,44 @@ export class App {
   }
 
   #refreshSearch() {
-    const input = this.searchInput;
-    if (input.value.trim()) {
-      this.api.call("session.search", { query: input.value }).then(({ items }) => {
-        this.searchResults = items;
+    const query = this.searchInput.value.trim();
+    const seq = ++this.searchSeq;
+    this.searchSelected = 0;
+    if (query) {
+      this.api.call("session.search", { query }).then(({ items }) => {
+        if (seq !== this.searchSeq || this.searchInput.value.trim() !== query) return;
+        this.searchResults = items ?? [];
         this.redraw();
-      }).catch(() => {});
+      }).catch((e) => {
+        if (seq === this.searchSeq) this.toast(`搜索失败: ${e.message}`);
+      });
     } else this.searchResults = null;
   }
 
   #onSearchKey(ev) {
     const input = this.searchInput;
-    if (ev.type === "key" && ev.name === "escape") { this.searchActive = false; this.focus(this.sidebar); this.refreshSessions(); return; }
-    if (ev.type === "key" && ev.name === "enter") { this.searchActive = false; this.focus(this.sidebar); return; }
+    if (ev.type === "key" && ev.name === "escape") { this.searchActive = false; this.searchResults = null; this.focus(this.sidebar); this.refreshSessions(); return; }
+    if (ev.type === "key" && ev.name === "up" && this.searchResults?.length) { this.searchSelected = Math.max(0, this.searchSelected - 1); return; }
+    if (ev.type === "key" && ev.name === "down" && this.searchResults?.length) { this.searchSelected = Math.min(this.searchResults.length - 1, this.searchSelected + 1); return; }
+    if (ev.type === "key" && ev.name === "enter") {
+      const selected = this.searchResults?.[this.searchSelected];
+      this.searchActive = false; this.searchResults = null; this.focus(this.sidebar);
+      if (selected?.sessionId) this.openSession(selected.sessionId);
+      return;
+    }
     const handled = input.onKey(ev);
     if (handled) this.#refreshSearch();
   }
 
   #renderSearchResults(s) {
-    for (let i = 0; i < Math.min(this.sidebar.h, this.searchResults.length); i++) {
-      const it = this.searchResults[i];
-      s.text(this.sidebar.x, this.sidebar.y + i, truncate(`⚲ ${it.snippet}`, this.sidebar.w - 2), { fg: K.TXT });
+    const results = this.searchResults ?? [];
+    for (let i = 0; i < Math.min(this.sidebar.h, results.length); i++) {
+      const it = results[i];
+      const selected = i === this.searchSelected;
+      s.fillRect(this.sidebar.x, this.sidebar.y + i, this.sidebar.x + this.sidebar.w - 2, this.sidebar.y + i, " ", { bg: selected ? T.MENUSEL : T.BG });
+      s.text(this.sidebar.x, this.sidebar.y + i, truncate(`${selected ? "▸" : "⚲"} ${it.snippet ?? it.title ?? it.sessionId ?? ""}`, this.sidebar.w - 2), { fg: selected ? T.SELFG : K.TXT, bg: selected ? T.MENUSEL : T.BG });
     }
-    if (this.searchResults.length === 0) s.text(this.sidebar.x, this.sidebar.y, "无结果", { fg: K.FAINT });
+    if (results.length === 0) s.text(this.sidebar.x, this.sidebar.y, "无结果", { fg: K.FAINT });
   }
 
   redraw() {
@@ -3143,15 +3414,23 @@ export class App {
     this.chat.flushRebuild();
     const s = this.screen;
     s.clear(-1, T.BG);
+    if (this.tooSmall) {
+      const msg = "终端过小，至少需要 20×6";
+      s.text(Math.max(0, Math.floor((s.w - strWidth(msg)) / 2)), Math.max(0, Math.floor(s.h / 2)), truncate(msg, s.w), { fg: T.WARN });
+      this.term.output.write(s.render() + "\x1b[?25l");
+      return;
+    }
     this.#renderTabBar(s);
     if (this.sidebarVisible) {
       if (this.searchActive) {
         this.searchInput.render(s);
         this.sidebar.y = 1; this.sidebar.h = s.h - 2;
+        if (this.searchResults !== null) this.#renderSearchResults(s);
+        else this.sidebar.render(s);
       } else {
         this.sidebar.y = 0; this.sidebar.h = s.h - 1;
+        this.sidebar.render(s);
       }
-      this.sidebar.render(s);
       s.put(this.sidebar.w - 1, 0, "│", { fg: T.BORDER });
       for (let y = 1; y < s.h - 1; y++) s.put(this.sidebar.w - 1, y, "│", { fg: T.BORDER });
     }
@@ -3183,6 +3462,7 @@ export class App {
     const badge = perm && preset ? `${permName(perm)}/${modeName(preset)}`
       : perm ? permName(perm) : preset ? modeName(preset) : "未选会话";
     row0.left.push({ t: ` ${badge} `, fg: T.SELFG, bg: T.ACCENT, bold: true });
+    if (this.queueItems.length) row0.left.push({ t: ` ⏳队列 ${this.queueItems.length} `, fg: T.SELFG, bg: T.WARN, bold: true });
     if (this.sidebarVisible) row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });
     else row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });
     if (cur?.running) row0.left.push({ t: " ●运行 ", fg: T.OK, bg: T.STATUSBG });
@@ -3200,13 +3480,15 @@ export class App {
     const plan = this.projections.plan;
     if (plan?.active || plan?.pending) row0.right.push({ t: plan.active ? " ✎计划中 " : " ✎计划待审 ", fg: T.SELFG, bg: T.ACCENT2 });
     const sub = this.projections.subagent;
-    if (sub && typeof sub === "object" && (sub.running ?? sub.active)) row0.right.push({ t: " ⚑子代理 ", fg: T.SELFG, bg: T.PURPLE });
+    const subTiming = this.projections.subagentTiming;
+    if (sub && typeof sub === "object") row0.right.push({ t: ` ⚑${truncate(sub.label ?? "子代理", 16)}${subTiming?.active ? " ●" : ""} `, fg: T.SELFG, bg: T.PURPLE });
     const m = this.currentModel;
     const modelLabel = m
       ? `${m.provider}/${m.model}${m.reasoningEffort ? `@${m.reasoningEffort}` : ""}`
       : `${this.provider}/${this.model}`;
     row0.right.push({ t: ` ${modelLabel} `, fg: T.DIM, bg: T.STATUSBG });
-    if (this.connState !== "connected") row0.right.push({ t: " ⚠离线 ", fg: T.SELFG, bg: T.ERR, bold: true });
+    if (this.connState === "disconnected") row0.right.push({ t: " ⚠离线 ", fg: T.SELFG, bg: T.ERR, bold: true });
+    else if (this.connState === "degraded" || this.connState === "connecting") row0.right.push({ t: " ⚠部分离线 ", fg: T.SELFG, bg: T.WARN, bold: true });
     rows.push(row0);
     // ── row 1: usage (context meter + tokens) ──
     const row1 = { left: [], right: [] };
@@ -3241,7 +3523,8 @@ export class App {
     if (stats) {
       if (stats.steps) row1.right.push({ t: ` ⚙${stats.steps}步 `, fg: T.FAINT, bg: T.STATUSBG });
       if (stats.turns) row1.right.push({ t: ` ${stats.turns}回合 `, fg: T.FAINT, bg: T.STATUSBG });
-      if (stats.ttftMs) row1.right.push({ t: ` 首响${Math.round(stats.ttftMs / stats.ttftSteps)}ms `, fg: T.FAINT, bg: T.STATUSBG });
+      if (stats.ttftMs && stats.ttftSteps) row1.right.push({ t: ` 首响${Math.round(stats.ttftMs / stats.ttftSteps)}ms `, fg: T.FAINT, bg: T.STATUSBG });
+      if (stats.decodeMs && stats.decodeTokens) row1.right.push({ t: ` 解码${Math.round(1000 * stats.decodeTokens / stats.decodeMs)}tok/s `, fg: T.FAINT, bg: T.STATUSBG });
     }
     rows.push(row1);
     // frozen-view indicator: N lines of new content arrived below
@@ -3305,7 +3588,9 @@ export class App {
   }
 
   stop() {
-    if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    if (this.timer) clearTimeout(this.timer);
+    this.pollTimer = this.timer = null;
     this.term.stop();
     this.api.close();
     process.exit(0);

@@ -25,10 +25,23 @@ export function wcwidth(cp) {
   return 1;
 }
 
+const GRAPHEME_SEGMENTER = typeof Intl?.Segmenter === "function" ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
+
+/** Iterate user-perceived graphemes so combining marks and ZWJ emoji stay intact. */
+export function graphemes(s) {
+  s = typeof s === "string" ? s : String(s ?? "");
+  return GRAPHEME_SEGMENTER ? Array.from(GRAPHEME_SEGMENTER.segment(s), (x) => x.segment) : Array.from(s);
+}
+
+export function graphemeWidth(g) {
+  const widths = Array.from(g, (ch) => wcwidth(ch.codePointAt(0)));
+  // Emoji joined by ZWJ occupy one glyph cell-pair, not the sum of members.
+  return g.includes("\u200d") ? Math.max(0, ...widths) : widths.reduce((a, b) => a + b, 0);
+}
+
 export function strWidth(s) {
-  if (typeof s !== "string") s = String(s ?? "");
   let w = 0;
-  for (const ch of s) w += wcwidth(ch.codePointAt(0));
+  for (const g of graphemes(s)) w += graphemeWidth(g);
   return w;
 }
 
@@ -38,8 +51,8 @@ export function truncate(s, w) {
   const ell = "…";
   if (strWidth(s) <= w) return s;
   let out = "", used = 0;
-  for (const ch of s) {
-    const cw = wcwidth(ch.codePointAt(0));
+  for (const ch of graphemes(s)) {
+    const cw = graphemeWidth(ch);
     if (used + cw > w - 1) break;
     out += ch; used += cw;
   }
@@ -124,7 +137,8 @@ export function bars(values, width, { min = 0, max = 1 } = {}) {
   const out = [];
   for (let i = 0; i < width; i++) {
     const t = values[i] ?? 0;
-    const v = Math.max(0, Math.min(1, (t - min) / (max - min)));
+    const span = max - min;
+    const v = span === 0 ? (t >= max ? 1 : 0) : Math.max(0, Math.min(1, (t - min) / span));
     let eighths = Math.round(v * 8);
     if (v > 0 && eighths <= 0) eighths = 1;   // visible sliver for tiny fractions
     if (eighths <= 0) out.push(" ");

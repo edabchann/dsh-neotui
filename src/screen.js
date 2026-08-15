@@ -1,5 +1,5 @@
 // screen.js — Cell-grid framebuffer with ANSI diff rendering.
-import { wcwidth } from "./text.js";
+import { wcwidth, graphemes, graphemeWidth } from "./text.js";
 
 export const ATTR = { BOLD: 1, DIM: 2, ITALIC: 4, UNDERLINE: 8, REVERSE: 16, STRIKE: 32 };
 
@@ -18,6 +18,8 @@ export class Screen {
   }
 
   resize(w, h) {
+    w = Number.isFinite(w) ? Math.max(1, Math.floor(w)) : 80;
+    h = Number.isFinite(h) ? Math.max(1, Math.floor(h)) : 24;
     this.w = w; this.h = h;
     this.cells = new Array(h);
     for (let y = 0; y < h; y++) {
@@ -51,7 +53,7 @@ export class Screen {
       }
     }
     const cell = this.cells[y][x];
-    const wide = wcwidth(ch.codePointAt(0)) === 2;
+    const wide = graphemeWidth(ch) === 2;
     if (wide && x + 1 >= this.w) ch = " "; // clip wide char at the right edge (terminal wrap corruption)
     cell.ch = ch; cell.fg = fg;
     // bg -1 = transparent: KEEP the cell's existing background (the layer
@@ -75,11 +77,16 @@ export class Screen {
   /** Write text; wide-aware; clips at right edge. Returns final x. */
   text(x, y, s, style = {}) {
     let px = x;
-    for (const ch of s) {
-      const cw = wcwidth(ch.codePointAt(0));
-      if (cw === 0) continue;
+    for (const ch of graphemes(s)) {
+      const cw = graphemeWidth(ch);
+      if (cw === 0) {
+        // Preserve a standalone combining cluster by attaching it to the
+        // previous visible cell; normally Intl.Segmenter already groups it.
+        if (px > 0 && y >= 0 && y < this.h) this.cells[y][px - 1].ch += ch;
+        continue;
+      }
       if (px >= this.w) break;
-      if (cw === 2 && px + 1 >= this.w) break; // wide char needs both columns
+      if (cw === 2 && px + 1 >= this.w) break;
       this.put(px, y, ch, style);
       px += cw;
     }

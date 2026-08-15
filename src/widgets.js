@@ -416,14 +416,19 @@ export class Input extends Widget {
         this.cursorCell = { x: this.x + promptW, y: this.y };
         return;
       }
-      const before = Array.from(this.value).slice(0, this.cursor).join("");
+      const cps = Array.from(this.value);
+      const before = cps.slice(0, this.cursor).join("");
       const cx = strWidth(before);
-      let start = 0;
-      while (cx - start >= inner) start += Math.max(1, Math.floor(inner / 2));
-      const visible = truncate(Array.from(this.value).slice(start).join(""), inner);
+      const desiredCol = Math.max(0, cx - Math.max(1, inner - 1));
+      let startIdx = 0, startCol = 0;
+      while (startIdx < cps.length && startCol + strWidth(cps[startIdx]) <= desiredCol) {
+        startCol += strWidth(cps[startIdx]);
+        startIdx++;
+      }
+      const visible = truncate(cps.slice(startIdx).join(""), inner);
       const drawn = this.masked ? "•".repeat(Array.from(visible).length) : visible;
       screen.text(this.x + promptW, this.y, drawn, { fg: this.fg, bg: this.bg });
-      this.cursorCell = { x: this.x + promptW + Math.min(inner, Math.max(0, cx - start)), y: this.y };
+      this.cursorCell = { x: this.x + promptW + Math.min(inner, Math.max(0, cx - startCol)), y: this.y };
       return;
     }
     // multi-line: auto-wrap + scroll window that follows the cursor

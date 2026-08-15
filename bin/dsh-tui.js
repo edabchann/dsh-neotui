@@ -20,6 +20,7 @@ const has = (name) => args.includes(name);
 
 const base = opt("--base", opt("--attach", process.env.DSH_URL || process.env.DSH_WEB_URL || "http://127.0.0.1:3080"));
 const log = (...a) => console.error("[dsh-tui]", ...a);
+let activeTerm = null;
 
 async function main() {
   const script = opt("--script", null);
@@ -38,6 +39,7 @@ async function main() {
     onResize: (w, h) => app.resize(w, h),
   });
   app.term = term;
+  activeTerm = term;
   screen.resize(term.w, term.h);
   app.resize(term.w, term.h);
   term.start();
@@ -127,4 +129,8 @@ function dump(app, plain) {
   out.chunks.length = 0;
 }
 
-main().catch((e) => { log("fatal:", e); process.exit(1); });
+main().catch((e) => {
+  log("fatal:", e);
+  try { activeTerm?.stop(); } catch {}
+  process.exit(1);
+});

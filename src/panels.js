@@ -840,12 +840,15 @@ export class TrajectoryPanel extends Widget {
     }
     // Dedupe concurrent loads of the same session (setMode + focusMessage).
     if (this.loadPromise && this.loadTarget === sessionId) return this.loadPromise;
+    const token = (this.loadToken ?? 0) + 1;
+    this.loadToken = token;
     this.loadTarget = sessionId;
-    this.loadPromise = this.#doLoad(sessionId);
-    try { await this.loadPromise; }
-    finally { this.loadPromise = null; this.loadTarget = null; }
+    const promise = this.#doLoad(sessionId, token);
+    this.loadPromise = promise;
+    try { await promise; }
+    finally { if (this.loadPromise === promise) { this.loadPromise = null; this.loadTarget = null; } }
   }
-  async #doLoad(sessionId) {
+  async #doLoad(sessionId, token) {
     this.sessionId = sessionId;
     this.loading = true;
     this.steps = [];
@@ -858,6 +861,7 @@ export class TrajectoryPanel extends Widget {
       // One bounded call for the recent steps (maxMessages = model messages =
       // steps). Older steps load on demand via PgUp/click.
       const h = await this.app.api.call("session.history", { sessionId, maxMessages: 20 });
+      if (this.sessionId !== sessionId || this.loadToken !== token) return;
       this.stats = h.projections?.values?.sessionStats ?? null;
       this.minSeq = h.events[0]?.event?.seq ?? null;
       this.hasMore = h.hasMore;
@@ -871,10 +875,13 @@ export class TrajectoryPanel extends Widget {
   }
   async loadOlder() {
     if (!this.hasMore || this.loadingOlder || this.minSeq == null) return;
+    const sessionId = this.sessionId;
+    const token = this.loadToken;
     this.loadingOlder = true;
     this.app.setStatus("加载更早轨迹…");
     try {
-      const h = await this.app.api.call("session.history", { sessionId: this.sessionId, beforeSeq: this.minSeq, maxMessages: 40 });
+      const h = await this.app.api.call("session.history", { sessionId, beforeSeq: this.minSeq, maxMessages: 40 });
+      if (this.sessionId !== sessionId || this.loadToken !== token) { this.loadingOlder = false; return; }
       if (h.events.length === 0) { this.hasMore = false; }
       else {
         this.minSeq = h.events[0]?.event?.seq ?? this.minSeq;
@@ -1004,9 +1011,12 @@ export class TrajectoryPanel extends Widget {
   /** Re-fetch the tail window while following the live turn. */
   async #refreshTail() {
     if (!this.sessionId) return;
+    const sessionId = this.sessionId;
+    const token = this.loadToken;
     this.refreshing = true;
     try {
-      const h = await this.app.api.call("session.history", { sessionId: this.sessionId, maxMessages: 20 });
+      const h = await this.app.api.call("session.history", { sessionId, maxMessages: 20 });
+      if (this.sessionId !== sessionId || this.loadToken !== token) { this.refreshing = false; return; }
       this.allEvents = h.events;
       this.minSeq = h.events[0]?.event?.seq ?? this.minSeq;
       this.hasMore = h.hasMore;
@@ -1081,7 +1091,7 @@ export function fmtMs(ms) {
 // ---- Terminal image viewer (kitty graphics / external viewer / chafa) ----
 
 export function kittyCapable(env = process.env) {
-  if (env.KITTY_WINDOW_ID || env.TERM_PROGRAM === "WezTerm" || env.TERM_PROGRAM === "foot" || env.TERM === "xterm-kitty") return true;
+  if (env.KITTY_WINDOW_ID || env.TERM_PROGRAM === "WezTerm" || env.TERM === "xterm-kitty") return true;
   if (env.DSH_TUI_NO_KITTY) return false;
   return false;
 }
@@ -1565,6 +1575,9 @@ export function buildGoalPopup(app) {
   else {
     lines.push([{ t: ` 目标: ${goal.objective ?? goal}`, fg: K.TXT }]);
     if (goal.phase) lines.push([{ t: ` 阶段: ${goal.phase}`, fg: K.DIM }]);
+    const rounds = app.goalData?.roundsStarted;
+    if (goal.maxGoalRounds != null) lines.push([{ t: ` 轮次: ${rounds ?? 0}/${goal.maxGoalRounds}${goal.revision != null ? ` · 修订 ${goal.revision}` : ""}`, fg: K.DIM }]);
+    if (goal.blockedReason?.message) lines.push([{ t: ` 阻塞: ${goal.blockedReason.message}${goal.blockedReason.code ? ` (${goal.blockedReason.code})` : ""}`, fg: K.ERR }]);
     if (goal.id) lines.push([{ t: ` id: ${goal.id}`, fg: K.FAINT }]);
   }
   if (todos.length) {
@@ -2299,10 +2312,12 @@ export class ModelPanel extends Widget {
   #deleteModel() {
     const route = this.#route();
     if (!route || this.modelsSel < 0) { this.app.toast("先选中一个模型"); return; }
-    this.#profile(route).models.splice(this.modelsSel, 1);
-    this.modelsSel = -1;
-    this.#rebuild();
-    this.app.redraw();
+    const model = this.#profile(route).models[this.modelsSel];
+    this.#confirmDelete(`删除模型 ${model?.name || model?.id || "（未命名）"}？`, () => {
+      this.#profile(route).models.splice(this.modelsSel, 1);
+      this.modelsSel = -1;
+      this.#rebuild(); this.app.redraw();
+    });
   }
   async #setDefaultModel() {
     const route = this.#route();
@@ -2379,16 +2394,28 @@ export class ModelPanel extends Widget {
     this.app.focus(popup);
     this.app.redraw();
   }
+  #confirmDelete(prompt, action) {
+    const w = Math.max(18, Math.min(60, this.app.screen.w - 4));
+    this.app.overlay = new Popup({
+      x: Math.max(0, Math.floor((this.app.screen.w - w) / 2)), y: Math.max(0, Math.floor(this.app.screen.h / 2) - 3),
+      w, h: Math.min(7, this.app.screen.h), title: "确认删除",
+      lines: [[{ t: " " + prompt, fg: K.WARN }]],
+      buttons: [{ label: "取消", action: "cancel" }, { label: "删除", action: "delete" }],
+      onAction: (btn) => { this.app.closeOverlay(); if (btn?.action === "delete") action(); },
+    });
+    this.app.redraw();
+  }
   async #deleteProvider() {
     const route = this.#route();
     if (!route) return;
-    delete this.providers[route];
-    this.routes = Object.keys(this.providers);
-    this.sel = Math.min(this.sel, this.routes.length - 1);
-    this.modelsSel = -1;
-    await this.#save();
-    this.#rebuild();
-    this.app.redraw();
+    this.#confirmDelete(`删除供应商 ${route}？此操作会立即保存。`, async () => {
+      delete this.providers[route];
+      this.routes = Object.keys(this.providers);
+      this.sel = Math.min(this.sel, this.routes.length - 1);
+      this.modelsSel = -1;
+      await this.#save();
+      this.#rebuild(); this.app.redraw();
+    });
   }
   async #scan() {
     const route = this.#route();
@@ -2675,9 +2702,12 @@ export class SubagentPanel extends Widget {
     this.input.x = x + listW + 1; this.input.y = y + h - 2; this.input.w = w - listW - 2;
   }
   async load(parentId) {
+    const token = (this.loadToken ?? 0) + 1;
+    this.loadToken = token;
     this.parentId = parentId;
     try {
       const res = await this.app.api.call("subagent.list", { parentSessionId: parentId });
+      if (this.parentId !== parentId || this.loadToken !== token) return;
       this.entries = res.entries ?? [];
       this.parentAvailable = res.parentAvailable;
     } catch (e) {
@@ -2701,16 +2731,27 @@ export class SubagentPanel extends Widget {
   async selectChild(i) {
     if (i < 0 || i >= this.entries.length) { this.view.setLines([[{ t: "选择左侧子代理查看历史", fg: K.FAINT }]]); this.selIdx = Math.max(0, i); return; }
     this.selIdx = i;
+    const parentId = this.parentId;
     const child = this.entries[i];
     this.view.setLines([[{ t: `加载 ${child.id.slice(0, 8)} 历史…`, fg: K.DIM }]]);
     try {
       const h = await this.app.api.call("subagent.history", {
-        parentSessionId: this.parentId,
+        parentSessionId: parentId,
         childSessionId: child.id,
         mode: child.mode,
         maxMessages: 100,
       });
-      const lines = [[{ t: `${child.label ?? child.id} — ${h.events.length} 事件`, fg: K.ACCENT, bold: true }], [{ t: "" }]];
+      if (this.parentId !== parentId || this.entries[this.selIdx]?.id !== child.id) return;
+      const projections = h.projections?.values ?? h.projections ?? {};
+      const identity = projections.subagent;
+      const timing = projections.subagentTiming;
+      const elapsed = (timing?.settledMs ?? 0) + (timing?.active ? Math.max(0, Date.now() - timing.active.since) : 0);
+      const lines = [[{ t: `${identity?.label ?? child.label ?? child.id} — ${h.events.length} 事件${elapsed ? ` · ${fmtMs(elapsed)}` : ""}`, fg: K.ACCENT, bold: true }], [{ t: `模式 ${identity?.mode ?? child.mode}${timing?.active ? " · ●运行中" : ""}`, fg: K.DIM }]];
+      const goal = projections.goal?.goal ?? projections.goal;
+      if (goal?.objective) lines.push([{ t: `目标: ${truncate(goal.objective, this.view.w - 10)} · ${goal.phase ?? "active"}`, fg: K.WARN }]);
+      const todos = projections.todos ?? [];
+      if (todos.length) lines.push([{ t: `任务: ${todos.filter((t) => t.status === "completed").length}/${todos.length} 完成`, fg: K.DIM }]);
+      lines.push([{ t: "" }]);
       for (const { event } of h.events.slice(-200)) {
         const d = event.data ?? {};
         let summary = "";
@@ -2831,8 +2872,10 @@ export class SkillsPanel extends Widget {
     this.detail.x = x + 32; this.detail.y = y + 1; this.detail.w = w - 33; this.detail.h = h - 2;
   }
   async load() {
+    const sessionId = this.app.currentSession;
     try {
-      const r = await this.app.api.call("skill.list", { sessionId: this.app.currentSession });
+      const r = await this.app.api.call("skill.list", { sessionId });
+      if (sessionId !== this.app.currentSession) return;
       this.skills = r.skills ?? [];
     } catch (e) {
       this.skills = [];

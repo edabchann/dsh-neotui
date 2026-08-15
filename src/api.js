@@ -29,8 +29,10 @@ export class Api {
     this.muxWs = null;
     this.closed = false;
     this.connected = false;
-    this.retryDelay = 500;
-    this.pendingFrames = []; // frames buffered while reconnecting
+    this.connectionState = {
+      mux: { ws: null, connected: false, retryDelay: 500, timer: null },
+      host: { ws: null, connected: false, retryDelay: 500, timer: null },
+    };
   }
 
   async call(method, payload = {}) {
@@ -52,20 +54,36 @@ export class Api {
     return body.result.value;
   }
 
-  /** Answer an approval/question frame. ok=false means reject. */
+  /** Answer an approval/question frame successfully. */
   async respond(rpcId, value) {
-    const env = {
-      type: "client-response",
-      rpcId,
-      result: { ok: true, value },
-    };
-    const res = await fetch(`${this.base}/api/respond`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(env),
+    return this.#respondEnvelope(rpcId, { ok: true, value });
+  }
+
+  /** Cancel an answerable question using the gateway's fail-closed envelope. */
+  async cancelResponse(rpcId) {
+    return this.#respondEnvelope(rpcId, {
+      ok: false,
+      error: { code: "cancelled", message: "cancelled by the TUI user" },
     });
+  }
+
+  async #respondEnvelope(rpcId, result) {
+    let res;
+    try {
+      res = await fetch(`${this.base}/api/respond`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "client-response", rpcId, result }),
+      });
+    } catch (e) {
+      throw new ApiError({ code: "transport", message: `respond unreachable: ${e.message}` });
+    }
     if (!res.ok) throw new ApiError({ code: "http", message: `respond HTTP ${res.status}` });
-    return res.json();
+    const receipt = await res.json();
+    if (receipt?.accepted === false) {
+      throw new ApiError({ code: "response-rejected", message: receipt.reason ?? "response rejected" });
+    }
+    return receipt;
   }
 
   connectMux() {
@@ -82,17 +100,22 @@ export class Api {
 
   #connect(url, kind) {
     if (this.closed) return;
+    const state = this.connectionState[kind];
+    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
     const ws = new WebSocket(url);
+    state.ws = ws;
     if (kind === "mux") this.muxWs = ws;
     else this.hostWs = ws;
-    this.ws = ws; // most recent socket (for diagnostics)
+    this.ws = ws; // most recent socket (diagnostics only)
     ws.onopen = () => {
-      this.connected = true;
-      this.retryDelay = 500;
+      if (state.ws !== ws || this.closed) return;
+      state.connected = true;
+      state.retryDelay = 500;
       this.log(`[api] ${kind} stream connected`);
-      this.onStateChange("connected");
+      this.#publishConnectionState();
     };
     ws.onmessage = (m) => {
+      if (state.ws !== ws || this.closed) return;
       let body;
       try { body = JSON.parse(String(m.data)); } catch { return; }
       if (body?.type !== "server-request") return;
@@ -102,14 +125,27 @@ export class Api {
       else this.onHostFrame(frame);
     };
     ws.onclose = () => {
-      this.connected = false;
-      this.onStateChange("disconnected");
+      if (state.ws !== ws) return;
+      state.connected = false;
+      state.ws = null;
+      this.#publishConnectionState();
       if (this.closed) return;
-      this.log(`[api] ${kind} stream closed, reconnecting in ${this.retryDelay}ms`);
-      this.reconnectTimer = setTimeout(() => this.#connect(url, kind), this.retryDelay);
-      this.retryDelay = Math.min(this.retryDelay * 2, 15000);
+      const delay = state.retryDelay;
+      this.log(`[api] ${kind} stream closed, reconnecting in ${delay}ms`);
+      state.timer = setTimeout(() => {
+        state.timer = null;
+        this.#connect(url, kind);
+      }, delay);
+      state.retryDelay = Math.min(delay * 2, 15000);
     };
     ws.onerror = () => { /* onclose follows */ };
+  }
+
+  #publishConnectionState() {
+    const mux = this.connectionState.mux.connected;
+    const host = this.connectionState.host.connected;
+    this.connected = mux;
+    this.onStateChange(mux && host ? "connected" : (mux || host ? "degraded" : "disconnected"));
   }
 
   /** Typert gateway RPC: POST /api/<namespace>/<method> with {args} payload
@@ -139,15 +175,28 @@ export class Api {
    *  e.g. when the connect-time snapshot arrived before a session opened. */
   refreshMux() {
     if (this.closed) return;
-    try { this.muxWs?.close(); } catch {}
-    // the onclose handler reconnects with backoff
+    const state = this.connectionState.mux;
+    state.retryDelay = 0;
+    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+    if (state.ws) {
+      try { state.ws.close(); } catch {}
+    } else {
+      this.#connect(this.wsUrl("events.mux"), "mux");
+    }
   }
+
+  get muxConnected() { return this.connectionState.mux.connected; }
+  get hostConnected() { return this.connectionState.host.connected; }
 
   close() {
     this.closed = true;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    try { this.muxWs?.close(); } catch {}
-    try { this.hostWs?.close(); } catch {}
-    try { this.rpcWs?.close(); } catch {}
+    for (const state of Object.values(this.connectionState)) {
+      if (state.timer) clearTimeout(state.timer);
+      state.timer = null;
+      state.connected = false;
+      try { state.ws?.close(); } catch {}
+      state.ws = null;
+    }
+    this.connected = false;
   }
 }

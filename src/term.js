@@ -36,6 +36,7 @@ export class Term {
     this.started = false;
     this.pasteBuf = null;
     this.pasting = false;  // inside a bracketed paste (200~ … 201~)
+    this.dataHandler = (chunk) => this.#feed(this.decoder.write(chunk));
     this.w = (output.columns || 80); this.h = (output.rows || 24);
   }
 
@@ -44,7 +45,7 @@ export class Term {
     this.started = true;
     if (typeof this.input.setRawMode === "function") this.input.setRawMode(true);
     this.input.resume();
-    this.input.on("data", (chunk) => this.#feed(this.decoder.write(chunk)));
+    this.input.on("data", this.dataHandler);
     const o = this.output;
     o.write("\x1b[?1049h"); // alt screen
     o.write("\x1b[?25l");   // hide cursor (shown only over the focused input)
@@ -65,9 +66,14 @@ export class Term {
     if (!this.started) return;
     this.started = false;
     const o = this.output;
-    o.write("\x1b[?7h\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l");
+    o.write("\x1b[?7h\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0 q\x1b[?1049l");
     if (this.kitty) o.write("\x1b[<u");
     process.off("SIGWINCH", this.resizeHandler);
+    this.input.off("data", this.dataHandler);
+    if (this.escTimer) clearTimeout(this.escTimer);
+    this.escTimer = null;
+    this.buf = ""; this.pasteBuf = null; this.pasting = false;
+    this.decoder = new StringDecoder("utf8");
     this.input.pause();
     if (typeof this.input.setRawMode === "function") this.input.setRawMode(false);
   }

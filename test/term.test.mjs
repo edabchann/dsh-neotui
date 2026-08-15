@@ -3,6 +3,9 @@ import { PassThrough } from "node:stream";
 import { Term } from "../src/term.js";
 
 let pass = 0, fail = 0;
+const activeTerms = new Set();
+function track(term) { activeTerms.add(term); return term; }
+function stopAll() { for (const term of activeTerms) term.stop(); activeTerms.clear(); }
 function check(name, got, want) {
   const g = JSON.stringify(got), w = JSON.stringify(want);
   if (g === w) { pass++; console.log(`  ✓ ${name}`); }
@@ -13,9 +16,13 @@ function harness(bytes, kitty = false) {
   const input = new PassThrough();
   const output = { write: () => true };
   const events = [];
-  const term = new Term({ input, output, onEvent: (e) => events.push(e), kitty });
+  const term = track(new Term({ input, output, onEvent: (e) => events.push(e), kitty }));
   term.start();
   input.write(Buffer.from(bytes, "utf8"));
+  // All ordinary decoder cases settle synchronously; release their process
+  // listener immediately. A lone ESC intentionally stays alive for its 30ms
+  // fallback assertion in the async tail.
+  if (bytes !== "\x1b") { term.stop(); activeTerms.delete(term); }
   return { term, events };
 }
 
@@ -153,7 +160,7 @@ console.log("term.js decoder tests:");
   const input = new PassThrough();
   const output = { write: () => true };
   const events = [];
-  const term = new Term({ input, output, onEvent: (e) => events.push(e) });
+  const term = track(new Term({ input, output, onEvent: (e) => events.push(e) }));
   term.start();
   const bytes = Buffer.from("你好", "utf8");
   input.write(bytes.slice(0, 4));
@@ -189,7 +196,7 @@ setTimeout(() => {
           {
             const input2 = new PassThrough();
             const events2 = [];
-            const term2 = new Term({ input: input2, output: { write: () => true }, onEvent: (e) => events2.push(e) });
+            const term2 = track(new Term({ input: input2, output: { write: () => true }, onEvent: (e) => events2.push(e) }));
             term2.start();
             input2.write("\x1b[200~line one\nline two\nline t");
             input2.write("hree\x1b[20");
@@ -198,6 +205,7 @@ setTimeout(() => {
               check("chunked bracketed paste = one text event", events2[0], { type: "text", text: "line one\nline two\nline three" });
               check("text after paste parses normally", events2[1], { type: "text", text: "tail" });
               term2.stop();
+              stopAll();
               console.log(`\n${pass} passed, ${fail} failed`);
               process.exit(fail > 0 ? 1 : 0);
             }, 70);

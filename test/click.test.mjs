@@ -5,7 +5,7 @@ import { userInfo } from "node:os";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ChatView, App, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig } from "../src/views.js";
+import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig } from "../src/views.js";
 import { TrajectoryPanel, JobsPanel, SettingsPanel, ModelPanel } from "../src/panels.js";
 import { fmtDuration, strWidth } from "../src/text.js";
 import { renderMd } from "../src/md.js";
@@ -167,32 +167,31 @@ test("code block box corners align with the vertical bars (fixed row width)", ()
   assert.equal(strWidth(bottom.slice(0, bottom.indexOf("┘"))), strWidth(content.slice(0, content.lastIndexOf("│"))), "bottom-right corner above the right border");
   assert.equal(strWidth(top.slice(0, top.indexOf("┌"))), strWidth(content.slice(0, content.indexOf("│"))), "left corners aligned");
   assert.equal(strWidth(bottom), strWidth(content), "bottom row exactly as wide as content rows");
-  // in the chat, a message that STARTS with a code box puts the 🐳 marker on
-  // its own line, so the box rows all share the same indent (no top-border
-  // shift from the marker)
+  // in the chat, a message that STARTS with a code box puts the neutral ◆
+  // assistant marker on its own line, so all box rows share the same indent
   const { chat } = render([
     { kind: "assistant", id: "a2", step: 2, streaming: false, blocks: [{ kind: "text", text: "```lua\n" + code + "\n```" }] },
   ]);
   const rows = chat.lines.map((l) => l.map((g) => g.t).join(""));
-  const whaleRow = rows.find((r) => r.includes("🐳")) ?? "";
-  assert.ok(whaleRow.trim().endsWith("(step 2)") || /🐳\s*\(step 2\)\s*$/.test(whaleRow), `marker alone on its line: ${whaleRow}`);
+  const assistantRow = rows.find((r) => r.includes("◆")) ?? "";
+  assert.ok(assistantRow.trim().endsWith("(step 2)") || /◆\s*\(step 2\)\s*$/.test(assistantRow), `marker alone on its line: ${assistantRow}`);
   const cTop = rows.find((r) => r.includes("┌")) ?? "";
   const cContent = rows.find((r) => r.includes("│")) ?? "";
   assert.equal(strWidth(cTop.slice(0, cTop.indexOf("┌"))), strWidth(cContent.slice(0, cContent.indexOf("│"))), "chat: left border aligned with the content indent");
   assert.equal(strWidth(cTop.slice(0, cTop.indexOf("┐"))), strWidth(cContent.slice(0, cContent.lastIndexOf("│"))), "chat: top-right corner above the right border");
 });
 
-test("formal text blocks start with a 🐳 marker (vs 💭 think)", () => {
+test("formal text blocks use a neutral ◆ assistant marker (vs 💭 think)", () => {
   const { lines } = render([
     { kind: "assistant", id: "a9", step: 3, streaming: false, blocks: [{ kind: "text", text: "hello output" }] },
   ]);
   const first = lines.find((l) => l.includes("hello output")) ?? "";
-  assert.ok(first.includes("🐳"), `whale present: ${first}`);
+  assert.ok(first.includes("◆"), `neutral assistant marker present: ${first}`);
   const think = render([
     { kind: "assistant", id: "a10", step: 3, streaming: false, blocks: [{ kind: "reasoning", text: "thinking" }] },
   ]);
   const h = think.lines.find((l) => l.includes("💭")) ?? "";
-  assert.ok(h.includes("💭") && !h.includes("🐳"), "think header keeps 💭, no whale");
+  assert.ok(h.includes("💭") && !h.includes("◆"), "think header keeps 💭, no assistant marker");
 });
 
 test("shipped defaults: think expanded, tool blocks collapsed", () => {
@@ -704,14 +703,15 @@ test("INSERT mode exits only via Esc (clicks never switch the mode)", () => {
   assert.equal(app.focused, app.chat, "Esc exits INSERT");
 });
 
-test("the turn timer ticks from the QUESTION (before step 1 exists)", () => {
+test("the global deep-diving timer exists before any tool call", () => {
   const { chat } = render([
+    { kind: "turn-progress", turn: 1, startedAt: Date.now() - 30000, streaming: true },
     { kind: "user", id: "u1", step: 0, streaming: false, text: "hello?", turnStartAt: Date.now() - 30000 },
   ]);
   chat.running = true;
   chat.queueRebuild(); chat.flushRebuild();
   const text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
-  assert.ok(text.includes("🕐 本轮进行中…已经过"), text);
+  assert.ok(text.includes("Deep diving · 已经进行"), text);
   assert.ok(!text.includes("总耗时"), "not finalized yet");
 });
 
@@ -1048,14 +1048,17 @@ test("finalized think blocks keep their start time and turns carry their total",
     { event: { type: "turn/end", seq: 5, time: 9000, data: {} }, view: null },
   ];
   const nodes = nodeForEvents(events, () => {});
-  const b = nodes[0].blocks[0];
+  const assistant = nodes.find((n) => n.kind === "assistant");
+  const progress = nodes.find((n) => n.kind === "turn-progress");
+  const b = assistant.blocks[0];
   assert.equal(b.startedAt, 2000, "start inherited from the chunk block at finalization");
   assert.equal(b.endedAt, 9000, "finalization stamped the end");
-  assert.equal(nodes[0].turnMs, 8000, "turn duration attached to the final reply");
+  assert.equal(assistant.turnMs, 8000, "turn duration attached to the final reply");
+  assert.equal(progress.endedAt - progress.startedAt, 8000, "global turn timer froze at turn/end");
   const { chat } = render(nodes);
   const text = chat.lines.map((l) => l.map((g) => g.t).join("")).join("\n");
   assert.ok(text.includes("已完成,耗时 7秒"), text);
-  assert.ok(text.includes("🕐 本轮回答总耗时 8秒"), "turn trailer rendered");
+  assert.ok(text.includes("Deep diving · 总耗时 8秒"), "global turn trailer rendered");
 });
 
 test("a tool result with a mismatched callId still lands via the fallback", () => {
@@ -1490,6 +1493,44 @@ function headlessApp() {
   return app;
 }
 
+test("rapid session switch ignores a late older history response", async () => {
+  const app = headlessApp();
+  const pending = new Map();
+  app.api.call = (method, payload) => {
+    if (method === "session.history") return new Promise((resolve) => pending.set(payload.sessionId, resolve));
+    if (method === "session.list" || method === "workspace.list") return Promise.resolve({ items: [] });
+    return Promise.resolve({});
+  };
+  const first = app.openSession("A");
+  const second = app.openSession("B");
+  pending.get("B")({ events: [{ event: { type: "session/title", seq: 1, data: { title: "B title" } } }], hasMore: false, projections: { values: {} } });
+  await second;
+  pending.get("A")({ events: [{ event: { type: "session/title", seq: 1, data: { title: "A title" } } }], hasMore: false, projections: { values: {} } });
+  await first;
+  assert.equal(app.currentSession, "B");
+  assert.equal(app.chat.sessionId, "B");
+  assert.notEqual(app.chat.title, "A title");
+});
+
+test("session projection from a background session is ignored", () => {
+  const app = headlessApp();
+  app.currentSession = app.chat.sessionId = "B";
+  app.projections = { goal: { goal: { objective: "B" } } };
+  app.injectFrame({ type: "session/projection", sessionId: "A", key: "goal", value: { goal: { objective: "A" } } });
+  assert.equal(app.goalText, "B");
+});
+
+test("prompt requests queue instead of replacing the active approval", () => {
+  const app = headlessApp();
+  app.api.respond = async () => ({ accepted: true });
+  app.injectFrame({ type: "approval/requested", __rpcId: "r1", sessionId: "s", approvalId: "a1", toolName: "bash" });
+  app.injectFrame({ type: "approval/requested", __rpcId: "r2", sessionId: "s", approvalId: "a2", toolName: "edit" });
+  assert.equal(app.popup.frame.approvalId, "a1");
+  assert.equal(app.promptQueue.length, 1);
+  app.popup.onKey({ type: "key", name: "char", key: "n", ctrl: false, alt: false });
+  assert.equal(app.popup.frame.approvalId, "a2");
+});
+
 test("footer jobs row is a single 后台任务 summary", () => {
   const app = headlessApp();
   app.jobs = [
@@ -1521,9 +1562,10 @@ test("the todo box freezes its height once todos appear (no idle reflow)", () =>
   ];
   assert.equal(chat.todoHeight(), 7, "still 7 while the list changes");
   app.projections.todos = [];
-  assert.equal(chat.todoHeight(), 7, "box reserved even when the list empties");
+  assert.equal(chat.todoHeight(), 1, "empty list keeps a minimized strip after first appearance");
+  app.projections.todos = [{ content: "a", status: "in_progress" }];
   chat.todosVisible = false;
-  assert.equal(chat.todoHeight(), 0, "Shift+T collapse still hides it");
+  assert.equal(chat.todoHeight(), 1, "Shift+T minimizes instead of hiding it");
   assert.equal(app.footerHeight(), 3, "footer always 3 rows (no job-driven reflow)");
 });
 
