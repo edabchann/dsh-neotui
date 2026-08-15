@@ -46,6 +46,21 @@ test("plan review gets a dedicated surface and explicit approve action", async (
   assert.deepEqual(calls[0][2].answer.answers[0].selected, ["Approve"]);
 });
 
+test("long plan review scrolls with PgDn/Home/End and wheel", () => {
+  const { app } = appHarness();
+  const detail = Array.from({ length: 80 }, (_, i) => `step ${i + 1}`).join("\n");
+  const popup = new QuestionPopup({ app, frame: { rpcId: "plan", sessionId: "s", questions: [{ id: "plan-review", question: "Approve?", detail, intent: { kind: "plan-review", approve: "Approve" }, options: [{ label: "Approve" }, { label: "Keep planning" }] }] } });
+  popup.detailPage = 10;
+  popup.onKey({ type: "key", name: "pagedown" });
+  assert.equal(popup.detailScrollY, 10);
+  popup.onKey({ type: "key", name: "end" });
+  assert.equal(popup.detailScrollY, 70);
+  popup.onKey({ type: "key", name: "home" });
+  assert.equal(popup.detailScrollY, 0);
+  popup.onMouse({ type: "mouse", kind: "wheel-down", x: 5, y: 5 });
+  assert.equal(popup.detailScrollY, 3);
+});
+
 test("multi-select toggles independent options before submit", async () => {
   const { app, calls } = appHarness();
   const popup = new QuestionPopup({ app, frame: { rpcId: "q", sessionId: "s", questions: [{ id: "x", question: "Choose", multiSelect: true, options: [{ label: "A" }, { label: "B" }] }] } });

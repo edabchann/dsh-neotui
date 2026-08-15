@@ -18,7 +18,9 @@
   ],
   "scripts": {
     "start": "node bin/dsh-tui.js",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "test:pty": "python3 test/pty-crash.py",
+    "test:rc": "npm test && npm run test:pty"
   },
   "repository": {
     "type": "git",

@@ -1573,33 +1573,75 @@ export class QueuePanel extends Popup {
     const w = Math.max(24, Math.min(84, app.screen.w - 4));
     const h = Math.max(7, Math.min(24, app.screen.h - 4));
     super({ x: Math.max(0, Math.floor((app.screen.w - w) / 2)), y: Math.max(0, Math.floor((app.screen.h - h) / 2)), w, h, title: "消息队列", lines: [], buttons: [{ label: "关闭", action: "close" }], onAction: () => app.closeOverlay(), scrollable: true });
-    this.app = app; this.items = items; this.sel = 0; this.rebuild();
+    this.app = app; this.items = items; this.sel = 0; this.pending = false; this.editInput = null; this.rebuild();
   }
   rebuild() {
-    const lines = [[{ t: " ↑↓选择 · s 立即 steering · d 删除 · Esc关闭", fg: K.DIM }]];
+    const lines = [[{ t: ` ↑↓选择 · e 编辑 · s 立即 steering · d 删除 · Esc关闭${this.pending ? " · 操作中…" : ""}`, fg: this.pending ? K.WARN : K.DIM }]];
     for (let i = 0; i < this.items.length; i++) {
       const item = this.items[i];
       const text = partsText(item.message?.content).replace(/\s+/g, " ");
       lines.push([{ t: `${i === this.sel ? "▸" : " "} ${item.placement === "queued" ? "⏳" : item.placement === "steering" ? "↪" : "ℹ"} ${truncate(text || item.id, this.w - 8)}`, fg: i === this.sel ? T.SELFG : K.TXT, bg: i === this.sel ? T.MENUSEL : -1 }]);
     }
     if (!this.items.length) lines.push([{ t: " （队列为空）", fg: K.FAINT }]);
+    if (this.editInput) lines.push([{ t: ` 编辑: ${truncate(this.editInput.value, this.w - 8)}`, fg: K.ACCENT }]);
     this.lines = lines;
   }
-  async #mutate(kind) {
+  syncItems(items) {
+    const selectedId = this.items[this.sel]?.id;
+    this.items = items ?? [];
+    const next = selectedId ? this.items.findIndex((item) => item.id === selectedId) : -1;
+    this.sel = next >= 0 ? next : Math.min(this.sel, Math.max(0, this.items.length - 1));
+    this.rebuild();
+  }
+  #errorCode(error) { return error?.code ?? error?.details?.code ?? error?.cause?.code; }
+  async #mutate(kind, content) {
     const item = this.items[this.sel];
-    if (!item || item.placement === "context") { this.app.toast("该条目不可修改"); return; }
-    try { await this.app.api.call("session.updateQueue", { sessionId: this.app.currentSession, itemId: item.id, action: { kind } }); }
-    catch (e) { this.app.toast(`队列操作失败: ${e.message}`); }
+    if (this.pending) { this.app.toast("队列操作正在进行"); return; }
+    if (!item || item.placement === "context") { this.app.toast("该条目为只读上下文，不能修改"); return; }
+    this.pending = true; this.rebuild(); this.app.redraw();
+    try {
+      const action = kind === "edit" ? { kind, content: [{ type: "text", text: content }] } : { kind };
+      await this.app.api.call("session.updateQueue", { sessionId: this.app.currentSession, itemId: item.id, action });
+      if (kind === "remove") this.syncItems(this.items.filter((row) => row.id !== item.id));
+      this.editInput = null;
+    } catch (e) {
+      const code = this.#errorCode(e);
+      if (code === "queue-item-not-found" || /queue-item-not-found/.test(e.message ?? "")) {
+        this.syncItems(this.items.filter((row) => row.id !== item.id));
+        this.app.toast("队列已由其他客户端更新，该条目已移除");
+      } else if (code === "steer-unavailable" || /steer-unavailable/.test(e.message ?? "")) {
+        this.app.toast("当前回合 steering 窗口已关闭，消息仍保留在队列中");
+      } else this.app.toast(`队列操作失败: ${e.message}`);
+    } finally { this.pending = false; this.rebuild(); this.app.redraw(); }
+  }
+  #beginEdit() {
+    const item = this.items[this.sel];
+    if (!item || item.placement !== "queued") { this.app.toast("只有排队消息可以编辑"); return; }
+    this.editInput = new Input({ x: this.x + 2, y: this.y + this.h - 3, w: this.w - 4, h: 1, prompt: "编辑: ", allowEmptyEnter: false, onEnter: (value) => this.#mutate("edit", value) });
+    this.editInput.setValue(partsText(item.message?.content));
+    this.rebuild();
   }
   onKey(ev) {
+    if (this.editInput) {
+      if (ev.type === "key" && ev.name === "escape") { this.editInput = null; this.rebuild(); return true; }
+      if (this.editInput.onKey(ev)) { this.rebuild(); this.app.redraw(); return true; }
+    }
     if (ev.type === "key") {
       if (ev.name === "escape") { this.app.closeOverlay(); return true; }
       if (ev.name === "up") { this.sel = Math.max(0, this.sel - 1); this.rebuild(); return true; }
       if (ev.name === "down") { this.sel = Math.min(this.items.length - 1, this.sel + 1); this.rebuild(); return true; }
+      if (ev.name === "char" && ev.key === "e" && !ev.ctrl) { this.#beginEdit(); return true; }
       if (ev.name === "char" && ev.key === "s" && !ev.ctrl) { this.#mutate("steer"); return true; }
       if (ev.name === "char" && ev.key === "d" && !ev.ctrl) { this.#mutate("remove"); return true; }
     }
     return super.onKey(ev);
+  }
+  onMouse(ev) {
+    if (ev.kind === "press" && ev.button === 0) {
+      const idx = ev.y - this.y - 2;
+      if (idx >= 0 && idx < this.items.length) { this.sel = idx; this.rebuild(); this.app.redraw(); return true; }
+    }
+    return super.onMouse(ev);
   }
 }
 

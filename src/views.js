@@ -2210,6 +2210,9 @@ export class QuestionPopup extends Popup {
     this.frame = frame;
     this.questions = questions;
     this.planReview = planReview;
+    this.detailScrollY = 0;
+    this.detailPage = 1;
+    this.optionRows = [];
     this.questionIdx = 0;
     this.drafts = questions.map(() => ({ selected: [], custom: "", skipped: false }));
     this.selIdx = 0;
@@ -2241,11 +2244,20 @@ export class QuestionPopup extends Popup {
     if (q.detail) {
       const detailLines = String(q.detail).split("\n");
       const optionRows = opts.reduce((n, option) => n + (option.description ? 2 : 1), 0);
-      const room = Math.max(1, this.y + this.h - 3 - ly - optionRows);
-      for (const detail of detailLines.slice(0, room)) screen.text(this.x + 2, ly++, truncate(detail, this.w - 4), { fg: K.DIM });
-      if (detailLines.length > room && ly < this.y + this.h - 3) screen.text(this.x + 2, ly++, `…另有 ${detailLines.length - room} 行计划正文`, { fg: K.FAINT });
+      const room = Math.max(1, this.y + this.h - 4 - ly - optionRows);
+      const maxScroll = Math.max(0, detailLines.length - room);
+      this.detailScrollY = Math.max(0, Math.min(this.detailScrollY, maxScroll));
+      this.detailPage = room;
+      const visible = detailLines.slice(this.detailScrollY, this.detailScrollY + room);
+      for (const detail of visible) screen.text(this.x + 2, ly++, truncate(detail, this.w - 4), { fg: K.DIM });
+      if (this.planReview && detailLines.length > room && ly < this.y + this.h - 3) {
+        const start = this.detailScrollY + 1, end = Math.min(detailLines.length, this.detailScrollY + room);
+        screen.text(this.x + 2, ly++, `计划 ${start}–${end} / ${detailLines.length} 行 · PgUp/PgDn/Home/End/滚轮`, { fg: K.FAINT });
+      }
     }
+    this.optionRows = [];
     for (let i = 0; i < opts.length && ly < this.y + this.h - 3; i++) {
+      this.optionRows[i] = ly;
       const chosen = draft.selected.includes(opts[i].label);
       const cursor = this.selIdx === i;
       const glyph = q.multiSelect ? (chosen ? "☑" : "☐") : (chosen ? "●" : "○");
@@ -2268,16 +2280,19 @@ export class QuestionPopup extends Popup {
   }
 
   onMouse(ev) {
+    if (this.planReview && (ev.kind === "wheel-up" || ev.kind === "wheel-down")) {
+      this.detailScrollY = Math.max(0, this.detailScrollY + (ev.kind === "wheel-up" ? -3 : 3));
+      this.app.redraw(); return true;
+    }
     if (ev.kind === "press" && ev.button === 0) {
       const q = this.questions[this.questionIdx];
-      let ly = this.y + 3 + (this.planReview ? 1 : 0) + (q?.detail ? String(q.detail).split("\n").length : 0);
       for (let i = 0; i < (q?.options?.length ?? 0); i++) {
-        if (ev.y === ly || (q.options[i].description && ev.y === ly + 1)) {
+        const ly = this.optionRows[i];
+        if (ly != null && (ev.y === ly || (q.options[i].description && ev.y === ly + 1))) {
           this.selIdx = i; this.#choose(i);
           if (!q.multiSelect) this.#continueCurrent();
           return true;
         }
-        ly += q.options[i].description ? 2 : 1;
       }
     }
     return super.onMouse(ev);
@@ -2289,6 +2304,14 @@ export class QuestionPopup extends Popup {
     if (ev.type === "text") { draft.custom += ev.text; draft.skipped = false; return true; }
     if (ev.type !== "key") return false;
     const count = q?.options?.length ?? 0;
+    if (this.planReview && ["pageup", "pagedown", "home", "end"].includes(ev.name)) {
+      const total = String(q?.detail ?? "").split("\n").length;
+      if (ev.name === "pageup") this.detailScrollY = Math.max(0, this.detailScrollY - this.detailPage);
+      else if (ev.name === "pagedown") this.detailScrollY = Math.min(Math.max(0, total - this.detailPage), this.detailScrollY + this.detailPage);
+      else if (ev.name === "home") this.detailScrollY = 0;
+      else this.detailScrollY = Math.max(0, total - this.detailPage);
+      this.app.redraw(); return true;
+    }
     if (ev.name === "up") { this.selIdx = Math.max(0, this.selIdx - 1); return true; }
     if (ev.name === "down") { this.selIdx = Math.min(Math.max(0, count - 1), this.selIdx + 1); return true; }
     if (ev.name === "char" && ev.key === " " && count) { this.#choose(this.selIdx); return true; }
@@ -2313,7 +2336,7 @@ export class QuestionPopup extends Popup {
   }
 
   #advanceOrSubmit() {
-    if (this.questionIdx < this.questions.length - 1) { this.questionIdx++; this.selIdx = 0; this.#layout(); this.app.redraw(); return; }
+    if (this.questionIdx < this.questions.length - 1) { this.questionIdx++; this.selIdx = 0; this.detailScrollY = 0; this.#layout(); this.app.redraw(); return; }
     this.#submit();
   }
 
@@ -2674,7 +2697,10 @@ export class App {
       case "session/queue":
         if (frame.type === "session/queue" && frame.sessionId) this.queueBySession.set(frame.sessionId, frame.items ?? []);
         if (this.chat.sessionId === frame.sessionId) {
-          if (frame.type === "session/queue") this.queueItems = frame.items ?? [];
+          if (frame.type === "session/queue") {
+            this.queueItems = frame.items ?? [];
+            if (this.overlay instanceof QueuePanel) this.overlay.syncItems(this.queueItems);
+          }
           this.chat.onFrame(frame);
         }
         // refresh list on title updates

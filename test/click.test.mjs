@@ -6,7 +6,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig } from "../src/views.js";
-import { TrajectoryPanel, JobsPanel, SettingsPanel, ModelPanel } from "../src/panels.js";
+import { TrajectoryPanel, JobsPanel, QueuePanel, SettingsPanel, ModelPanel } from "../src/panels.js";
 import { fmtDuration, strWidth } from "../src/text.js";
 import { renderMd } from "../src/md.js";
 import { Input } from "../src/widgets.js";
@@ -1616,6 +1616,45 @@ test("JobsPanel: title, Enter/→ expand, ←/h collapse, q close", () => {
   // q closes
   panel.onKey({ type: "key", name: "char", key: "q", text: "q", ctrl: false, alt: false, shift: false });
   assert.equal(app.overlay, null, "q closed the overlay");
+});
+
+test("QueuePanel edits queued messages and preserves selected id on refresh", async () => {
+  const app = headlessApp();
+  app.currentSession = "s";
+  app.queueItems = [
+    { id: "a", placement: "queued", message: { content: [{ type: "text", text: "first" }] } },
+    { id: "b", placement: "queued", message: { content: [{ type: "text", text: "second" }] } },
+  ];
+  const calls = [];
+  app.api.call = async (method, payload) => { calls.push([method, payload]); return { accepted: true }; };
+  const panel = new QueuePanel(app);
+  panel.sel = 1;
+  panel.syncItems([app.queueItems[1], app.queueItems[0]]);
+  assert.equal(panel.items[panel.sel].id, "b");
+  panel.onKey({ type: "key", name: "char", key: "e", ctrl: false });
+  assert.ok(panel.editInput, "edit mode opened");
+  panel.editInput.setValue("changed");
+  panel.onKey({ type: "key", name: "enter" });
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(calls[0][0], "session.updateQueue");
+  assert.deepEqual(calls[0][1].action, { kind: "edit", content: [{ type: "text", text: "changed" }] });
+});
+
+test("QueuePanel converges stale rows and preserves steer-unavailable messages", async () => {
+  const app = headlessApp(); app.currentSession = "s";
+  app.queueItems = [{ id: "a", placement: "queued", message: { content: [{ type: "text", text: "keep" }] } }];
+  const toasts = []; app.toast = (s) => toasts.push(s);
+  let error = Object.assign(new Error("closed"), { code: "steer-unavailable" });
+  app.api.call = async () => { throw error; };
+  const panel = new QueuePanel(app);
+  panel.onKey({ type: "key", name: "char", key: "s", ctrl: false });
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(panel.items.length, 1);
+  assert.ok(toasts.at(-1).includes("窗口已关闭"));
+  error = Object.assign(new Error("gone"), { code: "queue-item-not-found" });
+  panel.onKey({ type: "key", name: "char", key: "d", ctrl: false });
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(panel.items.length, 0);
 });
 
 // ---- settings panel: TUI 界面 namespace persists userPrefix ----
