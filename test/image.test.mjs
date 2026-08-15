@@ -1,5 +1,5 @@
 // image.test.mjs — buildPromptParts unit tests (no network, no real send)
-import { buildPromptParts } from "../src/views.js";
+import { buildPromptParts, clipboardImageFromWayland } from "../src/views.js";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -45,6 +45,18 @@ const fs = (content) => (path) => (path === png ? Buffer.from(content).toString(
   const r = buildPromptParts(`两张图 @${png} 和 @${png}`, { readFile: fs("fakepngbytes") });
   check("two images", r.images.length, 2);
   check("mixed parts order", r.parts.map((p) => p.type), ["text", "image", "text", "image", "text"]);
+}
+{
+  const calls = [];
+  const run = (cmd, args, opts) => {
+    calls.push([cmd, args, opts.encoding]);
+    if (args[0] === "--list-types") return { status: 0, stdout: "text/plain\nimage/png\n" };
+    return { status: 0, stdout: Buffer.from("clipboard-png") };
+  };
+  const image = clipboardImageFromWayland(run);
+  check("clipboard media type", image.mediaType, "image/png");
+  check("clipboard data base64", image.data, Buffer.from("clipboard-png").toString("base64"));
+  check("clipboard queries exact mime", calls[1][1], ["--no-newline", "--type", "image/png"]);
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

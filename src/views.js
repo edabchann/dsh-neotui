@@ -2,8 +2,10 @@
 import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
 import { truncate, strWidth, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth } from "./text.js";
-import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
 import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
 export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
@@ -613,6 +615,24 @@ const IMAGE_EXT = /\.(png|jpe?g|webp|gif)$/i;
 const MEDIA_TYPES = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", gif: "image/gif" };
 
 /** Parse "@path" tokens; returns {parts, images, errors} where parts mix text/image. */
+export function clipboardImageFromWayland(run = spawnSync) {
+  const types = run("wl-paste", ["--list-types"], { encoding: "utf8" });
+  if (types.status !== 0) return null;
+  const mediaType = String(types.stdout ?? "").split(/\r?\n/).find((type) => ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(type));
+  if (!mediaType) return null;
+  const image = run("wl-paste", ["--no-newline", "--type", mediaType], { encoding: null, maxBuffer: 32 * 1024 * 1024 });
+  if (image.status !== 0 || !image.stdout?.length) return null;
+  const b = image.stdout;
+  // Some Wayland owners advertise image/png but return their native JPEG;
+  // trust magic bytes so the Host/model receives a truthful media type.
+  const actual = b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 ? "image/png"
+    : b[0] === 0xff && b[1] === 0xd8 ? "image/jpeg"
+    : b.slice(0, 4).toString() === "RIFF" && b.slice(8, 12).toString() === "WEBP" ? "image/webp"
+    : b.slice(0, 3).toString() === "GIF" ? "image/gif" : mediaType;
+  const ext = actual === "image/jpeg" ? "jpg" : actual.slice("image/".length);
+  return { mediaType: actual, data: b.toString("base64"), name: `clipboard-${Date.now()}.${ext}`, bytes: b.length };
+}
+
 export function buildPromptParts(text, { readFile = null } = {}) {
   const parts = [];
   const images = [];
@@ -922,6 +942,7 @@ export class ChatView extends Widget {
     this.selAnchor = null;
     this.selFocus = null;
     this.selectionMode = "character";
+    this.clipboardImages = [];
     this.stepState = { step: null }; // step/start tracking for the mux merge path
   }
 
@@ -1242,6 +1263,20 @@ export class ChatView extends Widget {
     }
   }
 
+  pasteClipboardImage() {
+    const acceptsImage = this.app.currentModel?.input?.includes?.("image") || this.app.currentModel?.input == null;
+    if (!acceptsImage) { this.app.toast("当前模型未声明图片输入能力"); return false; }
+    let image;
+    try { image = clipboardImageFromWayland(); } catch (e) { this.app.toast(`读取图片剪贴板失败: ${e.message}`); return false; }
+    if (!image) { this.app.toast("剪贴板中没有 PNG/JPEG/WebP/GIF 图片"); return false; }
+    this.clipboardImages.push(image);
+    this.input.insert(` [图片 ${this.clipboardImages.length}:${image.name}] `);
+    this.app.toast(`已粘贴图片 ${image.name} · ${Math.round(image.bytes / 1024)}KB（Ctrl+Enter/Enter 发送）`);
+    // Open the same Kitty-capable preview surface used by transcript images.
+    const path = join(tmpdir(), image.name); try { writeFileSync(path, Buffer.from(image.data, "base64")); this.app.openImage({ mediaType: image.mediaType, data: image.data, name: image.name, path }, { all: [{ mediaType: image.mediaType, data: image.data, name: image.name, path }], index: 0 }); } catch {}
+    return true;
+  }
+
   send(text) {
     if (!this.sessionId) return;
     const trimmed = text.trim();
@@ -1251,20 +1286,26 @@ export class ChatView extends Widget {
     if (trimmed === "/theme") { cycleTheme(); this.queueRebuild(); this.app.toast(`主题已切换: ${themeName()}`); return; }
     if (trimmed === "/permission") { this.app.showPermissionPicker(); return; }
     if (trimmed === "/goal") { this.app.showGoal(); return; }
-    if (!trimmed) return;
+    if (!trimmed && this.clipboardImages.length === 0) return;
     const { parts, images, errors } = buildPromptParts(trimmed, {
       readFile: (p) => {
         try { return readFileSync(p, "base64"); } catch { return null; }
       },
     });
     for (const e of errors) this.app.toast(`图片读取失败: ${e}`);
-    this.app.log(`[chat] prompt → ${this.sessionId.slice(0, 8)}: ${truncate(trimmed, 60)}${images.length ? ` (+${images.length} 图)` : ""}`);
+    const clipParts = this.clipboardImages.map(({ mediaType, data, name }) => ({ type: "image", mediaType, data, name }));
+    const clipboardCount = clipParts.length;
+    // Visual placeholder belongs to the editor only, never to model content.
+    for (const p of parts) if (p.type === "text") p.text = p.text.replace(/\s*\[图片 \d+:clipboard-[^\]]+\]\s*/g, " ");
+    parts.push(...clipParts);
+    this.app.log(`[chat] prompt → ${this.sessionId.slice(0, 8)}: ${truncate(trimmed, 60)}${images.length + clipboardCount ? ` (+${images.length + clipboardCount} 图)` : ""}`);
     this.app.api.call("session.prompt", {
       sessionId: this.sessionId,
       mode: this.running ? busyEnter() : "queue",
       content: parts.filter((p) => p.type === "image" || (p.text ?? "").trim() !== ""),
       clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     }).then((res) => {
+      this.clipboardImages = [];
       if (res.command?.text) this.app.toast(res.command.text);
     }).catch((e) => this.app.toast(`发送失败: ${e.message}`));
   }
@@ -3168,6 +3209,13 @@ export class App {
       const res = await this.api.call("session.models", { sessionId });
       if (sessionId !== this.currentSession || epoch !== this.sessionEpoch) return;
       this.currentModel = res.current ?? null;
+      try {
+        const settings = await this.api.call("settings.describe");
+        const providers = settings.namespaces?.find((ns) => ns.ns === "llm-pi-ai")?.value?.providers ?? {};
+        const profile = providers[this.currentModel?.provider];
+        const model = profile?.models?.find((entry) => entry.id === this.currentModel?.model);
+        if (this.currentModel && model?.input) this.currentModel.input = [...model.input];
+      } catch {}
     } catch { this.currentModel = null; }
   }
 
@@ -3660,6 +3708,8 @@ export class App {
           // so ordinary Vim muscle memory cannot accidentally stop a long turn.
           this.focus(this.chat);
           this.toast(this.chat.running ? "已退出输入；Ctrl+C 可中断当前回合" : "已退出输入（i 重新进入）");
+        } else if (ev.ctrl && ev.shift && ev.key === "v") {
+          if (!this.chat.pasteClipboardImage()) this.chat.input.onKey(ev);
         } else {
           this.chat.input.onKey(ev);
         }

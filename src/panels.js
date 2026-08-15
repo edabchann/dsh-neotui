@@ -1228,11 +1228,16 @@ export class ImagePopup extends Popup {
   }
   async load() {
     try {
-      if (!this.sessionId || !this.ref?.attachmentId) throw new Error("无附件引用");
-      const res = await this.app.api.call("session.attachment", { sessionId: this.sessionId, attachmentId: this.ref.attachmentId });
-      this.data = Buffer.from(res.data ?? "", "base64");
+      let attachment;
+      if (this.ref?.data && this.ref?.mediaType) {
+        this.data = Buffer.from(this.ref.data, "base64"); attachment = this.ref;
+      } else {
+        if (!this.sessionId || !this.ref?.attachmentId) throw new Error("无附件引用");
+        const res = await this.app.api.call("session.attachment", { sessionId: this.sessionId, attachmentId: this.ref.attachmentId });
+        this.data = Buffer.from(res.data ?? "", "base64"); attachment = res.attachment;
+      }
       this.title = this.galleryTitle();
-      this.lines = [[{ t: `${res.attachment.mediaType} · ${res.attachment.width}×${res.attachment.height} · ${Math.round(this.data.length / 1024)}KB`, fg: K.DIM }]];
+      this.lines = [[{ t: `${attachment.mediaType} · ${attachment.width ? `${attachment.width}×${attachment.height} · ` : ""}${Math.round(this.data.length / 1024)}KB`, fg: K.DIM }]];
       if (this.refs.length > 1) this.lines.push([{ t: "←/→ 切换图片", fg: K.FAINT }]);
       this.renderImage();
     } catch (e) {
