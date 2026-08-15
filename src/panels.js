@@ -1356,7 +1356,7 @@ export class ImagePopup extends Popup {
     // carry `m` alone. `a=f` is not a Kitty action and made WezTerm silently
     // discard every chunk after the first.
     const payload = chunks.map((c, i) => i === 0
-      ? `\x1b_Ga=T,f=100,i=${this.kittyId},q=2,m=${chunks.length === 1 ? 0 : 1};${c}\x1b\\`
+      ? `\x1b_Ga=t,f=100,i=${this.kittyId},q=2,m=${chunks.length === 1 ? 0 : 1};${c}\x1b\\`
       : `\x1b_Gm=${i === chunks.length - 1 ? 0 : 1};${c}\x1b\\`).join("");
     // Kitty places at the current cursor. Screen.render() leaves the cursor at
     // an arbitrary diff cell, so explicitly move to the popup image viewport.
