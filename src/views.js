@@ -3528,7 +3528,7 @@ export class App {
   }
 
   openImage(ref, opts = {}) {
-    this.overlay = new ImagePopup({ app: this, ref, sessionId: this.currentSession, refs: opts.all, index: opts.index ?? 0 });
+    this.overlay = new ImagePopup({ app: this, ref, sessionId: this.currentSession, refs: opts.all, index: opts.index ?? 0, returnTo: opts.returnTo ?? null });
     this.redraw();
   }
 
