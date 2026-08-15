@@ -53,6 +53,13 @@ export class Screen {
       }
     }
     const cell = this.cells[y][x];
+    // Overwriting the LEFT half of an existing wide glyph must clear its old
+    // continuation cell too. Otherwise emoji→text transitions leave a stray
+    // colored cell directly after the icon.
+    if (cell.wide && x + 1 < this.w) {
+      const oldCont = this.cells[y][x + 1];
+      oldCont.ch = " "; oldCont.wide = false; oldCont.link = "";
+    }
     const wide = graphemeWidth(ch) === 2;
     if (wide && x + 1 >= this.w) ch = " "; // clip wide char at the right edge (terminal wrap corruption)
     cell.ch = ch; cell.fg = fg;

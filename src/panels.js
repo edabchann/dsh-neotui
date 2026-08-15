@@ -1233,6 +1233,9 @@ export class ImagePopup extends Popup {
   }
   #deleteKittyImage() {
     if (this.kittyId && this.app.term?.output) this.app.term.output.write(`\x1b_Ga=d,d=i,i=${this.kittyId},q=2\x1b\\`);
+    // Kitty pixels live outside our framebuffer. After deletion, invalidate the
+    // ANSI diff cache so the text cells underneath are physically repainted.
+    if (this.app.screen) this.app.screen.prev = null;
   }
   #show(idx) {
     // Remove the current placement before allocating/transmitting the next
@@ -1272,6 +1275,7 @@ export class ImagePopup extends Popup {
     // Defensive cleanup for every id allocated while browsing this gallery.
     // Some terminals may process a switch/delete out of order under load.
     if (this.app.term?.output) for (const id of this.kittyIds) this.app.term.output.write(`\x1b_Ga=d,d=i,i=${id},q=2\x1b\\`);
+    if (this.app.screen) this.app.screen.prev = null;
     if (this.returnTo) {
       this.returnTo.sel = Math.max(0, Math.min(this.index, this.returnTo.items().length - 1));
       this.app.overlay = this.returnTo;
