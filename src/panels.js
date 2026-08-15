@@ -1818,6 +1818,63 @@ export class SettingsPanel extends Widget {
 
 // ---- Model provider management (simple form buffer) ----
 
+/** A centered standalone edit buffer (ControlPanel-style): its own Input with
+ *  a visible caret, full key isolation from NORMAL/INSERT routing, and paste
+ *  support — Enter commits, Esc cancels. */
+export class EditPopup extends Popup {
+  constructor(app, { title, value, onCommit }) {
+    const w = Math.min(80, app.screen.w - 8);
+    const h = Math.min(16, app.screen.h - 6);
+    super({
+      x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2),
+      w, h, title,
+      lines: [],
+      buttons: [],
+      onAction: () => {},
+    });
+    this.app = app;
+    this.onCommit = onCommit;
+    this.input = new Input({
+      x: this.x + 2, y: this.y + h - 2, w: w - 4, h: 1,
+      multi: true, maxLines: 4, app,
+      prompt: "> ", placeholder: "输入值…（Ctrl+Shift+V 粘贴,Enter 确定,Esc 取消）",
+    });
+    this.input.setValue(String(value ?? ""), { select: true });
+    this.#layout();
+  }
+  #layout() {
+    const lines = [];
+    lines.push([{ t: " 当前值预览:", fg: K.DIM, underline: true }]);
+    const v = this.input.value;
+    if (v === "") lines.push([{ t: "（空）", fg: K.FAINT }]);
+    else for (const ln of v.split("\n").slice(0, 6)) lines.push([{ t: " " + truncate(ln, this.w - 6), fg: K.TXT }]);
+    lines.push([{ t: "" }]);
+    this.lines = lines;
+  }
+  render(screen) {
+    super.render(screen);
+    this.input.render(screen);
+  }
+  onKey(ev) {
+    if (ev.type === "key" && ev.name === "escape") { this.app.closeOverlay(); this.app.focus(this.app.chat); return true; }
+    if (ev.type === "key" && ev.name === "enter") {
+      const v = this.input.value;
+      this.app.closeOverlay();
+      this.app.focus(this.app.chat);
+      this.onCommit?.(v);
+      return true;
+    }
+    const handled = this.input.onKey(ev);
+    if (handled) this.#layout();
+    this.app.redraw();
+    return true;
+  }
+  onMouse(ev) {
+    if (this.input.inside(ev.x, ev.y)) { this.input.onMouse(ev); this.app.redraw(); return true; }
+    return super.onMouse(ev);
+  }
+}
+
 export class ModelPanel extends Widget {
   constructor(app) {
     super({ x: 30, y: 0, w: app.screen.w - 30, h: app.screen.h - 1 });
@@ -1842,15 +1899,13 @@ export class ModelPanel extends Widget {
     this.scanning = false;
     const listW = 26;
     this.listView = new ScrollView({ x: this.x + 1, y: this.y + 1, w: listW, h: this.h - 2, showScrollbar: true });
-    this.formView = new ScrollView({ x: this.x + listW + 1, y: this.y + 1, w: this.w - listW - 2, h: this.h - 3, showScrollbar: true });
-    this.input = new Input({ x: this.x + listW + 1, y: this.y + this.h - 2, w: this.w - listW - 2, h: 1, prompt: "值: ", placeholder: "Enter 提交 · Esc 取消" });
+    this.formView = new ScrollView({ x: this.x + listW + 1, y: this.y + 1, w: this.w - listW - 2, h: this.h - 2, showScrollbar: true });
   }
   relayout(x, y, w, h) {
     this.x = x; this.y = y; this.w = w; this.h = h;
     const listW = 26;
     this.listView.x = x + 1; this.listView.y = y + 1; this.listView.w = listW; this.listView.h = h - 2;
-    this.formView.x = x + listW + 1; this.formView.y = y + 1; this.formView.w = w - listW - 2; this.formView.h = h - 3;
-    this.input.x = x + listW + 1; this.input.y = y + h - 2; this.input.w = w - listW - 2;
+    this.formView.x = x + listW + 1; this.formView.y = y + 1; this.formView.w = w - listW - 2; this.formView.h = h - 2;
   }
   async load() {
     try {
@@ -1988,22 +2043,17 @@ export class ModelPanel extends Widget {
     screen.text(this.x + 1, this.y, " 模型供应商", { fg: K.DIM });
     this.listView.render(screen);
     this.formView.render(screen);
-    if (this.editing) {
-      screen.text(this.x + 28, this.y + this.h - 3, `编辑 ${this.editing.label}`, { fg: K.WARN, bold: true });
-      this.input.render(screen);
-    }
   }
   #startEdit(label, value, commit) {
-    this.editing = { label, commit };
-    this.input.setValue(value ?? "", { select: true });
-    this.app.redraw();
-  }
-  #commitEdit() {
-    if (!this.editing) return;
-    const { label, commit } = this.editing;
-    this.editing = null;
-    commit(this.input.value);
-    this.#rebuild();
+    // a REAL standalone edit buffer in the middle of the window: own caret,
+    // isolated from NORMAL/INSERT routing, paste supported
+    const popup = new EditPopup(this.app, {
+      title: `编辑 ${label}`,
+      value,
+      onCommit: (text) => { commit(text); this.#rebuild(); this.app.redraw(); },
+    });
+    this.app.overlay = popup;
+    this.app.focus(popup.input);
     this.app.redraw();
   }
   #activateItem() {
@@ -2206,13 +2256,6 @@ export class ModelPanel extends Widget {
   }
   onKey(ev) {
     if (ev.type !== "key") return false;
-    if (this.editing) {
-      if (ev.name === "escape") { this.editing = null; this.#rebuild(); return true; }
-      if (ev.name === "enter") { this.#commitEdit(); return true; }
-      const handled = this.input.onKey(ev);
-      if (handled) this.app.redraw();
-      return true;
-    }
     if (this.scanMode) {
       if (ev.name === "escape") { this.scanMode = false; this.#rebuild(); return true; }
       if (ev.name === "up") { this.scanCursor = Math.max(0, this.scanCursor - 1); this.#rebuild(); this.app.redraw(); return true; }
@@ -2245,7 +2288,7 @@ export class ModelPanel extends Widget {
       if (ev.name === "enter") { this.#activateItem(); return true; }
       return false;
     }
-    if (ev.name === "escape") { this.editing = null; return false; } // App falls back to chat mode
+    if (ev.name === "escape") { return false; } // App falls back to chat mode
     // dual-focus navigation: ↑/↓ move the cursor INSIDE the focused region —
     // the provider column in list focus, the option rows in form focus.
     // → enters the form, ← returns to the list.
@@ -2280,7 +2323,6 @@ export class ModelPanel extends Widget {
     if (ev.kind === "wheel-up") { this.formView.scroll(-3); return true; }
     if (ev.kind === "wheel-down") { this.formView.scroll(3); return true; }
     if (ev.kind !== "press" || ev.button !== 0) return false;
-    if (this.editing && this.input.inside(ev.x, ev.y)) return this.input.onMouse(ev);
     if (ev.x < this.x + 26) {
       const idx = ev.y - this.listView.y + this.listView.scrollY;
       // one click = select AND open (same as Enter)

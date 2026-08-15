@@ -738,12 +738,16 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
   assert.ok(panel.routes.includes("新供应商"), "draft route created");
   assert.equal(panel.mode, "form");
   const fieldIdx = (label) => panel.formItems.findIndex((it) => it.kind === "field" && it.label === label);
-  // edit displayName and baseURL through the inline editor
+  // edit fields through the standalone centered edit buffer
   for (const [label, value] of [["显示名", "My GW"], ["baseURL", "https://gw/v1"]]) {
     panel.formIdx = fieldIdx(label);
     panel.onKey({ type: "key", name: "enter" });
-    panel.input.setValue(value);
-    panel.onKey({ type: "key", name: "enter" });
+    const popup = app.overlay;
+    assert.ok(popup?.input, `edit popup opened for ${label}`);
+    assert.ok(String(popup.title).includes(label), popup.title);
+    popup.input.setValue(value);
+    popup.onKey({ type: "key", name: "enter" });
+    assert.equal(app.overlay, null, "popup closed after commit");
   }
   assert.equal(panel.providers["新供应商"].displayName, "My GW");
   assert.equal(panel.providers["新供应商"].baseURL, "https://gw/v1");
