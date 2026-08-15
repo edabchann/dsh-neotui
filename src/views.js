@@ -1980,7 +1980,13 @@ export class QuestionPopup extends Popup {
     let ly = this.y + 1;
     screen.text(this.x + 2, ly++, truncate(`▎ ${q.header ?? `问题 ${this.questionIdx + 1}/${this.questions.length}`}`, this.w - 4), { fg: K.ACCENT, bold: true });
     screen.text(this.x + 2, ly++, truncate(q.question ?? "", this.w - 4), { fg: K.TXT });
-    if (q.detail) screen.text(this.x + 2, ly++, truncate(q.detail, this.w - 4), { fg: K.DIM });
+    if (q.detail) {
+      const detailLines = String(q.detail).split("\n");
+      for (const detail of detailLines) {
+        if (ly >= this.y + this.h - 3) break;
+        screen.text(this.x + 2, ly++, truncate(detail, this.w - 4), { fg: K.DIM });
+      }
+    }
     const opts = q.options ?? [];
     for (let i = 0; i < opts.length && ly < this.y + this.h - 3; i++) {
       const chosen = draft.selected.includes(opts[i].label);
@@ -2007,7 +2013,7 @@ export class QuestionPopup extends Popup {
   onMouse(ev) {
     if (ev.kind === "press" && ev.button === 0) {
       const q = this.questions[this.questionIdx];
-      let ly = this.y + 3 + (q?.detail ? 1 : 0);
+      let ly = this.y + 3 + (q?.detail ? String(q.detail).split("\n").length : 0);
       for (let i = 0; i < (q?.options?.length ?? 0); i++) {
         if (ev.y === ly || (q.options[i].description && ev.y === ly + 1)) {
           this.selIdx = i; this.#choose(i);
