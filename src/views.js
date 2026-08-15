@@ -3802,12 +3802,8 @@ export class App {
       if (startMs != null) parts.push(`开始 ${fmtDateTime(startMs)}`);
       if (parts.length) row0.left.push({ t: ` ${parts.join(" · ")} `, fg: T.DIM, bg: T.STATUSBG });
     }
-    if (this.goalText) row0.right.push({ t: " 🎯" + truncate(this.goalText, 22) + " ", fg: T.SELFG, bg: T.WARN, bold: true });
     const plan = this.projections.plan;
     if (plan?.active || plan?.pending) row0.right.push({ t: plan.active ? " ✎计划中 " : " ✎计划待审 ", fg: T.SELFG, bg: T.ACCENT2 });
-    const sub = this.projections.subagent;
-    const subTiming = this.projections.subagentTiming;
-    if (sub && typeof sub === "object") row0.right.push({ t: ` ⚑${truncate(sub.label ?? "子代理", 16)}${subTiming?.active ? " ●" : ""} `, fg: T.SELFG, bg: T.PURPLE });
     const m = this.currentModel;
     const modelLabel = m
       ? `${m.provider}/${m.model}${m.reasoningEffort ? `@${m.reasoningEffort}` : ""}`
@@ -3869,12 +3865,15 @@ export class App {
       const done = jobs.filter((j) => j.status === "completed").length;
       const failed = jobs.filter((j) => j.status === "failed").length;
       const row2 = { left: [], right: [] };
+      const sub = this.projections.subagent;
+      const subTiming = this.projections.subagentTiming;
       row2.left.push({
-        t: ` ${running > 0 ? `${running} 个任务正在后台运行` : "没有任务正在后台运行"} `,
+        t: ` ${running > 0 ? `${running} 个后台任务运行中` : "没有后台任务运行"} `,
         fg: running > 0 ? T.WARN : T.FAINT, bg: T.STATUSBG,
       });
       row2.left.push({ t: ` ${done}已完成${failed > 0 ? ` ${failed}失败` : ""} `, fg: done > 0 ? T.OK : T.FAINT, bg: T.STATUSBG });
-      row2.right.push({ t: " Ctrl+J 查看详情 ", fg: T.DIM, bg: T.STATUSBG });
+      if (sub) row2.left.push({ t: ` 🛰 ${truncate(sub.label ?? sub.mode ?? "子代理", 20)}${subTiming?.active ? " 运行中" : ""} `, fg: T.PURPLE, bg: T.STATUSBG, bold: !!subTiming?.active });
+      row2.right.push({ t: " Ctrl+J 任务/子代理 ", fg: T.DIM, bg: T.STATUSBG });
       rows.push(row2);
     }
     this.status.rows = rows;

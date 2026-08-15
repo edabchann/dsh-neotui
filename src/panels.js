@@ -1342,7 +1342,7 @@ export class ControlPanel extends Widget {
       });
       s.text(this.x + this.w - 24, this.y, "Shift+Tab 次级", { fg: T.FAINT });
     } else {
-      s.text(this.x + this.w - 12, this.y, "Tab 翻页", { fg: T.FAINT });
+      s.text(this.x + this.w - 18, this.y, "Tab/←→ 翻页", { fg: T.FAINT });
     }
     const items = this.items();
     if (this.sel >= items.length) this.sel = Math.max(0, items.length - 1);
@@ -1365,13 +1365,13 @@ export class ControlPanel extends Widget {
   onKey(ev) {
     if (ev.type !== "key") return false;
     if (ev.name === "escape") { this.app.closeOverlay(); return true; }
-    if (ev.name === "tab") {
+    if (ev.name === "tab" || ev.name === "right") {
       this.page = (this.page + 1) % this.pages.length;
       this.sel = 0;
       this.app.redraw();
       return true;
     }
-    if (ev.name === "backtab") {
+    if (ev.name === "backtab" || ev.name === "left") {
       if (this.page === 2) {
         this.subPage = (this.subPage + 1) % this.subPages.length;
         this.sel = 0;
@@ -1383,8 +1383,8 @@ export class ControlPanel extends Widget {
       }
       return true;
     }
-    if (ev.name === "pgup" || ev.name === "left") { this.sel = 0; this.app.redraw(); return true; }
-    if (ev.name === "pgdn" || ev.name === "right") { this.sel = this.items().length - 1; this.app.redraw(); return true; }
+    if (ev.name === "pgup" || ev.name === "home") { this.sel = 0; this.app.redraw(); return true; }
+    if (ev.name === "pgdn" || ev.name === "end") { this.sel = this.items().length - 1; this.app.redraw(); return true; }
     if (ev.name === "up") { this.sel = Math.max(0, this.sel - 1); this.app.redraw(); return true; }
     if (ev.name === "down") { this.sel = Math.min(this.items().length - 1, this.sel + 1); this.app.redraw(); return true; }
     if (ev.name === "enter") {
@@ -1446,11 +1446,21 @@ export class JobsPanel extends Popup {
       scrollable: true, // expanded details scroll instead of being clipped
     });
     this.app = app;
+    this.page = "jobs";
     this.jobs = jobs;
+    this.subagents = [];
+    this.subagentError = null;
     this.expanded = new Set(); // job indexes rendered expanded
     this.sel = 0;
-    this.rowOf = [];           // rendered line → job index (-1 = chrome/detail)
+    this.rowOf = [];           // rendered line → item index (-1 = chrome/detail)
     this.rebuild();
+    this.loadSubagents();
+  }
+  async loadSubagents() {
+    if (!this.app.currentSession) return;
+    try { const res = await this.app.api.call("subagent.list", { parentSessionId: this.app.currentSession }); this.subagents = res.items ?? res.entries ?? []; }
+    catch (e) { this.subagentError = e.message; }
+    this.rebuild(); this.app.redraw();
   }
   /** Width-aware character cut (no ellipsis — continuation chunks follow). */
   static #cutWidth(s, w) {
@@ -1495,8 +1505,20 @@ export class JobsPanel extends Popup {
     return lines;
   }
   rebuild() {
-    let lines = [[{ t: "  这些任务在后台运行,不阻塞会话 — Enter/→/l 展开,←/h 折叠,PgUp/PgDn 滚动,q 关闭", fg: K.DIM }]];
+    this.title = `后台活动 · ${this.page === "jobs" ? "任务" : "子代理"}（Tab/←→ 切页）`;
+    let lines = [[{ t: ` [${this.page === "jobs" ? "任务" : "任务"}] [${this.page === "subagents" ? "子代理" : "子代理"}] · Tab/←→ 切页 · ↑↓选择 · Enter展开 · q关闭`, fg: K.DIM }]];
     const rowOf = [-1];
+    if (this.page === "subagents") {
+      if (this.subagentError) { lines.push([{ t: ` 子代理加载失败: ${this.subagentError}`, fg: K.ERR }]); rowOf.push(-1); }
+      if (!this.subagents.length && !this.subagentError) { lines.push([{ t: " （当前会话没有子代理）", fg: K.FAINT }]); rowOf.push(-1); }
+      for (let i = 0; i < this.subagents.length; i++) {
+        const child = this.subagents[i], bg = i === this.sel ? T.MENUSEL : T.BG2;
+        const status = child.activity ?? child.status ?? child.mode ?? "idle";
+        lines.push([{ t: ` ${i === this.sel ? "▸" : " "} 🛰 ${truncate(child.label ?? child.sessionId ?? child.id ?? "子代理", 42)} `, fg: K.TXT, bg, bold: i === this.sel }, { t: status, fg: status === "running" ? K.WARN : K.DIM, bg }]); rowOf.push(i);
+        if (this.expanded.has(i)) for (const [key, value] of Object.entries(child)) { lines.push([{ t: `      ${key}: ${truncate(typeof value === "object" ? JSON.stringify(value) : value, this.w - 16)}`, fg: K.DIM }]); rowOf.push(-1); }
+      }
+      this.lines = lines; this.rowOf = rowOf; this.#ensureVisible(); return;
+    }
     const jobs = this.jobs;
     if (jobs.length === 0) {
       lines.push([{ t: "  （当前没有任务帧）", fg: K.FAINT }]);
@@ -1539,17 +1561,19 @@ export class JobsPanel extends Popup {
   onKey(ev) {
     if (ev.type === "key") {
       if (ev.name === "escape" || (ev.name === "char" && ev.key === "q" && !ev.ctrl)) { this.app.closeOverlay(); return true; }
-      if (this.jobs.length === 0) return super.onKey(ev);
+      if (ev.name === "tab" || ev.name === "backtab" || ev.name === "left" || ev.name === "right") { this.page = this.page === "jobs" ? "subagents" : "jobs"; this.sel = 0; this.expanded.clear(); this.scrollY = 0; this.rebuild(); return true; }
+      const current = this.page === "jobs" ? this.jobs : this.subagents;
+      if (current.length === 0) return super.onKey(ev);
       if (ev.name === "up" || (ev.name === "char" && ev.key === "k" && !ev.ctrl)) {
         this.sel = Math.max(0, this.sel - 1); this.rebuild(); return true;
       }
       if (ev.name === "down" || (ev.name === "char" && ev.key === "j" && !ev.ctrl)) {
-        this.sel = Math.min(this.jobs.length - 1, this.sel + 1); this.rebuild(); return true;
+        this.sel = Math.min(current.length - 1, this.sel + 1); this.rebuild(); return true;
       }
-      if (ev.name === "right" || ev.name === "enter" || (ev.name === "char" && ev.key === "l" && !ev.ctrl)) {
-        if (this.jobs[this.sel]) { this.expanded.add(this.sel); this.rebuild(); } return true;
+      if (ev.name === "enter" || (ev.name === "char" && ev.key === "l" && !ev.ctrl)) {
+        if (current[this.sel]) { if (this.expanded.has(this.sel)) this.expanded.delete(this.sel); else this.expanded.add(this.sel); this.rebuild(); } return true;
       }
-      if (ev.name === "left" || (ev.name === "char" && ev.key === "h" && !ev.ctrl)) {
+      if (ev.name === "char" && ev.key === "h" && !ev.ctrl) {
         this.expanded.delete(this.sel); this.rebuild(); return true;
       }
     }
@@ -1645,35 +1669,73 @@ export class QueuePanel extends Popup {
   }
 }
 
-export function buildGoalPopup(app) {
-  const goal = app.goalData?.goal ?? app.goalData;
-  const todos = app.todos ?? [];
-  const lines = [];
-  if (!goal) lines.push([{ t: "（当前会话没有目标）", fg: K.FAINT }]);
-  else {
-    lines.push([{ t: ` 目标: ${goal.objective ?? goal}`, fg: K.TXT }]);
-    if (goal.phase) lines.push([{ t: ` 阶段: ${goal.phase}`, fg: K.DIM }]);
-    const rounds = app.goalData?.roundsStarted;
-    if (goal.maxGoalRounds != null) lines.push([{ t: ` 轮次: ${rounds ?? 0}/${goal.maxGoalRounds}${goal.revision != null ? ` · 修订 ${goal.revision}` : ""}`, fg: K.DIM }]);
-    if (goal.blockedReason?.message) lines.push([{ t: ` 阻塞: ${goal.blockedReason.message}${goal.blockedReason.code ? ` (${goal.blockedReason.code})` : ""}`, fg: K.ERR }]);
-    if (goal.id) lines.push([{ t: ` id: ${goal.id}`, fg: K.FAINT }]);
+export class GoalPanel extends Popup {
+  constructor(app) {
+    super({ x: 4, y: 2, w: Math.max(24, Math.min(84, app.screen.w - 8)), h: Math.max(8, Math.min(26, app.screen.h - 4)), title: "目标与任务", lines: [], buttons: [], scrollable: true });
+    this.app = app; this.busy = false; this.rebuild();
   }
-  if (todos.length) {
-    lines.push([{ t: "" }, { t: " 任务清单:", fg: K.ACCENT, bold: true }]);
-    for (const t of todos.slice(0, 16)) {
-      const icon = t.status === "completed" ? "✓" : t.status === "in_progress" ? "◉" : "○";
-      const color = t.status === "completed" ? K.OK : t.status === "in_progress" ? K.WARN : K.DIM;
-      lines.push([{ t: `  ${icon} ${truncate(t.content, 60)}`, fg: color }]);
+  get goal() { return this.app.goalData?.goal ?? this.app.goalData; }
+  #ref() { const g = this.goal; return g?.id && g?.revision != null ? { id: g.id, revision: g.revision } : null; }
+  rebuild() {
+    const goal = this.goal, todos = this.app.todos ?? [], lines = [];
+    lines.push([{ t: goal ? " e 编辑目标 · m 修改轮次 · p 暂停/继续 · c 完成 · x 清除 · Esc关闭" : " n 创建目标 · Esc关闭", fg: this.busy ? K.WARN : K.DIM }]);
+    if (!goal) lines.push([{ t: " 当前会话没有目标", fg: K.FAINT }]);
+    else {
+      lines.push([{ t: ` 目标: ${goal.objective ?? goal}`, fg: K.TXT, bold: true }]);
+      lines.push([{ t: ` 阶段: ${goal.phase ?? "active"} · 轮次 ${this.app.goalData?.roundsStarted ?? 0}/${goal.maxGoalRounds ?? "∞"} · 修订 ${goal.revision ?? "?"}`, fg: K.DIM }]);
+      if (goal.blockedReason?.message) lines.push([{ t: ` 阻塞: ${goal.blockedReason.message}`, fg: K.ERR }]);
     }
-    if (todos.length > 16) lines.push([{ t: `  …共 ${todos.length} 项`, fg: K.FAINT }]);
+    lines.push([{ t: "" }, { t: ` 任务清单（${todos.filter((t) => t.status === "completed").length}/${todos.length}）`, fg: K.ACCENT, bold: true }]);
+    for (const todo of todos) {
+      const icon = todo.status === "completed" ? "✓" : todo.status === "in_progress" ? "◉" : "○";
+      lines.push([{ t: `  ${icon} ${truncate(todo.content, this.w - 8)}`, fg: todo.status === "completed" ? K.OK : todo.status === "in_progress" ? K.WARN : K.DIM }]);
+    }
+    if (!todos.length) lines.push([{ t: "  （没有任务）", fg: K.FAINT }]);
+    this.lines = lines;
   }
-  return new Popup({
-    x: 6, y: 3, w: Math.min(80, app.screen.w - 12), h: Math.min(lines.length + 5, 24), title: "目标",
-    lines: [[{ t: "" }], ...lines],
-    buttons: [{ label: "关闭", action: "close" }],
-    onAction: () => app.closeOverlay(),
-  });
+  async #call(method, payload) {
+    if (this.busy) return;
+    this.busy = true; this.rebuild(); this.app.redraw();
+    try { await this.app.api.call(method, { sessionId: this.app.currentSession, ...payload }); this.app.toast("目标已更新，等待同步"); }
+    catch (e) { this.app.toast(`目标操作失败: ${e.message}`); }
+    finally { this.busy = false; this.rebuild(); this.app.redraw(); }
+  }
+  #edit(field) {
+    const goal = this.goal;
+    const creating = !goal;
+    const value = field === "maxGoalRounds" ? String(goal?.maxGoalRounds ?? "") : String(goal?.objective ?? "");
+    const popup = new EditPopup(this.app, {
+      title: creating ? "创建目标" : field === "maxGoalRounds" ? "修改最大轮次" : "编辑目标",
+      value,
+      placeholder: field === "maxGoalRounds" ? "正整数，留空保持不变" : "输入目标…",
+      onCommit: (text) => {
+        this.app.overlay = this;
+        if (field === "maxGoalRounds") {
+          const n = Number(text.trim()); if (!Number.isSafeInteger(n) || n <= 0) { this.app.toast("最大轮次必须是正整数"); return; }
+          this.#call("goal.edit", { ref: this.#ref(), maxGoalRounds: n });
+        } else if (creating) {
+          if (!text.trim()) { this.app.toast("目标不能为空"); return; }
+          this.#call("goal.create", { objective: text.trim() });
+        } else this.#call("goal.edit", { ref: this.#ref(), objective: text.trim() });
+      },
+    });
+    this.app.overlay = popup; this.app.focus(popup.input); this.app.redraw();
+  }
+  onKey(ev) {
+    if (ev.type === "key") {
+      if (ev.name === "escape") { this.app.closeOverlay(); return true; }
+      if (ev.name === "char" && ev.key === "n" && !this.goal) { this.#edit("objective"); return true; }
+      if (ev.name === "char" && ev.key === "e" && this.goal) { this.#edit("objective"); return true; }
+      if (ev.name === "char" && ev.key === "m" && this.goal) { this.#edit("maxGoalRounds"); return true; }
+      if (ev.name === "char" && ev.key === "p" && this.goal) { this.#call(this.goal.phase === "active" ? "goal.pause" : "goal.resume", { ref: this.#ref() }); return true; }
+      if (ev.name === "char" && ev.key === "c" && this.goal) { this.#call("goal.complete", { ref: this.#ref() }); return true; }
+      if (ev.name === "char" && ev.key === "x" && this.goal) { this.#call("goal.clear", { ref: this.#ref() }); return true; }
+    }
+    return super.onKey(ev);
+  }
 }
+
+export function buildGoalPopup(app) { return new GoalPanel(app); }
 
 // ---- Settings panel (generic JSON-tree editor over settings.describe/mutate) ----
 
@@ -2028,6 +2090,8 @@ export class ModelPanel extends Widget {
     this.app = app;
     this.providers = {};   // route → profile (mirror of settings llm-pi-ai.providers)
     this.revision = 0;
+    this.defaultModelRevision = 0;
+    this.defaultModel = null;
     this.loaded = false;
     this.routes = [];
     this.sel = 0;          // list cursor (routes.length = the ＋ 添加供应商 row)
@@ -2060,8 +2124,11 @@ export class ModelPanel extends Widget {
     try {
       const d = await this.app.api.call("settings.describe");
       const ns = (d.namespaces ?? []).find((n) => n.ns === "llm-pi-ai");
+      const defaults = (d.namespaces ?? []).find((n) => n.ns === "agent-default-model");
       this.providers = { ...(ns?.value?.providers ?? {}) };
       this.revision = ns?.revision ?? 0;
+      this.defaultModel = defaults?.value ? { ...defaults.value } : null;
+      this.defaultModelRevision = defaults?.revision ?? 0;
       this.routes = Object.keys(this.providers);
     } catch (e) { this.app.toast(`模型配置加载失败: ${e.message}`); }
     this.savedSnapshot = JSON.stringify(this.providers);
@@ -2110,6 +2177,9 @@ export class ModelPanel extends Widget {
       completions: API_PROTOCOLS, note: "Tab 切换 · Enter 输入",
     });
     items.push({ kind: "field", key: "baseURL", label: "baseURL", value: p.baseURL ?? "" });
+    items.push({ kind: "field", key: "reasoning", label: "默认思考强度", value: p.reasoning ?? "", cycle: ["off", "minimal", "low", "medium", "high", "xhigh"], completions: ["off", "minimal", "low", "medium", "high", "xhigh"], note: "可选 · Tab 切换" });
+    items.push({ kind: "field", key: "defaultContextWindow", label: "默认上下文", value: p.defaultContextWindow ?? "", numeric: true });
+    items.push({ kind: "field", key: "defaultMaxTokens", label: "默认最大输出", value: p.defaultMaxTokens ?? "", numeric: true });
     // the api key: web-synced handling — the stored value is NEVER shown
     // (credentials.describe is structurally value-free), only its status dot;
     // Enter opens a masked, always-empty editor and a typed key travels one
@@ -2121,6 +2191,7 @@ export class ModelPanel extends Widget {
     const models = p.models ?? [];
     const names = models.slice(0, 5).map((m) => m.id || "（未命名）").join(" · ");
     items.push({ kind: "button", label: "模型管理", sub: names + (models.length > 5 ? " · …" : ""), action: () => this.#openModels() });
+    items.push({ kind: "field", key: "__defaultReasoningEffort", label: "默认 Agent 思考强度", value: this.defaultModel?.provider === route ? (this.defaultModel.reasoningEffort ?? "") : "", note: this.defaultModel?.provider === route ? `默认模型 ${this.defaultModel.model}` : "先将本路由模型设为默认" });
     items.push({ kind: "button", label: "💾 保存配置", action: () => this.#save() });
     items.push({ kind: "button", label: "🗑 删除供应商", action: () => this.#deleteProvider() });
     return items;
@@ -2141,11 +2212,14 @@ export class ModelPanel extends Widget {
         items.push({ kind: "field", key: `model.${mi}.name`, label: "  模型名", value: m.name ?? "" });
         items.push({ kind: "field", key: `model.${mi}.contextWindow`, label: "  上下文窗口", value: m.contextWindow ?? "", numeric: true });
         items.push({ kind: "field", key: `model.${mi}.maxTokens`, label: "  最大输出", value: m.maxTokens ?? "", numeric: true });
+        items.push({ kind: "field", key: `model.${mi}.reasoningEfforts`, label: "  思考强度映射", value: m.reasoningEfforts === false ? "false" : JSON.stringify(m.reasoningEfforts ?? {}), json: true, note: 'JSON，例如 {"off":null,"high":"high"}' });
+        items.push({ kind: "field", key: `model.${mi}.input`, label: "  输入模态", value: JSON.stringify(m.input ?? ["text"]), json: true, note: 'JSON，例如 ["text","image"]' });
       }
     }
     items.push({ kind: "button", label: "＋ 添加模型", action: () => this.#addModel() });
     items.push({ kind: "button", label: "🗑 删除选中模型", action: () => this.#deleteModel() });
     items.push({ kind: "button", label: "◉ 设为当前会话模型（选中模型）", action: () => this.#setDefaultModel() });
+    items.push({ kind: "button", label: "★ 设为默认 Agent/Subagent 目标", action: () => this.#setAgentDefault() });
     return items;
   }
   #openModels() {
@@ -2350,17 +2424,22 @@ export class ModelPanel extends Widget {
           }
         } else if (it.numeric) {
           const n = text.trim() === "" ? undefined : Number(text);
-          if (n !== undefined && !isFinite(n)) { this.app.toast("请输入数字"); return; }
-          const [, mi, field] = it.key.split(".");
-          p.models[Number(mi)][field] = n;
+          if (n !== undefined && (!isFinite(n) || n <= 0)) { this.app.toast("请输入正数"); return; }
+          if (it.key.startsWith("model.")) {
+            const [, mi, field] = it.key.split("."); p.models[Number(mi)][field] = n;
+          } else p[it.key] = n;
         } else if (it.key.startsWith("model.")) {
           const [, mi, field] = it.key.split(".");
-          p.models[Number(mi)][field] = text;
+          if (it.json) {
+            try { p.models[Number(mi)][field] = text.trim() === "false" ? false : JSON.parse(text); }
+            catch { this.app.toast("请输入有效 JSON"); return; }
+          } else p.models[Number(mi)][field] = text;
         } else {
-          if (it.key === "api" && !API_PROTOCOLS.includes(text.trim())) {
-            this.app.toast(`注意:${text.trim() || "空"} 不是已知协议,保存时可能被拒绝`);
-          }
-          p[it.key] = text;
+          if (it.key === "api" && !API_PROTOCOLS.includes(text.trim())) this.app.toast(`注意:${text.trim() || "空"} 不是已知协议,保存时可能被拒绝`);
+          if (it.key === "__defaultReasoningEffort") {
+            if (!this.defaultModel || this.defaultModel.provider !== route) { this.app.toast("请先在模型管理中将本供应商的模型设为当前会话模型；默认 Agent 模型可在 Settings 修改"); return; }
+            this.defaultModel.reasoningEffort = text.trim() || undefined;
+          } else p[it.key] = text;
         }
       }, it.completions);
       return;
@@ -2410,6 +2489,13 @@ export class ModelPanel extends Widget {
       this.app.toast(`已切换 ${route}/${m.id}`);
     } catch (e) { this.app.toast(`切换失败: ${e.message}`); }
   }
+  #setAgentDefault() {
+    const route = this.#route(), m = this.#profile(route)?.models?.[this.modelsSel];
+    if (!route || !m?.id) { this.app.toast("先选中一个模型"); return; }
+    this.defaultModel = { provider: route, model: m.id, ...(this.defaultModel?.reasoningEffort ? { reasoningEffort: this.defaultModel.reasoningEffort } : {}) };
+    this.app.toast(`默认 Agent/Subagent 目标设为 ${route}/${m.id}，点💾保存配置`);
+    this.#rebuild(); this.app.redraw();
+  }
   async #save() {
     try {
       const res = await this.app.api.call("settings.mutate", {
@@ -2420,7 +2506,11 @@ export class ModelPanel extends Widget {
       this.revision = res?.revision ?? this.revision;
       this.draftRoute = null;
       this.savedSnapshot = JSON.stringify(this.providers);
-      this.app.toast(`已保存 ${Object.keys(this.providers).length} 个供应商`);
+      if (this.defaultModel) {
+        const def = await this.app.api.call("settings.mutate", { ns: "agent-default-model", ops: [{ op: "set", path: [], value: this.defaultModel }], expectedRevision: this.defaultModelRevision });
+        this.defaultModelRevision = def?.revision ?? this.defaultModelRevision;
+      }
+      this.app.toast(`已保存 ${Object.keys(this.providers).length} 个供应商及默认模型参数`);
       return true;
     } catch (e) { this.app.toast(`保存失败: ${e.message}`); return false; }
   }
@@ -2645,6 +2735,7 @@ export class ModelPanel extends Widget {
       this.app.redraw();
       return true;
     }
+    if (ev.name === "enter") { this.#activateItem(); return true; }
     if (ev.name === "left" || (ev.name === "char" && ev.key === "h" && !ev.ctrl) || ev.name === "backtab") {
       if (this.mode === "form") {
         this.#leaveForm(() => { this.mode = "list"; this.sub = null; this.#rebuild(); this.app.redraw(); });
@@ -2652,7 +2743,6 @@ export class ModelPanel extends Widget {
       this.app.redraw();
       return true;
     }
-    if (ev.name === "enter") { this.#activateItem(); return true; }
     return false;
   }
   onMouse(ev) {

@@ -6,7 +6,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig } from "../src/views.js";
-import { TrajectoryPanel, JobsPanel, QueuePanel, SettingsPanel, ModelPanel } from "../src/panels.js";
+import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel } from "../src/panels.js";
 import { fmtDuration, strWidth } from "../src/text.js";
 import { renderMd } from "../src/md.js";
 import { Input } from "../src/widgets.js";
@@ -741,6 +741,8 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
   // the api protocol field is a CHOICE: Tab cycles the options in the form
   // (web <select> semantics) and Enter opens the autocomplete edit buffer
   const apiItem = panel.formItems[fieldIdx("协议 api")];
+  assert.ok(fieldIdx("默认思考强度") >= 0, "provider reasoning default is editable");
+  assert.ok(fieldIdx("默认上下文") >= 0 && fieldIdx("默认最大输出") >= 0, "provider fallback limits are editable");
   assert.deepEqual(apiItem.completions, ["openai-completions", "openai-responses", "anthropic-messages"], "all protocol choices offered");
   assert.ok(apiItem.cycle?.length >= 3, "tab-cycle options present");
   panel.formIdx = fieldIdx("协议 api");
@@ -1554,9 +1556,9 @@ test("footer jobs row is a single 后台任务 summary", () => {
   app.renderFrame();
   const row2 = app.status.rows[2];
   const text = [...(row2?.left ?? []), ...(row2?.right ?? [])].map((s) => s.t).join(" ");
-  assert.ok(text.includes("2 个任务正在后台运行"), text);
+  assert.ok(text.includes("2 个后台任务运行中"), text);
   assert.ok(text.includes("1已完成 1失败"), text);
-  assert.ok(text.includes("Ctrl+J 查看详情"), text);
+  assert.ok(text.includes("Ctrl+J 任务/子代理"), text);
   // no per-job noise rows
   assert.equal(app.status.rows.length, 3, "footer has exactly one jobs row");
 });
@@ -1581,12 +1583,24 @@ test("the todo box freezes its height once todos appear (no idle reflow)", () =>
   assert.equal(app.footerHeight(), 3, "footer always 3 rows (no job-driven reflow)");
 });
 
+test("footer avoids duplicate goal/subagent highlight chips", () => {
+  const app = headlessApp();
+  app.projections.goal = { goal: { id: "g", revision: 1, objective: "ship it", phase: "active" } };
+  app.projections.subagent = { label: "worker", mode: "continuable" };
+  app.projections.subagentTiming = { active: { since: Date.now() } };
+  app.renderFrame();
+  const row0 = [...(app.status.rows[0]?.left ?? []), ...(app.status.rows[0]?.right ?? [])].map((s) => s.t).join(" ");
+  const row2 = [...(app.status.rows[2]?.left ?? []), ...(app.status.rows[2]?.right ?? [])].map((s) => s.t).join(" ");
+  assert.ok(!row0.includes("ship it") && !row0.includes("worker"), row0);
+  assert.ok(row2.includes("worker") && row2.includes("任务/子代理"), row2);
+});
+
 test("footer jobs row says 没有任务正在后台运行 when none run", () => {
   const app = headlessApp();
   app.jobs = [{ status: "completed", kind: "goal", label: "done" }];
   app.renderFrame();
   const text = [...(app.status.rows[2]?.left ?? []), ...(app.status.rows[2]?.right ?? [])].map((s) => s.t).join(" ");
-  assert.ok(text.includes("没有任务正在后台运行"), text);
+  assert.ok(text.includes("没有后台任务运行"), text);
   assert.ok(text.includes("1已完成"), text);
 });
 
@@ -1598,7 +1612,7 @@ test("JobsPanel: title, Enter/→ expand, ←/h collapse, q close", () => {
     { status: "completed", kind: "subagent", label: "child done" },
   ];
   const panel = new JobsPanel(app);
-  assert.ok(panel.title.includes("后台任务"), panel.title);
+  assert.ok(panel.title.includes("后台活动"), panel.title);
   assert.equal(panel.expanded.size, 0);
   assert.equal(panel.lines.filter((l) => l.some((g) => g.t.includes("结果:"))).length, 0, "detail hidden before expand");
   // Enter expands the selected job
@@ -1616,6 +1630,31 @@ test("JobsPanel: title, Enter/→ expand, ←/h collapse, q close", () => {
   // q closes
   panel.onKey({ type: "key", name: "char", key: "q", text: "q", ctrl: false, alt: false, shift: false });
   assert.equal(app.overlay, null, "q closed the overlay");
+});
+
+test("GoalPanel exposes CAS-backed edit and lifecycle actions", async () => {
+  const app = headlessApp(); app.currentSession = "s";
+  app.projections.goal = { goal: { id: "g", revision: 3, objective: "old", phase: "active", maxGoalRounds: 4 }, roundsStarted: 1 };
+  const calls = []; app.api.call = async (method, payload) => { calls.push([method, payload]); return { ref: { id: "g", revision: 4 } }; };
+  const panel = new GoalPanel(app);
+  panel.onKey({ type: "key", name: "char", key: "p", ctrl: false });
+  await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(calls[0], ["goal.pause", { sessionId: "s", ref: { id: "g", revision: 3 } }]);
+  panel.onKey({ type: "key", name: "char", key: "c", ctrl: false });
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(calls[1][0], "goal.complete");
+});
+
+test("JobsPanel shares one buffer with subagents via Tab and arrows", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 30 }; app.currentSession = "s"; app.jobs = [];
+  app.api.call = async (method) => method === "subagent.list" ? { items: [{ sessionId: "child", label: "researcher", activity: "running" }] } : {};
+  const panel = new JobsPanel(app);
+  await Promise.resolve(); await Promise.resolve();
+  panel.onKey({ type: "key", name: "tab" });
+  assert.equal(panel.page, "subagents");
+  assert.ok(panel.lines.flat().some((part) => part.t?.includes("researcher")));
+  panel.onKey({ type: "key", name: "left" });
+  assert.equal(panel.page, "jobs");
 });
 
 test("QueuePanel edits queued messages and preserves selected id on refresh", async () => {

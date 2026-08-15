@@ -20,7 +20,8 @@ DeepSeek Harness 的终端界面。它连接 DSH Host，提供会话、流式对
 - 工作区文件浏览、轨迹视图、Skills 和 Settings；
 - 鼠标、bracketed paste、Kitty keyboard、OSC 8 链接和 OSC 52 复制；
 - CJK、组合字符和 ZWJ emoji 的 grapheme-aware 渲染；
-- dark、light、gruvbox 三套主题。
+- dark、light、gruvbox 三套主题；
+- 第三方供应商高级配置：route/model 思考强度、上下文与输出上限、输入模态，以及默认 Agent/Subagent 模型目标。
 
 ## 运行方式
 
@@ -163,9 +164,9 @@ Host 若报告 steering 窗口已关闭，消息会继续保留；若条目已�
 | `Shift+Tab` | 对话与轨迹切换 |
 | `Ctrl+E` | 按 step 快速转跳 |
 | `Ctrl+F` | 搜索当前会话 |
-| `Ctrl+J` | 后台任务 |
+| `Ctrl+J` | 后台活动（任务 / Subagent，Tab 或 ←→ 切页） |
 | `Ctrl+U` | 消息队列 |
-| `Ctrl+G` | Goal / TODO |
+| `Ctrl+G` | Goal / TODO（创建、编辑、轮次、暂停、继续、完成、清除） |
 | `Ctrl+S` | Settings |
 | `Ctrl+A` | Subagent |
 | `Ctrl+K` | Skills |
