@@ -738,19 +738,29 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
   assert.ok(panel.routes.includes("新供应商"), "draft route created");
   assert.equal(panel.mode, "form");
   const fieldIdx = (label) => panel.formItems.findIndex((it) => it.kind === "field" && it.label === label);
+  // the api field is editable too
+  assert.ok(fieldIdx("协议 api") >= 0, "api field present");
   // edit fields through the standalone centered edit buffer
-  for (const [label, value] of [["显示名", "My GW"], ["baseURL", "https://gw/v1"]]) {
+  for (const [label, value] of [["显示名", "My GW"], ["baseURL", "https://gw/v1"], ["协议 api", "anthropic-messages"]]) {
     panel.formIdx = fieldIdx(label);
     panel.onKey({ type: "key", name: "enter" });
     const popup = app.overlay;
     assert.ok(popup?.input, `edit popup opened for ${label}`);
     assert.ok(String(popup.title).includes(label), popup.title);
-    popup.input.setValue(value);
+    // the ORIGINAL value sits in the editor (modify, not replace): appending
+    // extends it instead of wiping it
+    const before = popup.input.value;
+    popup.input.onKey({ type: "key", name: "end" });
+    popup.input.onKey({ type: "text", text: "-x" });
     popup.onKey({ type: "key", name: "enter" });
     assert.equal(app.overlay, null, "popup closed after commit");
+    assert.equal(panel.providers["新供应商"][label === "显示名" ? "displayName" : label === "baseURL" ? "baseURL" : "api"], before + "-x", `${label} modified in place`);
+    // reset the appended suffix for the value we actually want
+    panel.providers["新供应商"][label === "显示名" ? "displayName" : label === "baseURL" ? "baseURL" : "api"] = value;
   }
   assert.equal(panel.providers["新供应商"].displayName, "My GW");
   assert.equal(panel.providers["新供应商"].baseURL, "https://gw/v1");
+  assert.equal(panel.providers["新供应商"].api, "anthropic-messages");
   // save persists via settings.mutate
   panel.formIdx = panel.formItems.findIndex((it) => it.kind === "button" && it.label.includes("保存配置"));
   panel.onKey({ type: "key", name: "enter" });

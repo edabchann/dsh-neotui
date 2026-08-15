@@ -1839,7 +1839,9 @@ export class EditPopup extends Popup {
       multi: true, maxLines: 4, app,
       prompt: "> ", placeholder: "输入值…（Ctrl+Shift+V 粘贴,Enter 确定,Esc 取消）",
     });
-    this.input.setValue(String(value ?? ""), { select: true });
+    // the cursor starts at the END of the existing value: typing appends and
+    // edits in place instead of wiping the original (modify, not replace)
+    this.input.setValue(String(value ?? ""));
     this.#layout();
   }
   #layout() {
@@ -1930,6 +1932,7 @@ export class ModelPanel extends Widget {
     // the route key only appears for a brand-new draft (rename once)
     if (this.draftRoute === route) items.push({ kind: "field", key: "route", label: "路由名", value: route });
     items.push({ kind: "field", key: "displayName", label: "显示名", value: p.displayName ?? "" });
+    items.push({ kind: "field", key: "api", label: "协议 api", value: p.api ?? "openai-completions" });
     items.push({ kind: "field", key: "baseURL", label: "baseURL", value: p.baseURL ?? "" });
     items.push({ kind: "field", key: "apiKeyEnv", label: "apiKeyEnv", value: p.apiKeyEnv ?? "", note: "环境变量名（密钥不落盘）" });
     // models are NOT flat here: one 模型管理 entry summarizing the first
