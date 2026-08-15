@@ -1214,7 +1214,7 @@ export class ImagePopup extends Popup {
       w, h, title: `🖼 ${truncate(ref?.name ?? "image", 50)}`,
       lines: [[{ t: "加载中…", fg: K.DIM }]],
       buttons: [],
-      onAction: () => app.closeOverlay(),
+      onAction: () => this.closePreview(),
     });
     this.app = app;
     this.refs = (refs && refs.length > 0) ? refs : [ref];
@@ -1247,7 +1247,7 @@ export class ImagePopup extends Popup {
     if (ev.type === "key" && ev.name === "left" && this.refs.length > 1) { this.#show(this.index - 1); return true; }
     if (ev.type === "key" && ev.name === "right" && this.refs.length > 1) { this.#show(this.index + 1); return true; }
     if (ev.type === "key" && ev.name === "enter") { this.openExternal(); return true; }
-    if (ev.type === "key" && ev.name === "escape") { this.app.closeOverlay(); return true; }
+    if (ev.type === "key" && ev.name === "escape") { this.closePreview(); return true; }
     if (ev.type === "key" && ev.name === "char" && ev.key === "y") { this.copyImage(); return true; }
     return true;
   }
@@ -1255,6 +1255,10 @@ export class ImagePopup extends Popup {
     if (ev.kind === "press" && ev.button === 0) { const now = Date.now(); if (this.lastClickAt && now - this.lastClickAt < 400) { this.openExternal(); this.lastClickAt = 0; } else this.lastClickAt = now; return true; }
     if (ev.kind === "press" && ev.button === 2) { this.app.openMenu([{ label: "打开系统查看器", action: () => this.openExternal() }, { label: "复制图片", action: () => this.copyImage() }], ev); return true; }
     return super.onMouse(ev);
+  }
+  closePreview() {
+    if (this.kittyId && this.app.term?.output) this.app.term.output.write(`\x1b_Ga=d,d=i,i=${this.kittyId},q=2\x1b\\`);
+    this.app.closeOverlay();
   }
   copyImage() {
     try { const child = spawn("wl-copy", ["--type", this.ref?.mediaType ?? "image/png"], { stdio: ["pipe", "ignore", "ignore"] }); child.stdin.end(this.data); this.app.toast("图片已复制到剪贴板"); }
@@ -1327,7 +1331,7 @@ export class ImagePopup extends Popup {
   }
   kittyTransmit() {
     // kitty graphics protocol: transmit + place. Returns ANSI or "".
-    if (!this.data || !kittyCapable()) return "";
+    if (!this.data || !kittyCapable() || this.app.term?.kitty === false) return "";
     const w = Math.min(70, this.w - 4), h = Math.max(4, this.h - 6);
     // Screen redraws every second for clocks/timers. Transmit once per loaded
     // image instead of streaming the full base64 payload on every frame.
@@ -1336,7 +1340,12 @@ export class ImagePopup extends Popup {
     const b64 = this.data.toString("base64");
     const chunks = [];
     for (let i = 0; i < b64.length; i += 4096) chunks.push(b64.slice(i, i + 4096));
-    const payload = chunks.map((c, i) => `\x1b_Ga=${i === 0 ? "T" : "f"},f=100,i=${this.kittyId},q=2,m=${i === chunks.length - 1 ? 0 : 1};${c}\x1b\\`).join("");
+    // Only the first chunk carries transmission metadata; continuation chunks
+    // carry `m` alone. `a=f` is not a Kitty action and made WezTerm silently
+    // discard every chunk after the first.
+    const payload = chunks.map((c, i) => i === 0
+      ? `\x1b_Ga=T,f=100,i=${this.kittyId},q=2,m=${chunks.length === 1 ? 0 : 1};${c}\x1b\\`
+      : `\x1b_Gm=${i === chunks.length - 1 ? 0 : 1};${c}\x1b\\`).join("");
     // Kitty places at the current cursor. Screen.render() leaves the cursor at
     // an arbitrary diff cell, so explicitly move to the popup image viewport.
     const move = `\x1b[${this.y + 4};${this.x + 3}H`;
