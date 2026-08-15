@@ -278,6 +278,15 @@ test("clicking a think header in all-collapsed mode (t) expands it alone", () =>
   assert.ok(text.includes("deep thought two"), "full reasoning visible");
 });
 
+test("[ loads at most one older page when that page has no user question", async () => {
+  const { app, chat } = render([{ kind: "assistant", id: "a", step: 1, streaming: false, blocks: [{ kind: "text", text: "answer only" }] }]);
+  app.focus(chat); chat.view.scrollY = 0; chat.view.follow = false; chat.hasMore = true; chat.minSeq = 100;
+  let calls = 0; app.api.call = async () => { calls++; return { events: [{ event: { seq: 99, type: "session/event", data: {} } }], hasMore: true }; };
+  chat.onKey({ type: "key", name: "char", key: "[", text: "[", ctrl: false, alt: false, shift: false });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(calls, 1, "one key press fetches one page without recursive paging");
+});
+
 test("[ and ] jump to the previous/next question's end", () => {
   const mk = (id, text) => ({ kind: "user", id, step: 0, streaming: false, text });
   const mkA = (id, step, text) => ({ kind: "assistant", id, step, streaming: false, blocks: [{ kind: "text", text }] });

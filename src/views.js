@@ -1173,7 +1173,7 @@ export class ChatView extends Widget {
   }
 
   async loadOlder(onDone = null) {
-    if (!this.hasMore || this.loadingOlder || this.minSeq == null) { onDone?.(); return; }
+    if (!this.hasMore || this.loadingOlder || this.minSeq == null) { if (onDone) queueMicrotask(onDone); return; }
     const sessionId = this.sessionId;
     const epoch = this.app.sessionEpoch;
     this.loadingOlder = true;
@@ -1195,14 +1195,17 @@ export class ChatView extends Widget {
     }
     this.loadingOlder = false;
     this.#rebuild();
-    onDone?.();
+    // Always break the history-load Promise continuation before navigation.
+    // This also prevents a synchronous API test double from building an
+    // unbounded PromiseRejectCallback chain.
+    if (onDone) queueMicrotask(onDone);
   }
 
   /** [ / ] — jump the viewport to the END of the previous (dir -1) or next
    *  (dir +1) user question. `previous` walks to the question entirely above
    *  the viewport top (loading older history first when needed); `next` walks
    *  to the first question that starts below the viewport top. */
-  #jumpQuestion(dir) {
+  #jumpQuestion(dir, allowLoad = true) {
     this.flushRebuild(); // lineMap must reflect the current nodes array
     const top = this.view.scrollY;
     const qs = [];
@@ -1220,8 +1223,12 @@ export class ChatView extends Widget {
       for (let k = qs.length - 1; k >= 0; k--) {
         if (qs[k].last < top) { target = qs[k]; break; }
       }
-      if (!target && this.hasMore && this.minSeq != null) {
-        this.loadOlder(() => this.#jumpQuestion(-1)); // after the prepend, retry against the fuller window
+      if (!target && allowLoad && this.hasMore && this.minSeq != null) {
+        // One key press loads at most one history page. The old callback called
+        // #jumpQuestion again with loading still enabled; if a page contained
+        // no user question, an already-resolved mocked/local history Promise
+        // could recurse synchronously through every page and overflow the stack.
+        void this.loadOlder(() => this.#jumpQuestion(-1, false));
         return true;
       }
     } else {
@@ -1270,11 +1277,10 @@ export class ChatView extends Widget {
     if (!image) { this.app.toast("剪贴板中没有 PNG/JPEG/WebP/GIF 图片"); return false; }
     this.clipboardImages.push(image);
     this.input.insert(` [🖼 ${image.name}] `);
-    this.app.toast(`已粘贴图片 ${image.name} · ${Math.round(image.bytes / 1024)}KB（Enter 发送；发送后点图片预览）`);
-    // Keep the compose-time image staged and represented by a stable token.
-    // Do not open/transmit a Kitty popup from inside the paste input callback:
-    // several terminal emulators reject graphics writes while resolving their
-    // own bracketed-paste promise, producing PromiseRejectCall recursion.
+    this.app.toast(`已粘贴图片 ${image.name} · ${Math.round(image.bytes / 1024)}KB（Enter 发送）`);
+    // Open the same Kitty-capable preview surface used by transcript images.
+    const ref = { mediaType: image.mediaType, data: image.data, name: image.name };
+    this.app.openImage(ref, { all: [ref], index: 0 });
     return true;
   }
 
