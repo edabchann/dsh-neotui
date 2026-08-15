@@ -10,7 +10,7 @@ export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefa
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
   modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker,
-  ImagePopup, kittyCapable, buildGoalPopup, SettingsPanel, SubagentPanel,
+  ImagePopup, kittyCapable, buildGoalPopup, GoalPanel, SettingsPanel, SubagentPanel,
   SkillsPanel, ControlPanel, JobsPanel, QueuePanel, ModelPanel, fmtMs,
 } from "./panels.js";
 
@@ -1083,7 +1083,7 @@ export class ChatView extends Widget {
     const subagent = this.app.projections.subagent;
     let h = 0;
     if (subagent) h++;
-    if (!todos || todos.length === 0) return h + (this.todoSeen ? 2 : 0);
+    if (!todos || todos.length === 0) { this.todoSeen = false; return h; }
     this.todoSeen = true;
     // The task dock owns a framed header and footer. Folded keeps the framed
     // two-row strip visible rather than blending one text row into transcript.
@@ -2028,7 +2028,7 @@ export class ChatView extends Widget {
       const ms = (timing?.settledMs ?? 0) + (timing?.active ? Math.max(0, Date.now() - timing.active.since) : 0);
       screen.text(this.x, row++, ` 🛰 子代理 · ${subagent.label ?? subagent.mode}${ms ? ` · ${fmtDuration(ms)}` : ""}`, { fg: T.PURPLE, bg: T.STATUSBG, bold: true });
     }
-    if (!(todos.length || this.todoSeen)) return;
+    if (!todos.length) return;
     const done = todos.filter((t) => t.status === "completed").length;
     const active = todos.filter((t) => t.status === "in_progress").length;
     const progress = todos.length ? ` · ${done}/${todos.length} 完成${active ? ` · ${active} 进行中` : ""}` : "";
@@ -2806,6 +2806,7 @@ export class App {
         // Every bottom dock projection can change the transcript viewport.
         // Reflow immediately so the tail remains reachable above fixed docks.
         if (["todos", "goal", "subagent"].includes(frame.key)) this.chat.inputChanged();
+        if (["todos", "goal"].includes(frame.key) && this.overlay instanceof GoalPanel) this.overlay.sync();
         break;
       }
       case "approval/resolved":

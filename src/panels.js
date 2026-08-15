@@ -1762,6 +1762,8 @@ export class GoalPanel extends Popup {
     super({ x: 4, y: 2, w: Math.max(24, Math.min(84, app.screen.w - 8)), h: Math.max(10, Math.min(28, app.screen.h - 4)), title: "目标与任务", lines: [], buttons: [], scrollable: true });
     this.app = app; this.busy = false; this.actionSel = 0; this.actions = []; this.actionRows = []; this.rebuild();
   }
+  /** Called by App when a live goal/todo projection arrives while open. */
+  sync() { this.rebuild(); this.app.redraw(); }
   get goal() { return this.app.goalData?.goal ?? this.app.goalData; }
   #ref() { const g = this.goal; return g?.id && g?.revision != null ? { id: g.id, revision: g.revision } : null; }
   rebuild() {

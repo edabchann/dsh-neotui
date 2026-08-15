@@ -1630,7 +1630,7 @@ test("footer jobs row is a single 后台任务 summary", () => {
   assert.equal(app.status.rows.length, 3, "footer has exactly one jobs row");
 });
 
-test("the todo box freezes its height once todos appear (no idle reflow)", () => {
+test("the todo box freezes while populated and disappears when empty", () => {
   const app = headlessApp();
   const chat = app.chat;
   assert.equal(chat.todoHeight(), 0, "empty before any todos");
@@ -1643,7 +1643,8 @@ test("the todo box freezes its height once todos appear (no idle reflow)", () =>
   ];
   assert.equal(chat.todoHeight(), 8, "still 8 while the list changes");
   app.projections.todos = [];
-  assert.equal(chat.todoHeight(), 2, "empty list keeps a framed minimized strip after first appearance");
+  assert.equal(chat.todoHeight(), 0, "empty list removes the task dock entirely");
+  assert.equal(chat.todoSeen, false, "empty projection clears historical residency");
   app.projections.todos = [{ content: "a", status: "in_progress" }];
   chat.todosVisible = false;
   assert.equal(chat.todoHeight(), 2, "Shift+T minimizes to a framed strip instead of hiding it");
@@ -1748,6 +1749,15 @@ test("JobsPanel: title, Enter/→ expand, ←/h collapse, q close", () => {
   // q closes
   panel.onKey({ type: "key", name: "char", key: "q", text: "q", ctrl: false, alt: false, shift: false });
   assert.equal(app.overlay, null, "q closed the overlay");
+});
+
+test("GoalPanel sync rebuild reads the same live todos as bottom dock", () => {
+  const app = headlessApp(); app.projections.todos = [{ content: "first", status: "in_progress" }];
+  const panel = new GoalPanel(app);
+  assert.ok(panel.lines.flat().some((seg) => seg.t?.includes("first")));
+  app.projections.todos = [{ content: "second", status: "completed" }]; panel.sync();
+  assert.ok(panel.lines.flat().some((seg) => seg.t?.includes("second")));
+  assert.ok(!panel.lines.flat().some((seg) => seg.t?.includes("first")));
 });
 
 test("GoalPanel exposes CAS-backed edit and lifecycle actions", async () => {
