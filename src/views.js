@@ -647,9 +647,11 @@ class SidebarTree extends Widget {
   }
   setData(workspaces, sessions, archivedIds, currentSessionId) {
     const archived = new Set(archivedIds ?? []);
-    // Blank drafts are noise (empty sessions minted by "new session" clicks);
-    // hide them except the one currently open, which the user is working in.
-    const visible = (s) => !s.blank || s.sessionId === currentSessionId;
+    // Blank drafts and durable subagent children are not root navigation rows.
+    // Subagents belong in Ctrl+J/Ctrl+A; listing them under 未分组 leaks the
+    // implementation's child Sessions into the user's conversation library.
+    // Keep the currently-open id visible only for an ordinary root draft.
+    const visible = (s) => s.origin !== "subagent" && (!s.blank || s.sessionId === currentSessionId);
     const byId = new Map(sessions.map((s) => [s.sessionId, s]));
     const groups = [];
     const accounted = new Set();

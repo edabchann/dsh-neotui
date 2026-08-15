@@ -349,6 +349,18 @@ test("the sidebar divider drags to resize the session pane", () => {
   assert.equal(app.focused, app.chat, "click routing restored after the drag");
 });
 
+test("sidebar excludes subagent child sessions from 未分组", () => {
+  const app = headlessApp();
+  app.sidebar.setData([], [
+    { sessionId: "root", blank: false, updatedAt: 2 },
+    { sessionId: "child-1", blank: false, origin: "subagent", parentSessionId: "root", updatedAt: 3 },
+    { sessionId: "child-2", blank: false, origin: "subagent", parentSessionId: "root", updatedAt: 4 },
+  ], [], "root");
+  const stray = app.sidebar.groups.find((g) => g.title === "未分组");
+  assert.deepEqual(stray?.sessions.map((s) => s.sessionId), ["root"]);
+  assert.ok(!app.sidebar.rows.some((row) => row.session?.origin === "subagent"));
+});
+
 test("session/jobs snapshots buffered before the session opens survive (footer counts)", async () => {
   const app = headlessApp();
   const jobs = Array.from({ length: 11 }, (_, i) => ({ id: `j${i}`, kind: "bash", label: `job ${i}`, status: "completed" }));
