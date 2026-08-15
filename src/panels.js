@@ -1218,6 +1218,8 @@ export class ImagePopup extends Popup {
     this.sessionId = sessionId;
     this.data = null;
     this.imageKey = "";
+    this.kittySentKey = "";
+    this.kittyId = Math.floor(Math.random() * 2147483646) + 1;
     this.load();
   }
   #show(idx) {
@@ -1225,6 +1227,8 @@ export class ImagePopup extends Popup {
     this.ref = this.refs[this.index];
     this.data = null;
     this.chafaTmp = null;
+    this.kittySentKey = "";
+    this.kittyId = Math.floor(Math.random() * 2147483646) + 1;
     this.lines = [[{ t: "加载中…", fg: K.DIM }]];
     this.app.redraw();
     this.load();
@@ -1320,13 +1324,15 @@ export class ImagePopup extends Popup {
     // kitty graphics protocol: transmit + place. Returns ANSI or "".
     if (!this.data || !kittyCapable()) return "";
     const w = Math.min(70, this.w - 4), h = Math.max(4, this.h - 5);
+    // Screen redraws every second for clocks/timers. Transmit once per loaded
+    // image instead of streaming the full base64 payload on every frame.
+    if (this.kittySentKey === this.imageKey) return "";
+    this.kittySentKey = this.imageKey;
     const b64 = this.data.toString("base64");
     const chunks = [];
     for (let i = 0; i < b64.length; i += 4096) chunks.push(b64.slice(i, i + 4096));
-    const payload = chunks.map((c, i) => `\x1b_Ga=${i === 0 ? "T" : "f"},f=100,q=2,m=${i === chunks.length - 1 ? 0 : 1};${c}\x1b\\`).join("");
-    // place the transmitted PNG by image id; s/v are pixel dimensions and
-    // must not be confused with terminal columns/rows.
-    const place = `\x1b_Ga=p,c=${w},r=${h},q=2;${this.imageKey}\x1b\\`;
+    const payload = chunks.map((c, i) => `\x1b_Ga=${i === 0 ? "T" : "f"},f=100,i=${this.kittyId},q=2,m=${i === chunks.length - 1 ? 0 : 1};${c}\x1b\\`).join("");
+    const place = `\x1b_Ga=p,i=${this.kittyId},c=${w},r=${h},q=2\x1b\\`;
     return payload + place;
   }
 }
