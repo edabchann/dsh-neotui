@@ -436,6 +436,7 @@ test("single-line horizontal drag selects transcript instead of toggling block",
   assert.notEqual(chat.selStart, null);
   chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 12, y: chat.view.y });
   assert.equal(typeof app.copied, "string", "horizontal drag completed the selection/copy path");
+  assert.ok(!app.copied.includes("select this line") || app.copied.length < "  edabchann > select this line".length, "character mode copies a range rather than whole line");
 });
 
 test("the input supports drag-selection and Ctrl+Shift+C copy", () => {

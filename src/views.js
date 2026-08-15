@@ -1,7 +1,7 @@
 // views.js — App composition: session list + chat timeline + approvals + status.
 import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
-import { truncate, strWidth, bars, fmtDuration, fmtClock, fmtDateTime } from "./text.js";
+import { truncate, strWidth, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth } from "./text.js";
 import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
@@ -919,6 +919,9 @@ export class ChatView extends Widget {
     this.pressX = null;
     this.selStart = null;
     this.selEnd = null;
+    this.selAnchor = null;
+    this.selFocus = null;
+    this.selectionMode = "character";
     this.stepState = { step: null }; // step/start tracking for the mux merge path
   }
 
@@ -1967,7 +1970,17 @@ export class ChatView extends Widget {
       const y0 = Math.max(this.view.scrollY, this.selStart);
       const y1 = Math.min(this.view.scrollY + this.view.h - 1, this.selEnd);
       if (y1 >= y0) {
-        screen.invertRect(this.view.x, this.view.y + (y0 - this.view.scrollY), this.view.x + this.view.w - 2, this.view.y + (y1 - this.view.scrollY));
+        for (let line = y0; line <= y1; line++) {
+          let x0 = this.view.x, x1 = this.view.x + this.view.w - 2;
+          if (this.selectionMode === "character" && this.selAnchor && this.selFocus) {
+            const a = this.selAnchor, b = this.selFocus;
+            const first = a.line < b.line || (a.line === b.line && a.col <= b.col) ? a : b;
+            const last = first === a ? b : a;
+            if (line === first.line) x0 = this.view.x + first.col;
+            if (line === last.line) x1 = this.view.x + Math.max(last.col, line === first.line ? first.col : 0);
+          }
+          screen.invertRect(x0, this.view.y + (line - this.view.scrollY), x1, this.view.y + (line - this.view.scrollY));
+        }
       }
     }
     this.#renderTodos(screen);
@@ -2024,9 +2037,16 @@ export class ChatView extends Widget {
     const header = truncate(title, inner - 2);
     const left = Math.max(1, inner - strWidth(header) - 1);
     screen.fillRect(this.x, row, this.x + this.w - 1, y + th - 1, " ", { bg: T.PANEL });
-    screen.text(this.x, row, "┌" + "─".repeat(left) + header + "─".repeat(Math.max(0, inner - left - strWidth(header))) + "┐", { fg: T.BORDER2, bg: T.PANEL, bold: true });
+    // Place borders at absolute cells (rather than one mixed-width string).
+    // This is the framebuffer equivalent of the code-block segmented rows and
+    // prevents a wide title glyph from shifting or swallowing the right edge.
+    screen.hline(this.x, this.x + this.w - 1, row, "─", { fg: T.BORDER2, bg: T.PANEL });
+    screen.put(this.x, row, "┌", { fg: T.BORDER2, bg: T.PANEL });
+    screen.text(this.x + 1 + left, row, header, { fg: T.ACCENT, bg: T.PANEL, bold: true });
+    screen.put(this.x + this.w - 1, row, "┐", { fg: T.BORDER2, bg: T.PANEL });
     if (!this.todosVisible) {
-      screen.text(this.x, row + 1, "└" + "─".repeat(inner) + "┘", { fg: T.BORDER2, bg: T.PANEL });
+      screen.hline(this.x, this.x + this.w - 1, row + 1, "─", { fg: T.BORDER2, bg: T.PANEL });
+      screen.put(this.x, row + 1, "└", { fg: T.BORDER2, bg: T.PANEL }); screen.put(this.x + this.w - 1, row + 1, "┘", { fg: T.BORDER2, bg: T.PANEL });
       return;
     }
     row++;
@@ -2036,9 +2056,12 @@ export class ChatView extends Widget {
       const body = t ? `${t.status === "completed" ? "✓" : t.status === "in_progress" ? "◉" : "○"} ${t.content ?? String(t)}` : "";
       const shown = truncate(body, Math.max(1, inner - 2));
       const color = t?.status === "completed" ? T.FAINT : t?.status === "in_progress" ? T.WARN : T.DIM;
-      screen.text(this.x, row + i, "│ " + shown + " ".repeat(Math.max(0, inner - 2 - strWidth(shown))) + " │", { fg: color, bg: T.PANEL, bold: t?.status === "in_progress" });
+      screen.put(this.x, row + i, "│", { fg: T.BORDER2, bg: T.PANEL });
+      screen.text(this.x + 2, row + i, shown, { fg: color, bg: T.PANEL, bold: t?.status === "in_progress" });
+      screen.put(this.x + this.w - 1, row + i, "│", { fg: T.BORDER2, bg: T.PANEL });
     }
-    screen.text(this.x, bottom, "└" + "─".repeat(inner) + "┘", { fg: T.BORDER2, bg: T.PANEL });
+    screen.hline(this.x, this.x + this.w - 1, bottom, "─", { fg: T.BORDER2, bg: T.PANEL });
+    screen.put(this.x, bottom, "└", { fg: T.BORDER2, bg: T.PANEL }); screen.put(this.x + this.w - 1, bottom, "┘", { fg: T.BORDER2, bg: T.PANEL });
   }
 
   onMouse(ev) {
@@ -2063,6 +2086,8 @@ export class ChatView extends Widget {
         // toggle a block a few lines away from the one the user saw.
         this.pressInfo = this.lineMap?.[this.pressY] ?? null;
         this.pressX = ev.x;
+        this.selAnchor = { line: this.pressY, col: Math.max(0, ev.x - this.view.x) };
+        this.selFocus = null;
         this.pressCtx = this.pressInfo ? this.#anchorCtx(this.pressInfo, this.pressY, ev.x) : null;
         if (process.env.DSH_TUI_DEBUG_CLICK) {
           const t = this.lines[this.pressY]?.map((g) => g.t).join("") ?? "";
@@ -2077,6 +2102,7 @@ export class ChatView extends Widget {
           // must still enter selection mode instead of toggling that block.
           this.selStart = Math.min(this.pressY, y);
           this.selEnd = Math.max(this.pressY, y);
+          this.selFocus = { line: y, col: Math.max(0, Math.min(this.view.w - 2, ev.x - this.view.x)) };
           this.app.redraw();
         }
         return true;
@@ -2086,14 +2112,21 @@ export class ChatView extends Widget {
         this.pressY = null;
         if (this.selStart !== null && this.selEnd !== null) {
           this.pressInfo = null; this.pressCtx = null;
-          const text = this.lines.slice(this.selStart, this.selEnd + 1).map((l) => l.map((g) => g.t).join("")).join("\n");
           const rows = this.selEnd - this.selStart + 1;
-          this.selStart = this.selEnd = null;
+          let text;
+          if (this.selectionMode === "character" && this.selAnchor && this.selFocus) {
+            const a = this.selAnchor, b = this.selFocus;
+            const first = a.line < b.line || (a.line === b.line && a.col <= b.col) ? a : b;
+            const last = first === a ? b : a;
+            const cut = (s, from, to) => { let out = "", col = 0; for (const g of graphemes(s)) { const next = col + graphemeWidth(g); if (next > from && col <= to) out += g; col = next; } return out; };
+            text = this.lines.slice(first.line, last.line + 1).map((l, i, all) => { const s = l.map((g) => g.t).join(""); return cut(s, i === 0 ? first.col : 0, i === all.length - 1 ? last.col : Infinity); }).join("\n");
+          } else text = this.lines.slice(this.selStart, this.selEnd + 1).map((l) => l.map((g) => g.t).join("")).join("\n");
+          this.selStart = this.selEnd = null; this.selAnchor = this.selFocus = null;
           this.app.copyText(text);
           this.app.toast(`已复制 ${rows} 行`);
           return true;
         }
-        this.selStart = this.selEnd = null;
+        this.selStart = this.selEnd = null; this.selAnchor = this.selFocus = null;
         this.#toggleAt(this.pressInfo, this.pressCtx);
         this.pressInfo = null;
         this.pressCtx = null;
@@ -2160,7 +2193,8 @@ export class ChatView extends Widget {
       return this.#jumpQuestion(ev.key === "[" ? -1 : 1);
     }
     if (ev.name === "escape" && this.app.searchQuery) { this.app.searchQuery = null; this.queueRebuild(); return true; }
-    if (ev.name === "escape" && this.selStart !== null) { this.selStart = this.selEnd = null; this.app.redraw(); return true; }
+    if (ev.name === "escape" && this.selStart !== null) { this.selStart = this.selEnd = null; this.selAnchor = this.selFocus = null; this.app.redraw(); return true; }
+    if (ev.name === "char" && ev.key === "v" && !ev.ctrl && !ev.alt) { this.selectionMode = this.selectionMode === "character" ? "line" : "character"; this.app.toast(`正文选择：${this.selectionMode === "character" ? "字符自由选择" : "整行选择"}（v 切换）`); return true; }
     if (ev.name === "char" && ev.key === "i" && !ev.ctrl && !ev.alt) { this.app.focus(this.input); return true; }
     if (ev.name === "char" && ev.key === "/" && !ev.ctrl && !ev.alt) { this.app.startSearch(); return true; }
     if (ev.name === "char" && ev.key === "b" && !ev.ctrl && !ev.alt) {
