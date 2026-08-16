@@ -61,6 +61,20 @@ test("long plan review scrolls with PgDn/Home/End and wheel", () => {
   assert.equal(popup.detailScrollY, 3);
 });
 
+test("question mouse only activates the rendered option text hitbox", async () => {
+  const { app, calls } = appHarness();
+  const popup = new QuestionPopup({ app, frame: { rpcId: "q", sessionId: "s", questions: [{ id: "x", question: "Choose", options: [{ label: "A" }, { label: "B" }] }] } });
+  const fakeScreen={text(){},fillRect(){},box(){},hline(){},put(){}};
+  popup.render(fakeScreen);
+  const box=popup.optionHitboxes[0];
+  popup.onMouse({type:"mouse",kind:"press",button:0,x:popup.x+popup.w-3,y:box.y1});
+  await Promise.resolve();
+  assert.equal(calls.length,0,"blank highlighted row area must not submit");
+  popup.onMouse({type:"mouse",kind:"press",button:0,x:box.x1,y:box.y1});
+  await Promise.resolve();
+  assert.equal(calls[0][0],"respond");
+});
+
 test("question offers a third custom-answer row and submits typed text", async () => {
   const { app, calls } = appHarness();
   const popup = new QuestionPopup({ app, frame: { rpcId: "q", sessionId: "s", questions: [{ id: "x", question: "Choose", options: [{ label: "A" }, { label: "B" }] }] } });

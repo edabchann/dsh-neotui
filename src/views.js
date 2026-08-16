@@ -2368,6 +2368,7 @@ export class QuestionPopup extends Popup {
     this.detailScrollY = 0;
     this.detailPage = 1;
     this.optionRows = [];
+    this.optionHitboxes = [];
     this.questionIdx = 0;
     this.drafts = questions.map(() => ({ selected: [], custom: "", skipped: false }));
     this.selIdx = 0;
@@ -2411,19 +2412,23 @@ export class QuestionPopup extends Popup {
         screen.text(this.x + 2, ly++, `计划 ${start}–${end} / ${detailLines.length} 行 · PgUp/PgDn/Home/End/滚轮`, { fg: K.FAINT });
       }
     }
-    this.optionRows = [];
+    this.optionRows = []; this.optionHitboxes = [];
     for (let i = 0; i < opts.length && ly < this.y + this.h - 3; i++) {
       this.optionRows[i] = ly;
       const chosen = draft.selected.includes(opts[i].label);
       const cursor = this.selIdx === i;
       const glyph = q.multiSelect ? (chosen ? "☑" : "☐") : (chosen ? "●" : "○");
-      screen.text(this.x + 2, ly++, truncate(` ${cursor ? "▸" : " "} ${glyph} ${opts[i].label}`, this.w - 6), { fg: cursor ? T.SELFG : K.TXT, bg: cursor ? T.MENUSEL : -1 });
+      const optionText=truncate(` ${cursor ? "▸" : " "} ${glyph} ${opts[i].label}`, this.w - 6);
+      this.optionHitboxes[i]={x1:this.x+2,x2:this.x+2+strWidth(optionText)-1,y1:ly,y2:ly+(opts[i].description?1:0)};
+      screen.text(this.x + 2, ly++, optionText, { fg: cursor ? T.SELFG : K.TXT, bg: cursor ? T.MENUSEL : -1 });
       if (opts[i].description && ly < this.y + this.h - 3) screen.text(this.x + 7, ly++, truncate(opts[i].description, this.w - 10), { fg: K.FAINT });
     }
     if (!this.planReview && ly < this.y + this.h - 3) {
       this.optionRows[opts.length] = ly;
       const cursor = this.selIdx === opts.length;
-      screen.text(this.x + 2, ly++, truncate(` ${cursor ? "▸" : " "} ✎ 输入自己的回答${draft.custom ? `: ${draft.custom}` : ""}`, this.w - 6), { fg: cursor ? T.SELFG : K.ACCENT, bg: cursor ? T.MENUSEL : -1 });
+      const customText=truncate(` ${cursor ? "▸" : " "} ✎ 输入自己的回答${draft.custom ? `: ${draft.custom}` : ""}`, this.w - 6);
+      this.optionHitboxes[opts.length]={x1:this.x+2,x2:this.x+2+strWidth(customText)-1,y1:ly,y2:ly};
+      screen.text(this.x + 2, ly++, customText, { fg: cursor ? T.SELFG : K.ACCENT, bg: cursor ? T.MENUSEL : -1 });
     }
     if (this.customEditing && ly < this.y + this.h - 2) screen.text(this.x + 4, ly, truncate(`> ${draft.custom}▏`, this.w - 8), { fg: K.TXT });
   }
@@ -2448,15 +2453,15 @@ export class QuestionPopup extends Popup {
     if (ev.kind === "press" && ev.button === 0) {
       const q = this.questions[this.questionIdx];
       for (let i = 0; i < (q?.options?.length ?? 0); i++) {
-        const ly = this.optionRows[i];
-        if (ly != null && (ev.y === ly || (q.options[i].description && ev.y === ly + 1))) {
+        const box=this.optionHitboxes[i];
+        if (box && ev.x>=box.x1 && ev.x<=box.x2 && ev.y>=box.y1 && ev.y<=box.y2) {
           this.selIdx = i; this.customEditing = false; this.#choose(i);
           if (!q.multiSelect) this.#continueCurrent();
           return true;
         }
       }
-      const customRow=this.optionRows[q?.options?.length??0];
-      if(customRow!=null&&ev.y===customRow){this.selIdx=q.options?.length??0;this.customEditing=true;this.drafts[this.questionIdx].selected=[];this.app.redraw();return true;}
+      const customBox=this.optionHitboxes[q?.options?.length??0];
+      if(customBox&&ev.x>=customBox.x1&&ev.x<=customBox.x2&&ev.y===customBox.y1){this.selIdx=q.options?.length??0;this.customEditing=true;this.drafts[this.questionIdx].selected=[];this.app.redraw();return true;}
     }
     return super.onMouse(ev);
   }
