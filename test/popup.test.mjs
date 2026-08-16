@@ -67,15 +67,23 @@ test("long plan review scrolls with PgDn/Home/End and wheel", () => {
   const { app } = appHarness();
   const detail = Array.from({ length: 80 }, (_, i) => `step ${i + 1}`).join("\n");
   const popup = new QuestionPopup({ app, frame: { rpcId: "plan", sessionId: "s", questions: [{ id: "plan-review", question: "Approve?", detail, intent: { kind: "plan-review", approve: "Approve" }, options: [{ label: "Approve" }, { label: "Keep planning" }] }] } });
+  const screen={text(){},fillRect(){},box(){},hline(){},put(){}};popup.render(screen);
   popup.detailPage = 10;
   popup.onKey({ type: "key", name: "pagedown" });
   assert.equal(popup.detailScrollY, 10);
   popup.onKey({ type: "key", name: "end" });
-  assert.equal(popup.detailScrollY, 70);
+  assert.equal(popup.detailScrollY, Math.max(0,popup.detailTotal-popup.detailPage));
   popup.onKey({ type: "key", name: "home" });
   assert.equal(popup.detailScrollY, 0);
   popup.onMouse({ type: "mouse", kind: "wheel-down", x: 5, y: 5 });
   assert.equal(popup.detailScrollY, 3);
+});
+
+test("long question wraps and scrolls while action rows stay visible", () => {
+  const { app }=appHarness();const popup=new QuestionPopup({app,frame:{rpcId:"q",sessionId:"s",questions:[{id:"x",header:"Long",question:"问题内容 ".repeat(80),options:[{label:"A",description:"描述 ".repeat(50)},{label:"B"}]}]}});
+  const drawn=[];const screen={text(x,y,t){drawn.push({x,y,t});},fillRect(){},box(){},hline(){},put(){}};popup.render(screen);
+  assert.ok(popup.detailTotal>popup.detailPage);assert.ok(drawn.some(x=>String(x.t).includes("输入自己的回答")));assert.ok(drawn.some(x=>String(x.t).includes("跳过此问题")));
+  const before=popup.detailScrollY;popup.onMouse({type:"mouse",kind:"wheel-down",x:popup.x+2,y:popup.y+2});assert.equal(popup.detailScrollY,before+3);
 });
 
 test("question mouse only activates the rendered option text hitbox", async () => {
