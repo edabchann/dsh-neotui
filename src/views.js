@@ -2403,22 +2403,21 @@ export class QuestionPopup extends Popup {
     if (!q) return;
     const draft = this.drafts[this.questionIdx];
     const opts = q.options ?? [];
-    const actionRows = opts.length + (this.planReview ? 0 : 3);
-    const actionTop = Math.max(this.y + 5, this.y + this.h - 1 - actionRows);
+    const optionDescriptionRows=opts.reduce((n,o)=>n+(o.description?wrapDisplayText(o.description,this.w-10).length:0),0);
+    const actionRows = opts.length + optionDescriptionRows + (this.planReview ? 0 : Math.min(6,Math.max(3,wrapDisplayText(draft.custom||"在此输入…",this.w-10).length))+2);
+    const actionTop = Math.max(this.y + 5, this.y + this.h - 1 - Math.min(actionRows,this.h-6));
     const doc = [
       { text: `▎ ${q.header ?? `问题 ${this.questionIdx + 1}/${this.questions.length}`}`, fg: K.ACCENT, bold: true },
       ...wrapDisplayText(q.question ?? "", this.w - 4).map((text) => ({ text, fg: K.TXT })),
       ...(q.detail ? wrapDisplayText(q.detail, this.w - 4).map((text) => ({ text, fg: K.DIM })) : []),
     ];
-    for (const [i, option] of opts.entries()) if (option.description) {
-      doc.push({ text: `  ${i + 1}. ${option.label}`, fg: K.FAINT, bold: true }, ...wrapDisplayText(option.description, this.w - 8).map((text) => ({ text: `    ${text}`, fg: K.FAINT })));
-    }
+
     const room = Math.max(1, actionTop - (this.y + 1));
     const maxScroll = Math.max(0, doc.length - room);
     this.detailScrollY = Math.max(0, Math.min(this.detailScrollY, maxScroll)); this.detailPage = room; this.detailTotal = doc.length;
     let ly = this.y + 1;
     for (const line of doc.slice(this.detailScrollY, this.detailScrollY + room)) screen.text(this.x + 2, ly++, truncate(line.text, this.w - 4), { fg: line.fg, attrs: line.bold ? 1 : 0 });
-    if(maxScroll>0){screen.text(this.x+this.w-30,this.y,`文档 Alt+↑↓/PgUp·PgDn ${this.detailScrollY+1}-${Math.min(doc.length,this.detailScrollY+room)}/${doc.length}`,{fg:K.ACCENT,bg:T.BG2});}
+    if(maxScroll>0){screen.text(this.x+this.w-26,this.y,`正文 Ctrl+↑↓ 翻页 ${this.detailScrollY+1}-${Math.min(doc.length,this.detailScrollY+room)}/${doc.length}`,{fg:K.ACCENT,bg:T.BG2});}
     screen.hline(this.x+1,this.x+this.w-2,actionTop-1,"─",{fg:T.BORDER2,bg:T.BG2});screen.text(this.x+3,actionTop-1," 回答（↑/↓ 选择） ",{fg:K.ACCENT,bg:T.BG2});
     ly=actionTop;
     this.optionRows = []; this.optionHitboxes = [];
@@ -2428,9 +2427,10 @@ export class QuestionPopup extends Popup {
       const cursor = this.selIdx === i;
       const glyph = q.multiSelect ? (chosen ? "☑" : "☐") : (chosen ? "●" : "○");
       const optionText=truncate(` ${cursor ? "▸" : " "} ${glyph} ${opts[i].label}`, this.w - 6);
-      this.optionHitboxes[i]={x1:this.x+2,x2:this.x+2+strWidth(optionText)-1,y1:ly,y2:ly+(opts[i].description?1:0)};
+      const descLines=opts[i].description?wrapDisplayText(opts[i].description,this.w-10):[];
+      this.optionHitboxes[i]={x1:this.x+2,x2:this.x+2+strWidth(optionText)-1,y1:ly,y2:ly+descLines.length};
       screen.text(this.x + 2, ly++, optionText, { fg: cursor ? T.SELFG : K.TXT, bg: cursor ? T.MENUSEL : -1 });
-
+      for(const line of descLines)screen.text(this.x+7,ly++,line,{fg:K.FAINT,bg:cursor?T.MENUSEL:-1});
     }
     if (!this.planReview) {
       this.optionRows[opts.length] = ly;
@@ -2438,7 +2438,7 @@ export class QuestionPopup extends Popup {
       const customText=truncate(` ${cursor ? "▸" : " "} ✎ 输入自己的回答`, this.w - 6);
       this.optionHitboxes[opts.length]={x1:this.x+2,x2:this.x+2+strWidth(customText)-1,y1:ly,y2:ly};
       screen.text(this.x + 2, ly++, customText, { fg: cursor ? T.SELFG : K.ACCENT, bg: cursor ? T.MENUSEL : -1 });
-      {const chars=Array.from(draft.custom),shown=this.customEditing?[...chars.slice(0,this.customCursor),"▏",...chars.slice(this.customCursor)].join(""):draft.custom;const inputText=truncate(`   > ${shown||"在此输入…"}`,this.w-8);screen.text(this.x+2,ly++,inputText,{fg:this.customEditing?K.TXT:K.FAINT,bg:this.customEditing?T.BG2:-1});}
+      {const chars=Array.from(draft.custom),shown=this.customEditing?[...chars.slice(0,this.customCursor),"▏",...chars.slice(this.customCursor)].join(""):draft.custom;const inputLines=wrapDisplayText(shown||"在此输入…",this.w-10).slice(-6);for(let i=0;i<inputLines.length;i++)screen.text(this.x+4,ly++,`${i===0?"> ":"  "}${inputLines[i]}`,{fg:this.customEditing?K.TXT:K.FAINT,bg:this.customEditing?T.BG2:-1});}
       {this.optionRows[opts.length+1]=ly;const skip=this.selIdx===opts.length+1,skipText=` ${skip?"▸":" "} ↷ 跳过此问题`;this.optionHitboxes[opts.length+1]={x1:this.x+2,x2:this.x+2+strWidth(skipText)-1,y1:ly,y2:ly};screen.text(this.x+2,ly++,skipText,{fg:skip?T.SELFG:K.FAINT,bg:skip?T.MENUSEL:-1});}
     }
   }
@@ -2493,8 +2493,8 @@ export class QuestionPopup extends Popup {
       else this.detailScrollY = max;
       this.app.redraw(); return true;
     }
-    if(!this.customEditing&&ev.alt&&ev.name==="up"){this.detailScrollY=Math.max(0,this.detailScrollY-1);return true;}
-    if(!this.customEditing&&ev.alt&&ev.name==="down"){this.detailScrollY=Math.min(Math.max(0,(this.detailTotal??0)-this.detailPage),this.detailScrollY+1);return true;}
+    if(!this.customEditing&&ev.ctrl&&ev.name==="up"){this.detailScrollY=Math.max(0,this.detailScrollY-this.detailPage);return true;}
+    if(!this.customEditing&&ev.ctrl&&ev.name==="down"){this.detailScrollY=Math.min(Math.max(0,(this.detailTotal??0)-this.detailPage),this.detailScrollY+this.detailPage);return true;}
     if(this.customEditing&&ev.name==="left"){this.customCursor=Math.max(0,this.customCursor-1);return true;}
     if(this.customEditing&&ev.name==="right"){this.customCursor=Math.min(Array.from(draft.custom).length,this.customCursor+1);return true;}
     if(this.customEditing&&ev.name==="home"){this.customCursor=0;return true;}
