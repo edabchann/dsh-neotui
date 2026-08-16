@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
 import { UploadPicker } from "./file-picker.js";
-import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
+import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, keyBindings, DEFAULT_KEYBINDINGS } from "./config.js";
 export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
@@ -892,6 +892,10 @@ const SLASH_COMMANDS = [
   { name: "/theme", desc: "切换配色主题" },
   { name: "/permission", desc: "修改权限模式" },
   { name: "/goal", desc: "查看当前目标" },
+  { name: "/compact", desc: "压缩较早对话历史" },
+  { name: "/export", desc: "导出当前会话日志" },
+  { name: "/feedback", desc: "提交会话反馈" },
+  { name: "/plan", desc: "进入或退出计划模式" },
 ];
 
 export class ChatView extends Widget {
@@ -3895,8 +3899,9 @@ export class App {
     if (ev.type === "key" && ev.name === "down" && this.searchResults?.length) { this.searchSelected = Math.min(this.searchResults.length - 1, this.searchSelected + 1); return; }
     if (ev.type === "key" && ev.name === "enter") {
       const selected = this.searchResults?.[this.searchSelected];
-      this.searchActive = false; this.searchResults = null; this.focus(this.sidebar);
       if (selected?.sessionId) this.openSession(selected.sessionId);
+      // Keep the filter active and its query fixed after opening.
+      this.focus(this.searchInput);
       return;
     }
     const handled = input.onKey(ev);
@@ -3904,14 +3909,11 @@ export class App {
   }
 
   #renderSearchResults(s) {
-    const results = this.searchResults ?? [];
-    for (let i = 0; i < Math.min(this.sidebar.h, results.length); i++) {
-      const it = results[i];
-      const selected = i === this.searchSelected;
-      s.fillRect(this.sidebar.x, this.sidebar.y + i, this.sidebar.x + this.sidebar.w - 2, this.sidebar.y + i, " ", { bg: selected ? T.MENUSEL : T.BG });
-      s.text(this.sidebar.x, this.sidebar.y + i, truncate(`${selected ? "▸" : "⚲"} ${it.snippet ?? it.title ?? it.sessionId ?? ""}`, this.sidebar.w - 2), { fg: selected ? T.SELFG : K.TXT, bg: selected ? T.MENUSEL : T.BG });
-    }
-    if (results.length === 0) s.text(this.sidebar.x, this.sidebar.y, "无结果", { fg: K.FAINT });
+    const ids=new Set((this.searchResults??[]).map(x=>x.sessionId));
+    const groups=this.sidebar.groups.map(g=>({...g,sessions:g.sessions.filter(x=>ids.has(x.sessionId))})).filter(g=>g.sessions.length);
+    let y=this.sidebar.y;
+    for(const g of groups){if(y>=this.sidebar.y+this.sidebar.h)break;s.text(this.sidebar.x,y++,truncate(`▾ ${g.title} (${g.sessions.length})`,this.sidebar.w-2),{fg:K.DIM});for(const sess of g.sessions){if(y>=this.sidebar.y+this.sidebar.h)break;const index=(this.searchResults??[]).findIndex(x=>x.sessionId===sess.sessionId),selected=index===this.searchSelected;s.fillRect(this.sidebar.x,y,this.sidebar.x+this.sidebar.w-2,y," ",{bg:selected?T.MENUSEL:T.BG});s.text(this.sidebar.x,y++,truncate(`  ${selected?"▸":" "} ${sess.projections?.values?.title??sess.sessionId.slice(0,8)}`,this.sidebar.w-2),{fg:selected?T.SELFG:K.TXT,bg:selected?T.MENUSEL:T.BG});}}
+    if(!groups.length)s.text(this.sidebar.x,this.sidebar.y,"无结果",{fg:K.FAINT});
   }
 
   redraw() {

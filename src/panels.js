@@ -10,7 +10,7 @@ import { join, basename, extname, dirname } from "node:path";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 
 import { T, cycleTheme, themeName } from "./theme.js";
-import { loadTuiConfig, saveTuiConfig, userPrefix, userName, foldDefaults } from "./config.js";
+import { loadTuiConfig, saveTuiConfig, userPrefix, userName, foldDefaults, keyBindings, setKeyBinding, resetKeyBinding } from "./config.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
 const K = new Proxy({}, { get(_k, key) { return T[key]; } });
 
@@ -1431,6 +1431,7 @@ export class ControlPanel extends Widget {
     this.loadCommands();
     this.loadPlugins();
   }
+  editShortcut(id){const back=this,b=keyBindings()[id];const input=new Input({x:this.x+8,y:this.y+7,w:this.w-16,h:1,prompt:'JSON: ',allowEmptyEnter:true,onEnter(value){try{const parsed=JSON.parse(value);if(!["normal","insert","all"].includes(parsed.mode)||typeof parsed.key!=="string"||!parsed.key.trim())throw new Error('需要 {"mode":"normal|insert|all","key":"..."}');if(!setKeyBinding(id,parsed))throw new Error('写入配置失败');back.app.overlay=back;back.app.focus(back);back.app.toast('快捷键已保存');}catch(e){input.setValue(value);back.app.toast(`语法错误: ${e.message}`);}}});input.setValue(JSON.stringify(b));const pop=new Popup({x:this.x+6,y:this.y+5,w:this.w-12,h:6,title:`编辑 tui-config.json · keyBindings.${id}`,lines:[`配置项: keyBindings.${id}`],buttons:[]});pop.render=(s)=>{Popup.prototype.render.call(pop,s);input.render(s);};pop.onKey=(ev)=>{if(ev.type==='key'&&ev.name==='escape'){back.app.overlay=back;back.app.focus(back);return true;}return input.onKey(ev);};this.app.overlay=pop;this.app.focus(input);}
   async loadCommands() {
     try {
       const agentId = this.app.currentSession;
@@ -1449,32 +1450,10 @@ export class ControlPanel extends Widget {
     this.app.redraw();
   }
   shortcutItems() {
+    const b=keyBindings();
+    const row=(id,desc)=>[`${(b[id]?.mode??"all").toUpperCase()}\t${b[id]?.key??""}`,desc,null,id];
     return [
-      ["NORMAL · t", "思考块 展开/折叠", () => this.app.chat.onKey({ type: "key", name: "char", key: "t", text: "t", ctrl: false, alt: false, shift: false })],
-      ["NORMAL · b", "工具块 展开/折叠", () => this.app.chat.onKey({ type: "key", name: "char", key: "b", text: "b", ctrl: false, alt: false, shift: false })],
-      ["NORMAL · i", "进入输入", () => this.app.focus(this.app.chat.input)],
-      ["INSERT · Esc", "退出输入", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); }],
-      ["NORMAL · /", "筛选会话", () => { this.app.closeOverlay(); this.app.startSearch(); }],
-      ["n", "新建会话", () => this.app.newSession()],
-      ["g g", "滚动到顶", () => { this.app.closeOverlay(); this.app.chat.view.scrollY = 0; }],
-      ["G", "滚动到底", () => { this.app.closeOverlay(); this.app.chat.view.scrollY = this.app.chat.view.maxScroll(); }],
-      ["[", "上一提问的终点", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); this.app.chat.onKey({ type: "key", name: "char", key: "[", text: "[", ctrl: false, alt: false, shift: false }); }],
-      ["]", "下一提问的终点", () => { this.app.closeOverlay(); this.app.focus(this.app.chat); this.app.chat.onKey({ type: "key", name: "char", key: "]", text: "]", ctrl: false, alt: false, shift: false }); }],
-      ["INSERT · Ctrl+L", "输入栏 展开/折叠", () => { this.app.closeOverlay(); this.app.focus(this.app.chat.input); this.app.chat.input.onKey({ type: "key", name: "char", key: "l", text: "l", ctrl: true, alt: false, shift: false }); }],
-      ["INSERT · Ctrl+Shift+C", "复制输入栏选区", () => { this.app.closeOverlay(); this.app.chat.input.onKey({ type: "key", name: "char", key: "c", text: "c", ctrl: true, alt: false, shift: true }); }],
-      ["NORMAL · Ctrl+P", "控制面板", () => { this.page = 1; this.sel = 0; this.app.redraw(); }],
-      ["Ctrl+M", "切换模型", () => { this.app.overlay = buildModelPicker(this.app); }],
-      ["Ctrl+T", "轨迹视图", () => { this.app.closeOverlay(); this.app.setMode("trajectory"); }],
-      ["Shift+Tab", "主页 对话/轨迹 切换", () => { this.app.closeOverlay(); this.app.toggleChatTrajectory(); }],
-      ["Ctrl+W", "工作区", () => { this.app.closeOverlay(); this.app.setMode("workspace"); }],
-      ["Ctrl+S", "设置", () => { this.app.closeOverlay(); this.app.setMode("settings"); }],
-      ["Ctrl+A", "子代理", () => { this.app.closeOverlay(); this.app.setMode("subagent"); }],
-      ["Ctrl+K", "技能", () => { this.app.closeOverlay(); this.app.setMode("skills"); }],
-      ["Ctrl+G", "目标", () => this.app.showGoal()],
-      ["Ctrl+J", "后台任务", () => this.app.showJobs()],
-      ["Ctrl+E", "步骤转跳（fzf 式）", () => this.app.quickJumpStep()],
-      ["Ctrl+B", "侧栏 显示/隐藏", () => this.app.toggleSidebar()],
-      ["Ctrl+Q", "退出", () => this.app.stop()],
+      row("think","思考块 展开/折叠"),row("tools","工具块 展开/折叠"),row("insert","进入输入"),row("leaveInsert","退出输入"),row("sessionFilter","筛选会话"),row("newSession","新建会话"),row("top","滚动到顶"),row("bottom","滚动到底"),row("prevQuestion","上一提问的终点"),row("nextQuestion","下一提问的终点"),row("expandInput","输入栏 展开/折叠"),row("copyInput","复制输入栏选区"),row("panel","控制面板"),row("model","切换模型"),row("trajectory","轨迹视图"),row("homeSwitch","对话/轨迹切换"),row("workspace","工作区"),row("settings","设置"),row("subagent","子代理"),row("skills","技能"),row("goal","目标"),row("jobs","后台任务"),row("stepJump","步骤转跳"),row("sidebar","侧栏显示/隐藏"),row("quit","退出"),
     ];
   }
   items() {
@@ -1526,6 +1505,8 @@ export class ControlPanel extends Widget {
     if (this.sel < this.scroll) this.scroll = this.sel;
     else if (this.sel >= this.scroll + visible) this.scroll = this.sel - visible + 1;
     this.scroll = Math.max(0, Math.min(Math.max(0, items.length - visible), this.scroll));
+    if(this.page===0){s.text(this.x+2,this.y+1,"MODE",{fg:T.PURPLE,bg:T.PANEL,attrs:1});s.text(this.x+13,this.y+1,"KEY",{fg:T.ACCENT,bg:T.PANEL,attrs:1});s.text(this.x+32,this.y+1,"FUNCTION",{fg:T.OK,bg:T.PANEL,attrs:1});}
+    if(this.page===3&&this.pluginFilter){s.text(this.x+2,this.y+1,`/ ${this.pluginQuery}`,{fg:T.ACCENT,bg:T.PANEL,attrs:1});}
     for (let i = 0; i < visible; i++) {
       const idx = this.scroll + i;
       const it = items[idx];
@@ -1533,10 +1514,10 @@ export class ControlPanel extends Widget {
       const sel = idx === this.sel;
       s.fillRect(this.x + 1, this.y + 2 + i, this.x + this.w - 2, this.y + 2 + i, " ", { bg: sel ? T.MENUSEL : T.PANEL });
       const label = it[0];
-      s.text(this.x + 2, this.y + 2 + i, truncate(label, this.w - 34), { fg: sel ? T.BOLD : (this.page === 0 ? T.ACCENT : T.TXT), bg: sel ? T.MENUSEL : T.PANEL, attrs: sel ? 1 : 0 });
-      if (it[1]) s.text(this.x + this.w - 30, this.y + 2 + i, truncate(it[1], 28), { fg: T.FAINT, bg: sel ? T.MENUSEL : T.PANEL });
+      if(this.page===0){const [mode,key]=label.split("\t");s.text(this.x+2,this.y+2+i,pad(mode,9),{fg:T.PURPLE,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+13,this.y+2+i,pad(truncate(key,17),18),{fg:T.ACCENT,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+32,this.y+2+i,truncate(it[1],this.w-35),{fg:T.OK,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});}
+      else{s.text(this.x + 2, this.y + 2 + i, truncate(label, this.w - 34), { fg: sel ? T.BOLD : T.TXT, bg: sel ? T.MENUSEL : T.PANEL, attrs: sel ? 1 : 0 });if (it[1]) s.text(this.x + this.w - 30, this.y + 2 + i, truncate(it[1], 28), { fg: T.FAINT, bg: sel ? T.MENUSEL : T.PANEL });}
     }
-    s.text(this.x + 2, this.y + this.h - 1, this.page===3?`/ 筛选插件 · Ctrl+/ 清除 · ↑↓ 选择 · Esc 关闭${this.pluginQuery?` · ${this.pluginQuery}`:""}`:"↑↓ 选择 · Enter 执行 · Esc 关闭", { fg: T.FAINT });
+    s.text(this.x + 2, this.y + this.h - 1, this.page===0?"↑↓ 选择 · Enter 编辑 · Shift+Tab 轮换模式 · Alt+Enter 恢复默认 · Esc 关闭":this.page===3?`/ 筛选插件 · Ctrl+/ 清除 · ↑↓ 选择 · Esc 关闭${this.pluginQuery?` · ${this.pluginQuery}`:""}`:"↑↓ 选择 · Enter 执行 · Esc 关闭", { fg: T.FAINT });
   }
   onKey(ev) {
     if(this.page===3&&this.pluginFilter){if(ev.type==="text"){this.pluginQuery+=ev.text;this.sel=0;return true;}if(ev.type==="key"&&ev.name==="backspace"){this.pluginQuery=this.pluginQuery.slice(0,-1);this.sel=0;return true;}if(ev.type==="key"&&ev.name==="enter"){this.pluginFilter=false;return true;}if(ev.type==="key"&&ev.ctrl&&(ev.key==="/"||ev.key==="_")){this.pluginFilter=false;this.pluginQuery="";return true;}}
@@ -1545,6 +1526,8 @@ export class ControlPanel extends Widget {
     if(this.page===3&&ev.name==="char"&&ev.key==="/"){this.pluginFilter=true;this.pluginQuery="";return true;}
     if(this.page===3&&ev.ctrl&&(ev.key==="/"||ev.key==="_")){this.pluginQuery="";return true;}
     if (ev.name === "escape") { this.app.closeOverlay(); return true; }
+    if(this.page===0&&ev.name==="backtab"){const it=this.items()[this.sel],id=it?.[3];if(id){const b=keyBindings()[id],modes=["normal","insert","all"],mode=modes[(modes.indexOf(b.mode)+1)%3];setKeyBinding(id,{...b,mode});this.app.toast(`适用模式: ${mode.toUpperCase()}`);}return true;}
+    if(this.page===0&&ev.alt&&ev.name==="enter"){const id=this.items()[this.sel]?.[3];if(id){resetKeyBinding(id);this.app.toast("已恢复默认快捷键");}return true;}
     if (ev.name === "tab" || ev.name === "right") {
       this.page = (this.page + 1) % this.pages.length;
       this.sel = 0;
@@ -1558,6 +1541,7 @@ export class ControlPanel extends Widget {
     if (ev.name === "down") { this.sel = Math.min(this.items().length - 1, this.sel + 1); this.app.redraw(); return true; }
     if (ev.name === "enter") {
       const it = this.items()[this.sel];
+      if(this.page===0&&it?.[3]){this.editShortcut(it[3]);return true;}
       if (it && it[2]) { it[2](); this.app.redraw(); }
       return true;
     }

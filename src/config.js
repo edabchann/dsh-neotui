@@ -69,6 +69,20 @@ export function busyEnter() {
   return loadTuiConfig().busyEnter === "steer" ? "steer" : "queue";
 }
 
+export const DEFAULT_KEYBINDINGS = {
+  think: { mode: "normal", key: "t" }, tools: { mode: "normal", key: "b" }, insert: { mode: "normal", key: "i" },
+  leaveInsert: { mode: "insert", key: "Esc" }, sessionFilter: { mode: "normal", key: "/" }, newSession: { mode: "normal", key: "n" },
+  top: { mode: "normal", key: "g g" }, bottom: { mode: "normal", key: "G" }, prevQuestion: { mode: "normal", key: "[" }, nextQuestion: { mode: "normal", key: "]" },
+  expandInput: { mode: "insert", key: "Ctrl+L" }, copyInput: { mode: "insert", key: "Ctrl+Shift+C" }, panel: { mode: "all", key: "Ctrl+Space" },
+  model: { mode: "normal", key: "Ctrl+M" }, trajectory: { mode: "normal", key: "Ctrl+T" }, homeSwitch: { mode: "normal", key: "Shift+Tab" },
+  workspace: { mode: "normal", key: "Ctrl+W" }, settings: { mode: "normal", key: "Ctrl+S" }, subagent: { mode: "normal", key: "Ctrl+A" },
+  skills: { mode: "normal", key: "Ctrl+K" }, goal: { mode: "normal", key: "Ctrl+G" }, jobs: { mode: "normal", key: "Ctrl+J" },
+  stepJump: { mode: "normal", key: "Ctrl+E" }, sidebar: { mode: "normal", key: "Ctrl+B" }, quit: { mode: "all", key: "Ctrl+Q" },
+};
+export function keyBindings() { return { ...DEFAULT_KEYBINDINGS, ...(loadTuiConfig().keyBindings ?? {}) }; }
+export function setKeyBinding(id, value) { const all = { ...(loadTuiConfig().keyBindings ?? {}) }; all[id] = value; return saveTuiConfig({ keyBindings: all }); }
+export function resetKeyBinding(id) { const all = { ...(loadTuiConfig().keyBindings ?? {}) }; delete all[id]; return saveTuiConfig({ keyBindings: all }); }
+
 export function foldDefaults() {
   const fd = loadTuiConfig().foldDefaults ?? {};
   return {
