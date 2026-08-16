@@ -65,11 +65,11 @@ export class UploadPicker extends Widget {
   current() { return this.items()[this.sel]; }
   changePath(path, selectName = null) {
     if (this.selected.size) { this.confirmAbandon(path, selectName); return; }
-    this.path = path; this.filter = ''; this.load(selectName);
+    this.clearKitty(); this.path = path; this.filter = ''; this.load(selectName);
   }
   confirmAbandon(path, selectName) {
     const back = this;
-    this.app.overlay = new YnPopup({ x: this.x + 10, y: this.y + 5, w: this.w - 20, h: 7, title: '放弃已选择文件？', lines: [`已选择 ${this.selected.size} 个文件。切换目录会清空选择。`], buttons: [{ label: '是 (y)', action: 'yes' }, { label: '否 (n)', action: 'no' }], onAction(b) { if (b.action === 'yes') { back.selected.clear(); back.path = path; back.filter = ''; back.load(selectName); } back.app.overlay = back; back.app.focus(back); back.app.redraw(); } });
+    this.app.overlay = new YnPopup({ x: this.x + 10, y: this.y + 5, w: this.w - 20, h: 7, title: '放弃已选择文件？', lines: [`已选择 ${this.selected.size} 个文件。切换目录会清空选择。`], buttons: [{ label: '是 (y)', action: 'yes' }, { label: '否 (n)', action: 'no' }], onAction(b) { if (b.action === 'yes') { back.clearKitty(); back.selected.clear(); back.path = path; back.filter = ''; back.load(selectName); } back.app.overlay = back; back.app.focus(back); back.app.redraw(); } });
     this.app.focus(this.app.overlay);
   }
   goParent() { const old = this.path; this.changePath(dirname(old), basename(old)); }
@@ -121,7 +121,8 @@ export class UploadPicker extends Widget {
         try { info = execFileSync('magick', ['identify', '-format', '%m · %wx%h', it.path], { encoding: 'utf8', timeout: 2000 }); } catch {}
         // The right pane reserves cells for a real Kitty placement. Metadata is
         // still drawn underneath for non-Kitty terminals.
-        this.imagePreview = { path: it.path, key: `${it.path}:${st.mtimeMs}`, width, height: Math.max(4, height - 3), pixelInfo: info };
+        let pixelWidth=0,pixelHeight=0;const dims=/([0-9]+)x([0-9]+)/.exec(info);if(dims){pixelWidth=Number(dims[1]);pixelHeight=Number(dims[2]);}
+        this.imagePreview = { path: it.path, key: `${it.path}:${st.mtimeMs}`, width, height: Math.max(4, height - 3), pixelWidth, pixelHeight, pixelInfo: info };
         return [info, `${st.size} bytes`, this.app.term?.kitty ? 'Kitty 图片预览' : '终端不支持 Kitty；显示图片信息'];
       }
       return [`${ICON[it.kind]} ${it.name}`, `${st.size} bytes`, '无文本预览'];
@@ -138,9 +139,11 @@ export class UploadPicker extends Widget {
     const b64=data.toString('base64'),chunks=[];for(let i=0;i<b64.length;i+=4096)chunks.push(b64.slice(i,i+4096));
     const payload=chunks.map((c,i)=>i===0?`\x1b_Ga=t,f=100,i=${this.kittyId},q=2,m=${chunks.length===1?0:1};${c}\x1b\\`:`\x1b_Gm=${i===chunks.length-1?0:1};${c}\x1b\\`).join('');
     const inner=this.w-4,l=Math.floor(inner*.25),m=Math.floor(inner*.38),x=this.x+5+l+m,y=this.y+4;
-    return payload+`\x1b[${y};${x}H\x1b_Ga=p,i=${this.kittyId},c=${Math.max(4,p.width)},r=${Math.max(3,p.height)},q=2\x1b\\`;
+    const sourceAspect=p.pixelWidth&&p.pixelHeight?p.pixelWidth/p.pixelHeight:1,boxAspect=p.width/Math.max(1,p.height*2);
+    const fit=sourceAspect>=boxAspect?`c=${Math.max(4,p.width)}`:`r=${Math.max(3,p.height)}`;
+    return payload+`\x1b[${y};${x}H\x1b_Ga=p,i=${this.kittyId},${fit},q=2\x1b\\`;
   }
-  clearKitty(){if(this.kittyId&&this.app.term?.output)this.app.term.output.write(`\x1b_Ga=d,d=i,i=${this.kittyId},q=2\x1b\\`);this.kittyId=null;this.kittyShownKey=null;if(this.app.screen)this.app.screen.prev=null;}
+  clearKitty(){if(this.kittyId&&this.app.term?.output)this.app.term.output.write(`\x1b_Ga=d,d=i,i=${this.kittyId},q=2\x1b\\`);this.kittyId=null;this.kittyShownKey=null;this.imagePreview=null;if(this.app.screen){this.app.screen.prev=null;this.app.redraw();}}
   render(s) {
     this.imagePreview=null;
     s.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, ' ', { bg: T.BG2 });
