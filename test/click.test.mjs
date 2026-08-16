@@ -1440,6 +1440,46 @@ test("ModelPanel: the API key row is a masked, web-synced credential edit", asyn
   assert.equal(Object.hasOwn(panel.providers["my-gw"], "apiKeyEnv"), false, "discard restores the unsaved profile reference");
 });
 
+test("ModelPanel: explicit credential clear warns about shared global references", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "settings.describe") return {
+      namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: {
+        a: { apiKeyEnv: "SHARED_KEY" },
+        b: { apiKeyEnv: "SHARED_KEY" },
+      } } }],
+      writable: true,
+    };
+    if (method === "credentials.describe") return { credentials: { SHARED_KEY: { configured: true, writable: true } } };
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.onKey({ type: "key", name: "enter" });
+  panel.pendingProbeKeys.set("a", "new-a");
+  panel.pendingProbeKeys.set("b", "new-b");
+  panel.formIdx = panel.formItems.findIndex((item) => item.label?.includes("清除 API 密钥"));
+  panel.onKey({ type: "key", name: "enter" });
+  let text = app.overlay.lines.flat().map((part) => part.t ?? "").join("\n");
+  assert.equal(app.overlay.title, "全局清除 API 密钥");
+  assert.match(text, /其他引用者: b/);
+  assert.match(text, /自定义引用，可能还被面板外配置使用/);
+  assert.match(text, /2 个待保存密钥草稿也会取消/);
+  assert.deepEqual(app.overlay.buttons.map((button) => button.label), ["取消", "全局清除"]);
+  await app.overlay.onAction({ label: "取消", action: "cancel" });
+  assert.equal(calls.some(([method]) => method === "credentials.unset"), false, "cancel leaves the shared credential intact");
+  assert.equal(panel.pendingProbeKeys.size, 2, "cancel preserves every draft");
+
+  panel.formIdx = panel.formItems.findIndex((item) => item.label?.includes("清除 API 密钥"));
+  panel.onKey({ type: "key", name: "enter" });
+  await app.overlay.onAction({ label: "全局清除", action: "clear" });
+  assert.deepEqual(calls.find(([method]) => method === "credentials.unset")?.[1], { ref: "SHARED_KEY" });
+  assert.equal(panel.pendingProbeKeys.size, 0, "global clear cancels drafts for every known ref user");
+});
+
 test("ModelPanel: credential save failure keeps a retryable write-only draft", async () => {
   const app = fakeApp();
   app.screen = { w: 100, h: 30 };

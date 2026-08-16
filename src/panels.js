@@ -2665,7 +2665,7 @@ export class ModelPanel extends Widget {
     // write-only draft until save persists it through credentials.set.
     const keyRef = this.#keyRef(route);
     items.push({ kind: "key", key: "apiKeyEnv", label: "API 密钥", ref: keyRef, pending: this.pendingProbeKeys.has(route), action: () => this.#editKey(route, keyRef) });
-    if (this.writable && this.keyStatus?.[keyRef]?.configured && this.keyStatus[keyRef].writable !== false) items.push({ kind: "button", label: "清除 API 密钥…", action: () => this.#clearKey(route, keyRef) });
+    if (this.writable && this.keyStatus?.[keyRef]?.configured && this.keyStatus[keyRef].writable === true) items.push({ kind: "button", label: "清除 API 密钥…", action: () => this.#clearKey(route, keyRef) });
     // models are NOT flat here: one 模型管理 entry summarizing the first
     // five, which opens its own sub-buffer (scan on top, model form below)
     const models = p.models ?? [];
@@ -2851,13 +2851,36 @@ export class ModelPanel extends Widget {
    *  The stored value is never read back; a non-empty commit stays write-only
    *  until #save persists it, while an empty commit keeps the existing key. */
   #clearKey(route, ref) {
-    const confirm = new Popup({ x: Math.max(1, Math.floor(this.app.screen.w / 2) - 28), y: Math.max(1, Math.floor(this.app.screen.h / 2) - 3), w: Math.min(56, this.app.screen.w - 2), h: 7, title: "清除 API 密钥", lines: [[{ t: ` 确认从凭据存储中清除 ${ref}？`, fg: K.WARN }]], buttons: [{ label: "取消", action: "cancel" }, { label: "确认清除", action: "clear" }], onAction: async (btn) => {
-      this.app.closeOverlay();
-      if (btn.action !== "clear") { this.app.redraw(); return; }
-      try { await this.app.api.call("credentials.unset", { ref }); this.pendingProbeKeys.delete(route); this.app.toast(`已清除 ${ref}`); await this.#refreshKeys(); this.#rebuild(); }
-      catch (e) { this.app.toast(`清除密钥失败: ${e.message}`); }
-      this.app.redraw();
-    } });
+    const users = this.routes.filter((candidate) => this.#keyRef(candidate) === ref);
+    const others = users.filter((candidate) => candidate !== route);
+    const pending = users.filter((candidate) => this.pendingProbeKeys.has(candidate));
+    const lines = [
+      [{ t: ` ${inlineLabel(ref)} 是凭据存储中的全局引用。`, fg: K.WARN }],
+      ...(others.length > 0 ? [[{ t: ` 其他引用者: ${truncate(others.map(inlineLabel).join("、"), 52)}`, fg: K.WARN }]] : []),
+      ...(ref !== deriveKeyRef(route) ? [[{ t: " 这是自定义引用，可能还被面板外配置使用。", fg: K.WARN }]] : []),
+      ...(pending.length > 0 ? [[{ t: ` ${pending.length} 个待保存密钥草稿也会取消。`, fg: K.TXT }]] : []),
+      [{ t: " 清除后，所有引用者将立即失去此密钥。", fg: K.TXT }],
+    ];
+    const w = Math.max(32, Math.min(64, this.app.screen.w - 4));
+    const h = Math.min(lines.length + 4, this.app.screen.h);
+    const confirm = new Popup({
+      x: Math.max(0, Math.floor((this.app.screen.w - w) / 2)),
+      y: Math.max(0, Math.floor((this.app.screen.h - h) / 2)),
+      w, h, title: "全局清除 API 密钥", lines,
+      buttons: [{ label: "取消", action: "cancel" }, { label: "全局清除", action: "clear" }],
+      onAction: async (btn) => {
+        this.app.closeOverlay();
+        if (btn.action !== "clear") { this.app.redraw(); return; }
+        try {
+          await this.app.api.call("credentials.unset", { ref });
+          for (const candidate of users) this.pendingProbeKeys.delete(candidate);
+          this.app.toast(`已全局清除 ${ref}`);
+          await this.#refreshKeys();
+          this.#rebuild();
+        } catch (e) { this.app.toast(`清除密钥失败: ${e.message}`); }
+        this.app.redraw();
+      },
+    });
     this.app.overlay = confirm; this.app.redraw();
   }
   #editKey(route, ref) {
