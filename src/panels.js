@@ -1416,7 +1416,7 @@ const DEFAULT_COMMANDS = [
 
 export class ControlPanel extends Widget {
   constructor(app, { startPage = 0 } = {}) {
-    const w = Math.min(74, app.screen.w - 4);
+    const w = Math.min(104, app.screen.w - 4);
     const h = Math.min(24, app.screen.h - 4);
     super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h });
     this.app = app;
