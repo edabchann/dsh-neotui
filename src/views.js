@@ -2423,9 +2423,9 @@ export class QuestionPopup extends Popup {
       const customText=truncate(` ${cursor ? "▸" : " "} ✎ 输入自己的回答`, this.w - 6);
       this.optionHitboxes[opts.length]={x1:this.x+2,x2:this.x+2+strWidth(customText)-1,y1:ly,y2:ly};
       screen.text(this.x + 2, ly++, customText, { fg: cursor ? T.SELFG : K.ACCENT, bg: cursor ? T.MENUSEL : -1 });
+      if(ly<this.y+this.h-3){const chars=Array.from(draft.custom),shown=this.customEditing?[...chars.slice(0,this.customCursor),"▏",...chars.slice(this.customCursor)].join(""):draft.custom;const inputText=truncate(`   > ${shown||"在此输入…"}`,this.w-8);screen.text(this.x+2,ly++,inputText,{fg:this.customEditing?K.TXT:K.FAINT,bg:this.customEditing?T.BG2:-1});}
       if(ly<this.y+this.h-3){this.optionRows[opts.length+1]=ly;const skip=this.selIdx===opts.length+1,skipText=` ${skip?"▸":" "} ↷ 跳过此问题`;this.optionHitboxes[opts.length+1]={x1:this.x+2,x2:this.x+2+strWidth(skipText)-1,y1:ly,y2:ly};screen.text(this.x+2,ly++,skipText,{fg:skip?T.SELFG:K.FAINT,bg:skip?T.MENUSEL:-1});}
     }
-    if (this.customEditing && ly < this.y + this.h - 2) {const chars=Array.from(draft.custom),shown=[...chars.slice(0,this.customCursor),"▏",...chars.slice(this.customCursor)].join("");screen.text(this.x + 4, ly, truncate(`> ${shown}`, this.w - 8), { fg: K.TXT });}
   }
 
   #choose(i) {

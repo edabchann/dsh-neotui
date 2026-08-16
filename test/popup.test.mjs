@@ -84,6 +84,17 @@ test("question skip is a real list item and submits a skipped answer", async () 
   assert.deepEqual(calls[0][2].answer.answers[0],{id:"x",selected:[]});
 });
 
+test("custom editor input row is always directly below its option", () => {
+  const { app } = appHarness();
+  const popup = new QuestionPopup({ app, frame: { rpcId: "q", sessionId: "s", questions: [{ id: "x", question: "Choose", options: [{ label: "A" }] }] } });
+  const drawn=[];const screen={text(x,y,t){drawn.push({x,y,t});},fillRect(){},box(){},hline(){},put(){}};
+  popup.render(screen);
+  const custom=drawn.find(x=>String(x.t).includes("输入自己的回答"));
+  const input=drawn.find(x=>String(x.t).includes("在此输入"));
+  const skip=drawn.find(x=>String(x.t).includes("跳过此问题"));
+  assert.equal(input.y,custom.y+1);assert.equal(skip.y,input.y+1);
+});
+
 test("custom editor reserves left/right for cursor movement", async () => {
   const { app, calls } = appHarness();
   const popup = new QuestionPopup({ app, frame: { rpcId: "q", sessionId: "s", questions: [{ id: "x", question: "Choose", options: [{ label: "A" }] }] } });
