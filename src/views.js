@@ -2371,6 +2371,7 @@ export class QuestionPopup extends Popup {
     this.questionIdx = 0;
     this.drafts = questions.map(() => ({ selected: [], custom: "", skipped: false }));
     this.selIdx = 0;
+    this.customEditing = false;
     this.onAction = (btn) => {
       if (btn.action === "cancel") this.#skipCurrent();
       else if (btn.action === "custom") this.#continueCurrent();
@@ -2419,7 +2420,12 @@ export class QuestionPopup extends Popup {
       screen.text(this.x + 2, ly++, truncate(` ${cursor ? "▸" : " "} ${glyph} ${opts[i].label}`, this.w - 6), { fg: cursor ? T.SELFG : K.TXT, bg: cursor ? T.MENUSEL : -1 });
       if (opts[i].description && ly < this.y + this.h - 3) screen.text(this.x + 7, ly++, truncate(opts[i].description, this.w - 10), { fg: K.FAINT });
     }
-    if (draft.custom) screen.text(this.x + 2, Math.min(ly, this.y + this.h - 3), truncate(`自定义: ${draft.custom}`, this.w - 4), { fg: K.ACCENT });
+    if (!this.planReview && ly < this.y + this.h - 3) {
+      this.optionRows[opts.length] = ly;
+      const cursor = this.selIdx === opts.length;
+      screen.text(this.x + 2, ly++, truncate(` ${cursor ? "▸" : " "} ✎ 输入自己的回答${draft.custom ? `: ${draft.custom}` : ""}`, this.w - 6), { fg: cursor ? T.SELFG : K.ACCENT, bg: cursor ? T.MENUSEL : -1 });
+    }
+    if (this.customEditing && ly < this.y + this.h - 2) screen.text(this.x + 4, ly, truncate(`> ${draft.custom}▏`, this.w - 8), { fg: K.TXT });
   }
 
   #choose(i) {
@@ -2444,11 +2450,13 @@ export class QuestionPopup extends Popup {
       for (let i = 0; i < (q?.options?.length ?? 0); i++) {
         const ly = this.optionRows[i];
         if (ly != null && (ev.y === ly || (q.options[i].description && ev.y === ly + 1))) {
-          this.selIdx = i; this.#choose(i);
+          this.selIdx = i; this.customEditing = false; this.#choose(i);
           if (!q.multiSelect) this.#continueCurrent();
           return true;
         }
       }
+      const customRow=this.optionRows[q?.options?.length??0];
+      if(customRow!=null&&ev.y===customRow){this.selIdx=q.options?.length??0;this.customEditing=true;this.drafts[this.questionIdx].selected=[];this.app.redraw();return true;}
     }
     return super.onMouse(ev);
   }
@@ -2456,9 +2464,10 @@ export class QuestionPopup extends Popup {
   onKey(ev) {
     const q = this.questions[this.questionIdx];
     const draft = this.drafts[this.questionIdx];
-    if (ev.type === "text") { draft.custom += ev.text; draft.skipped = false; return true; }
-    if (ev.type !== "key") return false;
     const count = q?.options?.length ?? 0;
+    const choices = count + (this.planReview ? 0 : 1);
+    if (ev.type === "text") { if(this.customEditing||this.selIdx===count){this.customEditing=true;draft.selected=[];draft.custom += ev.text;draft.skipped=false;return true;} return false; }
+    if (ev.type !== "key") return false;
     if (this.planReview && ["pageup", "pagedown", "home", "end"].includes(ev.name)) {
       const total = String(q?.detail ?? "").split("\n").length;
       if (ev.name === "pageup") this.detailScrollY = Math.max(0, this.detailScrollY - this.detailPage);
@@ -2467,11 +2476,13 @@ export class QuestionPopup extends Popup {
       else this.detailScrollY = Math.max(0, total - this.detailPage);
       this.app.redraw(); return true;
     }
-    if (ev.name === "up") { this.selIdx = Math.max(0, this.selIdx - 1); return true; }
-    if (ev.name === "down") { this.selIdx = Math.min(Math.max(0, count - 1), this.selIdx + 1); return true; }
-    if (ev.name === "char" && ev.key === " " && count) { this.#choose(this.selIdx); return true; }
-    if (ev.name === "backspace" && draft.custom) { draft.custom = Array.from(draft.custom).slice(0, -1).join(""); return true; }
+    if (ev.name === "up") { this.customEditing=false;this.selIdx = Math.max(0, this.selIdx - 1); return true; }
+    if (ev.name === "down") { this.customEditing=false;this.selIdx = Math.min(Math.max(0, choices - 1), this.selIdx + 1); return true; }
+    if (ev.name === "char" && ev.key === " " && count && this.selIdx<count) { this.#choose(this.selIdx); return true; }
+    if (ev.name === "backspace" && this.customEditing && draft.custom) { draft.custom = Array.from(draft.custom).slice(0, -1).join(""); return true; }
     if (ev.name === "enter") {
+      if(!this.planReview&&this.selIdx===count&&!this.customEditing){this.customEditing=true;draft.selected=[];return true;}
+      if(this.customEditing){if(!draft.custom.trim()){this.app.toast("请输入自己的回答");return true;}this.#continueCurrent();return true;}
       if (count && draft.selected.length === 0 && !draft.custom) this.#choose(this.selIdx);
       this.#continueCurrent(); return true;
     }

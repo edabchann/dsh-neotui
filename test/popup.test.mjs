@@ -61,6 +61,20 @@ test("long plan review scrolls with PgDn/Home/End and wheel", () => {
   assert.equal(popup.detailScrollY, 3);
 });
 
+test("question offers a third custom-answer row and submits typed text", async () => {
+  const { app, calls } = appHarness();
+  const popup = new QuestionPopup({ app, frame: { rpcId: "q", sessionId: "s", questions: [{ id: "x", question: "Choose", options: [{ label: "A" }, { label: "B" }] }] } });
+  popup.onKey({ type: "key", name: "down" });
+  popup.onKey({ type: "key", name: "down" });
+  assert.equal(popup.selIdx, 2);
+  popup.onKey({ type: "key", name: "enter" });
+  assert.equal(popup.customEditing, true);
+  popup.onKey({ type: "text", text: "my answer" });
+  popup.onKey({ type: "key", name: "enter" });
+  await Promise.resolve();
+  assert.deepEqual(calls[0][2].answer.answers[0], { id: "x", selected: [], custom: "my answer" });
+});
+
 test("multi-select toggles independent options before submit", async () => {
   const { app, calls } = appHarness();
   const popup = new QuestionPopup({ app, frame: { rpcId: "q", sessionId: "s", questions: [{ id: "x", question: "Choose", multiSelect: true, options: [{ label: "A" }, { label: "B" }] }] } });
