@@ -75,6 +75,24 @@ test("question mouse only activates the rendered option text hitbox", async () =
   assert.equal(calls[0][0],"respond");
 });
 
+test("question skip is a real list item and submits a skipped answer", async () => {
+  const { app, calls } = appHarness();
+  const popup = new QuestionPopup({ app, frame: { rpcId: "q", sessionId: "s", questions: [{ id: "x", question: "Choose", options: [{ label: "A" }, { label: "B" }] }] } });
+  popup.onKey({ type: "key", name: "down" });popup.onKey({ type: "key", name: "down" });popup.onKey({ type: "key", name: "down" });
+  assert.equal(popup.selIdx,3);
+  popup.onKey({type:"key",name:"enter"});await Promise.resolve();
+  assert.deepEqual(calls[0][2].answer.answers[0],{id:"x",selected:[]});
+});
+
+test("custom editor reserves left/right for cursor movement", async () => {
+  const { app, calls } = appHarness();
+  const popup = new QuestionPopup({ app, frame: { rpcId: "q", sessionId: "s", questions: [{ id: "x", question: "Choose", options: [{ label: "A" }] }] } });
+  popup.onKey({type:"key",name:"down"});popup.onKey({type:"key",name:"enter"});
+  popup.onKey({type:"text",text:"ac"});popup.onKey({type:"key",name:"left"});popup.onKey({type:"text",text:"b"});
+  assert.equal(popup.drafts[0].custom,"abc");
+  popup.onKey({type:"key",name:"enter"});await Promise.resolve();assert.equal(calls[0][2].answer.answers[0].custom,"abc");
+});
+
 test("question offers a third custom-answer row and submits typed text", async () => {
   const { app, calls } = appHarness();
   const popup = new QuestionPopup({ app, frame: { rpcId: "q", sessionId: "s", questions: [{ id: "x", question: "Choose", options: [{ label: "A" }, { label: "B" }] }] } });
