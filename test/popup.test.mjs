@@ -18,6 +18,13 @@ function appHarness() {
   return { app, calls };
 }
 
+test("approval preserves every wrapped reason and command line", () => {
+  const { app }=appHarness();app.chat.toolCommandForCall=()=>Array.from({length:20},(_,i)=>`command ${i}`).join("\n");
+  const popup=new ApprovalPopup({app,frame:{rpcId:"r",sessionId:"s",approvalId:"a",callId:"c",reason:"very long ".repeat(30)}});
+  const text=popup.lines.flat().map(x=>typeof x==="string"?x:x.t).join("\n");
+  assert.match(text,/command 19/);assert.ok(popup.maxScroll()>0);assert.match(popup.title,/可滚动/);
+});
+
 test("approval scrolls one line with up/down without changing safe button", () => {
   const { app } = appHarness();
   app.chat.toolCommandForCall=()=>Array.from({length:20},(_,i)=>`line ${i}`).join("\n");

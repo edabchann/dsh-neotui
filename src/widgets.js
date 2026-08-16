@@ -788,8 +788,8 @@ export class Popup extends Widget {
       }
       if (this.maxScroll() > 0) {
         // "↑N" / "↓N" overflow indicators on the border row
-        if (this.scrollY > 0) screen.text(this.x + this.w - 6, this.y, ` ↑${this.scrollY}`, { fg: T.ACCENT, bg: T.BG2 });
-        if (this.scrollY < this.maxScroll()) screen.text(this.x + this.w - 8, this.y + this.h - 1, ` ↓${this.maxScroll() - this.scrollY}`, { fg: T.ACCENT, bg: T.BG2 });
+        if (this.scrollY > 0) screen.text(this.x + this.w - 10, this.y, ` ↑ ${this.scrollY}/${this.lines.length}`, { fg: T.ACCENT, bg: T.BG2 });
+        if (this.scrollY < this.maxScroll()) screen.text(this.x + this.w - 12, this.y + this.h - 1, ` ↓ ${this.scrollY + this.contentRows()}/${this.lines.length}`, { fg: T.ACCENT, bg: T.BG2 });
       }
     } else {
       for (const line of this.lines) draw(line);

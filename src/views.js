@@ -2538,13 +2538,14 @@ export class ApprovalPopup extends Popup {
     const maxW = Math.max(12, app.screen.w - 2);
     const w = Math.min(72, maxW);
     const command = app.chat?.toolCommandForCall?.(frame.callId) ?? null;
-    const lines = [
-      [{ t: ` ${frame.reason ?? `工具 ${frame.toolName ?? "tool"} 请求越权执行`}`, fg: K.WARN }],
-    ];
-    if (command) lines.push([{ t: " 将执行:", fg: K.DIM, underline: true }], ...String(command).split("\n").slice(0, 6).map((line) => [{ t: "  " + truncate(line, w - 4), fg: K.TXT }]));
+    const wrap=(value,width)=>{const out=[];for(const raw of String(value??"").split("\n")){const gs=graphemes(raw);let line="",used=0;for(const g of gs){const gw=graphemeWidth(g);if(used+gw>width&&line){out.push(line);line="";used=0;}line+=g;used+=gw;}out.push(line);}return out;};
+    const reason=frame.reason ?? `工具 ${frame.toolName ?? "tool"} 请求越权执行`;
+    const lines = [[{t:" 请求原因",fg:K.DIM,underline:true}],...wrap(reason,w-6).map(line=>[{t:`  ${line}`,fg:K.WARN}])];
+    if (command) lines.push([{ t: " 将执行", fg: K.DIM, underline: true }], ...wrap(command,w-6).map((line) => [{ t: "  " + line, fg: K.TXT }]));
+    lines.push([{t:" 导航：↑/↓ 逐行 · PgUp/PgDn 翻页 · 滚轮 · ←/→ 选择",fg:K.FAINT}]);
     super({
-      x: Math.max(0, Math.floor((app.screen.w - w) / 2)), y: Math.max(0, Math.floor(app.screen.h / 2) - 4),
-      w, h: Math.min(app.screen.h, command ? 10 : 7), title: "⚠ 工具需要授权",
+      x: Math.max(0, Math.floor((app.screen.w - w) / 2)), y: Math.max(0, Math.floor((app.screen.h - Math.min(app.screen.h - 2, Math.max(10, Math.min(24, lines.length + 4)))) / 2)),
+      w, h: Math.min(app.screen.h - 2, Math.max(10, Math.min(24, lines.length + 4))), title: "⚠ 工具需要授权 · 可滚动",
       lines,
       buttons: [
         { label: "允许一次", action: "allowed-once" },
