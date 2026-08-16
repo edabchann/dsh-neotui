@@ -1861,12 +1861,16 @@ test("installed version helpers expose usable package versions", () => {
 test("welcome update checks compare both npm packages without blocking", async () => {
   const seen = [];
   const screen = new Screen(100, 30), term = { output: { write() {} } };
-  const app = new App({ screen, term, api: {}, versionFetcher: async (name) => { seen.push(name); return name === "dsh-neotui" ? "0.2.3" : "0.1.0-rc.6"; } });
+  const latestTui = `${TUI_VERSION.split(".").slice(0, 2).join(".")}.${Number(TUI_VERSION.split(".")[2]) + 1}`;
+  const app = new App({ screen, term, api: {}, versionFetcher: async (name) => { seen.push(name); return name === "dsh-neotui" ? latestTui : "0.1.0-rc.6"; } });
   app.dshVersion = "0.1.0-rc.6";
   await app.checkUpdates();
   assert.deepEqual(seen.sort(), ["@deepseek-ai/dsh", "dsh-neotui"]);
   assert.equal(app.versionChecks.dsh.state, "current");
-  assert.deepEqual(app.versionChecks.tui, { state: "update", latest: "0.2.3" });
+  assert.deepEqual(app.versionChecks.tui, { state: "update", latest: latestTui });
+  app.versionFetcher = async () => "0.1.0";
+  await app.checkUpdates("tui");
+  assert.equal(app.versionChecks.tui.state, "current", "an older registry tag never offers a downgrade");
 });
 
 test("QueuePanel keeps one command per row, preserves selection, and dd removes", async () => {

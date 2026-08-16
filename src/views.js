@@ -57,6 +57,31 @@ async function latestNpmVersion(name) {
   } finally { clearTimeout(timer); }
 }
 
+/** Semver comparison for update checks. Returns null for an unparseable value,
+ * otherwise -1/0/1 for left older/equal/newer than right. In particular, a
+ * locally newer build must never be advertised as "可更新" to an older npm tag. */
+function compareSemver(left, right) {
+  const parse = (value) => {
+    const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(String(value ?? ""));
+    if (!match) return null;
+    return { core: match.slice(1, 4).map(Number), pre: match[4]?.split(".") ?? [] };
+  };
+  const a = parse(left), b = parse(right);
+  if (!a || !b) return null;
+  for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] > b.core[i] ? 1 : -1;
+  if (a.pre.length === 0 || b.pre.length === 0) return a.pre.length === b.pre.length ? 0 : a.pre.length === 0 ? 1 : -1;
+  const n = Math.max(a.pre.length, b.pre.length);
+  for (let i = 0; i < n; i++) {
+    if (a.pre[i] === undefined || b.pre[i] === undefined) return a.pre[i] === b.pre[i] ? 0 : a.pre[i] === undefined ? -1 : 1;
+    if (a.pre[i] === b.pre[i]) continue;
+    const ai = /^\d+$/.test(a.pre[i]), bi = /^\d+$/.test(b.pre[i]);
+    if (ai && bi) return Number(a.pre[i]) > Number(b.pre[i]) ? 1 : -1;
+    if (ai !== bi) return ai ? -1 : 1;
+    return a.pre[i] > b.pre[i] ? 1 : -1;
+  }
+  return 0;
+}
+
 // ---- Tool card renderers (host-computed view models) ----
 
 function renderToolCard(view, width, expanded) {
@@ -2760,7 +2785,8 @@ export class App {
       this.redraw();
       try {
         const latest = await this.versionFetcher(spec.package);
-        const state = latest === spec.current ? "current" : "update";
+        const comparison = compareSemver(spec.current, latest);
+        const state = comparison === null ? (latest === spec.current ? "current" : "update") : comparison < 0 ? "update" : "current";
         this.versionChecks[key] = { state, latest };
         if (notify) this.toast(state === "current" ? `${spec.label} 已是最新版本 ${spec.current}` : `${spec.label} 可更新: ${spec.current} → ${latest}`);
       } catch (error) {
