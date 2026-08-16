@@ -797,6 +797,7 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
       writable: true,
     };
     if (m === "settings.mutate") return { revision: 4 };
+    if (m === "llm.discoverModels") return { models: [{ id: "m1" }, { id: "m2" }] };
     return {};
   };
   const panel = new ModelPanel(app);
@@ -806,23 +807,28 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
   panel.sel = panel.routes.length;
   panel.mode = "list";
   panel.onKey({ type: "key", name: "enter" });
-  assert.ok(panel.routes.includes("新供应商"), "draft route created");
+  assert.ok(panel.routes.includes("new-provider"), "draft route created");
   assert.equal(panel.mode, "form");
   const fieldIdx = (label) => panel.formItems.findIndex((it) => it.kind === "field" && it.label === label);
   // the api protocol field is a CHOICE: Tab cycles the options in the form
   // (web <select> semantics) and Enter opens the autocomplete edit buffer
   const apiItem = panel.formItems[fieldIdx("协议 api")];
   assert.ok(fieldIdx("默认思考强度") >= 0, "provider reasoning default is editable");
+  assert.ok(panel.formItems[fieldIdx("默认思考强度")].completions.includes("max"), "Pi max thinking level is editable");
   assert.ok(fieldIdx("默认上下文") >= 0 && fieldIdx("默认最大输出") >= 0, "provider fallback limits are editable");
+  assert.ok(fieldIdx("compat.thinkingFormat") >= 0 && fieldIdx("compat.supportsReasoningEffort") >= 0, "route-level compat switches are editable");
+  assert.ok(panel.formItems.some((it) => it.kind === "choice" && it.key === "defaultInput.text"), "provider text modality toggle present");
+  assert.ok(panel.formItems.some((it) => it.kind === "choice" && it.key === "defaultInput.image"), "provider image modality toggle present");
+  assert.equal(fieldIdx("默认 Agent 思考强度"), -1, "agent-default-model controls hidden when the namespace is not exposed");
   assert.deepEqual(apiItem.completions, ["openai-completions", "openai-responses", "anthropic-messages"], "all protocol choices offered");
   assert.ok(apiItem.cycle?.length >= 3, "tab-cycle options present");
   panel.formIdx = fieldIdx("协议 api");
   panel.onKey({ type: "key", name: "tab" });
-  assert.equal(panel.providers["新供应商"].api, "openai-responses", "Tab cycles to the next protocol");
+  assert.equal(panel.providers["new-provider"].api, "openai-responses", "Tab cycles to the next protocol");
   panel.onKey({ type: "key", name: "tab" });
-  assert.equal(panel.providers["新供应商"].api, "anthropic-messages", "Tab cycles again");
+  assert.equal(panel.providers["new-provider"].api, "anthropic-messages", "Tab cycles again");
   panel.onKey({ type: "key", name: "tab" });
-  assert.equal(panel.providers["新供应商"].api, "openai-completions", "Tab wraps around");
+  assert.equal(panel.providers["new-provider"].api, "openai-completions", "Tab wraps around");
   // the apiKeyEnv text field is gone: the API 密钥 row shows a status dot and
   // the reference, never the value (the web's credential posture)
   assert.equal(panel.formItems.findIndex((it) => it.kind === "field" && it.label === "apiKeyEnv"), -1, "no raw apiKeyEnv text field");
@@ -843,13 +849,20 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
     popup.input.onKey({ type: "text", text: "-x" });
     popup.onKey({ type: "key", name: "enter" });
     assert.equal(app.overlay, null, "popup closed after commit");
-    assert.equal(panel.providers["新供应商"][label === "显示名" ? "displayName" : label === "baseURL" ? "baseURL" : "api"], before + "-x", `${label} modified in place`);
-    // reset the appended suffix for the value we actually want
-    panel.providers["新供应商"][label === "显示名" ? "displayName" : label === "baseURL" ? "baseURL" : "api"] = value;
+    const key = label === "显示名" ? "displayName" : label === "baseURL" ? "baseURL" : "api";
+    if (label === "协议 api") assert.equal(panel.providers["new-provider"].api, before, "unsupported protocol is rejected");
+    else assert.equal(panel.providers["new-provider"][key], before + "-x", `${label} modified in place`);
+    // reset the field for the value we actually want
+    panel.providers["new-provider"][key] = value;
   }
-  assert.equal(panel.providers["新供应商"].displayName, "My GW");
-  assert.equal(panel.providers["新供应商"].baseURL, "https://gw/v1");
-  assert.equal(panel.providers["新供应商"].api, "anthropic-messages");
+  assert.equal(panel.providers["new-provider"].displayName, "My GW");
+  assert.equal(panel.providers["new-provider"].baseURL, "https://gw/v1");
+  assert.equal(panel.providers["new-provider"].api, "anthropic-messages");
+  panel.formIdx = fieldIdx("默认思考强度");
+  panel.onKey({ type: "key", name: "enter" });
+  app.overlay.onKey({ type: "text", text: "turbo" });
+  app.overlay.onKey({ type: "key", name: "enter" });
+  assert.equal(Object.hasOwn(panel.providers["new-provider"], "reasoning"), false, "unsupported reasoning level is rejected");
   // save persists via settings.mutate
   panel.formIdx = panel.formItems.findIndex((it) => it.kind === "button" && it.label.includes("保存配置"));
   panel.onKey({ type: "key", name: "enter" });
@@ -857,34 +870,401 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
   assert.ok(mutate, "settings.mutate called");
   assert.equal(mutate[1].ns, "llm-pi-ai");
   assert.equal(mutate[1].expectedRevision, 3);
-  assert.equal(mutate[1].ops[0].value["新供应商"].displayName, "My GW");
+  assert.deepEqual(mutate[1].ops[0].path, ["providers", "new-provider"]);
+  assert.equal(mutate[1].ops[0].value.displayName, "My GW");
   // the 模型管理 entry opens a sub-buffer; its FIRST row is the auto-scan
   panel.formIdx = panel.formItems.findIndex((it) => it.kind === "button" && it.label === "模型管理");
   panel.onKey({ type: "key", name: "enter" });
   assert.ok(panel.sub != null, "模型管理 sub-buffer opened");
-  assert.equal(panel.subItems[0].label.includes("自动扫描"), true, "scan is the first sub-buffer row");
+  assert.equal(panel.subItems[0].label.includes("自动发现"), true, "discovery is the first sub-buffer row");
   // the sub-buffer cursor moves AND the rendered highlight follows it
   panel.onKey({ type: "key", name: "down" });
   assert.equal(panel.sub.cursor, 1, "sub cursor moved");
   const row = panel.formView.lines[1 + panel.sub.cursor].map((g) => g.t).join("");
   assert.ok(row.includes("▸"), `rendered highlight follows the sub cursor: ${row}`);
+  panel.sub.cursor = 0;
+  panel.onKey({ type: "key", name: "enter" });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(panel.scanMode, true, "scan mode entered");
+  assert.deepEqual(panel.scanItems.map((m) => m.id), ["m1", "m2"]);
+  panel.onKey({ type: "key", name: "enter" }); // add the selected scan results
+  const ids = (panel.providers["new-provider"].models ?? []).map((m) => m.id);
+  assert.deepEqual(ids, ["m1", "m2"], "scanned models added");
+  // Esc closes the sub-buffer back to the provider form
+  panel.onKey({ type: "key", name: "escape" });
+  assert.equal(panel.sub, null, "Esc returned from the sub-buffer");
+});
+
+test("ModelPanel: draft keys reach Host discovery once without local fetch", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "settings.describe") return { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: {} } }], writable: true };
+    if (method === "credentials.set") return {};
+    if (method === "llm.discoverModels") return { models: [{ id: "draft-model" }] };
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.sel = panel.routes.length;
+  panel.onKey({ type: "key", name: "enter" });
+  const keyRow = panel.formItems.find((item) => item.kind === "key");
+  panel.formIdx = panel.formItems.indexOf(keyRow);
+  panel.onKey({ type: "key", name: "enter" });
+  app.overlay.onKey({ type: "text", text: "sk-draft" });
+  app.overlay.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  panel.formIdx = panel.formItems.findIndex((item) => item.label === "模型管理");
+  panel.onKey({ type: "key", name: "enter" });
+  panel.sub.cursor = 0;
+  panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const discovery = calls.find(([method]) => method === "llm.discoverModels");
+  assert.equal(discovery?.[1].apiKey, "sk-draft", "draft key crosses only the one-shot Host discovery request");
+  assert.equal(discovery?.[1].provider, "new-provider");
+});
+
+test("ModelPanel: draft route rename validates identifiers and migrates derived key state", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  app.api.call = async (method) => method === "settings.describe"
+    ? { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: {} } }], writable: true }
+    : {};
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.sel = 0;
+  panel.onKey({ type: "key", name: "enter" });
+  const routeIdx = () => panel.formItems.findIndex((item) => item.key === "route");
+  const keyIdx = () => panel.formItems.findIndex((item) => item.kind === "key");
+  panel.formIdx = keyIdx();
+  panel.onKey({ type: "key", name: "enter" });
+  app.overlay.onKey({ type: "text", text: "sk-route" });
+  app.overlay.onKey({ type: "key", name: "enter" });
+  panel.formIdx = routeIdx();
+  panel.onKey({ type: "key", name: "enter" });
+  app.overlay.input.value = "Bad Route";
+  app.overlay.input.caret = app.overlay.input.value.length;
+  app.overlay.onKey({ type: "key", name: "enter" });
+  assert.equal(panel.draftRoute, "new-provider", "invalid route is rejected");
+  panel.formIdx = routeIdx();
+  panel.onKey({ type: "key", name: "enter" });
+  app.overlay.input.value = "my-gateway";
+  app.overlay.input.caret = app.overlay.input.value.length;
+  app.overlay.onKey({ type: "key", name: "enter" });
+  assert.equal(panel.draftRoute, "my-gateway");
+  assert.equal(panel.providers["my-gateway"].apiKeyEnv, "MY_GATEWAY_API_KEY", "derived reference follows the route rename");
+  assert.equal(panel.pendingProbeKeys.get("my-gateway"), "sk-route", "write-only key draft follows the route rename");
+});
+
+test("ModelPanel: user-layer fields save minimally without materializing resolved defaults", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "settings.describe") return {
+      namespaces: [{
+        ns: "llm-pi-ai", revision: 2,
+        user: { providers: { gw: { displayName: "GW" } } },
+        value: { providers: { gw: { displayName: "GW", defaultContextWindow: 262144, defaultInput: ["text"], headers: { inherited: "yes" } } } },
+      }], writable: true,
+    };
+    if (method === "settings.mutate") return { revision: 3 };
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  assert.deepEqual(panel.providers.gw, { displayName: "GW" }, "draft starts from the stored user layer");
+  panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label === "显示名");
+  panel.onKey({ type: "key", name: "enter" });
+  app.overlay.input.value = "Gateway";
+  app.overlay.input.caret = app.overlay.input.value.length;
+  app.overlay.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("保存配置"));
+  panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const mutate = calls.find(([method]) => method === "settings.mutate");
+  assert.deepEqual(mutate[1].ops, [{ op: "set", path: ["providers", "gw", "displayName"], value: "Gateway" }]);
+});
+
+test("ModelPanel: base-only providers remain visible and use resolved discovery fallback", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "settings.describe") return {
+      namespaces: [{
+        ns: "llm-pi-ai", revision: 4,
+        user: {},
+        base: { providers: { inherited: { apiKeyEnv: "INHERITED_API_KEY", api: "anthropic-messages", baseURL: "https://base.example/v1", models: [{ id: "base-model" }] } } },
+        value: { providers: { inherited: { displayName: "Inherited", apiKeyEnv: "INHERITED_API_KEY", api: "anthropic-messages", baseURL: "https://base.example/v1", models: [{ id: "base-model" }] } } },
+      }], writable: true,
+    };
+    if (method === "llm.discoverModels") return { models: [] };
+    if (method === "settings.mutate") return { revision: 5 };
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  assert.deepEqual(panel.routes, ["inherited"], "resolved base route remains visible");
+  assert.deepEqual(panel.providers, {}, "base profile is not materialized into the user draft");
+  panel.onKey({ type: "key", name: "enter" });
+  assert.ok(panel.formItems.find((item) => item.label === "模型管理")?.sub.includes("base-model"), "inherited models remain visible");
+  assert.equal(panel.formItems.some((item) => item.label.includes("删除供应商")), false, "composition-owned route is not removable");
+  panel.formIdx = panel.formItems.findIndex((item) => item.label === "显示名");
+  panel.onKey({ type: "key", name: "enter" });
+  app.overlay.input.value = "Override";
+  app.overlay.input.caret = app.overlay.input.value.length;
+  app.overlay.onKey({ type: "key", name: "enter" });
+  assert.deepEqual(panel.providers.inherited, { displayName: "Override" }, "editing creates only the named user override");
+  panel.formIdx = panel.formItems.findIndex((item) => item.label === "模型管理");
+  panel.onKey({ type: "key", name: "enter" });
+  panel.sub.cursor = panel.subItems.findIndex((item) => item.label?.includes("自动发现"));
+  panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const discovery = calls.find(([method]) => method === "llm.discoverModels");
+  assert.equal(discovery[1].api, "anthropic-messages");
+  assert.equal(discovery[1].baseURL, "https://base.example/v1");
+  panel.onKey({ type: "key", name: "escape" }); // leave scan results
+  panel.onKey({ type: "key", name: "escape" }); // leave model sub-buffer
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("保存配置"));
+  panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const mutate = calls.find(([method]) => method === "settings.mutate");
+  assert.deepEqual(mutate[1].ops, [{ op: "set", path: ["providers", "inherited", "displayName"], value: "Override" }]);
+});
+
+test("ModelPanel: inherited key references support key-only save without user materialization", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "settings.describe") return {
+      namespaces: [{ ns: "llm-pi-ai", revision: 1, user: {}, base: { providers: { base: { apiKeyEnv: "BASE_API_KEY" } } }, value: { providers: { base: { apiKeyEnv: "BASE_API_KEY" } } } }],
+      writable: true,
+    };
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.kind === "key");
+  panel.onKey({ type: "key", name: "enter" });
+  app.overlay.onKey({ type: "text", text: "sk-base" });
+  app.overlay.onKey({ type: "key", name: "enter" });
+  assert.deepEqual(panel.providers, {}, "editing an inherited key does not create a user profile");
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("保存配置"));
+  panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls.find(([method]) => method === "credentials.set")?.[1], { ref: "BASE_API_KEY", value: "sk-base" });
+  assert.equal(calls.some(([method]) => method === "settings.mutate"), false);
+});
+
+test("ModelPanel: host llm.discoverModels is preferred and preserves metadata", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  let discoverCalls = 0;
+  app.api.call = async (m, p) => {
+    if (m === "settings.describe") return {
+      namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { gw: { displayName: "GW", api: "openai-completions", baseURL: "https://gw/v1" } } } }],
+      writable: true,
+    };
+    if (m === "llm.discoverModels") {
+      discoverCalls++;
+      assert.deepEqual(p, { settingsNs: "llm-pi-ai", provider: "gw", api: "openai-completions", baseURL: "https://gw/v1" });
+      return { models: [{ id: "host-model", name: "Host Model", contextWindow: 456, maxTokens: 789 }] };
+    }
+    return {};
+  };
   const realFetch = globalThis.fetch;
-  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ data: [{ id: "m1" }, { id: "m2" }] }) });
+  globalThis.fetch = async () => { throw new Error("legacy /models fetch should not be used when the host answers"); };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.onKey({ type: "key", name: "enter" }); // open provider form
+  panel.formIdx = panel.formItems.findIndex((it) => it.kind === "button" && it.label === "模型管理");
+  panel.onKey({ type: "key", name: "enter" }); // open 模型管理
+  panel.sub.cursor = 0;
   try {
-    panel.sub.cursor = 0;
-    panel.onKey({ type: "key", name: "enter" });
-    await new Promise((r) => setTimeout(r, 30));
-    assert.equal(panel.scanMode, true, "scan mode entered");
-    assert.deepEqual(panel.scanItems.map((m) => m.id), ["m1", "m2"]);
-    panel.onKey({ type: "key", name: "enter" }); // add the selected scan results
-    const ids = (panel.providers["新供应商"].models ?? []).map((m) => m.id);
-    assert.deepEqual(ids, ["m1", "m2"], "scanned models added");
-    // Esc closes the sub-buffer back to the provider form
-    panel.onKey({ type: "key", name: "escape" });
-    assert.equal(panel.sub, null, "Esc returned from the sub-buffer");
+    panel.onKey({ type: "key", name: "enter" }); // scan
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(discoverCalls, 1, "llm.discoverModels called once");
+    assert.equal(panel.scanMode, true, "host scan entered scan mode");
+    assert.deepEqual(panel.scanItems, [{ id: "host-model", name: "Host Model", contextWindow: 456, maxTokens: 789 }]);
+    panel.onKey({ type: "key", name: "enter" }); // adopt
+    const model = panel.providers.gw.models[0];
+    assert.deepEqual(model, { id: "host-model", name: "Host Model", contextWindow: 456, maxTokens: 789 }, "host-provided capacities survive adoption");
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+test("ModelPanel: catalog control characters are sanitized only at render time", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  app.api.call = async (method) => method === "settings.describe"
+    ? { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { gw: { displayName: "GW\u001b", models: [{ id: "m\u0007x", name: "Bell\nName" }] } } } }], writable: true }
+    : {};
+  const panel = new ModelPanel(app);
+  await panel.load();
+  assert.equal(panel.providers.gw.models[0].id, "m\u0007x", "raw model identity is preserved for Host calls");
+  panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label === "模型管理");
+  panel.onKey({ type: "key", name: "enter" });
+  const rendered = panel.listView.lines.concat(panel.formView.lines).flat().map((glyph) => glyph.t).join("\n");
+  assert.equal(/[\x00-\x1F\x7F]/.test(rendered.replace(/\n/g, "")), false, "rendered labels contain no terminal control characters");
+});
+
+test("ModelPanel: compat values are typed and model selection uses the public default path", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  app.currentSession = "s";
+  const calls = [];
+  app.api.call = async (m, p) => {
+    calls.push([m, p]);
+    if (m === "settings.describe") return {
+      namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { ucas: { displayName: "UCAS", api: "openai-completions", models: [{ id: "m1" }] } } } }],
+      writable: true,
+    };
+    return {};
+  };
+  app.updateModel = async () => {};
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.onKey({ type: "key", name: "enter" }); // provider form
+  const fieldIdx = (label) => panel.formItems.findIndex((it) => it.kind === "field" && it.label === label);
+  panel.formIdx = fieldIdx("compat.supportsReasoningEffort");
+  panel.onKey({ type: "key", name: "enter" });
+  let popup = app.overlay;
+  popup.input.onKey({ type: "text", text: "true" });
+  popup.onKey({ type: "key", name: "enter" });
+  assert.equal(panel.providers.ucas.compat.supportsReasoningEffort, true);
+  panel.formIdx = fieldIdx("compat.thinkingFormat");
+  panel.onKey({ type: "key", name: "enter" });
+  popup = app.overlay;
+  popup.input.onKey({ type: "text", text: "deepseek" });
+  popup.onKey({ type: "key", name: "enter" });
+  assert.equal(panel.providers.ucas.compat.thinkingFormat, "deepseek");
+  panel.formIdx = panel.formItems.findIndex((it) => it.kind === "button" && it.label === "模型管理");
+  panel.onKey({ type: "key", name: "enter" });
+  panel.sub.cursor = panel.subItems.findIndex((it) => it.kind === "model");
+  panel.onKey({ type: "key", name: "enter" });
+  panel.sub.cursor = panel.subItems.findIndex((it) => it.kind === "button" && it.label.includes("当前会话及后续 Agent"));
+  panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const select = calls.find(([method]) => method === "session.selectModel");
+  assert.deepEqual(select?.[1], { sessionId: "s", provider: "ucas", model: "m1" });
+  assert.equal(calls.some(([, payload]) => payload?.ns === "agent-default-model"), false, "unexposed namespace is never written directly");
+});
+
+test("ModelPanel: model capability controls preserve inheritance and valid custom states", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  app.api.call = async (method) => method === "settings.describe"
+    ? { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { gw: { api: "openai-completions", models: [{ id: "m1" }] } } } }], writable: true }
+    : {};
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label === "模型管理");
+  panel.onKey({ type: "key", name: "enter" });
+  panel.sub.cursor = panel.subItems.findIndex((item) => item.kind === "model");
+  panel.onKey({ type: "key", name: "enter" });
+  const activate = (key) => {
+    panel.sub.cursor = panel.subItems.findIndex((item) => item.key === key);
+    assert.ok(panel.sub.cursor >= 0, `${key} row exists`);
+    panel.onKey({ type: "key", name: "enter" });
+  };
+  activate("model.0.reasoningMode");
+  assert.equal(panel.providers.gw.models[0].reasoningEfforts, false, "inheritance can become explicitly disabled");
+  activate("model.0.reasoningMode");
+  assert.deepEqual(panel.providers.gw.models[0].reasoningEfforts, { medium: "medium" }, "custom mode starts schema-valid");
+  panel.sub.cursor = panel.subItems.findIndex((item) => item.key === "model.0.reasoning.high");
+  panel.onKey({ type: "key", name: "enter" });
+  app.overlay.onKey({ type: "text", text: "null" });
+  app.overlay.onKey({ type: "key", name: "enter" });
+  assert.equal(Object.hasOwn(panel.providers.gw.models[0].reasoningEfforts, "high"), false, "non-off null is rejected locally");
+  assert.match(app.toastMsg, /只有 off/);
+  panel.sub.cursor = panel.subItems.findIndex((item) => item.key === "model.0.reasoning.off");
+  panel.onKey({ type: "key", name: "enter" });
+  app.overlay.onKey({ type: "text", text: "null" });
+  app.overlay.onKey({ type: "key", name: "enter" });
+  assert.equal(panel.providers.gw.models[0].reasoningEfforts.off, null, "off may explicitly map to null");
+  activate("model.0.reasoningMode");
+  assert.equal(Object.hasOwn(panel.providers.gw.models[0], "reasoningEfforts"), false, "custom mode can return to inheritance");
+  activate("model.0.inputMode");
+  assert.deepEqual(panel.providers.gw.models[0].input, ["text"], "custom input begins from conservative text capability");
+  activate("model.0.input.image");
+  assert.deepEqual(panel.providers.gw.models[0].input, ["text", "image"]);
+  activate("model.0.inputMode");
+  assert.equal(Object.hasOwn(panel.providers.gw.models[0], "input"), false, "input capability can return to catalog inheritance");
+});
+
+test("ModelPanel: non-completions protocols remove incompatible reasoning switches", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  app.api.call = async (method) => method === "settings.describe"
+    ? { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { gw: { api: "openai-completions", compat: { thinkingFormat: "deepseek" }, models: [{ id: "m1", compat: { supportsReasoningEffort: true } }] } } } }], writable: true }
+    : {};
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label === "协议 api");
+  panel.onKey({ type: "key", name: "tab" });
+  assert.equal(panel.providers.gw.api, "openai-responses");
+  assert.equal(Object.hasOwn(panel.providers.gw, "compat"), false, "route compat removed");
+  assert.equal(Object.hasOwn(panel.providers.gw.models[0], "compat"), false, "model compat removed");
+  assert.equal(panel.formItems.some((item) => item.label === "compat.thinkingFormat"), false, "incompatible controls hidden");
+
+  const inherited = { api: "openai-completions", compat: { thinkingFormat: "deepseek" }, models: [{ id: "m1", compat: { supportsReasoningEffort: true } }] };
+  const layered = new ModelPanel(app);
+  app.api.call = async (method) => method === "settings.describe"
+    ? { namespaces: [{ ns: "llm-pi-ai", revision: 2, user: {}, base: { providers: { base: structuredClone(inherited) } }, value: { providers: { base: structuredClone(inherited) } } }], writable: true }
+    : {};
+  await layered.load();
+  layered.onKey({ type: "key", name: "enter" });
+  layered.formIdx = layered.formItems.findIndex((item) => item.label === "协议 api");
+  layered.onKey({ type: "key", name: "tab" });
+  assert.equal(layered.providers.base.api, "openai-responses");
+  assert.equal(Object.hasOwn(layered.providers.base, "compat"), false);
+  assert.equal(Object.hasOwn(layered.providers.base.models[0], "compat"), false, "inherited model compat is stripped through copy-on-write");
+  assert.equal(inherited.models[0].compat.supportsReasoningEffort, true, "resolved/base source is not mutated");
+});
+
+test("ModelPanel: reload preserves dirty drafts and read-only namespaces reject edits", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  let describes = 0;
+  app.api.call = async (method) => {
+    if (method === "settings.describe") {
+      describes++;
+      return { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { a: { displayName: "A" } } } }], writable: true };
+    }
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.providers.a.displayName = "Draft";
+  await panel.load();
+  assert.equal(describes, 1, "re-entering a dirty panel does not overwrite it from Host");
+  assert.equal(panel.providers.a.displayName, "Draft");
+  assert.match(app.toastMsg, /未保存修改/);
+
+  const ro = new ModelPanel(app);
+  app.api.call = async (method) => method === "settings.describe"
+    ? { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { a: { displayName: "A" } } } }], writable: false }
+    : {};
+  await ro.load();
+  ro.onKey({ type: "key", name: "enter" });
+  ro.formIdx = ro.formItems.findIndex((item) => item.label === "显示名");
+  ro.onKey({ type: "key", name: "enter" });
+  assert.ok(!app.overlay, "read-only edit does not open an editor");
+  assert.equal(ro.providers.a.displayName, "A");
+  assert.match(app.toastMsg, /只读/);
 });
 
 test("ModelPanel navigation: ↑/↓ move within the focused region, →/← switch focus", async () => {
@@ -998,13 +1378,28 @@ test("ModelPanel: the API key row is a masked, web-synced credential edit", asyn
   assert.ok(preview.includes("••••"), `masked preview bullets: ${preview}`);
   assert.ok(!preview.includes("sk-test-123"), "the secret never appears in the preview");
   assert.ok(preview.includes("11 字符"), "character count shown");
-  // committing a value writes through credentials.set, one way
+  // committing a value creates a write-only draft; save writes it one way
   popup.onKey({ type: "key", name: "enter" });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(calls.some(([m]) => m === "credentials.set"), false, "editing alone does not mutate credential storage");
+  assert.equal(panel.pendingProbeKeys.get("ucas"), "sk-test-123");
+  const pendingRow = panel.formView.lines.map((l) => l.map((g) => g.t).join("")).find((t) => t.includes("API 密钥"));
+  assert.match(pendingRow, /待保存/);
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("保存配置"));
+  panel.onKey({ type: "key", name: "enter" });
   await new Promise((r) => setTimeout(r, 10));
   const setCall = calls.find(([m]) => m === "credentials.set");
-  assert.ok(setCall, "credentials.set called");
+  assert.ok(setCall, "save calls credentials.set");
   assert.deepEqual(setCall[1], { ref: "UCAS_API_KEY", value: "sk-test-123" });
+  assert.equal(calls.some(([m]) => m === "settings.mutate"), false, "key-only save avoids an empty settings CAS");
+  assert.equal(panel.pendingProbeKeys.size, 0, "saved providers do not retain plaintext probe keys");
   assert.equal(app.overlay, null, "popup closed");
+  const clearRow = panel.formItems.find((item) => item.label?.includes("清除 API 密钥"));
+  panel.formIdx = panel.formItems.indexOf(clearRow);
+  panel.onKey({ type: "key", name: "enter" });
+  await app.overlay.onAction({ label: "确认清除", action: "clear" });
+  assert.deepEqual(calls.find(([method]) => method === "credentials.unset")?.[1], { ref: "UCAS_API_KEY" }, "explicit clear unsets the named credential");
+  assert.equal(app.overlay, null, "clear confirmation closes cleanly");
   // an empty commit keeps the existing key (no set call)
   panel.formIdx = panel.formItems.indexOf(panel.formItems.find((it) => it.kind === "key"));
   panel.onKey({ type: "key", name: "enter" });
@@ -1030,6 +1425,369 @@ test("ModelPanel: the API key row is a masked, web-synced credential edit", asyn
   const derived = panel.formItems.find((it) => it.kind === "key");
   assert.equal(derived.ref, "MY_GW_API_KEY", "derived reference follows the web convention");
   assert.ok(panel.formView.lines.map((l) => l.map((g) => g.t).join("")).find((t) => t.includes("○ 未配置")), "missing dot rendered");
+  panel.formIdx = panel.formItems.indexOf(derived);
+  panel.onKey({ type: "key", name: "enter" });
+  popup = app.overlay;
+  popup.onKey({ type: "text", text: "sk-new-ref" });
+  popup.onKey({ type: "key", name: "enter" });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(panel.pendingProbeKeys.get("my-gw"), "sk-new-ref", "newly added references keep a one-shot key until settings are saved");
+  panel.onKey({ type: "key", name: "escape" });
+  popup = app.overlay;
+  await popup.onAction({ label: "不保存", action: "discard" });
+  assert.equal(calls.filter(([m]) => m === "credentials.set").length, setCount, "discard never writes the drafted credential");
+  assert.equal(panel.pendingProbeKeys.size, 0, "discard drops the in-memory key draft");
+  assert.equal(Object.hasOwn(panel.providers["my-gw"], "apiKeyEnv"), false, "discard restores the unsaved profile reference");
+});
+
+test("ModelPanel: credential save failure keeps a retryable write-only draft", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  let failCredential = true;
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "settings.describe") return { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { a: { apiKeyEnv: "A_API_KEY" } } } }], writable: true };
+    if (method === "credentials.set" && failCredential) throw new Error("credential store unavailable");
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.kind === "key");
+  panel.onKey({ type: "key", name: "enter" });
+  app.overlay.onKey({ type: "text", text: "sk-retry" });
+  app.overlay.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("保存配置"));
+  panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(panel.pendingProbeKeys.get("a"), "sk-retry", "failed credential remains available only for retry");
+  assert.match(app.toastMsg, /^API 密钥保存失败/);
+  failCredential = false;
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("保存配置"));
+  panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(panel.pendingProbeKeys.size, 0, "retry clears the key draft after success");
+  assert.equal(calls.filter(([method]) => method === "credentials.set").length, 2);
+});
+
+test("ModelPanel: discard compensates a provider write after credential failure", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "settings.describe") return { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { a: {} } } }], writable: true };
+    if (method === "settings.mutate") return { revision: calls.filter(([name]) => name === "settings.mutate").length + 1 };
+    if (method === "credentials.set") throw new Error("credential store unavailable");
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.kind === "key");
+  panel.onKey({ type: "key", name: "enter" });
+  app.overlay.onKey({ type: "text", text: "sk-compensate" });
+  app.overlay.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("保存配置"));
+  panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(JSON.parse(panel.hostSnapshot).a.apiKeyEnv, "A_API_KEY", "Host snapshot tracks the provider step");
+  assert.equal(Object.hasOwn(JSON.parse(panel.savedSnapshot).a, "apiKeyEnv"), false, "full save point waits for credential success");
+  panel.onKey({ type: "key", name: "escape" });
+  await app.overlay.onAction({ label: "不保存", action: "discard" });
+  const mutations = calls.filter(([method]) => method === "settings.mutate");
+  assert.equal(mutations.length, 2, "discard sends one compensating settings mutation");
+  assert.deepEqual(mutations[1][1].ops, [{ op: "unset", path: ["providers", "a", "apiKeyEnv"] }]);
+  assert.equal(panel.pendingProbeKeys.size, 0);
+  assert.equal(Object.hasOwn(panel.providers.a, "apiKeyEnv"), false);
+});
+
+test("ModelPanel: partial multi-key failure keeps completed credentials paired", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "settings.describe") return { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { a: {}, b: {} } } }], writable: true };
+    if (method === "settings.mutate") return { revision: calls.filter(([name]) => name === "settings.mutate").length + 1 };
+    if (method === "credentials.set" && payload.ref === "B_API_KEY") throw new Error("second credential failed");
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.providers.a.apiKeyEnv = "A_API_KEY";
+  panel.providers.b.apiKeyEnv = "B_API_KEY";
+  panel.pendingProbeKeys.set("a", "sk-a");
+  panel.pendingProbeKeys.set("b", "sk-b");
+  panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("保存配置"));
+  panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(panel.pendingProbeKeys.has("a"), false, "completed credential draft is cleared");
+  assert.equal(panel.pendingProbeKeys.get("b"), "sk-b", "failed credential remains retryable");
+  assert.equal(JSON.parse(panel.savedSnapshot).a.apiKeyEnv, "A_API_KEY", "completed provider/key pair advances the full save point");
+  assert.equal(Object.hasOwn(JSON.parse(panel.savedSnapshot).b, "apiKeyEnv"), false, "failed provider/key pair does not advance the full save point");
+  panel.onKey({ type: "key", name: "escape" });
+  await app.overlay.onAction({ label: "不保存", action: "discard" });
+  const mutations = calls.filter(([method]) => method === "settings.mutate");
+  assert.deepEqual(mutations[1][1].ops, [{ op: "unset", path: ["providers", "b", "apiKeyEnv"] }], "discard compensates only the failed key's reference");
+  assert.equal(panel.providers.a.apiKeyEnv, "A_API_KEY");
+  assert.equal(Object.hasOwn(panel.providers.b, "apiKeyEnv"), false);
+});
+
+test("ModelPanel: provider deletion removes only its managed derived credential", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "settings.describe") return { namespaces: [{ ns: "llm-pi-ai", revision: 3, value: { providers: { managed: { apiKeyEnv: "MANAGED_API_KEY" }, shared: { apiKeyEnv: "SHARED_KEY" } } } }], writable: true };
+    if (method === "credentials.describe") return { credentials: { MANAGED_API_KEY: { configured: true, writable: true }, SHARED_KEY: { configured: true, writable: true } } };
+    if (method === "settings.mutate") return { revision: 4 };
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("删除供应商"));
+  panel.onKey({ type: "key", name: "enter" });
+  await app.overlay.onAction({ label: "删除", action: "delete" });
+  const managedMutateAt = calls.findIndex(([method]) => method === "settings.mutate");
+  const managedUnsetAt = calls.findIndex(([method]) => method === "credentials.unset");
+  assert.ok(managedMutateAt >= 0 && managedUnsetAt > managedMutateAt, "managed credential is cleaned only after provider removal persists");
+  assert.deepEqual(calls[managedUnsetAt][1], { ref: "MANAGED_API_KEY" });
+  panel.sel = panel.routes.indexOf("shared");
+  panel.mode = "form";
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("删除供应商"));
+  panel.onKey({ type: "key", name: "enter" });
+  await app.overlay.onAction({ label: "删除", action: "delete" });
+  assert.equal(calls.filter(([method]) => method === "credentials.unset").length, 1, "custom/shared credential references are preserved");
+});
+
+test("ModelPanel: provider deletion rolls back without losing its key when Host persistence fails", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "settings.describe") return { namespaces: [{ ns: "llm-pi-ai", revision: 3, value: { providers: { a: { displayName: "A", apiKeyEnv: "A_API_KEY" }, b: { displayName: "B" } } } }], writable: true };
+    if (method === "credentials.describe") return { credentials: { A_API_KEY: { configured: true, writable: true } } };
+    if (method === "settings.mutate") throw new Error("revision conflict");
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("删除供应商"));
+  panel.onKey({ type: "key", name: "enter" });
+  await app.overlay.onAction({ label: "删除", action: "delete" });
+  assert.deepEqual(panel.routes, ["a", "b"], "failed delete restores the provider list");
+  assert.equal(panel.providers.a.displayName, "A", "failed delete restores the profile");
+  assert.equal(panel.sel, 0, "selection returns to the restored provider");
+  assert.equal(calls.some(([method]) => method === "credentials.unset"), false, "CAS failure never destroys the live provider credential");
+  assert.match(app.toastMsg, /revision conflict/);
+});
+
+test("ModelPanel: failed managed credential cleanup is journaled and retryable", async () => {
+  saveTuiConfig({ pendingModelCredentialCleanups: [] });
+  try {
+    const app = fakeApp();
+    app.screen = { w: 100, h: 30 };
+    const calls = [];
+    let failUnset = true;
+    let deleted = false;
+    app.api.call = async (method, payload) => {
+      calls.push([method, payload]);
+      if (method === "settings.describe") return { namespaces: [{ ns: "llm-pi-ai", revision: deleted ? 4 : 3, value: { providers: deleted ? {} : { managed: { apiKeyEnv: "MANAGED_API_KEY" } } } }], writable: true };
+      if (method === "credentials.describe") return { credentials: { MANAGED_API_KEY: { configured: true, writable: true } } };
+      if (method === "settings.mutate") {
+        assert.deepEqual(loadTuiConfig().pendingModelCredentialCleanups, [{ ref: "MANAGED_API_KEY", route: "managed", error: "等待确认供应商删除", reconcile: true }], "cleanup journal is durable before provider removal");
+        deleted = true;
+        return { revision: 4 };
+      }
+      if (method === "credentials.unset" && failUnset) throw new Error("credential store unavailable");
+      return {};
+    };
+    const panel = new ModelPanel(app);
+    await panel.load();
+    panel.onKey({ type: "key", name: "enter" });
+    panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("删除供应商"));
+    panel.onKey({ type: "key", name: "enter" });
+    await app.overlay.onAction({ label: "删除", action: "delete" });
+    assert.equal(panel.routes.includes("managed"), false, "provider removal remains committed");
+    assert.deepEqual(panel.pendingCredentialCleanups.get("MANAGED_API_KEY"), { route: "managed", error: "credential store unavailable" });
+    assert.deepEqual(loadTuiConfig().pendingModelCredentialCleanups, [{ ref: "MANAGED_API_KEY", route: "managed", error: "credential store unavailable" }]);
+    assert.equal(app.overlay?.title, "托管密钥待清理", "failure has a persistent decision surface");
+    assert.deepEqual(app.overlay.buttons.map((button) => button.action), ["later", "retry", "keep"]);
+    failUnset = false;
+    await app.overlay.onAction({ label: "重试清理", action: "retry" });
+    assert.equal(panel.pendingCredentialCleanups.size, 0, "successful retry clears in-memory journal");
+    assert.deepEqual(loadTuiConfig().pendingModelCredentialCleanups, [], "successful retry clears durable journal");
+    assert.equal(calls.filter(([method]) => method === "credentials.unset").length, 2, "retry reaches the credential store again");
+    assert.equal(app.overlay, null);
+  } finally {
+    saveTuiConfig({ pendingModelCredentialCleanups: [] });
+  }
+});
+
+test("ModelPanel: ambiguous provider deletion reconciles committed Host state before cleanup", async () => {
+  saveTuiConfig({ pendingModelCredentialCleanups: [] });
+  try {
+    const app = fakeApp();
+    app.screen = { w: 100, h: 30 };
+    const calls = [];
+    let deleted = false;
+    app.api.call = async (method, payload) => {
+      calls.push([method, payload]);
+      if (method === "settings.describe") return {
+        namespaces: [{ ns: "llm-pi-ai", revision: deleted ? 4 : 3, value: { providers: deleted ? {} : { managed: { apiKeyEnv: "MANAGED_API_KEY" } } } }],
+        writable: true,
+      };
+      if (method === "credentials.describe") return { credentials: { MANAGED_API_KEY: { configured: true, writable: true } } };
+      if (method === "settings.mutate") {
+        deleted = true;
+        throw Object.assign(new Error("response lost after commit"), { code: "internal" });
+      }
+      return {};
+    };
+    const panel = new ModelPanel(app);
+    await panel.load();
+    panel.onKey({ type: "key", name: "enter" });
+    panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("删除供应商"));
+    panel.onKey({ type: "key", name: "enter" });
+    await app.overlay.onAction({ label: "删除", action: "delete" });
+    assert.equal(panel.routes.includes("managed"), false, "authoritative Host state completes the local deletion");
+    assert.deepEqual(calls.find(([method]) => method === "credentials.unset")?.[1], { ref: "MANAGED_API_KEY" }, "cleanup runs only after reconciliation proves the route absent");
+    assert.equal(panel.pendingCredentialCleanups.size, 0);
+    assert.deepEqual(loadTuiConfig().pendingModelCredentialCleanups, []);
+  } finally {
+    saveTuiConfig({ pendingModelCredentialCleanups: [] });
+  }
+});
+
+test("ModelPanel: persisted cleanup retries after restart but preserves reused credentials", async () => {
+  saveTuiConfig({ pendingModelCredentialCleanups: [{ ref: "A_API_KEY", route: "a", error: "old failure" }] });
+  try {
+    const reusedApp = fakeApp();
+    reusedApp.screen = { w: 100, h: 30 };
+    const reusedCalls = [];
+    reusedApp.api.call = async (method, payload) => {
+      reusedCalls.push([method, payload]);
+      if (method === "settings.describe") return { namespaces: [{ ns: "llm-pi-ai", revision: 5, value: { providers: { a: { apiKeyEnv: "A_API_KEY" } } } }], writable: true };
+      return {};
+    };
+    const reused = new ModelPanel(reusedApp);
+    await reused.load();
+    assert.equal(reusedCalls.some(([method]) => method === "credentials.unset"), false, "a newly reused credential is never cleaned by the old journal");
+    assert.equal(reused.pendingCredentialCleanups.size, 0);
+    assert.deepEqual(loadTuiConfig().pendingModelCredentialCleanups, []);
+
+    saveTuiConfig({ pendingModelCredentialCleanups: [{ ref: "B_API_KEY", route: "b", error: "old failure" }] });
+    const retryApp = fakeApp();
+    retryApp.screen = { w: 100, h: 30 };
+    const retryCalls = [];
+    retryApp.api.call = async (method, payload) => {
+      retryCalls.push([method, payload]);
+      if (method === "settings.describe") return { namespaces: [{ ns: "llm-pi-ai", revision: 6, value: { providers: {} } }], writable: true };
+      return {};
+    };
+    const retry = new ModelPanel(retryApp);
+    await retry.load();
+    assert.deepEqual(retryCalls.find(([method]) => method === "credentials.unset")?.[1], { ref: "B_API_KEY" }, "restart resumes orphan cleanup");
+    assert.equal(retry.pendingCredentialCleanups.size, 0);
+    assert.deepEqual(loadTuiConfig().pendingModelCredentialCleanups, []);
+
+    saveTuiConfig({ pendingModelCredentialCleanups: [{ ref: "MY_GW_API_KEY", route: "My_GW", error: "old failure" }] });
+    const legacyApp = fakeApp();
+    legacyApp.screen = { w: 100, h: 30 };
+    const legacyCalls = [];
+    legacyApp.api.call = async (method, payload) => {
+      legacyCalls.push([method, payload]);
+      if (method === "settings.describe") return { namespaces: [{ ns: "llm-pi-ai", revision: 7, value: { providers: {} } }], writable: true };
+      return {};
+    };
+    const legacy = new ModelPanel(legacyApp);
+    await legacy.load();
+    assert.deepEqual(legacyCalls.find(([method]) => method === "credentials.unset")?.[1], { ref: "MY_GW_API_KEY" }, "legacy route names retain their durable cleanup task");
+    assert.equal(legacy.pendingCredentialCleanups.size, 0);
+  } finally {
+    saveTuiConfig({ pendingModelCredentialCleanups: [] });
+  }
+});
+
+test("ModelPanel: cleanup reconciliation failure never unsets and keep clears the journal", async () => {
+  saveTuiConfig({ pendingModelCredentialCleanups: [{ ref: "OLD_API_KEY", route: "old", error: "old failure" }] });
+  try {
+    const app = fakeApp();
+    app.screen = { w: 100, h: 30 };
+    const calls = [];
+    app.api.call = async (method, payload) => {
+      calls.push([method, payload]);
+      if (method === "settings.describe") throw new Error("host offline");
+      return {};
+    };
+    const panel = new ModelPanel(app);
+    await panel.load();
+    assert.equal(calls.some(([method]) => method === "credentials.unset"), false, "cleanup waits for authoritative provider state");
+    assert.equal(panel.pendingCredentialCleanups.has("OLD_API_KEY"), true);
+    const focusedBefore = { id: "models" };
+    app.focused = focusedBefore;
+    panel.onKey({ type: "key", name: "char", key: "c" });
+    assert.equal(app.overlay?.title, "托管密钥待清理", "cleanup hotkey opens the persistent task");
+    assert.equal(app.focused, focusedBefore, "cleanup popup does not replace persistent app focus");
+    await app.overlay.onAction({ label: "保留密钥", action: "keep" });
+    assert.equal(app.focused, focusedBefore, "closing cleanup popup leaves focus on the live widget");
+    assert.equal(panel.pendingCredentialCleanups.size, 0);
+    assert.deepEqual(loadTuiConfig().pendingModelCredentialCleanups, [], "keep decision is durable");
+  } finally {
+    saveTuiConfig({ pendingModelCredentialCleanups: [] });
+  }
+});
+
+test("ModelPanel: mouse targets follow rendered preview, cleanup, and scan rows", async () => {
+  const app = fakeApp();
+  app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "settings.describe") return { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { gw: { displayName: "GW", models: [{ id: "existing" }] } } } }], writable: true };
+    if (method === "settings.mutate") return { revision: 2 };
+    if (method === "llm.discoverModels") return { models: [{ id: "m1" }, { id: "m2" }] };
+    return {};
+  };
+  const panel = new ModelPanel(app);
+  await panel.load();
+  panel.onKey({ type: "key", name: "enter" });
+  const previewLine = panel.formView.lines.findIndex((line) => line.map((glyph) => glyph.t).join("").trim() === "existing");
+  assert.ok(previewLine >= 0, "model preview row rendered");
+  assert.equal(panel.onMouse({ type: "mouse", kind: "press", button: 0, x: panel.formView.x, y: panel.formView.y + previewLine }), true, "preview is non-focusable but swallows the click");
+  assert.equal(calls.some(([method]) => method === "settings.mutate"), false, "preview click does not hit the following save action");
+
+  panel.providers.gw.displayName = "Changed";
+  const saveLine = panel.formView.lines.findIndex((line) => line.map((glyph) => glyph.t).join("").includes("保存配置"));
+  panel.formView.scrollY = Math.max(0, saveLine - 2);
+  const visibleSaveY = panel.formView.y + saveLine - panel.formView.scrollY;
+  panel.onMouse({ type: "mouse", kind: "press", button: 0, x: panel.formView.x, y: visibleSaveY });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(calls.some(([method]) => method === "settings.mutate"), true, "scrolled save row clicks its own action after the preview row");
+  assert.ok(!app.overlay, "save click does not hit delete");
+
+  panel.pendingCredentialCleanups.set("OLD_API_KEY", { route: "old", error: "offline" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label === "模型管理");
+  panel.onKey({ type: "key", name: "enter" });
+  const cleanupLine = panel.formView.lines.findIndex((line) => line.map((glyph) => glyph.t).join("").includes("OLD_API_KEY"));
+  panel.onMouse({ type: "mouse", kind: "press", button: 0, x: panel.formView.x, y: panel.formView.y + cleanupLine });
+  assert.equal(app.overlay?.title, "托管密钥待清理", "cleanup warning row opens its decision popup");
+  await app.overlay.onAction({ label: "稍后", action: "later" });
+  panel.sub.cursor = panel.subItems.findIndex((item) => item.label?.includes("自动发现"));
+  panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const m2Line = panel.formView.lines.findIndex((line) => line.map((glyph) => glyph.t).join("").includes("m2"));
+  assert.equal(panel.scanSel.has("m2"), true);
+  panel.onMouse({ type: "mouse", kind: "press", button: 0, x: panel.formView.x, y: panel.formView.y + m2Line });
+  assert.equal(panel.scanSel.has("m2"), false, "scan result remains clickable after the cleanup warning row");
+  panel.pendingCredentialCleanups.clear();
 });
 
 test("ModelPanel: Esc leaves level by level and unsaved form edits ask 保存/不保存/取消", async () => {
@@ -1095,17 +1853,30 @@ test("ModelPanel: Esc leaves level by level and unsaved form edits ask 保存/�
   await popup.onAction({ label: "💾 保存并返回", action: "save" });
   const mutate = calls.filter(([m]) => m === "settings.mutate").at(-1);
   assert.ok(mutate, "save ran through settings.mutate");
-  assert.equal(mutate[1].ops[0].value.a.displayName, "A3", "saved value persisted");
+  assert.deepEqual(mutate[1].ops.find((op) => op.path.join(".") === "providers.a.displayName")?.value, "A3", "saved value persisted through a minimal field op");
   assert.equal(panel.mode, "list", "save returned to the list");
   assert.equal(panel.savedSnapshot, JSON.stringify(panel.providers), "clean after save");
-  // ← leaves through the same ask-first path
+  // a Host/CAS failure keeps the user in the form with the draft intact
   panel.onKey({ type: "key", name: "enter" });
   panel.formIdx = fieldIdx("显示名");
   panel.onKey({ type: "key", name: "enter" });
   popup = app.overlay;
   popup.input.onKey({ type: "key", name: "end" });
-  popup.input.onKey({ type: "text", text: "4" });
+  popup.input.onKey({ type: "text", text: "X" });
   popup.onKey({ type: "key", name: "enter" });
+  app.api.call = async (m, p) => {
+    calls.push([m, p]);
+    if (m === "settings.mutate") throw new Error("revision conflict");
+    return {};
+  };
+  panel.onKey({ type: "key", name: "escape" });
+  popup = app.overlay;
+  await popup.onAction({ label: "💾 保存并返回", action: "save" });
+  assert.equal(panel.mode, "form", "failed save stays in the provider form");
+  assert.equal(panel.providers.a.displayName, "A3X", "failed save preserves the draft");
+  assert.notEqual(panel.savedSnapshot, JSON.stringify(panel.providers), "failed save remains dirty");
+  assert.match(app.toastMsg, /revision conflict/);
+  // ← leaves through the same ask-first path
   panel.onKey({ type: "key", name: "left" });
   assert.ok(app.overlay?.buttons?.length === 3, "← also asks about unsaved changes");
   await app.overlay.onAction({ label: "取消", action: "cancel" });

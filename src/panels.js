@@ -2250,6 +2250,17 @@ export class EditPopup extends Popup {
  *  same union the web settings page reads out of the namespace schema, so the
  *  choices offered here cannot drift from the ones the host validates. */
 const API_PROTOCOLS = ["openai-completions", "openai-responses", "anthropic-messages"];
+/** pi-ai reasoning levels the adapter schema accepts, in escalation order. */
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+/** Request modalities the pi-ai adapter schema accepts (audio is NOT one of
+ *  them: the adapter rejects any profile that tries to declare it). */
+const INPUT_MODALITIES = ["text", "image"];
+/** Adapter fallback when neither a model nor its installed catalog declares input. */
+const DEFAULT_INPUT_MODALITIES = ["text"];
+/** compat.thinkingFormat spellings the adapter accepts on openai-completions. */
+const THINKING_FORMATS = ["openai", "deepseek", "openrouter", "together", "zai", "qwen", "string-thinking", "ant-ling"];
+/** New custom routes follow the web editor's unambiguous identifier grammar. */
+const ROUTE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 /** Credential reference names must be POSIX shell identifiers. */
 const KEY_REF_OK = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** The web settings page's v1 convention: a provider route's key lives under
@@ -2258,15 +2269,77 @@ function deriveKeyRef(provider) {
   return `${provider.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`;
 }
 
+/** Keep untrusted catalog/profile text inside one terminal row. */
+function inlineLabel(value) {
+  return String(value ?? "").replace(/[\x00-\x1F\x7F]/g, "?");
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function cloneConfig(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+/** Remove paths owned by the stored user layer, leaving inherited fallback. */
+function withoutOwned(resolved, owned) {
+  if (!isRecord(resolved)) return {};
+  const result = {};
+  const stored = isRecord(owned) ? owned : {};
+  for (const [key, value] of Object.entries(resolved)) {
+    if (!Object.hasOwn(stored, key)) result[key] = value;
+    else if (isRecord(value) && isRecord(stored[key])) {
+      const child = withoutOwned(value, stored[key]);
+      if (Object.keys(child).length > 0) result[key] = child;
+    }
+  }
+  return result;
+}
+
+function mergeConfig(inherited, draft) {
+  const result = { ...(isRecord(inherited) ? inherited : {}) };
+  for (const [key, value] of Object.entries(isRecord(draft) ? draft : {})) {
+    result[key] = isRecord(value) && isRecord(result[key]) ? mergeConfig(result[key], value) : value;
+  }
+  return result;
+}
+
+/** Minimal user-layer operations for the provider fields this panel changed. */
+function providerOps(before, after, wholeRoutes = new Set()) {
+  const ops = [];
+  for (const [route, profile] of Object.entries(after)) {
+    const previous = before[route];
+    if (previous === undefined && wholeRoutes.has(route)) {
+      ops.push({ op: "set", path: ["providers", route], value: profile });
+      continue;
+    }
+    const priorFields = previous ?? {};
+    for (const [field, value] of Object.entries(profile)) {
+      if (JSON.stringify(priorFields[field]) === JSON.stringify(value)) continue;
+      ops.push({ op: "set", path: ["providers", route, field], value });
+    }
+    for (const field of Object.keys(priorFields)) {
+      if (!(field in profile)) ops.push({ op: "unset", path: ["providers", route, field] });
+    }
+  }
+  for (const route of Object.keys(before)) {
+    if (!(route in after)) ops.push({ op: "unset", path: ["providers", route] });
+  }
+  return ops;
+}
+
 export class ModelPanel extends Widget {
   constructor(app) {
     super({ x: 30, y: 0, w: app.screen.w - 30, h: app.screen.h - 1 });
     this.app = app;
-    this.providers = {};   // route → profile (mirror of settings llm-pi-ai.providers)
+    this.providers = {};         // route → user-layer profile draft
+    this.resolvedProviders = {};  // route → effective profile received from Host
+    this.inheritedProviders = {}; // route → effective fields not owned by loaded user layer
+    this.baseProviders = {};      // route → composition-owned profile (not removable here)
     this.revision = 0;
-    this.defaultModelRevision = 0;
-    this.defaultModel = null;
     this.loaded = false;
+    this.writable = true;
     this.routes = [];
     this.sel = 0;          // list cursor (routes.length = the ＋ 添加供应商 row)
     this.mode = "list";    // list | form
@@ -2282,8 +2355,31 @@ export class ModelPanel extends Widget {
     this.scanSel = new Set();
     this.scanCursor = 0;
     this.scanning = false;
-    this.savedSnapshot = "{}"; // JSON of the last saved/loaded providers (dirty check)
+    this.savedSnapshot = "{}"; // last fully successful providers+credentials save point
+    this.hostSnapshot = "{}";  // provider settings last confirmed by the Host
     this.keyStatus = {};       // ref → {configured, writable, source} from credentials.describe
+    this.pendingProbeKeys = new Map(); // route → write-only key draft for discovery and save
+    // Journal managed cleanup on the App and in tui-config before provider
+    // deletion. Closing/recreating this panel cannot lose the retry surface;
+    // this map contains references and errors, never credential values.
+    if (!(app.pendingModelCredentialCleanups instanceof Map)) {
+      const savedCleanups = loadTuiConfig().pendingModelCredentialCleanups;
+      app.pendingModelCredentialCleanups = new Map((Array.isArray(savedCleanups) ? savedCleanups : []).flatMap((item) => {
+        const ref = typeof item?.ref === "string" ? item.ref : "";
+        const route = typeof item?.route === "string" ? item.route : "";
+        // Only this panel's route-derived managed credentials may ever enter the
+        // automatic cleanup path. Existing Host configs may predate the route
+        // grammar enforced for new drafts, so do not reject legacy route names.
+        if (!route || ref !== deriveKeyRef(route)) return [];
+        return [[ref, {
+          route,
+          error: typeof item.error === "string" ? item.error : "等待重试",
+          reconcile: item.reconcile === true,
+        }]];
+      }));
+    }
+    this.pendingCredentialCleanups = app.pendingModelCredentialCleanups; // ref → {route, error}
+    this.formClickMap = [];    // rendered form line → item, scan result, or cleanup action
     const listW = 26;
     this.listView = new ScrollView({ x: this.x + 1, y: this.y + 1, w: listW, h: this.h - 2, showScrollbar: true });
     this.formView = new ScrollView({ x: this.x + listW + 1, y: this.y + 1, w: this.w - listW - 2, h: this.h - 2, showScrollbar: true });
@@ -2295,21 +2391,191 @@ export class ModelPanel extends Widget {
     this.formView.x = x + listW + 1; this.formView.y = y + 1; this.formView.w = w - listW - 2; this.formView.h = h - 2;
   }
   async load() {
+    if (this.loaded && this.#dirty()) {
+      this.app.toast("模型配置仍有未保存修改");
+      this.#rebuild();
+      this.app.redraw();
+      return;
+    }
+    this.pendingProbeKeys.clear();
+    let described = false;
+    let providerState = null;
     try {
       const d = await this.app.api.call("settings.describe");
       const ns = (d.namespaces ?? []).find((n) => n.ns === "llm-pi-ai");
-      const defaults = (d.namespaces ?? []).find((n) => n.ns === "agent-default-model");
-      this.providers = { ...(ns?.value?.providers ?? {}) };
+      const hasLayerView = ns && (Object.hasOwn(ns, "user") || Object.hasOwn(ns, "base"));
+      const configured = hasLayerView ? ns.user?.providers : ns?.value?.providers;
+      this.providers = { ...(configured ?? {}) };
+      this.resolvedProviders = { ...(ns?.value?.providers ?? this.providers) };
+      this.baseProviders = { ...(ns?.base?.providers ?? {}) };
+      this.inheritedProviders = Object.fromEntries(Object.entries(this.resolvedProviders).map(([route, profile]) => [
+        route,
+        mergeConfig(withoutOwned(profile, this.providers[route]), this.baseProviders[route]),
+      ]));
       this.revision = ns?.revision ?? 0;
-      this.defaultModel = defaults?.value ? { ...defaults.value } : null;
-      this.defaultModelRevision = defaults?.revision ?? 0;
-      this.routes = Object.keys(this.providers);
+      this.writable = d.writable !== false;
+      this.#syncRoutes();
+      this.sel = Math.max(0, Math.min(this.sel, this.routes.length));
+      providerState = this.#providerStateFromDescription(d);
+      described = providerState !== null;
     } catch (e) { this.app.toast(`模型配置加载失败: ${e.message}`); }
     this.savedSnapshot = JSON.stringify(this.providers);
+    this.hostSnapshot = this.savedSnapshot;
+    const cleanup = described
+      ? await this.#retryPendingCredentialCleanups({ notify: false, providerState })
+      : { completed: [], failed: [] };
     await this.#refreshKeys();
+    if (cleanup.failed.length > 0) this.#showCredentialCleanupFailure(cleanup.failed[0]);
+    else if (cleanup.completed.length > 0) this.app.toast(`已清理托管密钥 ${cleanup.completed.join("、")}`);
     this.loaded = true;
     this.modelsSel = -1;
     this.#rebuild();
+    this.app.redraw();
+  }
+  #persistCredentialCleanups() {
+    return saveTuiConfig({
+      pendingModelCredentialCleanups: [...this.pendingCredentialCleanups].map(([ref, task]) => ({
+        ref,
+        route: task.route,
+        error: task.error,
+        ...(task.reconcile ? { reconcile: true } : {}),
+      })),
+    });
+  }
+  #providerStateFromDescription(description) {
+    const ns = (description?.namespaces ?? []).find((item) => item.ns === "llm-pi-ai");
+    if (!isRecord(ns?.value) || !isRecord(ns.value.providers)) return null;
+    const providers = ns.value.providers;
+    const routes = new Set(Object.keys(providers));
+    const refs = new Set(Object.entries(providers).map(([route, profile]) => {
+      const configured = isRecord(profile) && typeof profile.apiKeyEnv === "string" ? profile.apiKeyEnv : "";
+      return configured || deriveKeyRef(route);
+    }));
+    return { routes, refs };
+  }
+  #providerStateFromProfiles(providers) {
+    return this.#providerStateFromDescription({ namespaces: [{ ns: "llm-pi-ai", value: { providers } }] });
+  }
+  #cleanupRouteReserved(route) {
+    return [...this.pendingCredentialCleanups.values()].some((task) => task.route === route);
+  }
+  async #retryPendingCredentialCleanups({ onlyRef = null, notify = true, providerState = null } = {}) {
+    const targets = [...this.pendingCredentialCleanups].filter(([ref]) => onlyRef === null || ref === onlyRef);
+    if (targets.length === 0) return { completed: [], preserved: [], failed: [], persisted: true };
+    const before = new Map([...this.pendingCredentialCleanups].map(([ref, task]) => [ref, { ...task }]));
+    const completed = [], preserved = [], failed = [];
+    let state = providerState;
+    if (state === null) {
+      try {
+        state = this.#providerStateFromDescription(await this.app.api.call("settings.describe"));
+        if (state === null) throw new Error("llm-pi-ai 配置暂不可用");
+      } catch (error) {
+        const message = `无法核对 Host 模型配置: ${String(error?.message ?? error).slice(0, 500)}`;
+        for (const [ref, task] of targets) {
+          const failure = { ref, route: task.route, error: message, reconcile: task.reconcile === true };
+          this.pendingCredentialCleanups.set(ref, { route: task.route, error: message, reconcile: task.reconcile === true });
+          failed.push(failure);
+        }
+      }
+    }
+    if (state !== null) {
+      for (const [ref, task] of targets) {
+        // Any effective Host profile may reuse this reference. In that case the
+        // old deletion task resolves by preservation, never by an unset.
+        if (state.refs.has(ref)) {
+          this.pendingCredentialCleanups.delete(ref);
+          preserved.push(ref);
+          continue;
+        }
+        // A pre-mutation journal survives ambiguous transport failures. If its
+        // route now exists with another reference, do not guess whether it was
+        // recreated; require an explicit keep decision.
+        if (task.reconcile && state.routes.has(task.route)) {
+          const message = `路由 ${task.route} 仍存在，无法自动确认旧密钥可清理`;
+          const failure = { ref, route: task.route, error: message, reconcile: true };
+          this.pendingCredentialCleanups.set(ref, { route: task.route, error: message, reconcile: true });
+          failed.push(failure);
+          continue;
+        }
+        try {
+          await this.app.api.call("credentials.unset", { ref });
+          this.pendingCredentialCleanups.delete(ref);
+          completed.push(ref);
+        } catch (error) {
+          const message = String(error?.message ?? error).slice(0, 500);
+          const failure = { ref, route: task.route, error: message };
+          this.pendingCredentialCleanups.set(ref, { route: task.route, error: message });
+          failed.push(failure);
+        }
+      }
+    }
+    const persisted = this.#persistCredentialCleanups();
+    if (!persisted) {
+      this.pendingCredentialCleanups.clear();
+      for (const [ref, task] of before) this.pendingCredentialCleanups.set(ref, task);
+      completed.length = 0;
+      preserved.length = 0;
+      failed.length = 0;
+      for (const [ref, task] of targets) failed.push({
+        ref,
+        route: task.route,
+        error: "待清理密钥状态无法写入 tui-config.json",
+        reconcile: task.reconcile === true,
+      });
+    }
+    if (notify) {
+      if (failed.length > 0) this.app.toast(`托管密钥清理失败: ${failed[0].error}`);
+      else if (completed.length > 0) this.app.toast(`已清理托管密钥 ${completed.join("、")}`);
+      else if (preserved.length > 0) this.app.toast(`凭据 ${preserved.join("、")} 已被新配置使用，已保留`);
+    }
+    return { completed, preserved, failed, persisted };
+  }
+  #showCredentialCleanupFailure(task) {
+    const current = this.pendingCredentialCleanups.get(task.ref);
+    if (!current) return;
+    const ref = task.ref;
+    const error = current.error || task.error || "未知错误";
+    const w = Math.max(30, Math.min(72, this.app.screen.w - 4));
+    this.app.overlay = new Popup({
+      x: Math.max(0, Math.floor((this.app.screen.w - w) / 2)),
+      y: Math.max(0, Math.floor(this.app.screen.h / 2) - 4),
+      w, h: Math.min(9, this.app.screen.h), title: "托管密钥待清理",
+      lines: [
+        [{ t: current.reconcile
+          ? ` 供应商 ${inlineLabel(current.route)} 的删除结果待核对，${ref} 暂不清理。`
+          : ` 供应商 ${inlineLabel(current.route)} 已删除，但 ${ref} 尚未清理。`, fg: K.WARN }],
+        [{ t: ` ${truncate(inlineLabel(error), w - 4)}`, fg: K.DIM }],
+        [{ t: " 可立即重试；保留密钥会停止后续自动清理。", fg: K.TXT }],
+      ],
+      buttons: [
+        { label: "稍后", action: "later" },
+        { label: "重试清理", action: "retry" },
+        { label: "保留密钥", action: "keep" },
+      ],
+      onAction: async (button) => {
+        if (button?.action === "retry") {
+          this.app.closeOverlay();
+          const result = await this.#retryPendingCredentialCleanups({ onlyRef: ref });
+          await this.#refreshKeys();
+          if (result.failed.length > 0) this.#showCredentialCleanupFailure(result.failed[0]);
+        } else if (button?.action === "keep") {
+          const saved = this.pendingCredentialCleanups.get(ref);
+          this.pendingCredentialCleanups.delete(ref);
+          if (!this.#persistCredentialCleanups()) {
+            this.pendingCredentialCleanups.set(ref, saved);
+            this.app.toast("无法保存保留决定，清理任务仍待处理");
+          } else {
+            this.app.closeOverlay();
+            this.app.toast(`已保留 ${ref}，不会再自动清理`);
+          }
+        } else {
+          this.app.closeOverlay();
+          this.app.toast(`${ref} 仍待清理`);
+        }
+        this.#rebuild();
+        this.app.redraw();
+      },
+    });
     this.app.redraw();
   }
   /** One batched credentials.describe over every referenced key, exactly like
@@ -2331,8 +2597,36 @@ export class ModelPanel extends Widget {
     const p = this.#profile(route);
     return (p.apiKeyEnv && p.apiKeyEnv.length > 0) ? p.apiKeyEnv : deriveKeyRef(route);
   }
+  #syncRoutes() {
+    this.routes = [...new Set([...Object.keys(this.resolvedProviders), ...Object.keys(this.providers)])];
+  }
   #route() { return this.routes[this.sel] ?? null; }
-  #profile(route) { return route == null ? null : this.providers[route] ?? {}; }
+  #draftProfile(route) {
+    if (route == null) return null;
+    this.providers[route] ??= {};
+    return this.providers[route];
+  }
+  #profile(route) {
+    if (route == null) return null;
+    return mergeConfig(this.inheritedProviders[route], this.providers[route]);
+  }
+  #models(route, { mutable = false } = {}) {
+    const draft = mutable ? this.#draftProfile(route) : this.providers[route];
+    if (mutable && !Array.isArray(draft.models)) draft.models = cloneConfig(this.#profile(route).models ?? []);
+    return draft?.models ?? this.#profile(route).models ?? [];
+  }
+  #pruneEmptyDraft(route) {
+    if (!Object.hasOwn(JSON.parse(this.hostSnapshot), route) && Object.keys(this.providers[route] ?? {}).length === 0) {
+      delete this.providers[route];
+    }
+  }
+  #stripCompat(route) {
+    const profile = this.#draftProfile(route);
+    delete profile.compat;
+    if (this.#models(route).some((model) => model.compat !== undefined)) {
+      for (const model of this.#models(route, { mutable: true })) delete model.compat;
+    }
+  }
   #formRows() {
     const route = this.#route();
     if (route == null) return [];
@@ -2344,31 +2638,43 @@ export class ModelPanel extends Widget {
     // the api protocol is a CHOICE in the web UI (a select over the namespace
     // schema's union), so here Tab cycles the options in the form and Enter
     // opens an edit buffer with every candidate shown as an autocomplete hint
-    const api = p.api ?? "openai-completions";
+    const api = p.api ?? "";
     items.push({
       kind: "field", key: "api", label: "协议 api", value: api,
-      cycle: API_PROTOCOLS.includes(api) ? API_PROTOCOLS : [api, ...API_PROTOCOLS],
-      completions: API_PROTOCOLS, note: "Tab 切换 · Enter 输入",
+      cycle: API_PROTOCOLS.includes(api) ? API_PROTOCOLS : ["", ...(api ? [api] : []), ...API_PROTOCOLS],
+      completions: API_PROTOCOLS, note: "目录路由可留空继承 · Tab 切换",
     });
     items.push({ kind: "field", key: "baseURL", label: "baseURL", value: p.baseURL ?? "" });
-    items.push({ kind: "field", key: "reasoning", label: "默认思考强度", value: p.reasoning ?? "", cycle: ["off", "minimal", "low", "medium", "high", "xhigh"], completions: ["off", "minimal", "low", "medium", "high", "xhigh"], note: "可选 · Tab 切换" });
+    items.push({ kind: "field", key: "reasoning", label: "默认思考强度", value: p.reasoning ?? "", cycle: ["", ...THINKING_LEVELS], completions: THINKING_LEVELS, note: "留空=模型默认 · Tab 切换" });
     items.push({ kind: "field", key: "defaultContextWindow", label: "默认上下文", value: p.defaultContextWindow ?? "", numeric: true });
     items.push({ kind: "field", key: "defaultMaxTokens", label: "默认最大输出", value: p.defaultMaxTokens ?? "", numeric: true });
+    // route-level input fallback: only the modalities the pi-ai adapter schema
+    // accepts exist here (audio is absent on purpose).
+    for (const modality of INPUT_MODALITIES) {
+      items.push({ kind: "choice", key: `defaultInput.${modality}`, label: `默认输入 ${modality}`, value: (p.defaultInput ?? DEFAULT_INPUT_MODALITIES).includes(modality) ? "✓" : "·" });
+    }
+    // The adapter only applies these switches to openai-completions. Hiding
+    // them on other route protocols prevents a configuration the Host rejects.
+    if (api === "openai-completions") {
+      items.push({ kind: "field", key: "compat.thinkingFormat", label: "compat.thinkingFormat", value: p.compat?.thinkingFormat ?? "", completions: THINKING_FORMATS, note: "可选 · Tab 补全" });
+      items.push({ kind: "field", key: "compat.supportsReasoningEffort", label: "compat.supportsReasoningEffort", value: p.compat?.supportsReasoningEffort == null ? "" : String(p.compat.supportsReasoningEffort), completions: ["true", "false"], note: "可选 · true/false" });
+    }
     // the api key: web-synced handling — the stored value is NEVER shown
     // (credentials.describe is structurally value-free), only its status dot;
-    // Enter opens a masked, always-empty editor and a typed key travels one
-    // way through credentials.set under the profile's reference
+    // Enter opens a masked, always-empty editor. The typed value remains a
+    // write-only draft until save persists it through credentials.set.
     const keyRef = this.#keyRef(route);
-    items.push({ kind: "key", key: "apiKeyEnv", label: "API 密钥", ref: keyRef, action: () => this.#editKey(route, keyRef) });
-    if (this.keyStatus?.[keyRef]?.configured) items.push({ kind: "button", label: "清除 API 密钥…", action: () => this.#clearKey(keyRef) });
+    items.push({ kind: "key", key: "apiKeyEnv", label: "API 密钥", ref: keyRef, pending: this.pendingProbeKeys.has(route), action: () => this.#editKey(route, keyRef) });
+    if (this.writable && this.keyStatus?.[keyRef]?.configured && this.keyStatus[keyRef].writable !== false) items.push({ kind: "button", label: "清除 API 密钥…", action: () => this.#clearKey(route, keyRef) });
     // models are NOT flat here: one 模型管理 entry summarizing the first
     // five, which opens its own sub-buffer (scan on top, model form below)
     const models = p.models ?? [];
-    const names = models.slice(0, 5).map((m) => m.id || "（未命名）").join(" · ");
+    const names = models.slice(0, 5).map((m) => inlineLabel(m.id || "（未命名）")).join(" · ");
     items.push({ kind: "button", label: "模型管理", sub: names + (models.length > 5 ? " · …" : ""), action: () => this.#openModels() });
-    items.push({ kind: "field", key: "__defaultReasoningEffort", label: "默认 Agent 思考强度", value: this.defaultModel?.provider === route ? (this.defaultModel.reasoningEffort ?? "") : "", note: this.defaultModel?.provider === route ? `默认模型 ${this.defaultModel.model}` : "先将本路由模型设为默认" });
     items.push({ kind: "button", label: "💾 保存配置", action: () => this.#save() });
-    items.push({ kind: "button", label: "🗑 删除供应商", action: () => this.#deleteProvider() });
+    if (Object.hasOwn(this.providers, route) && !Object.hasOwn(this.baseProviders, route)) {
+      items.push({ kind: "button", label: "🗑 删除供应商", action: () => this.#deleteProvider() });
+    }
     return items;
   }
   /** The 模型管理 sub-buffer: scan first, then the model-info form rows. */
@@ -2377,7 +2683,7 @@ export class ModelPanel extends Widget {
     if (route == null) return [];
     const p = this.#profile(route);
     const items = [];
-    items.push({ kind: "button", label: "🔄 自动扫描可用模型（读 /models 端点）", action: () => this.#scan() });
+    items.push({ kind: "button", label: "🔄 自动发现可用模型", action: () => this.#scan() });
     const models = p.models ?? [];
     for (let mi = 0; mi < models.length; mi++) {
       const m = models[mi];
@@ -2387,15 +2693,29 @@ export class ModelPanel extends Widget {
         items.push({ kind: "field", key: `model.${mi}.name`, label: "  模型名", value: m.name ?? "" });
         items.push({ kind: "field", key: `model.${mi}.contextWindow`, label: "  上下文窗口", value: m.contextWindow ?? "", numeric: true });
         items.push({ kind: "field", key: `model.${mi}.maxTokens`, label: "  最大输出", value: m.maxTokens ?? "", numeric: true });
-        items.push({ kind: "choice", key: `model.${mi}.reasoningEnabled`, label: "  启用思考强度", value: m.reasoningEfforts === false ? "否" : "是", cycle: ["是", "否"] });
-        for (const level of ["off", "minimal", "low", "medium", "high", "xhigh"]) items.push({ kind: "field", key: `model.${mi}.reasoning.${level}`, label: `    ${level}`, value: m.reasoningEfforts === false ? "" : (m.reasoningEfforts?.[level] ?? (level === "off" && Object.hasOwn(m.reasoningEfforts ?? {}, level) ? "null" : "")), note: level === "off" ? "null 表示关闭" : "留空=不提供" });
-        for (const modality of ["text", "image", "audio"]) items.push({ kind: "choice", key: `model.${mi}.input.${modality}`, label: `  输入 ${modality}`, value: (m.input ?? ["text"]).includes(modality) ? "✓" : "·", cycle: ["✓", "·"] });
+        const reasoningState = m.reasoningEfforts === undefined ? "继承" : m.reasoningEfforts === false ? "关闭" : "自定义";
+        items.push({ kind: "choice", key: `model.${mi}.reasoningMode`, label: "  思考能力", value: reasoningState, cycle: ["继承", "关闭", "自定义"] });
+        if (reasoningState === "自定义") {
+          for (const level of THINKING_LEVELS) {
+            const declared = Object.hasOwn(m.reasoningEfforts, level);
+            const value = declared && m.reasoningEfforts[level] === null ? "null" : declared ? m.reasoningEfforts[level] : "";
+            items.push({ kind: "field", key: `model.${mi}.reasoning.${level}`, label: `    ${level}`, value, note: level === "off" ? "null 表示关闭" : "至少填写一种非 off 强度" });
+          }
+        }
+        const inputState = m.input === undefined || m.input.length === 0 ? "继承" : "自定义";
+        items.push({ kind: "choice", key: `model.${mi}.inputMode`, label: "  输入能力", value: inputState, cycle: ["继承", "自定义"] });
+        if (inputState === "自定义") {
+          for (const modality of INPUT_MODALITIES) items.push({ kind: "choice", key: `model.${mi}.input.${modality}`, label: `    ${modality}`, value: m.input.includes(modality) ? "✓" : "·", cycle: ["✓", "·"] });
+        }
+        if (p.api === "openai-completions") {
+          items.push({ kind: "field", key: `model.${mi}.compat.thinkingFormat`, label: "  compat.thinkingFormat", value: m.compat?.thinkingFormat ?? "", completions: THINKING_FORMATS, note: "可选 · Tab 补全" });
+          items.push({ kind: "field", key: `model.${mi}.compat.supportsReasoningEffort`, label: "  compat.supportsReasoningEffort", value: m.compat?.supportsReasoningEffort == null ? "" : String(m.compat.supportsReasoningEffort), completions: ["true", "false"], note: "可选 · true/false" });
+        }
       }
     }
     items.push({ kind: "button", label: "＋ 添加模型", action: () => this.#addModel() });
     items.push({ kind: "button", label: "🗑 删除选中模型", action: () => this.#deleteModel() });
-    items.push({ kind: "button", label: "◉ 设为当前会话模型（选中模型）", action: () => this.#setDefaultModel() });
-    items.push({ kind: "button", label: "★ 设为默认 Agent/Subagent 目标", action: () => this.#setAgentDefault() });
+    items.push({ kind: "button", label: "◉ 设为当前会话及后续 Agent 默认模型", action: () => this.#setDefaultModel() });
     return items;
   }
   #openModels() {
@@ -2410,35 +2730,50 @@ export class ModelPanel extends Widget {
     const listLines = [];
     for (let i = 0; i < this.routes.length; i++) {
       const r = this.routes[i];
-      const p = this.providers[r] ?? {};
+      const p = this.#profile(r);
       const cur = i === this.sel;
       const editing = cur && this.mode === "form";
       listLines.push([{
-        t: ` ${cur ? "●" : " "} ${truncate(p.displayName || r, 18)}${editing ? " ✎" : ""}`,
+        t: ` ${cur ? "●" : " "} ${truncate(inlineLabel(p.displayName || r), 18)}${editing ? " ✎" : ""}`,
         fg: cur ? T.SELFG : T.TXT, bg: cur ? (editing ? T.MENUSEL : T.SELBG) : T.BG2, bold: cur,
       }]);
     }
     const addCur = this.sel === this.routes.length;
     listLines.push([{ t: ` ${addCur ? "●" : " "} ＋ 添加供应商`, fg: addCur ? T.SELFG : T.ACCENT, bg: addCur ? T.MENUSEL : T.BG2, bold: true }]);
     this.listView.setLines(listLines);
-    // right form
+
+    // Keep a target beside every rendered row. Titles, previews and help text
+    // deliberately map to null, so extra visual rows cannot shift mouse clicks
+    // onto the following form action.
     const route = this.#route();
     const formLines = [];
+    this.formClickMap = [];
+    const pushForm = (line, target = null) => {
+      formLines.push(line);
+      this.formClickMap.push(target);
+    };
+    for (const [ref, task] of this.pendingCredentialCleanups) {
+      pushForm([{
+        t: truncate(`  ⚠ ${ref} 待清理 (${inlineLabel(task.error)}) · [c 处理]`, Math.max(20, this.formView.w - 4)),
+        fg: K.WARN, bold: true,
+      }], { type: "cleanup", ref });
+    }
     if (route == null) {
-      formLines.push([{ t: "  左侧 ↑/↓ 选择供应商,Enter 打开编辑", fg: K.FAINT }]);
-      formLines.push([{ t: "  把光标移到底部的“＋ 添加供应商”回车即可新建", fg: K.FAINT }]);
-      formLines.push([{ t: "  Esc 退出供应商配置", fg: K.FAINT }]);
+      pushForm([{ t: "  左侧 ↑/↓ 选择供应商,Enter 打开编辑", fg: K.FAINT }]);
+      pushForm([{ t: "  把光标移到底部的“＋ 添加供应商”回车即可新建", fg: K.FAINT }]);
+      pushForm([{ t: "  高级字段(modelOverrides/headers/重试/超时/transport)在 设置 → llm-pi-ai 编辑", fg: K.FAINT }]);
+      pushForm([{ t: "  Esc 退出供应商配置", fg: K.FAINT }]);
       this.formItems = [];
     } else if (this.scanMode) {
-      formLines.push([{ t: `  扫描 ${truncate(this.#profile(route).baseURL ?? "", 44)} — 空格勾选,Enter 添加,↑/↓ 移动`, fg: K.ACCENT, bold: true }]);
-      if (this.scanning) formLines.push([{ t: "  扫描中…", fg: K.WARN }]);
+      pushForm([{ t: `  扫描 ${truncate(inlineLabel(this.#profile(route).baseURL), 44)} — 空格勾选,Enter 添加,↑/↓ 移动`, fg: K.ACCENT, bold: true }]);
+      if (this.scanning) pushForm([{ t: "  扫描中…", fg: K.WARN }]);
       for (let i = 0; i < this.scanItems.length; i++) {
         const m = this.scanItems[i];
         const on = this.scanSel.has(m.id);
         const cur = i === this.scanCursor;
-        formLines.push([{ t: `  ${cur ? "▸" : " "} [${on ? "x" : " "}] ${truncate(m.id, this.formView.w - 10)}`, fg: on ? K.OK : cur ? T.TXT : K.DIM, bg: cur ? T.MENUSEL : T.BG2 }]);
+        pushForm([{ t: `  ${cur ? "▸" : " "} [${on ? "x" : " "}] ${truncate(inlineLabel(m.id), this.formView.w - 10)}`, fg: on ? K.OK : cur ? T.TXT : K.DIM, bg: cur ? T.MENUSEL : T.BG2 }], { type: "scan", index: i });
       }
-      formLines.push([{ t: "  Enter 添加选中 · Esc 取消扫描", fg: K.FAINT }]);
+      pushForm([{ t: "  Enter 添加选中 · Esc 取消扫描", fg: K.FAINT }]);
       this.formItems = [];
     } else {
       const isSub = this.sub != null;
@@ -2447,36 +2782,37 @@ export class ModelPanel extends Widget {
       else this.formItems = items;
       const w = Math.max(30, this.formView.w - 4);
       const cursor = isSub ? this.sub.cursor : this.formIdx;
-      if (isSub) formLines.push([{ t: `  模型管理 — ${truncate(this.#profile(route).displayName || route, 30)}  (Esc 返回)`, fg: K.ACCENT, bold: true }]);
+      if (isSub) pushForm([{ t: `  模型管理 — ${truncate(inlineLabel(this.#profile(route).displayName || route), 30)}  (Esc 返回)`, fg: K.ACCENT, bold: true }]);
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
         const cur = i === cursor;
         let t;
         if (it.kind === "field" || it.kind === "choice") {
-          const v = it.value === "" || it.value == null ? "（空）" : String(it.value);
+          const v = it.value === "" || it.value == null ? "（空）" : inlineLabel(it.value);
           t = ` ${cur ? "▸" : " "} ${it.label}: ${truncate(v, w - strWidth(it.label) - 6)}${it.note ? `  [${it.note}]` : ""}`;
         } else if (it.kind === "key") {
           // status dot + reference, NEVER the value (web-synced posture)
           const st = this.keyStatus?.[it.ref];
-          const status = st?.configured ? "● 已配置" : "○ 未配置";
+          const status = it.pending ? "◐ 待保存" : st?.configured ? "● 已配置" : "○ 未配置";
           const ro = st && st.writable === false ? " [只读]" : "";
           t = ` ${cur ? "▸" : " "} ${it.label}: ${status}${ro} (${it.ref})`;
         } else if (it.kind === "model") {
           const extras = [it.ctx != null ? `ctx ${it.ctx}` : "", it.max != null ? `max ${it.max}` : ""].filter(Boolean).join(" ");
-          t = ` ${cur ? "▸" : " "} 模型 ${truncate(it.id || "（未命名）", 24)}  ${truncate(it.name || "", 20)}  ${truncate(extras, 24)}`;
+          t = ` ${cur ? "▸" : " "} 模型 ${truncate(inlineLabel(it.id || "（未命名）"), 24)}  ${truncate(inlineLabel(it.name || ""), 20)}  ${truncate(extras, 24)}`;
         } else {
           t = ` ${cur ? "▸" : " "} ${it.label}`;
         }
-        formLines.push([{ t: truncate(t, w), fg: cur ? T.SELFG : T.TXT, bg: cur ? T.MENUSEL : T.BG2 }]);
+        pushForm([{ t: truncate(t, w), fg: cur ? T.SELFG : T.TXT, bg: cur ? T.MENUSEL : T.BG2 }], { type: "item", index: i, sub: isSub });
         // the 模型管理 preview: an indented, non-focusable summary line
         if (!isSub && it.kind === "button" && it.sub) {
-          formLines.push([{ t: `       ${truncate(it.sub, w - 8)}`, fg: K.FAINT, bg: T.BG2 }]);
+          pushForm([{ t: `       ${truncate(it.sub, w - 8)}`, fg: K.FAINT, bg: T.BG2 }]);
         }
       }
-      formLines.push([{ t: isSub
+      pushForm([{ t: isSub
         ? "  ↑/↓ 移动 · Enter 编辑或执行 · Esc 返回供应商"
         : "  ↑/↓ 移动 · → 进入选项 · ← 返回列表 · Enter 编辑或执行 · Tab 切换选项 · Esc 返回列表", fg: K.FAINT }]);
     }
+    if (!this.writable) pushForm([{ t: "  模型配置只读 · 可浏览、发现模型和切换当前会话模型", fg: K.WARN }]);
     this.formView.setLines(formLines);
   }
   render(screen) {
@@ -2511,15 +2847,14 @@ export class ModelPanel extends Widget {
     if (!/^[\x21-\x7E]+$/.test(value)) return "密钥只能包含可打印 ASCII 字符";
     return null;
   }
-  /** Edit the API key value the web-synced way: a masked, always-empty editor
-   *  (the stored value is never read back), a non-empty commit travels one way
-   *  through credentials.set under the profile's reference, an empty commit
-   *  keeps the existing key. */
-  #clearKey(ref) {
+  /** Edit the API key value the web-synced way: a masked, always-empty editor.
+   *  The stored value is never read back; a non-empty commit stays write-only
+   *  until #save persists it, while an empty commit keeps the existing key. */
+  #clearKey(route, ref) {
     const confirm = new Popup({ x: Math.max(1, Math.floor(this.app.screen.w / 2) - 28), y: Math.max(1, Math.floor(this.app.screen.h / 2) - 3), w: Math.min(56, this.app.screen.w - 2), h: 7, title: "清除 API 密钥", lines: [[{ t: ` 确认从凭据存储中清除 ${ref}？`, fg: K.WARN }]], buttons: [{ label: "取消", action: "cancel" }, { label: "确认清除", action: "clear" }], onAction: async (btn) => {
-      this.app.overlay = this;
+      this.app.closeOverlay();
       if (btn.action !== "clear") { this.app.redraw(); return; }
-      try { await this.app.api.call("credentials.unset", { ref }); this.app.toast(`已清除 ${ref}`); await this.#refreshKeys(); this.#rebuild(); }
+      try { await this.app.api.call("credentials.unset", { ref }); this.pendingProbeKeys.delete(route); this.app.toast(`已清除 ${ref}`); await this.#refreshKeys(); this.#rebuild(); }
       catch (e) { this.app.toast(`清除密钥失败: ${e.message}`); }
       this.app.redraw();
     } });
@@ -2531,6 +2866,7 @@ export class ModelPanel extends Widget {
       return;
     }
     const st = this.keyStatus?.[ref];
+    if (st?.writable === false) { this.app.toast(`${ref} 为只读凭据`); return; }
     const popup = new EditPopup(this.app, {
       title: `设置 API 密钥 — ${ref}`,
       value: "",
@@ -2542,18 +2878,13 @@ export class ModelPanel extends Widget {
         if (failure) { this.app.toast(failure); this.#rebuild(); this.app.redraw(); return; }
         const v = text.trim();
         if (v === "") { this.app.toast("未输入新密钥,保持原值不变"); this.#rebuild(); this.app.redraw(); return; }
-        try {
-          await this.app.api.call("credentials.set", { ref, value: v });
-          this.app.toast(`密钥已写入 ${ref}`);
-          const p = this.#profile(route);
-          if (!p.apiKeyEnv) {
-            // the web create flow records the derived reference in the profile;
-            // persist it with the provider save
-            p.apiKeyEnv = ref;
-            this.app.toast(`已记录 apiKeyEnv · 点💾保存配置使供应商生效`);
-          }
-          await this.#refreshKeys();
-        } catch (e) { this.app.toast(`密钥写入失败: ${e.message}`); }
+        // Like the web editor, keep the typed value only in this write-only
+        // draft. #save persists settings first, then writes the credential.
+        this.pendingProbeKeys.set(route, v);
+        if (!this.providers[route]?.apiKeyEnv && !this.inheritedProviders[route]?.apiKeyEnv) {
+          this.#draftProfile(route).apiKeyEnv = ref;
+        }
+        this.app.toast(`密钥待保存到 ${ref} · 可先用于自动发现`);
         this.#rebuild();
         this.app.redraw();
       },
@@ -2563,11 +2894,12 @@ export class ModelPanel extends Widget {
     this.app.redraw();
   }
   #addProvider() {
-    let name = "新供应商", i = 2;
-    while (this.providers[name] !== undefined) name = `新供应商${i++}`;
-    this.providers[name] = { displayName: "", api: "openai-completions", baseURL: "", apiKeyEnv: "", models: [] };
+    if (!this.writable) { this.app.toast("模型配置为只读"); return; }
+    let name = "new-provider", i = 2;
+    while (this.routes.includes(name) || this.#cleanupRouteReserved(name) || this.pendingCredentialCleanups.has(deriveKeyRef(name))) name = `new-provider-${i++}`;
+    this.providers[name] = { api: "openai-completions", defaultInput: [...DEFAULT_INPUT_MODALITIES], models: [] };
     this.draftRoute = name;
-    this.routes = Object.keys(this.providers);
+    this.#syncRoutes();
     this.sel = this.routes.indexOf(name);
     this.mode = "form";
     this.formIdx = 0;
@@ -2592,51 +2924,136 @@ export class ModelPanel extends Widget {
     const it = items[idx];
     if (!it) return;
     const route = this.#route();
-    const p = this.#profile(route);
+    const effective = this.#profile(route);
+    const settingsMutation = it.kind === "field" || it.kind === "choice" || it.kind === "key"
+      || (it.kind === "button" && /保存配置|删除供应商|添加模型|删除选中模型|清除 API 密钥/.test(it.label));
+    if (!this.writable && settingsMutation) { this.app.toast("模型配置为只读"); return; }
     if (it.kind === "field") {
       // Enter always opens the standalone edit buffer; Tab (handled in onKey)
       // cycles a field that declares cycle options, and the buffer itself
       // offers every completion as an autocomplete hint
       this.#startEdit(it.label, it.value, (text) => {
+        if (it.key === "api" && text.trim() && !API_PROTOCOLS.includes(text.trim())) { this.app.toast(`协议 ${text.trim()} 不受支持`); return; }
+        if (it.key === "reasoning" && text.trim() && !THINKING_LEVELS.includes(text.trim())) { this.app.toast(`思考强度 ${text.trim()} 不受支持`); return; }
+        if (it.numeric) {
+          const candidate = text.trim() === "" ? undefined : Number(text);
+          if (candidate !== undefined && (!Number.isInteger(candidate) || candidate <= 0)) { this.app.toast("请输入正整数"); return; }
+        }
+        if (it.key !== "route" && text.trim() === String(it.value ?? "").trim()) return;
+        const p = this.#draftProfile(route);
         if (it.key === "route") {
-          // renaming the route key
-          const t = text.trim() || route;
-          if (t !== route && this.providers[t] !== undefined) { this.app.toast(`路由 ${t} 已存在`); return; }
+          const t = text.trim();
+          if (!ROUTE_PATTERN.test(t)) { this.app.toast("路由名须以小写字母开头，只能包含小写字母、数字和单连字符"); return; }
+          if (t !== route && this.routes.includes(t)) { this.app.toast(`路由 ${t} 已存在`); return; }
+          if (t !== route && (this.#cleanupRouteReserved(t) || this.pendingCredentialCleanups.has(deriveKeyRef(t)))) {
+            this.app.toast(`路由 ${t} 的托管密钥仍待处理，请先完成清理`);
+            return;
+          }
           if (t !== route) {
-            this.providers[t] = this.providers[route];
+            const profile = this.providers[route];
+            const oldDerivedRef = deriveKeyRef(route);
+            this.providers[t] = profile;
             delete this.providers[route];
-            this.routes = Object.keys(this.providers);
+            if (profile.apiKeyEnv === oldDerivedRef) profile.apiKeyEnv = deriveKeyRef(t);
+            if (this.pendingProbeKeys.has(route)) {
+              this.pendingProbeKeys.set(t, this.pendingProbeKeys.get(route));
+              this.pendingProbeKeys.delete(route);
+            }
+            this.draftRoute = t;
+            this.#syncRoutes();
             this.sel = this.routes.indexOf(t);
           }
         } else if (it.numeric) {
           const n = text.trim() === "" ? undefined : Number(text);
-          if (n !== undefined && (!isFinite(n) || n <= 0)) { this.app.toast("请输入正数"); return; }
           if (it.key.startsWith("model.")) {
-            const [, mi, field] = it.key.split("."); p.models[Number(mi)][field] = n;
-          } else p[it.key] = n;
+            const [, mi, field] = it.key.split(".");
+            const model = this.#models(route, { mutable: true })[Number(mi)];
+            if (n === undefined) delete model[field];
+            else model[field] = n;
+          } else if (n === undefined) delete p[it.key];
+          else p[it.key] = n;
         } else if (it.key.startsWith("model.")) {
           const [, mi, field, detail] = it.key.split(".");
-          const model = p.models[Number(mi)];
+          const model = this.#models(route, { mutable: true })[Number(mi)];
           if (field === "reasoning") {
-            if (model.reasoningEfforts === false) model.reasoningEfforts = {};
+            if (!model.reasoningEfforts || model.reasoningEfforts === false) model.reasoningEfforts = {};
             const value = text.trim();
             if (!value) delete model.reasoningEfforts[detail];
-            else model.reasoningEfforts[detail] = value === "null" ? null : value;
-          } else model[field] = text;
+            else if (value === "null") {
+              if (detail !== "off") { this.app.toast("只有 off 强度可以使用 null"); return; }
+              model.reasoningEfforts[detail] = null;
+            } else model.reasoningEfforts[detail] = value;
+          } else if (field === "compat") {
+            model.compat ??= {};
+            const value = text.trim();
+            if (!value) delete model.compat[detail];
+            else if (detail === "supportsReasoningEffort") {
+              if (value !== "true" && value !== "false") { this.app.toast("请输入 true 或 false,或留空删除"); return; }
+              model.compat[detail] = value === "true";
+            } else {
+              if (!THINKING_FORMATS.includes(value)) { this.app.toast("请选择有效的 thinkingFormat"); return; }
+              model.compat[detail] = value;
+            }
+            if (Object.keys(model.compat).length === 0) delete model.compat;
+          } else {
+            const value = text.trim();
+            if (!value && field !== "id") delete model[field];
+            else model[field] = value;
+          }
+        } else if (it.key.startsWith("compat.")) {
+          const field = it.key.slice("compat.".length);
+          p.compat ??= {};
+          const value = text.trim();
+          if (!value) delete p.compat[field];
+          else if (field === "supportsReasoningEffort") {
+            if (value !== "true" && value !== "false") { this.app.toast("请输入 true 或 false,或留空删除"); return; }
+            p.compat[field] = value === "true";
+          } else {
+            if (!THINKING_FORMATS.includes(value)) { this.app.toast("请选择有效的 thinkingFormat"); return; }
+            p.compat[field] = value;
+          }
+          if (Object.keys(p.compat).length === 0) delete p.compat;
         } else {
-          if (it.key === "api" && !API_PROTOCOLS.includes(text.trim())) this.app.toast(`注意:${text.trim() || "空"} 不是已知协议,保存时可能被拒绝`);
-          if (it.key === "__defaultReasoningEffort") {
-            if (!this.defaultModel || this.defaultModel.provider !== route) { this.app.toast("请先在模型管理中将本供应商的模型设为当前会话模型；默认 Agent 模型可在 Settings 修改"); return; }
-            this.defaultModel.reasoningEffort = text.trim() || undefined;
-          } else p[it.key] = text;
+          const value = text.trim();
+          if (!value) delete p[it.key];
+          else p[it.key] = value;
+          if (it.key === "api" && this.#profile(route).api !== "openai-completions") this.#stripCompat(route);
         }
+        this.#pruneEmptyDraft(route);
       }, it.completions);
       return;
     }
     if (it.kind === "choice") {
-      const [, mi, field, detail] = it.key.split("."); const model = p.models[Number(mi)];
-      if (field === "reasoningEnabled") model.reasoningEfforts = it.value === "是" ? false : {};
-      else if (field === "input") { const set = new Set(model.input ?? ["text"]); set.has(detail) ? set.delete(detail) : set.add(detail); model.input = [...set]; }
+      if (it.key.startsWith("defaultInput.")) {
+        const modality = it.key.slice("defaultInput.".length);
+        const set = new Set(effective.defaultInput ?? DEFAULT_INPUT_MODALITIES);
+        if (set.has(modality)) {
+          if (set.size === 1) { this.app.toast("defaultInput 至少需要一种模态"); return; }
+          set.delete(modality);
+        } else set.add(modality);
+        this.#draftProfile(route).defaultInput = INPUT_MODALITIES.filter((item) => set.has(item));
+      } else if (it.key.startsWith("model.")) {
+        const [, mi, field, detail] = it.key.split(".");
+        if (field === "input") {
+          const current = this.#models(route)[Number(mi)];
+          if (current.input?.includes(detail) && current.input.length === 1) { this.app.toast("模型输入能力至少需要一种模态"); return; }
+        }
+        const model = this.#models(route, { mutable: true })[Number(mi)];
+        if (field === "reasoningMode") {
+          const next = it.value === "继承" ? "关闭" : it.value === "关闭" ? "自定义" : "继承";
+          if (next === "继承") delete model.reasoningEfforts;
+          else if (next === "关闭") model.reasoningEfforts = false;
+          else model.reasoningEfforts = { medium: "medium" };
+        } else if (field === "inputMode") {
+          if (it.value === "继承") model.input = [...DEFAULT_INPUT_MODALITIES];
+          else delete model.input;
+        } else if (field === "input") {
+          const set = new Set(model.input);
+          if (set.has(detail)) set.delete(detail);
+          else set.add(detail);
+          model.input = INPUT_MODALITIES.filter((item) => set.has(item));
+        }
+      }
       this.#rebuild(); this.app.redraw(); return;
     }
     if (it.kind === "model") {
@@ -2654,19 +3071,18 @@ export class ModelPanel extends Widget {
   #addModel() {
     const route = this.#route();
     if (!route) return;
-    const p = this.#profile(route);
-    p.models ??= [];
-    p.models.push({ id: "", name: "" });
-    this.modelsSel = p.models.length - 1;
+    const models = this.#models(route, { mutable: true });
+    models.push({ id: "" });
+    this.modelsSel = models.length - 1;
     this.#rebuild();
     this.app.redraw();
   }
   #deleteModel() {
     const route = this.#route();
     if (!route || this.modelsSel < 0) { this.app.toast("先选中一个模型"); return; }
-    const model = this.#profile(route).models[this.modelsSel];
+    const model = this.#models(route)[this.modelsSel];
     this.#confirmDelete(`删除模型 ${model?.name || model?.id || "（未命名）"}？`, () => {
-      this.#profile(route).models.splice(this.modelsSel, 1);
+      this.#models(route, { mutable: true }).splice(this.modelsSel, 1);
       this.modelsSel = -1;
       this.#rebuild(); this.app.redraw();
     });
@@ -2674,60 +3090,112 @@ export class ModelPanel extends Widget {
   async #setDefaultModel() {
     const route = this.#route();
     if (!route) return;
-    const p = this.#profile(route);
-    const m = p.models?.[this.modelsSel];
+    const m = this.#models(route)[this.modelsSel];
     if (!m?.id) { this.app.toast("先选中一个模型"); return; }
     if (!this.app.currentSession) { this.app.toast("先打开一个会话"); return; }
     try {
       await this.app.api.call("session.selectModel", { sessionId: this.app.currentSession, provider: route, model: m.id });
-      this.app.updateModel();
-      this.app.toast(`已切换 ${route}/${m.id}`);
+      if (typeof this.app.updateModel === "function") await this.app.updateModel();
+      this.app.toast(`已切换 ${route}/${m.id}，后续 Agent/Subagent 默认使用此模型`);
     } catch (e) { this.app.toast(`切换失败: ${e.message}`); }
   }
-  #setAgentDefault() {
-    const route = this.#route(), m = this.#profile(route)?.models?.[this.modelsSel];
-    if (!route || !m?.id) { this.app.toast("先选中一个模型"); return; }
-    this.defaultModel = { provider: route, model: m.id, ...(this.defaultModel?.reasoningEffort ? { reasoningEffort: this.defaultModel.reasoningEffort } : {}) };
-    this.app.toast(`默认 Agent/Subagent 目标设为 ${route}/${m.id}，点💾保存配置`);
-    this.#rebuild(); this.app.redraw();
-  }
-  async #save() {
-    try {
-      const res = await this.app.api.call("settings.mutate", {
-        ns: "llm-pi-ai",
-        ops: [{ op: "set", path: ["providers"], value: this.providers }],
-        expectedRevision: this.revision,
-      });
-      this.revision = res?.revision ?? this.revision;
-      this.draftRoute = null;
-      this.savedSnapshot = JSON.stringify(this.providers);
-      if (this.defaultModel) {
-        const profile = this.providers[this.defaultModel.provider];
-        if (!profile || !(profile.models ?? []).some((model) => model.id === this.defaultModel.model)) {
-          this.app.toast("供应商已保存；默认 Agent 模型引用已失效，请选择一个现有模型后重试"); return false;
-        }
-        try {
-          const def = await this.app.api.call("settings.mutate", { ns: "agent-default-model", ops: [{ op: "set", path: [], value: this.defaultModel }], expectedRevision: this.defaultModelRevision });
-          this.defaultModelRevision = def?.revision ?? this.defaultModelRevision;
-        } catch (e) {
-          this.app.toast(`供应商已保存；默认 Agent 模型保存失败: ${e.message}`); return false;
+  async #save({ savePendingKeys = true } = {}) {
+    if (!this.writable) { this.app.toast("模型配置为只读"); return false; }
+    const persisted = JSON.parse(this.hostSnapshot);
+    for (const [route, profile] of Object.entries(this.providers)) {
+      if (!Object.hasOwn(persisted, route) && Object.keys(profile).length === 0 && !this.pendingProbeKeys.has(route)) delete this.providers[route];
+    }
+    for (const [route, profile] of Object.entries(this.providers)) {
+      if (!route.trim()) { this.app.toast("保存失败:供应商路由名不能为空"); return false; }
+      if (this.draftRoute === route && !ROUTE_PATTERN.test(route)) { this.app.toast("保存失败:新供应商路由名格式无效"); return false; }
+      if (profile.displayName !== undefined && !String(profile.displayName).trim()) { this.app.toast(`保存失败:${route} 的显示名不能为空`); return false; }
+      if (profile.baseURL !== undefined && !String(profile.baseURL).trim()) { this.app.toast(`保存失败:${route} 的 baseURL 不能为空`); return false; }
+      if (profile.apiKeyEnv !== undefined && !KEY_REF_OK.test(profile.apiKeyEnv)) { this.app.toast(`保存失败:${route} 的密钥引用无效`); return false; }
+      if (profile.api !== undefined && !API_PROTOCOLS.includes(profile.api)) { this.app.toast(`保存失败:${route} 的协议不受支持`); return false; }
+      for (const model of profile.models ?? []) {
+        if (!String(model.id ?? "").trim()) { this.app.toast(`保存失败:${route} 有未填写 id 的模型`); return false; }
+        if (model.reasoningEfforts && model.reasoningEfforts !== false) {
+          const declared = Object.entries(model.reasoningEfforts);
+          if (declared.some(([level, wire]) => level !== "off" && (typeof wire !== "string" || wire.length === 0))) {
+            this.app.toast(`保存失败:${route}/${model.id} 的非 off 思考强度必须填写 wire 值`); return false;
+          }
+          if (!declared.some(([level, wire]) => level !== "off" && typeof wire === "string" && wire.length > 0)) {
+            this.app.toast(`保存失败:${route}/${model.id} 的自定义思考能力至少需要一种非 off 强度`); return false;
+          }
         }
       }
-      this.app.toast(`已保存 ${Object.keys(this.providers).length} 个供应商及默认模型参数`);
+    }
+    let settingsChanged = false;
+    const confirmed = JSON.parse(this.savedSnapshot);
+    if (JSON.stringify(this.providers) !== this.hostSnapshot) {
+      try {
+        const ops = providerOps(JSON.parse(this.hostSnapshot), this.providers, new Set(this.draftRoute ? [this.draftRoute] : []));
+        const res = await this.app.api.call("settings.mutate", {
+          ns: "llm-pi-ai",
+          ops,
+          expectedRevision: this.revision,
+        });
+        this.revision = res?.revision ?? this.revision;
+        this.draftRoute = null;
+        this.hostSnapshot = JSON.stringify(this.providers);
+        settingsChanged = true;
+      } catch (e) { this.app.toast(`保存失败: ${e.message}`); return false; }
+    }
+    for (const route of new Set([...Object.keys(confirmed), ...Object.keys(this.providers)])) {
+      if (this.pendingProbeKeys.has(route)) continue;
+      if (Object.hasOwn(this.providers, route)) confirmed[route] = this.providers[route];
+      else delete confirmed[route];
+    }
+    this.savedSnapshot = JSON.stringify(confirmed);
+    try {
+      if (savePendingKeys) {
+        for (const [route, value] of [...this.pendingProbeKeys]) {
+          const ref = this.#keyRef(route);
+          await this.app.api.call("credentials.set", { ref, value });
+          this.pendingProbeKeys.delete(route);
+          if (Object.hasOwn(this.providers, route)) confirmed[route] = this.providers[route];
+          else delete confirmed[route];
+          this.savedSnapshot = JSON.stringify(confirmed);
+        }
+      }
+      await this.#refreshKeys();
+      this.app.toast(settingsChanged
+        ? `已保存 ${Object.keys(this.providers).length} 个供应商`
+        : savePendingKeys ? "API 密钥已保存" : "配置未变化");
       return true;
-    } catch (e) { this.app.toast(`保存失败: ${e.message}`); return false; }
+    } catch (e) {
+      await this.#refreshKeys();
+      this.app.toast(`${settingsChanged ? "供应商已保存；" : ""}API 密钥保存失败: ${e.message}`);
+      return false;
+    }
   }
-  #dirty() { return JSON.stringify(this.providers) !== this.savedSnapshot; }
-  /** Throw away the in-memory edits and restore the last saved/loaded state. */
-  #discard() {
+  #dirty() { return JSON.stringify(this.providers) !== this.savedSnapshot || this.pendingProbeKeys.size > 0; }
+  /** Throw away the in-memory edits and restore the last fully successful state. */
+  async #discard() {
+    if (this.hostSnapshot !== this.savedSnapshot) {
+      try {
+        const target = JSON.parse(this.savedSnapshot);
+        const ops = providerOps(JSON.parse(this.hostSnapshot), target);
+        if (ops.length > 0) {
+          const res = await this.app.api.call("settings.mutate", { ns: "llm-pi-ai", ops, expectedRevision: this.revision });
+          this.revision = res?.revision ?? this.revision;
+        }
+        this.hostSnapshot = this.savedSnapshot;
+      } catch (e) {
+        this.app.toast(`放弃修改失败: ${e.message}`);
+        return false;
+      }
+    }
     this.providers = JSON.parse(this.savedSnapshot);
-    this.routes = Object.keys(this.providers);
+    this.pendingProbeKeys.clear();
+    this.#syncRoutes();
     this.draftRoute = null;
     this.modelsSel = -1;
     this.sub = null;
-    this.sel = Math.min(this.sel, this.routes.length - 1);
+    this.sel = this.routes.length === 0 ? 0 : Math.min(this.sel, this.routes.length - 1);
     this.#rebuild();
     this.app.redraw();
+    return true;
   }
   /** Leave the provider form for another level. With unsaved changes this asks
    *  保存/不保存/取消 first; a failed save keeps the user on the form. */
@@ -2754,7 +3222,7 @@ export class ModelPanel extends Widget {
           const ok = await this.#save();
           if (!ok) return;                          // save failed: stay (toast shown)
         } else if (btn?.action === "discard") {
-          this.#discard();
+          if (!await this.#discard()) return;
         } else {
           return;                                   // Esc = __cancel__
         }
@@ -2772,19 +3240,106 @@ export class ModelPanel extends Widget {
       w, h: Math.min(7, this.app.screen.h), title: "确认删除",
       lines: [[{ t: " " + prompt, fg: K.WARN }]],
       buttons: [{ label: "取消", action: "cancel" }, { label: "删除", action: "delete" }],
-      onAction: (btn) => { this.app.closeOverlay(); if (btn?.action === "delete") action(); },
+      onAction: (btn) => { this.app.closeOverlay(); if (btn?.action === "delete") return action(); },
     });
     this.app.redraw();
   }
   async #deleteProvider() {
     const route = this.#route();
     if (!route) return;
+    if (this.#dirty()) { this.app.toast("请先保存或放弃其他修改，再删除供应商"); return; }
     this.#confirmDelete(`删除供应商 ${route}？此操作会立即保存。`, async () => {
+      const profile = this.#profile(route);
+      const ref = this.#keyRef(route);
+      const managedCredential = profile.apiKeyEnv === deriveKeyRef(route)
+        && this.keyStatus?.[ref]?.configured === true
+        && this.keyStatus[ref].writable === true;
+      if (managedCredential) {
+        // Journal first. If the process exits after the Host mutation but before
+        // credentials.unset, the next ModelPanel load can safely finish it.
+        this.pendingCredentialCleanups.set(ref, { route, error: "等待确认供应商删除", reconcile: true });
+        if (!this.#persistCredentialCleanups()) {
+          this.pendingCredentialCleanups.delete(ref);
+          this.app.toast("删除失败: 无法记录托管密钥清理任务");
+          return;
+        }
+      }
+      let providerState = null;
+      try {
+        const res = await this.app.api.call("settings.mutate", {
+          ns: "llm-pi-ai",
+          ops: [{ op: "unset", path: ["providers", route] }],
+          expectedRevision: this.revision,
+        });
+        this.revision = res?.revision ?? this.revision;
+        providerState = this.#providerStateFromProfiles(res?.value?.providers ?? Object.fromEntries(
+          Object.entries(this.resolvedProviders).filter(([candidate]) => candidate !== route),
+        ));
+      } catch (e) {
+        const conflict = e?.code === "settings-conflict";
+        if (managedCredential && conflict) {
+          const task = this.pendingCredentialCleanups.get(ref);
+          this.pendingCredentialCleanups.delete(ref);
+          if (!this.#persistCredentialCleanups()) this.pendingCredentialCleanups.set(ref, task);
+          this.app.toast(`删除失败: ${e.message}`);
+          this.#rebuild();
+          this.app.redraw();
+          return;
+        }
+        if (!managedCredential) {
+          this.app.toast(`删除失败: ${e.message}`);
+          return;
+        }
+        this.pendingCredentialCleanups.set(ref, { route, error: `等待核对删除结果: ${String(e?.message ?? e).slice(0, 500)}`, reconcile: true });
+        this.#persistCredentialCleanups();
+        try {
+          providerState = this.#providerStateFromDescription(await this.app.api.call("settings.describe"));
+        } catch {}
+        if (providerState === null) {
+          const failure = { ref, route, error: this.pendingCredentialCleanups.get(ref).error, reconcile: true };
+          this.app.toast(`删除结果待核对: ${e.message}`);
+          this.#showCredentialCleanupFailure(failure);
+          this.#rebuild();
+          this.app.redraw();
+          return;
+        }
+        if (providerState.routes.has(route)) {
+          if (providerState.refs.has(ref)) {
+            const task = this.pendingCredentialCleanups.get(ref);
+            this.pendingCredentialCleanups.delete(ref);
+            if (!this.#persistCredentialCleanups()) this.pendingCredentialCleanups.set(ref, task);
+            this.app.toast(`删除失败: ${e.message}`);
+          } else {
+            const failure = { ref, route, error: `路由 ${route} 仍存在，无法自动确认旧密钥可清理`, reconcile: true };
+            this.pendingCredentialCleanups.set(ref, { route, error: failure.error, reconcile: true });
+            this.#persistCredentialCleanups();
+            this.app.toast(`删除结果待核对: ${e.message}`);
+            this.#showCredentialCleanupFailure(failure);
+          }
+          this.#rebuild();
+          this.app.redraw();
+          return;
+        }
+      }
       delete this.providers[route];
-      this.routes = Object.keys(this.providers);
-      this.sel = Math.min(this.sel, this.routes.length - 1);
+      delete this.resolvedProviders[route];
+      delete this.inheritedProviders[route];
+      this.pendingProbeKeys.delete(route);
+      this.#syncRoutes();
+      this.sel = this.routes.length === 0 ? 0 : Math.min(this.sel, this.routes.length - 1);
       this.modelsSel = -1;
-      await this.#save();
+      this.savedSnapshot = JSON.stringify(this.providers);
+      this.hostSnapshot = this.savedSnapshot;
+      const cleanup = managedCredential
+        ? await this.#retryPendingCredentialCleanups({ onlyRef: ref, notify: false, providerState })
+        : { completed: [], failed: [] };
+      await this.#refreshKeys();
+      if (cleanup.failed.length > 0) {
+        this.app.toast(`供应商已删除；托管密钥待清理: ${cleanup.failed[0].error}`);
+        this.#showCredentialCleanupFailure(cleanup.failed[0]);
+      } else {
+        this.app.toast(`已删除供应商 ${route}`);
+      }
       this.#rebuild(); this.app.redraw();
     });
   }
@@ -2793,46 +3348,40 @@ export class ModelPanel extends Widget {
     if (!route) return;
     const p = this.#profile(route);
     const base = String(p.baseURL ?? "").replace(/\/+$/, "");
-    if (!base) { this.app.toast("先填写 baseURL"); return; }
     this.scanning = true;
     this.scanMode = true;
     this.scanItems = [];
     this.scanCursor = 0;
     this.#rebuild();
     this.app.redraw();
-    const key = p.apiKeyEnv ? process.env[p.apiKeyEnv] : null;
-    const headers = key ? { Authorization: `Bearer ${key}` } : {};
-    const tryFetch = async (dispatcher) => {
-      const res = await fetch(`${base}/models`, { headers, dispatcher });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return res.json();
-    };
     try {
-      let body;
-      try { body = await tryFetch(undefined); }
-      catch (e0) {
-        // self-signed gateways: retry with TLS verification disabled
-        try {
-          const { Agent } = await import("undici");
-          body = await tryFetch(new Agent({ connect: { rejectUnauthorized: false } }));
-        } catch { throw e0; }
-      }
-      const list = Array.isArray(body?.data) ? body.data : Array.isArray(body?.models) ? body.models : [];
+      // The Host owns protocol handling and stored credentials. Keeping the
+      // request on this path avoids exposing secrets or weakening TLS locally.
+      const res = await this.app.api.call("llm.discoverModels", {
+        settingsNs: "llm-pi-ai",
+        provider: route,
+        ...(p.api ? { api: p.api } : {}),
+        ...(base ? { baseURL: base } : {}),
+        ...(this.pendingProbeKeys.has(route) ? { apiKey: this.pendingProbeKeys.get(route) } : {}),
+      });
       const seen = new Set();
-      const items = [];
-      for (const e of list) {
-        if (!e || typeof e !== "object") continue;
-        const id = String(e.id ?? e.name ?? "").trim();
-        if (!id || seen.has(id)) continue;
+      this.scanItems = (res?.models ?? []).flatMap((entry) => {
+        if (!entry || typeof entry !== "object") return [];
+        const id = String(entry.id ?? "").trim();
+        if (!id || seen.has(id)) return [];
         seen.add(id);
-        items.push({ id, name: e.name ?? e.id ?? id });
-      }
-      this.scanItems = items;
-      this.scanSel = new Set(items.map((m) => m.id));
-      if (items.length === 0) this.app.toast("扫描完成:未发现模型");
-      else this.app.toast(`发现 ${items.length} 个模型,空格勾选,Enter 添加`);
+        return [{
+          id,
+          ...(typeof entry.name === "string" && entry.name ? { name: entry.name } : {}),
+          ...(Number.isInteger(entry.contextWindow) && entry.contextWindow > 0 ? { contextWindow: entry.contextWindow } : {}),
+          ...(Number.isInteger(entry.maxTokens) && entry.maxTokens > 0 ? { maxTokens: entry.maxTokens } : {}),
+        }];
+      });
+      this.scanSel = new Set(this.scanItems.map((model) => model.id));
+      if (this.scanItems.length === 0) this.app.toast("扫描完成:未发现模型");
+      else this.app.toast(`发现 ${this.scanItems.length} 个模型,空格勾选,Enter 添加`);
     } catch (e) {
-      this.app.toast(`扫描失败: ${e.message}`);
+      this.app.toast(`扫描失败:${String(e.message ?? e).replace(/^[^:]+:\s*/, "")}`);
       this.scanMode = false;
     }
     this.scanning = false;
@@ -2842,13 +3391,17 @@ export class ModelPanel extends Widget {
   #scanCommit() {
     const route = this.#route();
     if (!route) return;
-    const p = this.#profile(route);
-    p.models ??= [];
-    const existing = new Set(p.models.map((m) => m.id));
+    if (!this.writable) { this.scanMode = false; this.app.toast("模型配置为只读，未添加发现结果"); this.#rebuild(); this.app.redraw(); return; }
+    const existing = new Set(this.#models(route).map((m) => m.id));
+    const selected = this.scanItems.filter((model) => this.scanSel.has(model.id) && !existing.has(model.id));
     let added = 0;
-    for (const m of this.scanItems) {
-      if (!this.scanSel.has(m.id) || existing.has(m.id)) continue;
-      p.models.push({ id: m.id, name: m.name });
+    for (const m of selected) {
+      this.#models(route, { mutable: true }).push({
+        id: m.id,
+        ...(m.name != null ? { name: m.name } : {}),
+        ...(m.contextWindow != null ? { contextWindow: m.contextWindow } : {}),
+        ...(m.maxTokens != null ? { maxTokens: m.maxTokens } : {}),
+      });
       added++;
     }
     this.scanMode = false;
@@ -2858,6 +3411,11 @@ export class ModelPanel extends Widget {
   }
   onKey(ev) {
     if (ev.type !== "key") return false;
+    if (ev.name === "char" && ev.key === "c" && !ev.ctrl && this.pendingCredentialCleanups.size > 0) {
+      const [ref, task] = this.pendingCredentialCleanups.entries().next().value;
+      this.#showCredentialCleanupFailure({ ref, ...task });
+      return true;
+    }
     if (this.scanMode) {
       if (ev.name === "escape") { this.scanMode = false; this.#rebuild(); return true; }
       if (ev.name === "up") { this.scanCursor = Math.max(0, this.scanCursor - 1); this.#rebuild(); this.app.redraw(); return true; }
@@ -2922,10 +3480,15 @@ export class ModelPanel extends Widget {
     // walks to the next form item. Otherwise (list focus) it behaves like →.
     if (ev.name === "tab" && this.mode === "form" && this.sub == null) {
       const it = this.formItems[this.formIdx];
+      if (it?.cycle?.length && !this.writable) { this.app.toast("模型配置为只读"); return true; }
       if (it?.cycle?.length) {
         const cur = String(it.value ?? "");
         const idx = it.cycle.indexOf(cur);
-        this.#profile(this.#route())[it.key] = it.cycle[(idx + 1) % it.cycle.length];
+        const value = it.cycle[(idx + 1) % it.cycle.length];
+        const profile = this.#draftProfile(this.#route());
+        if ((it.key === "api" || it.key === "reasoning") && value === "") delete profile[it.key];
+        else profile[it.key] = value;
+        if (it.key === "api" && value !== "openai-completions") this.#stripCompat(this.#route());
       } else if (this.formItems.length > 0) {
         this.formIdx = Math.min(this.formItems.length - 1, this.formIdx + 1);
       }
@@ -2980,25 +3543,35 @@ export class ModelPanel extends Widget {
       }
       return false;
     }
-    if (this.scanMode) {
-      const idx = ev.y - this.formView.y + this.formView.scrollY - 1;
-      if (idx >= 0 && idx < this.scanItems.length) {
-        this.scanCursor = idx;
-        const m = this.scanItems[idx];
-        if (this.scanSel.has(m.id)) this.scanSel.delete(m.id); else this.scanSel.add(m.id);
-        this.app.redraw();
-        return true;
-      }
-      return false;
+    if (!this.formView.inside(ev.x, ev.y)) return false;
+    const line = ev.y - this.formView.y + this.formView.scrollY;
+    const target = this.formClickMap[line];
+    if (!target) return true;
+    if (target.type === "cleanup") {
+      const task = this.pendingCredentialCleanups.get(target.ref);
+      if (task) this.#showCredentialCleanupFailure({ ref: target.ref, ...task });
+      return true;
     }
-    const idx = ev.y - this.formView.y + this.formView.scrollY;
-    if (this.sub != null) {
-      // the sub-buffer's title row is visual-only; rows below it are items
-      const itemIdx = idx - 1;
-      if (itemIdx >= 0 && itemIdx < this.#subItems().length) { this.sub.cursor = itemIdx; this.#activateItem(); return true; }
-      return false;
+    if (target.type === "scan") {
+      const m = this.scanItems[target.index];
+      if (!m) return false;
+      this.scanCursor = target.index;
+      if (this.scanSel.has(m.id)) this.scanSel.delete(m.id); else this.scanSel.add(m.id);
+      this.#rebuild();
+      this.app.redraw();
+      return true;
     }
-    if (idx >= 0 && idx < this.formItems.length) { this.formIdx = idx; this.mode = "form"; this.#activateItem(); return true; }
+    if (target.type === "item" && target.sub && this.sub != null) {
+      this.sub.cursor = target.index;
+      this.#activateItem();
+      return true;
+    }
+    if (target.type === "item" && !target.sub && this.sub == null && target.index < this.formItems.length) {
+      this.formIdx = target.index;
+      this.mode = "form";
+      this.#activateItem();
+      return true;
+    }
     return false;
   }
 }
