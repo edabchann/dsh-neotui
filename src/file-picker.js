@@ -90,6 +90,7 @@ export class UploadPicker extends Widget {
     this.app.focus(this.app.overlay);
   }
   confirmUpload() {
+    this.clearKitty();
     if (!this.selected.size) { this.app.toast('请先按 Space 选择文件'); return; }
     const back = this, list = [...this.selected.values()], shown = list.slice(0, 5).map((x) => x.name);
     this.app.overlay = new YnPopup({ x: this.x + 10, y: this.y + 4, w: this.w - 20, h: Math.min(12, shown.length + 6), title: '确认上传文件', lines: [...shown, `共 ${list.length} 个文件`], buttons: [{ label: '确定 (y)', action: 'yes' }, { label: '取消 (n)', action: 'no' }], onAction(b) { if (b.action === 'yes') { back.selected.clear(); back.onUpload?.(list); } back.app.overlay = back; back.app.focus(back); back.app.redraw(); } });
@@ -139,9 +140,12 @@ export class UploadPicker extends Widget {
     const b64=data.toString('base64'),chunks=[];for(let i=0;i<b64.length;i+=4096)chunks.push(b64.slice(i,i+4096));
     const payload=chunks.map((c,i)=>i===0?`\x1b_Ga=t,f=100,i=${this.kittyId},q=2,m=${chunks.length===1?0:1};${c}\x1b\\`:`\x1b_Gm=${i===chunks.length-1?0:1};${c}\x1b\\`).join('');
     const inner=this.w-4,l=Math.floor(inner*.25),m=Math.floor(inner*.38),x=this.x+5+l+m,y=this.y+4;
-    const sourceAspect=p.pixelWidth&&p.pixelHeight?p.pixelWidth/p.pixelHeight:1,boxAspect=p.width/Math.max(1,p.height*2);
-    const fit=sourceAspect>=boxAspect?`c=${Math.max(4,p.width)}`:`r=${Math.max(3,p.height)}`;
-    return payload+`\x1b[${y};${x}H\x1b_Ga=p,i=${this.kittyId},${fit},q=2\x1b\\`;
+    const sourceAspect=p.pixelWidth&&p.pixelHeight?p.pixelWidth/p.pixelHeight:1;
+    // WezTerm does not consistently infer the missing dimension. Compute an
+    // aspect-fit box ourselves using the terminal's ~2:1 cell height ratio.
+    let cols=Math.max(4,p.width),rows=Math.max(3,Math.round(cols/sourceAspect/2));
+    if(rows>p.height){rows=Math.max(3,p.height);cols=Math.max(4,Math.min(p.width,Math.round(rows*sourceAspect*2)));}
+    return payload+`\x1b[${y};${x}H\x1b_Ga=p,i=${this.kittyId},c=${cols},r=${rows},q=2\x1b\\`;
   }
   clearKitty(){if(this.kittyId&&this.app.term?.output)this.app.term.output.write(`\x1b_Ga=d,d=i,i=${this.kittyId},q=2\x1b\\`);this.kittyId=null;this.kittyShownKey=null;this.imagePreview=null;if(this.app.screen){this.app.screen.prev=null;this.app.redraw();}}
   render(s) {

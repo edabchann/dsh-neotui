@@ -1386,9 +1386,9 @@ export class ImagePopup extends Popup {
     // Supplying both c and r stretches the raster to that exact cell box.
     // Supply only the limiting dimension so Kitty/WezTerm preserves aspect.
     const sourceAspect = this.pixelWidth && this.pixelHeight ? this.pixelWidth / this.pixelHeight : 1;
-    const boxAspect = w / Math.max(1, h * 2);
-    const fit = sourceAspect >= boxAspect ? `c=${w}` : `r=${h}`;
-    const place = `\x1b_Ga=p,i=${this.kittyId},${fit},q=2\x1b\\`;
+    let cols=w,rows=Math.max(1,Math.round(cols/sourceAspect/2));
+    if(rows>h){rows=h;cols=Math.max(1,Math.min(w,Math.round(rows*sourceAspect*2)));}
+    const place = `\x1b_Ga=p,i=${this.kittyId},c=${cols},r=${rows},q=2\x1b\\`;
     return payload + move + place;
   }
 }
