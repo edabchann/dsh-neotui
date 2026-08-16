@@ -1803,7 +1803,7 @@ test("JobsPanel shares one buffer with subagents via Tab and arrows", async () =
   assert.equal(panel.page, "jobs");
 });
 
-test("QueuePanel edits queued messages and preserves selected id on refresh", async () => {
+test("QueuePanel keeps one command per row, preserves selection, and dd removes", async () => {
   const app = headlessApp();
   app.currentSession = "s";
   app.queueItems = [
@@ -1816,28 +1816,21 @@ test("QueuePanel edits queued messages and preserves selected id on refresh", as
   panel.sel = 1;
   panel.syncItems([app.queueItems[1], app.queueItems[0]]);
   assert.equal(panel.items[panel.sel].id, "b");
-  panel.onKey({ type: "key", name: "char", key: "e", ctrl: false });
-  assert.ok(panel.editInput, "edit mode opened");
-  panel.editInput.setValue("changed");
-  panel.onKey({ type: "key", name: "enter" });
+  assert.equal(panel.lines.length,2,"one line per command");
+  panel.onKey({ type: "text", text: "d" });
+  assert.equal(calls.length,0,"first d only arms removal");
+  panel.onKey({ type: "text", text: "d" });
   await Promise.resolve(); await Promise.resolve();
   assert.equal(calls[0][0], "session.updateQueue");
-  assert.deepEqual(calls[0][1].action, { kind: "edit", content: [{ type: "text", text: "changed" }] });
+  assert.deepEqual(calls[0][1].action, { kind: "remove" });
 });
 
-test("QueuePanel converges stale rows and preserves steer-unavailable messages", async () => {
+test("QueuePanel dd converges a stale remotely removed row", async () => {
   const app = headlessApp(); app.currentSession = "s";
   app.queueItems = [{ id: "a", placement: "queued", message: { content: [{ type: "text", text: "keep" }] } }];
-  const toasts = []; app.toast = (s) => toasts.push(s);
-  let error = Object.assign(new Error("closed"), { code: "steer-unavailable" });
-  app.api.call = async () => { throw error; };
+  app.api.call = async () => { throw Object.assign(new Error("gone"), { code: "queue-item-not-found" }); };
   const panel = new QueuePanel(app);
-  panel.onKey({ type: "key", name: "char", key: "s", ctrl: false });
-  await Promise.resolve(); await Promise.resolve();
-  assert.equal(panel.items.length, 1);
-  assert.ok(toasts.at(-1).includes("窗口已关闭"));
-  error = Object.assign(new Error("gone"), { code: "queue-item-not-found" });
-  panel.onKey({ type: "key", name: "char", key: "d", ctrl: false });
+  panel.onKey({ type: "text", text: "d" });panel.onKey({ type: "text", text: "d" });
   await Promise.resolve(); await Promise.resolve();
   assert.equal(panel.items.length, 0);
 });

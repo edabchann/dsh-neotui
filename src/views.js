@@ -3858,7 +3858,7 @@ export class App {
       if (ev.ctrl && ev.key === "t") { this.setMode("trajectory"); return; }
       if (ev.ctrl && ev.key === "e") { this.quickJumpStep(); return; }
       if (ev.ctrl && ev.key === "j") { this.showJobs(); return; }
-      if (ev.ctrl && ev.key === "u") { this.showQueue(); return; }
+      if (ev.ctrl && ev.key === "n") { this.showQueue(); return; }
       if (ev.ctrl && ev.key === "y") {
         const next = busyEnter() === "queue" ? "steer" : "queue";
         saveTuiConfig({ busyEnter: next });
@@ -4052,7 +4052,6 @@ export class App {
     if (rawGoal && !["complete", "completed", "cleared"].includes(rawGoal.phase)) {
       row0.left.push({ t: ` 🎯 ${truncate(rawGoal.objective ?? "目标", 14)} · Ctrl+G `, fg: T.SELFG, bg: T.WARN, bold: true });
     }
-    if (this.queueItems.length) row0.left.push({ t: ` ⏳队列 ${this.queueItems.length} (Ctrl+U) `, fg: T.SELFG, bg: T.WARN, bold: true });
     if (this.sidebarVisible) row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });
     else row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });
     if (cur?.running) row0.left.push({ t: " ●运行 ", fg: T.OK, bg: T.STATUSBG });
@@ -4139,6 +4138,7 @@ export class App {
       row2.left.push({ t: ` ${done}已完成${failed > 0 ? ` ${failed}失败` : ""} `, fg: done > 0 ? T.OK : T.FAINT, bg: T.STATUSBG });
       row2.left.push({ t: ` ${subStats.running > 0 ? `${subStats.running} 个子代理运行中` : "没有子代理运行"} ${subStats.completed}已完成 `, fg: subStats.running > 0 ? T.PURPLE : T.FAINT, bg: T.STATUSBG, bold: subStats.running > 0 });
       if (sub) row2.left.push({ t: ` 🛰 ${truncate(sub.label ?? sub.mode ?? "子代理", 20)} `, fg: T.PURPLE, bg: T.STATUSBG });
+      if(this.queueItems.length)row2.left.push({t:` 有${this.queueItems.length}条命令正在排队 Ctrl+N查看详情 `,fg:T.SELFG,bg:T.WARN,bold:true});
       row2.right.push({ t: " Ctrl+J 任务/子代理 ", fg: T.DIM, bg: T.STATUSBG });
       rows.push(row2);
     }
