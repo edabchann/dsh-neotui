@@ -131,7 +131,7 @@ Kitty graphics 可用时，图片在文件选择器和附件预览中等比例�
 - `queue`：加入下一回合队列；
 - `steer`：追加到当前回合。
 
-`Ctrl+Y` 切换策略，`Ctrl+U` 打开队列。队列面板使用 `e` 编辑、`s` steering、`d` 删除、`Esc` 关闭。
+`Ctrl+Y` 切换策略，`Ctrl+N` 打开排队命令详情。队列面板每条命令一行，使用 `↑/↓` 选择、`dd` 删除、`Esc` 关闭。
 
 ## 快捷键
 
@@ -144,14 +144,15 @@ Kitty graphics 可用时，图片在文件选择器和附件预览中等比例�
 | NORMAL | `Ctrl+F` | 跨会话模糊定位 |
 | NORMAL | `Ctrl+B` | 显示/隐藏侧栏 |
 | NORMAL | `Ctrl+M` | 模型与思考强度 |
-| NORMAL | `F8` / `F9` | 权限策略 / Agent 模式 |
+| NORMAL | `Shift+Tab` / `F8` | 权限模式轮换 |
+| NORMAL | `F9` | Agent 模式 |
 | NORMAL | `Ctrl+W` | 工作区 |
 | NORMAL | `Ctrl+Shift+W` | 添加工作区 |
 | NORMAL | `Ctrl+T` | 轨迹视图 |
-| NORMAL | `Shift+Tab` | 对话/轨迹切换 |
+| NORMAL | `Tab` | 对话/轨迹切换 |
 | NORMAL | `Ctrl+E` | 按 step 快速跳转 |
 | NORMAL | `Ctrl+J` | 后台任务与 Subagent |
-| NORMAL | `Ctrl+U` | 消息队列 |
+| NORMAL | `Ctrl+N` | 排队命令详情 |
 | NORMAL | `Ctrl+G` | Goal / TODO |
 | NORMAL | `Ctrl+S` | Settings |
 | NORMAL | `Ctrl+A` | Subagent |

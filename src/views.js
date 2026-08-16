@@ -5,6 +5,7 @@ import { truncate, strWidth, bars, fmtDuration, fmtClock, fmtDateTime, graphemes
 import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
 import { UploadPicker } from "./file-picker.js";
 import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, keyBindings, DEFAULT_KEYBINDINGS } from "./config.js";
@@ -19,6 +20,42 @@ import {
 import { T, themeName, cycleTheme } from "./theme.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
 const K = new Proxy({}, { get(_k, key) { return T[key]; } });
+
+const require = createRequire(import.meta.url);
+export const TUI_VERSION = (() => {
+  try { return JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version; }
+  catch { return "unknown"; }
+})();
+let dshVersionCache = null;
+export function installedDshVersion(run = spawnSync) {
+  if (dshVersionCache) return dshVersionCache;
+  if (process.env.DSH_VERSION) return (dshVersionCache = process.env.DSH_VERSION.replace(/^v/, ""));
+  try {
+    const file = require.resolve("@deepseek-ai/dsh/package.json");
+    const version = JSON.parse(readFileSync(file, "utf8")).version;
+    if (version) return (dshVersionCache = version);
+  } catch {}
+  try {
+    const result = run("dsh", ["--version"], { encoding: "utf8", timeout: 2000 });
+    const version = String(result.stdout ?? "").trim().replace(/^v/, "");
+    if (result.status === 0 && version) return (dshVersionCache = version);
+  } catch {}
+  return (dshVersionCache = "unknown");
+}
+
+async function latestNpmVersion(name) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(name)}/latest`, {
+      headers: { accept: "application/json" }, signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body = await response.json();
+    if (typeof body?.version !== "string" || !body.version) throw new Error("缺少版本号");
+    return body.version;
+  } finally { clearTimeout(timer); }
+}
 
 // ---- Tool card renderers (host-computed view models) ----
 
@@ -913,7 +950,6 @@ export class ChatView extends Widget {
     this.thinkMode = fd.think ? "expanded" : "collapsed";   // t toggles
     this.bashMode = fd.bash ? "expanded" : "collapsed";     // b toggles
     this.todosVisible = fd.todos;                           // Shift+T toggles
-    this.todoSeen = false;             // once seen, the todo box keeps its height
     this.running = false;
     this.hasMore = false;
     this.loadingOlder = false;
@@ -1100,20 +1136,15 @@ export class ChatView extends Widget {
     }
   }
 
-  /** Height of the collapsible todo block. FROZEN at the max (1 header + 6
-   *  items) once the session has ever shown todos: the harness updates the
-   *  list in the background while the user reads, and a height that tracks
-   *  the count reflows the whole layout every time (the idle 2-line shifts). */
+  /** Height of the collapsible todo block: one framed row per visible task,
+   *  capped at six items. Short lists must not reserve blank body rows. */
   todoHeight() {
     const todos = this.app.todos;
     const subagent = this.app.projections.subagent;
-    let h = 0;
-    if (subagent) h++;
-    if (!todos || todos.length === 0) { this.todoSeen = false; return h; }
-    this.todoSeen = true;
-    // The task dock owns a framed header and footer. Folded keeps the framed
-    // two-row strip visible rather than blending one text row into transcript.
-    return h + (this.todosVisible ? 8 : 2);
+    const subagentRows = subagent ? 1 : 0;
+    if (!todos || todos.length === 0) return subagentRows;
+    // Header + actual body rows + footer. Folded retains only the frame.
+    return subagentRows + (this.todosVisible ? Math.min(todos.length, 6) + 2 : 2);
   }
 
   divingNode() { return [...this.nodes].reverse().find((node) => node.kind === "turn-progress") ?? null; }
@@ -1980,8 +2011,20 @@ export class ChatView extends Widget {
     let y = this.view.y + 1;
     const put = (t, fg, bold) => { if (y < this.view.y + this.view.h) { screen.text(cx, y, t, { fg, attrs: bold ? 1 : 0 }); } y++; };
     put("", 0, false);
-    put("  DeepSeek Harness", T.HEADING, true);
-    put("  dsh-neotui", T.FAINT, false);
+    this.welcomeVersionRows = [];
+    const versionLine = (name, version, key, fg, bold) => {
+      const check = this.app.versionChecks?.[key];
+      const status = check?.state === "checking" ? "← 检查更新…"
+        : check?.state === "current" ? "← 已是最新"
+        : check?.state === "update" ? `← 可更新 ${check.latest}`
+        : check?.state === "error" ? "← 检查失败（点击重试）"
+        : "← 检查更新";
+      const text = `  ${name} ${version === "unknown" ? "版本未知" : `v${version}`}  ${status}`;
+      put(text, fg, bold);
+      this.welcomeVersionRows[y - 1] = { key, x1: cx, x2: cx + strWidth(text) - 1 };
+    };
+    versionLine("DeepSeek Harness", this.app.dshVersion ?? "unknown", "dsh", T.HEADING, true);
+    versionLine("dsh-neotui", TUI_VERSION, "tui", T.FAINT, false);
     put("", 0, false);
     if (this.app.currentSession == null) {
       put("  打开一个会话开始，或 Ctrl+N 新建", T.DIM, false);
@@ -1990,6 +2033,7 @@ export class ChatView extends Widget {
     put("  请选择模式（F9 或点击下方，选择后立即生效）：", T.WARN, true);
     put("", 0, false);
     this.welcomeModes = [];
+    const currentPreset = this.app.sessions.find((s) => s.sessionId === this.app.currentSession)?.agentPreset;
     const presets = [
       ["standard", "标准模式", "完整编码 Agent（文件/Shell/检索/Skills/目标/子代理）"],
       ["code", "PTC 模式", "标准模式能力 + Code Mode SDK 单程序多步操作"],
@@ -1998,8 +2042,10 @@ export class ChatView extends Widget {
     ];
     for (const [id, name, desc] of presets) {
       if (y < this.view.y + this.view.h) {
-        screen.text(cx, y, `  ○ ${name}`, { fg: T.ACCENT, attrs: 1 });
-        screen.text(cx + 2 + strWidth(`○ ${name}`) + 1, y, truncate(desc, this.view.w - 20), { fg: T.DIM });
+        const selected = id === currentPreset;
+        const label = `${selected ? "●" : "○"} ${name}${selected ? " [当前]" : ""}`;
+        screen.text(cx, y, `  ${label}`, { fg: selected ? T.OK : T.ACCENT, bg: selected ? T.MENUSEL : -1, attrs: 1 });
+        screen.text(cx + 2 + strWidth(label) + 1, y, truncate(desc, Math.max(1, this.view.w - strWidth(label) - 8)), { fg: selected ? T.TXT : T.DIM, bg: selected ? T.MENUSEL : -1 });
         this.welcomeModes[y] = id;
       }
       y++;
@@ -2148,6 +2194,8 @@ export class ChatView extends Widget {
       if (this.app.focused !== this.app.chat?.input) this.app.focus(this);
       // Welcome-screen mode click: select the preset under the cursor.
       if (this.nodes.length === 0 && ev.kind === "press" && ev.button === 0) {
+        const versionHit = this.welcomeVersionRows?.[ev.y];
+        if (versionHit && ev.x >= versionHit.x1 && ev.x <= versionHit.x2) { this.app.checkUpdates(versionHit.key, true); return true; }
         const id = this.welcomeModes[ev.y];
         if (id) { this.app.selectPreset(id); return true; }
       }
@@ -2596,11 +2644,12 @@ export class ApprovalPopup extends Popup {
 // ---- App ----
 
 export class App {
-  constructor({ screen, term, api, base, log }) {
+  constructor({ screen, term, api, base, log, versionFetcher = latestNpmVersion }) {
     this.screen = screen;
     this.term = term;
     this.api = api;
     this.log = log ?? (() => {});
+    this.versionFetcher = versionFetcher;
     this.popup = null;
     this.activePrompt = null;
     this.promptQueue = [];
@@ -2626,6 +2675,11 @@ export class App {
     this.tokenUsage = null;
     this.sessions = [];
     this.currentSession = null;
+    this.dshVersion = installedDshVersion();
+    this.versionChecks = {
+      dsh: { state: "idle", latest: null },
+      tui: { state: "idle", latest: null },
+    };
     this.searchActive = false;
     this.overlay = null;       // Picker / Popup / ImagePopup modal
     this.mode = "chat";        // chat | workspace | trajectory
@@ -2691,6 +2745,30 @@ export class App {
   toggleChatTrajectory() {
     if (!this.currentSession) { this.toast("先打开一个会话"); return; }
     this.setMode(this.mode === "trajectory" ? "chat" : "trajectory");
+  }
+
+  async checkUpdates(target = null, notify = false) {
+    const specs = {
+      dsh: { package: "@deepseek-ai/dsh", current: this.dshVersion, label: "DeepSeek Harness" },
+      tui: { package: "dsh-neotui", current: TUI_VERSION, label: "dsh-neotui" },
+    };
+    const keys = target ? [target] : Object.keys(specs);
+    await Promise.all(keys.map(async (key) => {
+      const spec = specs[key];
+      if (!spec) return;
+      this.versionChecks[key] = { state: "checking", latest: null };
+      this.redraw();
+      try {
+        const latest = await this.versionFetcher(spec.package);
+        const state = latest === spec.current ? "current" : "update";
+        this.versionChecks[key] = { state, latest };
+        if (notify) this.toast(state === "current" ? `${spec.label} 已是最新版本 ${spec.current}` : `${spec.label} 可更新: ${spec.current} → ${latest}`);
+      } catch (error) {
+        this.versionChecks[key] = { state: "error", latest: null };
+        if (notify) this.toast(`${spec.label} 更新检查失败: ${error.message}`);
+      }
+      this.redraw();
+    }));
   }
 
   /** Chat → trajectory: open the trajectory panel at the step containing a
@@ -2825,6 +2903,7 @@ export class App {
       this.provider = host.provider ?? "";
       this.model = host.model ?? "";
     } catch (e) { this.log(`[app] host.describe: ${e.message}`); }
+    void this.checkUpdates();
     await this.refreshSessions();
     // A /restart handoff carries the session to reopen: resume it instead of
     // minting a fresh blank session (which was leaking a stray "new session"
@@ -3498,7 +3577,9 @@ export class App {
     }
     try {
       await this.api.call("agentPreset.select", { sessionId: this.currentSession, agentPreset: id });
+      if (sess) sess.agentPreset = id;
       this.toast(`模式已切换: ${modeName(id)}`);
+      this.redraw();
       this.refreshSessions();
     } catch (e) {
       if (e.code === "agent-preset-locked") { this.toast("会话已开始，模式固定；已设为新会话默认"); this.setDefaultPreset(id); }
@@ -3547,7 +3628,7 @@ export class App {
     } catch (e) { this.toast(`权限切换失败: ${e.message}`); }
   }
 
-  /** F8: cycle read-only → workspace-write → danger-full-access (full access gates). */
+  /** Shift+Tab/F8: cycle read-only → workspace-write → danger-full-access. */
   rotatePermission() {
     const order = ["read-only", "workspace-write", "danger-full-access"];
     const cur = this.projections.permissions?.currentValue;
@@ -3826,12 +3907,8 @@ export class App {
         this.redraw();
         return;
       }
-      if (ev.name === "backtab" && !ev.ctrl) {
-        if (this.mode === "trajectory") this.setMode("chat");
-        else if (this.mode === "chat") this.setMode("trajectory");
-        this.redraw();
-        return;
-      }
+      if (ev.name === "tab" && !ev.ctrl) { this.toggleChatTrajectory(); return; }
+      if (ev.name === "backtab" && !ev.ctrl) { this.rotatePermission(); return; }
       if (ev.ctrl && ev.key === "q") { this.stop(); return; }
       if (ev.ctrl && ev.key === "c") {
         // NORMAL-mode Ctrl+C: two presses within the toast window exit the
@@ -3844,7 +3921,6 @@ export class App {
         this.toast("再按一次 Ctrl+C 退出 TUI");
         return;
       }
-      if (ev.ctrl && ev.key === "n") { this.focus(this.chat); this.redraw(); return; }
       if (ev.ctrl && ev.key === "o") { this.overlay = new AttachmentPanel(this); this.focus(this.overlay); this.redraw(); return; }
       if (ev.ctrl && ev.key === "b") { this.toggleSidebar(); return; }
       if (ev.ctrl && ev.key === "p") { this.overlay = new ControlPanel(this, { startPage: 1 }); this.redraw(); return; }

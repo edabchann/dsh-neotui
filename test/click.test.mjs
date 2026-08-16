@@ -5,7 +5,7 @@ import { userInfo } from "node:os";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig } from "../src/views.js";
+import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion } from "../src/views.js";
 import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel } from "../src/panels.js";
 import { fmtDuration, strWidth } from "../src/text.js";
 import { renderMd } from "../src/md.js";
@@ -1648,21 +1648,52 @@ test("footer jobs row is a single 后台任务 summary", () => {
   assert.equal(app.status.rows.length, 3, "footer has exactly one jobs row");
 });
 
-test("the todo box freezes while populated and disappears when empty", () => {
+test("blank welcome highlights the current preset and shows both versions", () => {
+  const app = headlessApp();
+  app.currentSession = "blank";
+  app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "cordis" }];
+  app.dshVersion = "0.1.0-rc.6";
+  app.versionChecks = { dsh: { state: "current", latest: "0.1.0-rc.6" }, tui: { state: "update", latest: "0.2.3" } };
+  app.chat.sessionId = "blank";
+  app.chat.nodes = [];
+  app.layout(); app.chat.render(app.screen);
+  const rows = app.screen.cells.map((row) => row.map((cell) => cell.ch).join(""));
+  assert.ok(rows.some((row) => row.includes("DeepSeek Harness v0.1.0-rc.6") && row.includes("已是最新")), "DSH version and update state shown");
+  assert.ok(rows.some((row) => row.includes(`dsh-neotui v${TUI_VERSION}`) && row.includes("可更新 0.2.3")), "TUI version and update state shown");
+  assert.ok(rows.some((row) => row.includes("● 创造模式 [当前]")), "active blank-session preset highlighted");
+  assert.ok(rows.some((row) => row.includes("○ 标准模式")), "inactive presets remain unselected");
+});
+
+test("blank preset selection updates highlight immediately", async () => {
+  const app = headlessApp();
+  app.currentSession = "blank";
+  app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "standard" }];
+  app.api.call = async (method, payload) => {
+    assert.equal(method, "agentPreset.select");
+    assert.deepEqual(payload, { sessionId: "blank", agentPreset: "cordis" });
+    return {};
+  };
+  app.refreshSessions = async () => {};
+  await app.selectPreset("cordis");
+  assert.equal(app.sessions[0].agentPreset, "cordis");
+});
+
+test("the todo box follows visible item count and disappears when empty", () => {
   const app = headlessApp();
   const chat = app.chat;
   assert.equal(chat.todoHeight(), 0, "empty before any todos");
   app.projections.todos = [{ content: "a", status: "in_progress" }];
-  assert.equal(chat.todoHeight(), 8, "fixed framed max once seen");
+  assert.equal(chat.todoHeight(), 3, "one task uses header + one body + footer");
   app.projections.todos = [
     { content: "a", status: "completed" },
     { content: "b", status: "in_progress" },
     { content: "c", status: "in_progress" },
   ];
-  assert.equal(chat.todoHeight(), 8, "still 8 while the list changes");
+  assert.equal(chat.todoHeight(), 5, "three tasks do not reserve blank rows");
+  app.projections.todos = Array.from({ length: 9 }, (_, i) => ({ content: String(i), status: "pending" }));
+  assert.equal(chat.todoHeight(), 8, "body remains capped at six rows");
   app.projections.todos = [];
   assert.equal(chat.todoHeight(), 0, "empty list removes the task dock entirely");
-  assert.equal(chat.todoSeen, false, "empty projection clears historical residency");
   app.projections.todos = [{ content: "a", status: "in_progress" }];
   chat.todosVisible = false;
   assert.equal(chat.todoHeight(), 2, "Shift+T minimizes to a framed strip instead of hiding it");
@@ -1672,7 +1703,7 @@ test("the todo box freezes while populated and disappears when empty", () => {
 test("fixed bottom docks reduce transcript viewport and keep its tail reachable", () => {
   const app = headlessApp(); app.chat.nodes = [{ kind: "turn-progress", startedAt: Date.now(), streaming: true }];
   app.projections.todos = [{ content: "task", status: "in_progress" }];
-  app.chat.todoSeen = true; app.layout();
+  app.layout();
   assert.equal(app.chat.view.y + app.chat.view.h, app.chat.input.y - app.chat.todoHeight() - app.chat.divingHeight() - 1);
   app.chat.view.scrollY = app.chat.view.maxScroll();
   assert.equal(app.chat.view.scrollY, Math.max(0, app.chat.view.lines.length - app.chat.view.h));
@@ -1791,16 +1822,51 @@ test("GoalPanel exposes CAS-backed edit and lifecycle actions", async () => {
   assert.equal(calls.length, 1, "destructive action not sent before confirmation");
 });
 
-test("JobsPanel shares one buffer with subagents via Tab and arrows", async () => {
+test("JobsPanel shares one buffer with subagents and updates expand triangle", async () => {
   const app = fakeApp(); app.screen = { w: 100, h: 30 }; app.currentSession = "s"; app.jobs = [];
   app.api.call = async (method) => method === "subagent.list" ? { items: [{ sessionId: "child", label: "researcher", activity: "running" }] } : {};
   const panel = new JobsPanel(app);
   await Promise.resolve(); await Promise.resolve();
   panel.onKey({ type: "key", name: "tab" });
   assert.equal(panel.page, "subagents");
-  assert.ok(panel.lines.flat().some((part) => part.t?.includes("researcher")));
+  let line = panel.lines.flat().map((part) => part.t ?? "").join("");
+  assert.ok(line.includes("▸ 🛰 researcher"), line);
+  panel.onKey({ type: "key", name: "enter" });
+  line = panel.lines.flat().map((part) => part.t ?? "").join("");
+  assert.ok(line.includes("▾ 🛰 researcher"), line);
+  panel.onKey({ type: "key", name: "enter" });
+  line = panel.lines.flat().map((part) => part.t ?? "").join("");
+  assert.ok(line.includes("▸ 🛰 researcher"), line);
   panel.onKey({ type: "key", name: "left" });
   assert.equal(panel.page, "jobs");
+});
+
+test("NORMAL Tab toggles chat/trajectory and Shift+Tab rotates permissions", () => {
+  const app = headlessApp(); app.currentSession = "s";
+  let rotations = 0; app.rotatePermission = () => { rotations++; };
+  app.onEvent({ type: "key", name: "tab", ctrl: false, shift: false });
+  assert.equal(app.mode, "trajectory");
+  app.onEvent({ type: "key", name: "tab", ctrl: false, shift: false });
+  assert.equal(app.mode, "chat");
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(rotations, 1);
+});
+
+test("installed version helpers expose usable package versions", () => {
+  const versionPattern = /^(?:unknown|\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/;
+  assert.match(installedDshVersion(), versionPattern);
+  assert.match(TUI_VERSION, versionPattern);
+});
+
+test("welcome update checks compare both npm packages without blocking", async () => {
+  const seen = [];
+  const screen = new Screen(100, 30), term = { output: { write() {} } };
+  const app = new App({ screen, term, api: {}, versionFetcher: async (name) => { seen.push(name); return name === "dsh-neotui" ? "0.2.3" : "0.1.0-rc.6"; } });
+  app.dshVersion = "0.1.0-rc.6";
+  await app.checkUpdates();
+  assert.deepEqual(seen.sort(), ["@deepseek-ai/dsh", "dsh-neotui"]);
+  assert.equal(app.versionChecks.dsh.state, "current");
+  assert.deepEqual(app.versionChecks.tui, { state: "update", latest: "0.2.3" });
 });
 
 test("QueuePanel keeps one command per row, preserves selection, and dd removes", async () => {

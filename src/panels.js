@@ -1453,7 +1453,7 @@ export class ControlPanel extends Widget {
     const b=keyBindings();
     const row=(id,desc)=>[`${(b[id]?.mode??"all").toUpperCase()}\t${b[id]?.key??""}`,desc,null,id];
     return [
-      row("think","思考块 展开/折叠"),row("tools","工具块 展开/折叠"),row("insert","进入输入"),row("leaveInsert","退出输入"),row("sessionFilter","筛选会话"),row("newSession","新建会话"),row("top","滚动到顶"),row("bottom","滚动到底"),row("prevQuestion","上一提问的终点"),row("nextQuestion","下一提问的终点"),row("expandInput","输入栏 展开/折叠"),row("copyInput","复制输入栏选区"),row("panel","控制面板"),row("model","切换模型"),row("trajectory","轨迹视图"),row("homeSwitch","对话/轨迹切换"),row("workspace","工作区"),row("settings","设置"),row("subagent","子代理"),row("skills","技能"),row("goal","目标"),row("jobs","后台任务"),row("stepJump","步骤转跳"),row("sidebar","侧栏显示/隐藏"),row("quit","退出"),
+      row("think","思考块 展开/折叠"),row("tools","工具块 展开/折叠"),row("insert","进入输入"),row("leaveInsert","退出输入"),row("sessionFilter","筛选会话"),row("newSession","新建会话"),row("top","滚动到顶"),row("bottom","滚动到底"),row("prevQuestion","上一提问的终点"),row("nextQuestion","下一提问的终点"),row("expandInput","输入栏 展开/折叠"),row("copyInput","复制输入栏选区"),row("panel","控制面板"),row("model","切换模型"),row("trajectory","轨迹视图"),row("homeSwitch","对话/轨迹切换"),row("permissionRotate","权限模式轮换"),row("workspace","工作区"),row("settings","设置"),row("subagent","子代理"),row("skills","技能"),row("goal","目标"),row("jobs","后台任务"),row("stepJump","步骤转跳"),row("sidebar","侧栏显示/隐藏"),row("quit","退出"),
     ];
   }
   items() {
@@ -1669,7 +1669,8 @@ export class JobsPanel extends Popup {
       for (let i = 0; i < this.subagents.length; i++) {
         const child = this.subagents[i], bg = i === this.sel ? T.MENUSEL : T.BG2;
         const status = child.activity ?? child.status ?? child.mode ?? "idle";
-        lines.push([{ t: ` ${i === this.sel ? "▸" : " "} 🛰 ${truncate(child.label ?? child.sessionId ?? child.id ?? "子代理", 42)} `, fg: K.TXT, bg, bold: i === this.sel }, { t: status, fg: status === "running" ? K.WARN : K.DIM, bg }]); rowOf.push(i);
+        const open = this.expanded.has(i);
+        lines.push([{ t: ` ${open ? "▾" : "▸"} 🛰 ${truncate(child.label ?? child.sessionId ?? child.id ?? "子代理", 42)} `, fg: K.TXT, bg, bold: i === this.sel }, { t: status, fg: status === "running" ? K.WARN : K.DIM, bg }]); rowOf.push(i);
         if (this.expanded.has(i)) for (const [key, value] of Object.entries(child)) { lines.push([{ t: `      ${key}: ${truncate(typeof value === "object" ? JSON.stringify(value) : value, this.w - 16)}`, fg: K.DIM }]); rowOf.push(-1); }
       }
       this.lines = lines; this.rowOf = rowOf; this.#ensureVisible(); return;
