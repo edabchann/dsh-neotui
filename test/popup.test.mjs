@@ -18,6 +18,16 @@ function appHarness() {
   return { app, calls };
 }
 
+test("approval scrolls one line with up/down without changing safe button", () => {
+  const { app } = appHarness();
+  app.chat.toolCommandForCall=()=>Array.from({length:20},(_,i)=>`line ${i}`).join("\n");
+  const popup=new ApprovalPopup({app,frame:{rpcId:"r",sessionId:"s",approvalId:"a",callId:"c",toolName:"bash"}});
+  popup.lines.push(...Array.from({length:10},(_,i)=>`extra ${i}`));
+  assert.equal(popup.btnIdx,1);
+  popup.onKey({type:"key",name:"down"});assert.equal(popup.scrollY,1);assert.equal(popup.btnIdx,1);
+  popup.onKey({type:"key",name:"up"});assert.equal(popup.scrollY,0);assert.equal(popup.btnIdx,1);
+});
+
 test("approval shows command and Y submits allowed-once", async () => {
   const { app, calls } = appHarness();
   const popup = new ApprovalPopup({ app, frame: { rpcId: "r", sessionId: "s", approvalId: "a", callId: "c", toolName: "bash" } });

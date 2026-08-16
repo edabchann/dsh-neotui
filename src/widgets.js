@@ -832,6 +832,8 @@ export class Popup extends Widget {
   onKey(ev) {
     if (ev.type !== "key") return false;
     if (this.scrollable) {
+      if (ev.name === "up") { this.scrollY = Math.max(0, this.scrollY - 1); return true; }
+      if (ev.name === "down") { this.scrollY = Math.min(this.maxScroll(), this.scrollY + 1); return true; }
       if (ev.name === "pgup") { this.scrollY = Math.max(0, this.scrollY - this.contentRows()); return true; }
       if (ev.name === "pgdn") { this.scrollY = Math.min(this.maxScroll(), this.scrollY + this.contentRows()); return true; }
     }
