@@ -2366,7 +2366,9 @@ export class QuestionPopup extends Popup {
     const questions = frame.questions ?? [];
     const planReview = questions.length === 1 && questions[0]?.intent?.kind === "plan-review";
     const w = Math.max(12, Math.min(planReview ? 96 : 92, app.screen.w - 2));
-    const h = Math.max(12, app.screen.h - 2);
+    const wrapCount=(value,width)=>wrapDisplayText(value,width).length;
+    const estimated=questions.reduce((n,q)=>n+1+wrapCount(q.question??"",w-4)+(q.detail?wrapCount(q.detail,w-4):0)+(q.options??[]).reduce((m,o)=>m+1+(o.description?wrapCount(o.description,w-10):0),0)+(q.intent?.kind==="plan-review"?0:4),0)+2;
+    const h=Math.max(10,Math.min(app.screen.h-2,estimated));
     super({
       x: Math.max(0, Math.floor((app.screen.w - w) / 2)), y: Math.max(0, Math.floor((app.screen.h - h) / 2)),
       w, h, title: planReview ? "✎ 计划审阅" : "❓ 需要你的回答",

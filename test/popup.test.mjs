@@ -79,6 +79,11 @@ test("long plan review scrolls with PgDn/Home/End and wheel", () => {
   assert.equal(popup.detailScrollY, 3);
 });
 
+test("short question popup uses content height instead of full terminal", () => {
+  const { app }=appHarness();app.screen.h=50;const popup=new QuestionPopup({app,frame:{rpcId:"q",sessionId:"s",questions:[{id:"x",question:"Short",options:[{label:"A"},{label:"B"}]}]}});
+  assert.ok(popup.h<app.screen.h/2);assert.ok(popup.h>=10);
+});
+
 test("long question wraps and scrolls while action rows stay visible", () => {
   const { app }=appHarness();const popup=new QuestionPopup({app,frame:{rpcId:"q",sessionId:"s",questions:[{id:"x",header:"Long",question:"问题内容 ".repeat(80),options:[{label:"A",description:"描述 ".repeat(50)},{label:"B"}]}]}});
   const drawn=[];const screen={text(x,y,t){drawn.push({x,y,t});},fillRect(){},box(){},hline(){},put(){}};popup.render(screen);
