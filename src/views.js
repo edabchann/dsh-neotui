@@ -2365,8 +2365,8 @@ export class QuestionPopup extends Popup {
   constructor({ app, frame }) {
     const questions = frame.questions ?? [];
     const planReview = questions.length === 1 && questions[0]?.intent?.kind === "plan-review";
-    const w = Math.max(12, Math.min(planReview ? 88 : 72, app.screen.w - 2));
-    const h = Math.max(5, Math.min(Math.max(5, app.screen.h - 2), planReview ? app.screen.h - 2 : questions.length * 5 + 8));
+    const w = Math.max(12, Math.min(planReview ? 96 : 92, app.screen.w - 2));
+    const h = Math.max(12, app.screen.h - 2);
     super({
       x: Math.max(0, Math.floor((app.screen.w - w) / 2)), y: Math.max(0, Math.floor((app.screen.h - h) / 2)),
       w, h, title: planReview ? "✎ 计划审阅" : "❓ 需要你的回答",
@@ -2404,7 +2404,7 @@ export class QuestionPopup extends Popup {
     const draft = this.drafts[this.questionIdx];
     const opts = q.options ?? [];
     const actionRows = opts.length + (this.planReview ? 0 : 3);
-    const actionTop = Math.max(this.y + 4, this.y + this.h - 1 - actionRows);
+    const actionTop = Math.max(this.y + 5, this.y + this.h - 1 - actionRows);
     const doc = [
       { text: `▎ ${q.header ?? `问题 ${this.questionIdx + 1}/${this.questions.length}`}`, fg: K.ACCENT, bold: true },
       ...wrapDisplayText(q.question ?? "", this.w - 4).map((text) => ({ text, fg: K.TXT })),
@@ -2418,7 +2418,8 @@ export class QuestionPopup extends Popup {
     this.detailScrollY = Math.max(0, Math.min(this.detailScrollY, maxScroll)); this.detailPage = room; this.detailTotal = doc.length;
     let ly = this.y + 1;
     for (const line of doc.slice(this.detailScrollY, this.detailScrollY + room)) screen.text(this.x + 2, ly++, truncate(line.text, this.w - 4), { fg: line.fg, attrs: line.bold ? 1 : 0 });
-    if(maxScroll>0){screen.text(this.x+this.w-16,this.y,`↑↓ ${this.detailScrollY+1}-${Math.min(doc.length,this.detailScrollY+room)}/${doc.length}`,{fg:K.ACCENT,bg:T.BG2});}
+    if(maxScroll>0){screen.text(this.x+this.w-30,this.y,`文档 Alt+↑↓/PgUp·PgDn ${this.detailScrollY+1}-${Math.min(doc.length,this.detailScrollY+room)}/${doc.length}`,{fg:K.ACCENT,bg:T.BG2});}
+    screen.hline(this.x+1,this.x+this.w-2,actionTop-1,"─",{fg:T.BORDER2,bg:T.BG2});screen.text(this.x+3,actionTop-1," 回答（↑/↓ 选择） ",{fg:K.ACCENT,bg:T.BG2});
     ly=actionTop;
     this.optionRows = []; this.optionHitboxes = [];
     for (let i = 0; i < opts.length; i++) {
