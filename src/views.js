@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { Widget, ScrollView, Input, Popup, Menu, StatusBar, wrapIndex } from "./widgets.js";
 import { UploadPicker } from "./file-picker.js";
-import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, keyBindings, tuiConfigFile, reloadTuiConfig } from "./config.js";
+import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, keyBindings, tuiConfigFile, reloadTuiConfig, searchHistory, rememberSearchQuery } from "./config.js";
 import { bindingMatchFor, matchKeyBinding, CHAT_BINDING_ORDER, SIDEBAR_BINDING_ORDER, KEYBINDING_ORDER } from "./keybindings.js";
 export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
 import {
@@ -21,6 +21,37 @@ import {
 import { T, themeName, cycleTheme } from "./theme.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
 const K = new Proxy({}, { get(_k, key) { return T[key]; } });
+
+/** Case-insensitive spans mapped back to original graphemes. Lowercasing may
+ *  expand one grapheme (notably U+0130), so raw folded string offsets are not
+ *  safe source offsets. */
+function caseInsensitiveParts(text, query) {
+  const source = graphemes(String(text ?? ""));
+  const needle = graphemes(String(query ?? "")).map((g) => g.toLowerCase()).join("");
+  if (!needle) return [{ t: source.join(""), hit: false }];
+  let folded = "";
+  const owner = [];
+  source.forEach((g, index) => {
+    const lower = g.toLowerCase();
+    folded += lower;
+    // String#indexOf offsets are UTF-16 code-unit offsets.
+    for (let i = 0; i < lower.length; i++) owner.push(index);
+  });
+  const parts = [];
+  let cursor = 0, from = 0;
+  while (from <= folded.length - needle.length) {
+    const at = folded.indexOf(needle, from);
+    if (at < 0) break;
+    from = at + Math.max(1, needle.length);
+    const start = owner[at], end = owner[at + needle.length - 1] + 1;
+    if (start == null || end == null || start < cursor) continue;
+    if (start > cursor) parts.push({ t: source.slice(cursor, start).join(""), hit: false });
+    parts.push({ t: source.slice(start, end).join(""), hit: true });
+    cursor = end;
+  }
+  if (cursor < source.length) parts.push({ t: source.slice(cursor).join(""), hit: false });
+  return parts.length ? parts : [{ t: source.join(""), hit: false }];
+}
 
 const require = createRequire(import.meta.url);
 export const TUI_VERSION = (() => {
@@ -1701,7 +1732,7 @@ export class ChatView extends Widget {
     const oldBlock = this.blockItems?.[this.blockSel] ?? null;
     const oldIdentity = oldBlock ? `${oldBlock.nodeKey}:${oldBlock.blockIdx ?? "n"}:${oldBlock.kind}:${oldBlock.codeIndex ?? "-"}` : null;
     const w = Math.max(20, this.view.w - 2);
-    const lines = [];
+    let lines = [];
     const lineMap = [];
     this.cardRanges = [];
     const mark = (nodeIdx, blockIdx = null, dispatchId = null) => lineMap.push(dispatchId != null ? { nodeIdx, blockIdx, dispatchId } : { nodeIdx, blockIdx });
@@ -2099,22 +2130,22 @@ export class ChatView extends Widget {
     }
     const q = this.app.searchQuery;
     if (q) {
-      const lower = q.toLowerCase();
-      lines = lines.map((ln) => ln.flatMap((seg) => {
-        if (!seg.t) return [seg];
-        const low = seg.t.toLowerCase();
-        if (!low.includes(lower)) return [seg];
-        const parts = [];
-        let idx = 0;
-        while (true) {
-          const i = low.indexOf(lower, idx);
-          if (i === -1) { if (idx < seg.t.length) parts.push({ ...seg, t: seg.t.slice(idx) }); break; }
-          if (i > idx) parts.push({ ...seg, t: seg.t.slice(idx, i) });
-          parts.push({ ...seg, t: seg.t.slice(i, i + q.length), bg: T.WARN, fg: T.SELFG });
-          idx = i + q.length;
+      const target = this.app.searchQueryTarget ?? null;
+      lines = lines.map((ln, li) => {
+        // A jumped-to result highlights only its own block; an in-conversation
+        // find (no target) highlights the whole transcript.
+        if (target != null) {
+          const mark = lineMap[li];
+          const node = mark?.nodeIdx != null ? this.nodes[mark.nodeIdx] : null;
+          if (this.#nodeKey(node ?? undefined) !== target.nodeKey || (target.blockIdx != null && mark?.blockIdx !== target.blockIdx)) return ln;
         }
-        return parts;
-      }));
+        return ln.flatMap((seg) => {
+          if (!seg.t) return [seg];
+          return caseInsensitiveParts(seg.t, q).map((part) => part.hit
+            ? { ...seg, t: part.t, bg: T.WARN, fg: T.SELFG }
+            : { ...seg, t: part.t });
+        });
+      });
     }
     this.lines = lines;
     this.lineMap = lineMap;
@@ -2125,9 +2156,14 @@ export class ChatView extends Widget {
     this.view.setLines(lines);
   }
 
+  /** Stable identity of a derived node (message id, or seq+kind fallback). */
+  #nodeKey(node) {
+    if (!node) return null;
+    return node.id ?? `seq:${node.firstSeq ?? "?"}:${node.kind}`;
+  }
+
   #rebuildBlockItems(oldIdentity = null) {
-    const items = [];
-    const nonBlank = (line) => (this.lines[line] ?? []).some((seg) => (seg.t ?? "").trim() !== "");
+    const items = [];    const nonBlank = (line) => (this.lines[line] ?? []).some((seg) => (seg.t ?? "").trim() !== "");
     const keyOf = (mark) => {
       if (!mark || mark.nodeIdx == null || mark.nodeIdx < 0) return null;
       if (mark.imgIdx !== undefined) return `${mark.nodeIdx}:img:${mark.imgIdx}`;
@@ -2146,7 +2182,7 @@ export class ChatView extends Widget {
       if (first >= 0 && node) {
         const block = mark.blockIdx != null ? node.blocks?.[mark.blockIdx] : null;
         const baseKind = mark.imgIdx !== undefined ? "image" : mark.dispatchId != null ? "tool" : block?.kind ?? node.kind;
-        const nodeKey = node.id ?? `seq:${node.firstSeq ?? "?"}:${node.kind}`;
+        const nodeKey = this.#nodeKey(node);
         const base = { first, last, headerLine: first, nodeIdx: mark.nodeIdx, nodeKey, blockIdx: mark.blockIdx ?? null, kind: baseKind, foldable: false, code: null };
         if (block?.kind === "reasoning" || block?.kind === "tool" || mark.dispatchId != null) base.foldable = true;
         else if (!block && ["user", "context", "goal-round", "subagent-receipt"].includes(node.kind)) base.foldable = true;
@@ -2723,7 +2759,7 @@ export class ChatView extends Widget {
       this.app.redraw();
       return true;
     }
-    if (ev.name === "escape" && this.app.searchQuery) { this.app.searchQuery = null; this.queueRebuild(); return true; }
+    if (ev.name === "escape" && this.app.searchQuery) { this.app.searchQuery = null; this.app.searchQueryTarget = null; this.queueRebuild(); return true; }
     if (ev.name === "escape" && this.cursorMode !== "block") { this.cursorMode = "block"; this.visualAnchor = null; this.#syncKeyboardSelection(); this.app.redraw(); return true; }
     if (ev.name === "escape" && this.selStart !== null) { this.selStart = this.selEnd = null; this.selAnchor = this.selFocus = null; this.app.redraw(); return true; }
     if (ev.name === "enter" && this.blockItems[this.blockSel]) { this.cursorMode = "normal"; const item = this.blockItems[this.blockSel]; this.cursor = { line: item.headerLine, col: Math.max(0, strWidth(this.#lineText(item.headerLine)) - 1) }; this.app.redraw(); return true; }
@@ -3079,7 +3115,8 @@ export class App {
     this.draggingDivider = false;
     this.inputDrag = false;     // mouse drag-selection inside the input is active
     this.feedbackMap = new Map(); // messageId → {rating, version}
-    this.searchQuery = null;      // active find-in-conversation term (highlight)
+    this.searchQuery = null;        // active find-in-conversation term (highlight)
+    this.searchQueryTarget = null;  // optional { nodeKey, blockIdx } result scope
     this.queueItems = [];
     this.findQuery = null;        // term being typed in the find picker
     this.projections = {};     // goal/todos/plan/sessionStats/contextPressure/…
@@ -3671,7 +3708,7 @@ export class App {
       x: Math.floor((this.screen.w - w) / 2), y: Math.floor((this.screen.h - h) / 2),
       w, h, title: "会话内搜索", items,
       onCancel: () => this.closeOverlay(),
-      onPick: (it) => { this.searchQuery = picker.query || null; this.closeOverlay(); this.chat.jumpToNode(it.idx); },
+      onPick: (it) => { this.searchQuery = picker.query || null; this.searchQueryTarget = null; this.closeOverlay(); this.chat.jumpToNode(it.idx); },
     });
     this.overlay = picker;
     this.redraw();
@@ -3743,6 +3780,12 @@ export class App {
   async openSession(sessionId) {
     if (typeof sessionId !== "string" || !sessionId) { this.toast("无法打开会话：缺少会话 ID"); return; }
     const epoch = ++this.sessionEpoch;
+    if (sessionId !== this.currentSession && !this.searchActive) {
+      // A scoped result highlight belongs to the session it was opened from;
+      // ordinary sidebar/session switches must not leak it into another chat.
+      this.searchQuery = null;
+      this.searchQueryTarget = null;
+    }
     this.currentSession = sessionId;
     this.projections = { ...(this.projectionsBySession.get(sessionId) ?? {}) };
     this.tokenUsage = this.projections.tokenUsage ?? null;
@@ -4452,8 +4495,10 @@ export class App {
   startSearch() {
     this.searchSeq++;
     this.searchActive = true;
+    this.searchInput.history = searchHistory();
+    this.searchInput.histIdx = -1;
     this.searchInput.setValue("");
-    this.searchState = { phase: "input", query: "", rows: [], selected: 0, collapsed: new Set(), typeFold: new Set(), preview: [], previewScroll: 0, loading: false, hasMore: false, fallback: false, fallbackError: null };
+    this.searchState = { phase: "input", query: "", rows: [], selected: 0, collapsed: new Set(), typeFold: new Set(), preview: [], previewScroll: 0, loading: false, hasMore: false, fallback: false, fallbackError: null, sort: "relevance" };
     this.focus(this.searchInput);
     this.redraw();
   }
@@ -4498,7 +4543,16 @@ export class App {
     for (let page = 0; deep && !resolved && history.hasMore && page < 40; page++) {
       const beforeSeq = allEvents[0]?.event?.seq;
       if (beforeSeq == null) break;
-      const older = await this.api.call("session.history", { sessionId, beforeSeq, maxMessages: 80 });
+      let older;
+      try { older = await this.api.call("session.history", { sessionId, beforeSeq, maxMessages: 80 }); }
+      catch (error) {
+        // The Host index already succeeded. A history-page failure only makes
+        // this hit approximate; it must not masquerade as an unavailable index
+        // and discard every other resolved candidate via the global fallback.
+        this.log("search history page failed:", sessionId, error?.message ?? error);
+        history = { ...history, hasMore: false };
+        break;
+      }
       if (seq !== this.searchSeq || !this.searchActive || this.searchState !== state) return null;
       const merged = this.#mergeHistoryEvents(older.events, allEvents);
       const newBeforeSeq = merged[0]?.event?.seq;
@@ -4522,20 +4576,29 @@ export class App {
     }
     if (!matches.length && deep) matches.push({ nodeIdx: -1, blockIdx: null, kind: "snippet", text: snippet ?? "", seq: null, approximate: true });
     const session = this.sessions.find((item) => item.sessionId === sessionId);
-    return { sessionId, title: session?.projections?.values?.title ?? sessionId.slice(0, 8), snippet: snippet ?? "", nodes, matches, hasMore: history.hasMore, beforeSeq: allEvents[0]?.event?.seq ?? null };
+    return { sessionId, title: session?.projections?.values?.title ?? sessionId.slice(0, 8), updatedAt: session?.updatedAt ?? 0, snippet: snippet ?? "", nodes, matches, hasMore: history.hasMore, beforeSeq: allEvents[0]?.event?.seq ?? null };
   }
 
   /** Bounded local scan over loaded sessions when the Host FTS index is absent. */
   async #localSearchFallback(query, lower, seq, state) {
     const groups = new Map();
-    const candidates = (this.sessions ?? []).filter((session) => !session.blank).slice(0, 20);
-    for (const session of candidates) {
+    const candidates = (this.sessions ?? []).filter((session) => !session.blank).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)).slice(0, 20);
+    state.progress = { done: 0, found: 0, total: candidates.length, label: "本地扫描（无 Host 索引）" };
+    this.redraw();
+    for (let rank = 0; rank < candidates.length; rank++) {
+      const session = candidates[rank];
+      state.progress = { ...state.progress, label: this.#searchTitleFor(session.sessionId) };
+      this.redraw();
       const entry = await this.#resolveSearchSession(session.sessionId, "", lower, seq, state, { deep: false });
       if (entry === null) return null;
+      entry.rank = rank;
+      state.progress.done++;
       if (entry.matches.length === 0) continue;
+      state.progress.found++;
       const ws = this.#searchWorkspaceFor(session.sessionId);
       if (!groups.has(ws.key)) groups.set(ws.key, { ...ws, sessions: [] });
       groups.get(ws.key).sessions.push(entry);
+      this.redraw();
     }
     return [...groups.values()];
   }
@@ -4544,51 +4607,150 @@ export class App {
     const state = this.searchState;
     const query = this.searchInput.value.trim();
     if (!state || !query || state.loading) { if (!query) this.toast("请输入搜索内容"); return; }
-    state.loading = true; state.error = null; state.fallback = false; state.fallbackError = null; state.phase = "results"; state.query = query; state.rows = []; state.preview = []; state.selected = 0; this.focus(this); this.redraw();
+    rememberSearchQuery(query); // best-effort history; search itself must never depend on config writes
+    this.searchInput.history = searchHistory(); this.searchInput.histIdx = -1;
+    state.loading = true; state.error = null; state.fallback = false; state.fallbackError = null; state.progress = { done: 0, total: 0, label: "" }; state.phase = "results"; state.query = query; state.rows = []; state.preview = []; state.selected = 0; this.focus(this); this.redraw();
     const seq = ++this.searchSeq;
     const lower = query.toLowerCase();
     try {
       const result = await this.api.call("session.search", { query });
+      if (seq !== this.searchSeq || !this.searchActive || this.searchState !== state) return;
       const groups = new Map();
-      for (const hit of result.items ?? []) {
+      // Defensive dedupe keeps row identities, fold state and selection keys
+      // stable even if a Host implementation repeats one session candidate.
+      const seenSessions = new Set();
+      const hits = (Array.isArray(result.items) ? result.items : []).filter((hit) => {
+        if (typeof hit?.sessionId !== "string" || !hit.sessionId || seenSessions.has(hit.sessionId)) return false;
+        seenSessions.add(hit.sessionId);
+        return true;
+      });
+      state.progress = { done: 0, total: hits.length, label: "搜索完成，开始解析候选会话" };
+      this.redraw();
+      for (let rank = 0; rank < hits.length; rank++) {
+        const hit = hits[rank];
+        state.progress = { ...state.progress, label: this.#searchTitleFor(hit.sessionId) };
+        this.redraw();
         const entry = await this.#resolveSearchSession(hit.sessionId, hit.snippet ?? "", lower, seq, state, { deep: true });
         if (entry === null) return;
+        entry.rank = rank;
+        state.progress.done++;
         const ws = this.#searchWorkspaceFor(hit.sessionId);
         if (!groups.has(ws.key)) groups.set(ws.key, { ...ws, sessions: [] });
         groups.get(ws.key).sessions.push(entry);
+        this.redraw();
       }
       if (seq !== this.searchSeq || !this.searchActive || this.searchState !== state) return;
-      state.groups = [...groups.values()]; state.hasMore = !!result.hasMore; state.loading = false; this.#flattenSearchRows();
+      state.groups = [...groups.values()]; state.hasMore = !!result.hasMore; state.loading = false; state.progress = null; this.#flattenSearchRows();
     } catch (error) {
       if (seq !== this.searchSeq || !this.searchActive || this.searchState !== state) return;
       // Deployments without @deepseek-ai/dsh-session-query reject session.search.
       // Degrade to a bounded local scan over the already-loaded sessions.
       const groups = await this.#localSearchFallback(query, lower, seq, state);
       if (groups === null) return;
-      state.groups = groups; state.hasMore = false; state.loading = false; state.fallback = true; state.fallbackError = error.message;
+      state.groups = groups; state.hasMore = false; state.loading = false; state.fallback = true; state.fallbackError = error.message; state.progress = null;
       this.#flattenSearchRows();
       this.toast("Host 搜索索引不可用；已改用本地有界扫描");
     }
     if (seq === this.searchSeq && this.searchState === state) this.redraw();
   }
 
+  #searchTitleFor(sessionId) {
+    const session = this.sessions.find((item) => item.sessionId === sessionId);
+    return session?.projections?.values?.title ?? sessionId.slice(0, 8);
+  }
+
+  #searchSortLabel(sort) { return { relevance: "相关度", recent: "最近更新", matches: "命中数" }[sort] ?? "相关度"; }
+  #searchSessionComparator(sort) {
+    const rank = (entry) => entry.rank ?? Number.MAX_SAFE_INTEGER;
+    if (sort === "recent") return (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || rank(a) - rank(b);
+    if (sort === "matches") return (a, b) => (b.matches?.length ?? 0) - (a.matches?.length ?? 0) || (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || rank(a) - rank(b);
+    return (a, b) => rank(a) - rank(b);
+  }
+
   #flattenSearchRows() {
     const state = this.searchState; if (!state) return;
+    const selectedKey = state.rows?.[state.selected]?.key ?? null;
+    const compare = this.#searchSessionComparator(state.sort);
+    const groups = (state.groups ?? []).map((group) => ({ ...group, sessions: [...group.sessions].sort(compare) }));
+    groups.sort((a, b) => compare(a.sessions[0] ?? {}, b.sessions[0] ?? {}));
     const rows = [];
-    for (const group of state.groups ?? []) {
+    for (const group of groups) {
       rows.push({ kind: "workspace", key: `w:${group.key}`, group });
       if (state.collapsed.has(`w:${group.key}`)) continue;
       for (const session of group.sessions) {
         rows.push({ kind: "session", key: `s:${session.sessionId}`, session, group });
         if (state.collapsed.has(`s:${session.sessionId}`)) continue;
-        for (let mi = 0; mi < session.matches.length; mi++) {
+        // Newest matches first: the freshest hit is usually the relevant one.
+        for (let mi = session.matches.length - 1; mi >= 0; mi--) {
           const match = session.matches[mi];
           if (state.typeFold.has(match.kind)) continue;
           rows.push({ kind: "match", key: `m:${session.sessionId}:${mi}`, session, group, match, matchIndex: mi });
         }
       }
     }
-    state.rows = rows; state.selected = Math.min(state.selected, Math.max(0, rows.length - 1)); this.#updateSearchPreview();
+    state.rows = rows;
+    const kept = selectedKey == null ? -1 : rows.findIndex((row) => row.key === selectedKey);
+    state.selected = kept >= 0 ? kept : Math.min(state.selected, Math.max(0, rows.length - 1));
+    this.#updateSearchPreview();
+  }
+
+  #searchSplit() {
+    // Keep both panes usable. On genuinely narrow terminals the left result
+    // tree takes half the surface instead of consuming the entire preview.
+    const w = this.screen.w;
+    return Math.max(8, Math.min(Math.max(24, Math.floor(w * 0.36)), 48, w - 16));
+  }
+
+  /** Draw text truncated to a width, with every query occurrence highlighted. */
+  #drawSearchHighlight(s, x, y, text, width, style, query) {
+    const parts = caseInsensitiveParts(text, query);
+    let px = x;
+    for (const part of parts) {
+      const avail = x + width - px;
+      if (avail <= 0) break;
+      const t = strWidth(part.t) > avail ? truncate(part.t, avail) : part.t;
+      s.text(px, y, t, part.hit ? { ...style, bg: T.WARN, fg: T.SELFG } : style);
+      px += strWidth(t);
+    }
+  }
+
+  #searchRowPrefix(row, selected, width) {
+    const desired = `    ${selected ? "=>" : "  "} [${row.match.kind}] `;
+    if (strWidth(desired) + 1 <= width) return desired;
+    if (width >= 4) return selected ? " => " : "    ";
+    return selected && width >= 2 ? "> " : "";
+  }
+
+  #searchPreviewPrefix(item) {
+    const desired = `${item.active ? "=>" : "  "} [${item.kind}] `;
+    const available = Math.max(0, this.screen.w - this.#searchSplit() - 4);
+    if (strWidth(desired) + 3 <= available) return desired;
+    return available >= 4 ? (item.active ? "=> " : "   ") : "";
+  }
+
+  #searchPreviewPrefixWidth(state = this.searchState) {
+    let width = 0;
+    for (const item of state?.preview ?? []) {
+      if (!state.typeFold.has(item.kind)) width = Math.max(width, strWidth(this.#searchPreviewPrefix(item)));
+    }
+    return width;
+  }
+
+  #searchPreviewMetrics(state = this.searchState) {
+    const width = Math.max(1, this.screen.w - this.#searchSplit() - 4 - this.#searchPreviewPrefixWidth(state));
+    let lines = 0;
+    for (const item of state?.preview ?? []) {
+      if (state.typeFold.has(item.kind)) continue;
+      lines += wrapDisplayText(item.text || "（空）", width).length;
+    }
+    const viewHeight = Math.max(1, this.screen.h - 5);
+    return { width, viewHeight, maxScroll: Math.max(0, lines - viewHeight) };
+  }
+
+  #scrollSearchPreview(delta) {
+    const state = this.searchState; if (!state) return;
+    const { maxScroll } = this.#searchPreviewMetrics(state);
+    state.previewScroll = Math.max(0, Math.min(maxScroll, state.previewScroll + delta));
   }
 
   #updateSearchPreview() {
@@ -4598,16 +4760,34 @@ export class App {
       state.preview = row.session.nodes.slice(from, to).flatMap((node, offset) => node.kind === "assistant" ? (node.blocks ?? []).map((block) => ({ kind: block.kind, text: this.#searchBlockText(node, block), active: from + offset === row.match.nodeIdx && block === node.blocks?.[row.match.blockIdx] })) : [{ kind: node.kind, text: this.#searchBlockText(node), active: from + offset === row.match.nodeIdx }]);
     } else if (row?.session) state.preview = [{ kind: "text", text: row.session.snippet }];
     else state.preview = [];
+    // Follow the selection: the active block's first wrapped line scrolls into
+    // view even when the neighbouring blocks are long. Manual Ctrl+↑/↓ keeps
+    // working afterwards; the next selection change re-follows.
     state.previewScroll = 0;
+    const activeIdx = state.preview.findIndex((item) => item.active);
+    if (activeIdx >= 0) {
+      const { width, viewHeight, maxScroll } = this.#searchPreviewMetrics(state);
+      let logical = 0;
+      for (let i = 0; i < state.preview.length; i++) {
+        const item = state.preview[i];
+        if (state.typeFold.has(item.kind)) continue;
+        const h = wrapDisplayText(item.text || "（空）", width).length;
+        if (i === activeIdx) { state.previewScroll = Math.min(maxScroll, Math.max(0, Math.min(logical, logical + h - viewHeight))); break; }
+        logical += h;
+      }
+    }
   }
 
   async #jumpSearchResult(row) {
     if (!row?.session) return;
     const sessionId = row.session.sessionId;
     const query = this.searchState?.query ?? "";
-    this.searchSeq++;
+    const jumpSeq = ++this.searchSeq;
     this.searchActive = false; this.searchState = null;
     await this.openSession(sessionId);
+    // The user may have started another search while the session was loading.
+    // Never let this stale jump steal its focus or apply an old highlight.
+    if (jumpSeq !== this.searchSeq || this.searchActive) return;
     this.setMode("chat"); this.focus(this.chat);
     if (row.kind === "match" && row.match.approximate) {
       this.toast("Host 找到该会话，但在解析预算内未定位到精确正文；已打开会话尾部");
@@ -4616,13 +4796,18 @@ export class App {
       let index = targetSeq == null ? row.match.nodeIdx : this.chat.nodes.findIndex((node) => node.firstSeq <= targetSeq && node.lastSeq >= targetSeq);
       // Search may have resolved up to forty 80-message pages; use the same
       // page size and budget while opening the target conversation.
-      for (let i = 0; index < 0 && this.chat.hasMore && i < 40; i++) { await this.chat.loadOlder(null, 80); index = this.chat.nodes.findIndex((node) => node.firstSeq <= targetSeq && node.lastSeq >= targetSeq); }
+      for (let i = 0; index < 0 && this.chat.hasMore && i < 40; i++) {
+        await this.chat.loadOlder(null, 80);
+        if (jumpSeq !== this.searchSeq || this.searchActive) return;
+        index = this.chat.nodes.findIndex((node) => node.firstSeq <= targetSeq && node.lastSeq >= targetSeq);
+      }
       if (index >= 0) {
         this.chat.jumpToNode(index);
         const block = this.chat.blockItems.findIndex((item) => item.nodeIdx === index && (row.match.blockIdx == null || item.blockIdx === row.match.blockIdx) && (row.match.kind !== "code" || item.kind === "code"));
         if (block >= 0) {
           const item = this.chat.blockItems[block]; this.chat.blockSel = block; this.chat.cursorMode = "block"; this.chat.cursor = { line: item.headerLine, col: 0 }; this.chat.view.scrollY = Math.max(0, item.headerLine - 2);
           this.searchQuery = query || null;
+          this.searchQueryTarget = { nodeKey: item.nodeKey, blockIdx: item.blockIdx }; // exact matched block
           this.chat.queueRebuild();
         } else {
           this.toast("已定位到消息，但匹配块当前不可见");
@@ -4647,10 +4832,26 @@ export class App {
     }
     if (ev.type !== "key") return;
     if (ev.name === "char" && ev.key === "/" && !ev.ctrl) { state.phase = "input"; this.searchInput.setValue(state.query); this.focus(this.searchInput); return; }
-    if (ev.ctrl && (ev.name === "up" || ev.name === "down")) { state.previewScroll = Math.max(0, state.previewScroll + (ev.name === "up" ? -1 : 1)); return; }
+    if (ev.ctrl && (ev.name === "up" || ev.name === "down")) { this.#scrollSearchPreview(ev.name === "up" ? -3 : 3); return; }
+    if (ev.ctrl && (ev.name === "pgup" || ev.name === "pgdn")) { const page = Math.max(1, this.screen.h - 5); this.#scrollSearchPreview(ev.name === "pgup" ? -page : page); return; }
+    if (ev.name === "pgup" || ev.name === "pgdn" || ev.name === "home" || ev.name === "end") {
+      if (state.rows.length === 0) return;
+      const page = Math.max(1, this.screen.h - 7);
+      const next = ev.name === "pgup" ? state.selected - page : ev.name === "pgdn" ? state.selected + page : ev.name === "home" ? 0 : state.rows.length - 1;
+      state.selected = Math.max(0, Math.min(state.rows.length - 1, next));
+      this.#updateSearchPreview();
+      return;
+    }
     if ((ev.name === "up" || ev.name === "down") && state.rows.length) { state.selected = wrapIndex(state.selected + (ev.name === "up" ? -1 : 1), state.rows.length); this.#updateSearchPreview(); return; }
     const row = state.rows[state.selected];
     if (ev.name === "char" && ev.key === " " && !ev.ctrl && row && row.kind !== "match") { const key = row.key; if (state.collapsed.has(key)) state.collapsed.delete(key); else state.collapsed.add(key); this.#flattenSearchRows(); return; }
+    if (ev.name === "char" && ev.key === "s" && !ev.ctrl && !ev.shift) {
+      const sorts = ["relevance", "recent", "matches"];
+      state.sort = sorts[(sorts.indexOf(state.sort) + 1) % sorts.length];
+      this.#flattenSearchRows();
+      this.toast(`搜索排序：${this.#searchSortLabel(state.sort)}`);
+      return;
+    }
     if (ev.name === "char" && (ev.key === "t" || ev.key === "b") && !ev.ctrl && !ev.shift) { const kind = ev.key === "t" ? "reasoning" : "tool"; if (state.typeFold.has(kind)) state.typeFold.delete(kind); else state.typeFold.add(kind); this.#flattenSearchRows(); return; }
     if (ev.name === "enter" && row) { if (row.kind === "match") void this.#jumpSearchResult(row); else { if (state.collapsed.has(row.key)) state.collapsed.delete(row.key); else state.collapsed.add(row.key); this.#flattenSearchRows(); } }
   }
@@ -4658,17 +4859,29 @@ export class App {
   #renderSearchBuffer(s) {
     const state = this.searchState; if (!state) return;
     s.fillRect(0, 0, s.w - 1, s.h - 1, " ", { bg: T.BG });
-    const split = Math.max(24, Math.min(Math.floor(s.w * 0.36), 48));
-    s.box(0, 0, s.w - 1, s.h - 1, { fg: T.BORDER2, bg: T.BG }, " 跨会话搜索 · Enter 执行 · / 编辑 · t/b 折叠类型 · Ctrl+↑↓ 预览 ");
+    const split = this.#searchSplit();
+    s.box(0, 0, s.w - 1, s.h - 1, { fg: T.BORDER2, bg: T.BG }, " 跨会话搜索 · Enter 执行 · / 编辑 · s 排序 · PgUp/PgDn 翻页 · t/b 折叠 · Ctrl+↑↓ 预览 ");
     s.vline(split, 1, s.h - 2, "│", { fg: T.BORDER2 });
     this.searchInput.x = 2; this.searchInput.y = 1; this.searchInput.w = Math.max(8, s.w - 4); this.searchInput.render(s);
     let y = 3;
     if (state.phase === "input") {
-      s.text(2, y++, "执行搜索前仅显示工作区 / 会话结构；不会实时扫描历史。", { fg: K.FAINT });
+      s.text(2, y++, "执行搜索前仅显示工作区 / 会话结构；不会实时扫描历史；↑/↓ 回溯最近 20 条查询。", { fg: K.FAINT });
+      s.text(2, y++, "Host 索引覆盖 user/assistant 消息；工具名、参数、结果与思考内容在候选会话内本地补充匹配。", { fg: K.FAINT });
       for (const group of this.sidebar.groups) { if (y >= s.h - 2) break; s.text(2, y++, truncate(`▾ ${group.title} (${group.sessions.length})`, split - 3), { fg: K.DIM }); for (const session of group.sessions) { if (y >= s.h - 2) break; s.text(4, y++, truncate(session.projections?.values?.title ?? session.sessionId.slice(0, 8), split - 5), { fg: K.FAINT }); } }
       return;
     }
-    if (state.loading) { s.text(2, y, "正在搜索 Host 索引并解析候选会话…", { fg: K.ACCENT }); return; }
+    s.text(2, 2, `排序: ${this.#searchSortLabel(state.sort)}（s 切换） · ↑/↓ 查询历史仅在编辑阶段`, { fg: K.FAINT });
+    if (state.loading) {
+      const p = state.progress;
+      if (p && p.total > 0) {
+        s.text(2, y, `正在解析候选会话 ${Math.min(p.done + 1, p.total)}/${p.total} · ${truncate(p.label, Math.max(10, split - 22))}…`, { fg: K.ACCENT });
+        const count = p.found == null ? `已解析 ${p.done} 个候选` : `已扫描 ${p.done} 个会话 · 命中 ${p.found} 个`;
+        s.text(2, y + 1, `${count} · Esc 可随时取消`, { fg: K.FAINT });
+      } else {
+        s.text(2, y, "正在搜索 Host 索引…", { fg: K.ACCENT });
+      }
+      return;
+    }
     if (state.error) s.text(2, y++, `搜索失败: ${truncate(state.error, split - 8)}`, { fg: K.ERR });
     if (state.fallback) s.text(2, y++, `Host 搜索索引不可用：已本地扫描最近 20 个会话的近期历史（${truncate(String(state.fallbackError ?? ""), Math.max(8, split - 30))}）`, { fg: K.WARN });
     if (state.hasMore && state.rows.length) s.text(2, y++, "Host 候选已截断，请缩小查询", { fg: K.WARN });
@@ -4676,14 +4889,31 @@ export class App {
     for (let i = 0; i < available; i++) {
       const index = scroll + i, row = state.rows[index]; if (!row) break;
       const selected = index === state.selected, folded = state.collapsed.has(row.key);
-      const label = row.kind === "workspace" ? `${folded ? "▸" : "▾"} ${row.group.title}` : row.kind === "session" ? `  ${folded ? "▸" : "▾"} ${row.session.title}` : `    ${selected ? "=>" : "  "} [${row.match.kind}] ${row.match.text.replace(/\s+/g, " ")}`;
-      s.text(1, y + i, truncate(label, split - 2), { fg: selected ? T.SELFG : row.kind === "match" ? K.TXT : K.DIM, bg: selected ? T.MENUSEL : -1, attrs: selected ? 1 : 0 });
+      const style = { fg: selected ? T.SELFG : row.kind === "match" ? K.TXT : K.DIM, bg: selected ? T.MENUSEL : -1, attrs: selected ? 1 : 0 };
+      if (row.kind === "workspace") s.text(1, y + i, truncate(`${folded ? "▸" : "▾"} ${row.group.title}`, split - 2), style);
+      else if (row.kind === "session") s.text(1, y + i, truncate(`  ${folded ? "▸" : "▾"} ${row.session.title} (${row.session.matches.length})`, split - 2), style);
+      else {
+        const rowWidth = Math.max(0, split - 2);
+        const prefix = this.#searchRowPrefix(row, selected, rowWidth);
+        const label = row.match.approximate ? `（仅摘要）${row.match.text.replace(/\s+/g, " ")}` : row.match.text.replace(/\s+/g, " ");
+        const prefixW = strWidth(prefix);
+        s.text(1, y + i, prefix, style);
+        this.#drawSearchHighlight(s, 1 + prefixW, y + i, label, rowWidth - prefixW, style, state.query);
+      }
     }
     let py = 3, logical = 0;
     for (const item of state.preview) {
       if (state.typeFold.has(item.kind)) continue;
-      const wrapped = wrapDisplayText(item.text || "（空）", Math.max(10, s.w - split - 5));
-      for (const line of wrapped) { if (logical++ < state.previewScroll) continue; if (py >= s.h - 2) break; s.text(split + 2, py++, truncate(`${item.active ? "=>" : "  "} [${item.kind}] ${line}`, s.w - split - 4), { fg: item.active ? T.ACCENT : K.TXT, attrs: item.active ? 1 : 0 }); }
+      const prefix = this.#searchPreviewPrefix(item);
+      const prefixW = strWidth(prefix);
+      const wrapped = wrapDisplayText(item.text || "（空）", Math.max(1, s.w - split - 4 - prefixW));
+      for (const line of wrapped) {
+        if (logical++ < state.previewScroll) continue; if (py >= s.h - 2) break;
+        const style = { fg: item.active ? T.ACCENT : K.TXT, attrs: item.active ? 1 : 0 };
+        s.text(split + 2, py, prefix, style);
+        this.#drawSearchHighlight(s, split + 2 + prefixW, py, line, s.w - split - 4 - prefixW, style, state.query);
+        py++;
+      }
       if (py >= s.h - 2) break;
     }
     if (!state.rows.length) s.text(2, y, state.error ? `搜索失败: ${state.error}` : state.fallback ? "本地扫描没有匹配（仅最近 20 个会话的近期历史）" : state.hasMore ? "结果超过 Host 上限，请缩小查询" : "没有匹配", { fg: state.error ? K.BAD : K.FAINT });

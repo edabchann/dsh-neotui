@@ -72,6 +72,20 @@ export function busyEnter() {
   return loadTuiConfig().busyEnter === "steer" ? "steer" : "queue";
 }
 
+/** Persist the newest 20 unique cross-session search queries (oldest→newest). */
+export function searchHistory() {
+  const raw = loadTuiConfig().searchHistory;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((query) => typeof query === "string" && query.trim()).map((query) => query.trim()).slice(-20);
+}
+export function rememberSearchQuery(query) {
+  query = String(query ?? "").trim();
+  if (!query) return false;
+  const next = searchHistory().filter((item) => item !== query);
+  next.push(query);
+  return saveTuiConfig({ searchHistory: next.slice(-20) });
+}
+
 /** Pre-registry one-slot defaults that would silently kill the new two-slot
  *  bindings (e.g. an old sessionFilter "/" override removes Ctrl+F). */
 const LEGACY_KEY_VALUES = {

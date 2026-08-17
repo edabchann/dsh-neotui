@@ -12,7 +12,7 @@ import { renderMd, wrapSegs } from "../src/md.js";
 import { Input, List } from "../src/widgets.js";
 import { Screen } from "../src/screen.js";
 import { T } from "../src/theme.js";
-import { keyBindings, setKeyBinding, resetKeyBinding, tuiConfigFile } from "../src/config.js";
+import { keyBindings, setKeyBinding, resetKeyBinding, tuiConfigFile, searchHistory, rememberSearchQuery } from "../src/config.js";
 import { matchKeyPart, matchKeyBinding, bindingMatchFor, describeSpec, validateKeySpec, KEYBINDING_ORDER } from "../src/keybindings.js";
 
 // isolate TUI config writes from the real ~/.dsh/tui-config.json
@@ -1328,6 +1328,206 @@ test("model picker management row opens the providers full-screen buffer", async
   picker.onKey({ type: "key", name: "enter" });
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(app.fullBuffer, app.modelPanel, "manage row opens the ModelPanel buffer");
+});
+
+test("search query history persists, dedupes, caps at 20 and recalls with Up/Down", () => {
+  saveTuiConfig({ searchHistory: [] });
+  for (let i = 0; i < 22; i++) assert.ok(rememberSearchQuery(`query-${i}`));
+  assert.ok(rememberSearchQuery("query-5")); // move an old duplicate to newest
+  const history = searchHistory();
+  assert.equal(history.length, 20);
+  assert.equal(history.at(-1), "query-5");
+  assert.equal(history.filter((query) => query === "query-5").length, 1);
+  const app = headlessApp(); app.startSearch();
+  app.onEvent({ type: "key", name: "up", ctrl: false });
+  assert.equal(app.searchInput.value, "query-5", "Up recalls the newest query");
+  app.onEvent({ type: "key", name: "down", ctrl: false });
+  assert.equal(app.searchInput.value, "", "Down returns to a fresh query");
+  saveTuiConfig({ searchHistory: [] });
+});
+
+test("search sorting cycles relevance, recent update and match count while preserving selection", async () => {
+  const app = headlessApp();
+  app.sessions = [
+    { sessionId: "s1", updatedAt: 1, projections: { values: { title: "One" } } },
+    { sessionId: "s2", updatedAt: 3, projections: { values: { title: "Two" } } },
+    { sessionId: "s3", updatedAt: 2, projections: { values: { title: "Three" } } },
+  ];
+  const counts = { s1: 1, s2: 2, s3: 3 };
+  app.api.call = async (method, payload) => {
+    if (method === "session.search") return { items: ["s1", "s2", "s3"].map((sessionId) => ({ sessionId, snippet: "needle" })), hasMore: false };
+    if (method === "session.history") return { events: Array.from({ length: counts[payload.sessionId] }, (_, i) => ({ event: { type: "user/message", seq: i + 1, data: { id: `${payload.sessionId}-${i}`, source: { kind: "user" }, content: [{ type: "text", text: `needle ${payload.sessionId} ${i}` }] } } })), hasMore: false };
+    return {};
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const order = () => app.searchState.rows.filter((row) => row.kind === "session").map((row) => row.session.sessionId);
+  assert.deepEqual(order(), ["s1", "s2", "s3"], "default keeps Host relevance order");
+  app.searchState.selected = app.searchState.rows.findIndex((row) => row.key === "s:s2");
+  app.onEvent({ type: "text", text: "s" });
+  assert.equal(app.searchState.sort, "recent"); assert.deepEqual(order(), ["s2", "s3", "s1"]);
+  assert.equal(app.searchState.rows[app.searchState.selected].key, "s:s2", "selection identity survives resort");
+  app.onEvent({ type: "text", text: "s" });
+  assert.equal(app.searchState.sort, "matches"); assert.deepEqual(order(), ["s3", "s2", "s1"]);
+  assert.equal(app.searchState.rows[app.searchState.selected].key, "s:s2");
+  app.onEvent({ type: "text", text: "s" });
+  assert.equal(app.searchState.sort, "relevance"); assert.deepEqual(order(), ["s1", "s2", "s3"]);
+  app.renderFrame(); assert.match(app.screen.toPlain(), /相 关 度/);
+  assert.equal(searchHistory().at(-1), "needle", "executing a search persists it to history");
+  saveTuiConfig({ searchHistory: [] });
+});
+
+test("search shows per-candidate progress while resolving sessions", async () => {
+  const app = headlessApp();
+  app.sessions = [{ sessionId: "s1", projections: { values: { title: "One" } } }, { sessionId: "s2", projections: { values: { title: "Two" } } }];
+  const pending = new Map();
+  app.api.call = async (method, payload) => {
+    if (method === "session.search") return { items: [{ sessionId: "s1", snippet: "n" }, { sessionId: "s2", snippet: "n" }], hasMore: false };
+    if (method === "session.history") return new Promise((resolve) => pending.set(payload.sessionId, resolve));
+    return {};
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(app.searchState.loading, true);
+  assert.equal(app.searchState.progress.total, 2);
+  app.renderFrame();
+  assert.match(app.screen.toPlain(), /1\/2/);
+  pending.get("s1")({ events: [{ event: { type: "user/message", seq: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "needle" }] } } }], hasMore: false });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(app.searchState.progress.done, 1);
+  app.renderFrame();
+  assert.match(app.screen.toPlain(), /2\/2/);
+  assert.match(app.screen.toPlain(), /Two/);
+  pending.get("s2")({ events: [], hasMore: false });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(app.searchState.loading, false);
+  assert.equal(app.searchState.progress, null);
+});
+
+test("search preview follows the selected match past long neighbouring blocks", async () => {
+  const app = headlessApp();
+  app.api.call = async (method, payload) => {
+    if (method === "session.search") return { items: [{ sessionId: "s", snippet: "needle" }], hasMore: false };
+    if (method === "session.history") return { events: [
+      { event: { type: "user/message", seq: 1, data: { id: "u0", source: { kind: "user" }, content: [{ type: "text", text: "LONG ".repeat(200) }] } } },
+      { event: { type: "user/message", seq: 2, data: { id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "LONG ".repeat(200) }] } } },
+      { event: { type: "user/message", seq: 3, data: { id: "u2", source: { kind: "user" }, content: [{ type: "text", text: "needle block" }] } } },
+    ], hasMore: false };
+    return {};
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const matchIdx = app.searchState.rows.findIndex((row) => row.kind === "match");
+  app.searchState.selected = matchIdx - 1;
+  app.onEvent({ type: "key", name: "down" }); // moves onto the match and rebuilds the preview
+  assert.equal(app.searchState.selected, matchIdx);
+  assert.ok(app.searchState.previewScroll > 0, `preview scrolls to the active block (got ${app.searchState.previewScroll})`);
+  app.renderFrame();
+  assert.match(app.screen.toPlain(), /needle block/);
+  assert.match(app.screen.toPlain(), /=> \[user\] needle block/);
+});
+
+test("search-jump highlight is scoped to the exact matched block only", () => {
+  const { app, chat } = render([]);
+  chat.nodes = [{
+    kind: "assistant", id: "a", streaming: false,
+    blocks: [{ kind: "reasoning", text: "needle thought" }, { kind: "text", text: "needle answer" }],
+  }];
+  app.searchQuery = "needle";
+  app.searchQueryTarget = { nodeKey: "a", blockIdx: 1 };
+  chat.resize(0, 1, 80, 24);
+  const warnBlocks = new Set();
+  chat.lines.forEach((line, li) => { if (line.some((seg) => seg.bg === T.WARN)) warnBlocks.add(chat.lineMap[li]?.blockIdx); });
+  assert.deepEqual([...warnBlocks], [1], "a sibling block in the same assistant node stays unhighlighted");
+  assert.ok(chat.lines.some((line) => line.some((seg) => seg.bg === T.WARN) && line.map((seg) => seg.t).join("").includes("answer")));
+  app.searchQueryTarget = null; chat.queueRebuild(); chat.flushRebuild();
+  assert.ok(chat.lines.some((line) => line.some((seg) => seg.bg === T.WARN) && line.map((seg) => seg.t).join("").includes("thought")), "no scope keeps the whole-transcript highlight");
+});
+
+test("in-conversation highlighting keeps source offsets after expanding lowercase graphemes", () => {
+  const { app, chat } = render([{ kind: "user", id: "u", text: "İ needle after" }]);
+  app.searchQuery = "needle"; app.searchQueryTarget = null;
+  chat.queueRebuild(); chat.flushRebuild();
+  const highlighted = chat.lines.flatMap((line) => line.filter((seg) => seg.bg === T.WARN).map((seg) => seg.t)).join("");
+  assert.equal(highlighted, "needle");
+});
+
+test("search highlighting preserves Unicode graphemes before a match", async () => {
+  const app = headlessApp();
+  app.api.call = async (method) => {
+    if (method === "session.search") return { items: [{ sessionId: "s", snippet: "İ needle" }], hasMore: false };
+    return { events: [{ event: { type: "user/message", seq: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "İ needle after" }] } } }], hasMore: false };
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0)); app.renderFrame();
+  const frame = app.screen.prev ?? app.screen.cells;
+  const highlighted = frame.flat().filter((cell) => cell.bg === T.WARN && cell.ch).map((cell) => cell.ch).join("");
+  assert.ok(highlighted.includes("needle"), `highlight keeps the exact original match, got ${JSON.stringify(highlighted)}`);
+  assert.ok(!highlighted.includes("eedle "), "length-changing lowercase before the match does not shift its source span");
+});
+
+test("search preview scroll clamps to its content instead of blanking the pane", async () => {
+  const app = headlessApp();
+  app.api.call = async (method) => method === "session.search"
+    ? { items: [{ sessionId: "s", snippet: "needle" }], hasMore: false }
+    : { events: [{ event: { type: "user/message", seq: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "needle" }] } } }], hasMore: false };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  app.searchState.selected = app.searchState.rows.findIndex((row) => row.kind === "match");
+  app.onEvent({ type: "key", name: "down" }); app.onEvent({ type: "key", name: "up" });
+  for (let i = 0; i < 100; i++) app.onEvent({ type: "key", name: "down", ctrl: true });
+  assert.equal(app.searchState.previewScroll, 0, "a one-line preview cannot scroll out of view");
+  app.renderFrame(); assert.match(app.screen.toPlain(), /needle/);
+});
+
+test("search keeps a readable preview on the minimum supported terminal width", async () => {
+  const app = headlessApp(); app.screen.resize(20, 8); app.layout();
+  app.api.call = async (method) => method === "session.search"
+    ? { items: [{ sessionId: "s", snippet: "needle" }], hasMore: false }
+    : { events: [{ event: { type: "user/message", seq: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "needle-preview-only" }] } } }], hasMore: false };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  app.searchState.selected = app.searchState.rows.findIndex((row) => row.kind === "match");
+  app.onEvent({ type: "key", name: "down" }); app.onEvent({ type: "key", name: "up" });
+  app.renderFrame();
+  const rows = app.screen.toPlain().split("\n");
+  const previewCells = rows.slice(3, -1).map((row) => row.split("│")[2] ?? "").join("").replace(/=>|\s/g, "");
+  assert.ok(previewCells.includes("needle-preview"), `the 20-cell preview body remains readable, got ${JSON.stringify(previewCells)}`);
+  assert.ok(rows.slice(3).every((row) => row.length <= app.screen.w), "compact row prefixes never overwrite the preview pane");
+});
+
+test("a stale search-result jump cannot steal focus from a newly opened search", async () => {
+  const app = headlessApp(); let releaseOpen;
+  app.api.call = async (method) => method === "session.search"
+    ? { items: [{ sessionId: "s", snippet: "needle" }], hasMore: false }
+    : { events: [{ event: { type: "user/message", seq: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "needle" }] } } }], hasMore: false };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  app.openSession = async () => new Promise((resolve) => { releaseOpen = resolve; });
+  app.searchState.selected = app.searchState.rows.findIndex((row) => row.kind === "match");
+  app.onEvent({ type: "key", name: "enter" }); await new Promise((resolve) => setTimeout(resolve, 0));
+  app.startSearch(); app.searchInput.setValue("new query");
+  releaseOpen(); await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(app.searchActive, true); assert.equal(app.focused, app.searchInput);
+  assert.equal(app.searchInput.value, "new query"); assert.equal(app.searchQuery, null);
+});
+
+test("search result list keeps the selected row visible while scrolling", async () => {
+  const app = headlessApp();
+  app.api.call = async (method, payload) => {
+    if (method === "session.search") return { items: Array.from({ length: 30 }, (_, i) => ({ sessionId: `s${i}`, snippet: `match ${i}` })), hasMore: false };
+    if (method === "session.history") return { events: [{ event: { type: "user/message", seq: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: `match ${payload.sessionId}` }] } } }], hasMore: false };
+    return {};
+  };
+  app.startSearch(); app.searchInput.setValue("match"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  app.searchState.selected = app.searchState.rows.length - 1;
+  app.onEvent({ type: "key", name: "up" }); // re-clamps and refreshes the preview through the public router
+  app.searchState.selected = app.searchState.rows.length - 1;
+  app.renderFrame();
+  const plain = app.screen.toPlain();
+  assert.ok(plain.includes("match s29"), "selected row is rendered");
+  assert.ok(!plain.includes("match s0"), "the list scrolled away from the top");
 });
 
 test("legacy one-slot keybinding values migrate to the new two-slot defaults", async () => {
@@ -3156,8 +3356,8 @@ test("Ctrl+F opens deferred full-screen search and Enter builds workspace/sessio
   assert.equal(app.searchState.phase, "results");
   assert.deepEqual(app.searchState.rows.map((row) => row.kind), ["workspace", "session", "match", "match", "match"]);
   const matches = app.searchState.rows.filter((row) => row.kind === "match");
-  assert.deepEqual(matches.map((row) => row.match.kind), ["user", "reasoning", "text"]);
-  assert.equal(matches[0].match.seq, 10, "derived block carries durable event seq");
+  assert.deepEqual(matches.map((row) => row.match.kind), ["text", "reasoning", "user"], "matches list newest-first");
+  assert.equal(matches.at(-1).match.seq, 10, "derived block carries durable event seq");
   app.searchState.selected = app.searchState.rows.findIndex((row) => row.kind === "session");
   app.onEvent({ type: "text", text: " " });
   assert.equal(app.searchState.rows.filter((row) => row.kind === "match").length, 0, "legacy text Space folds a session branch");
@@ -3188,6 +3388,39 @@ test("closing and reopening search rejects stale async results and errors", asyn
   assert.equal(app.searchState.query, "new");
   assert.ok(app.searchState.rows.some((row) => row.session?.sessionId === "new"));
   assert.ok(!app.searchState.rows.some((row) => row.session?.sessionId === "old"));
+});
+
+test("search keeps an indexed hit approximate when an older history page fails", async () => {
+  const app = headlessApp(); app.sessions = [{ sessionId: "s", projections: { values: { title: "S" } } }];
+  let calls = 0;
+  app.api.call = async (method) => {
+    if (method === "session.search") return { items: [{ sessionId: "s", snippet: "host needle snippet" }], hasMore: false };
+    calls++;
+    if (calls === 1) return { events: [{ event: { type: "user/message", seq: 20, data: { id: "tail", source: { kind: "user" }, content: [{ type: "text", text: "tail without match" }] } } }], hasMore: true };
+    throw new Error("older history unavailable");
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(app.searchState.fallback, false, "a history-page failure does not pretend the Host index is unavailable");
+  assert.equal(app.searchState.loading, false);
+  const match = app.searchState.rows.find((row) => row.kind === "match");
+  assert.equal(match?.match.approximate, true);
+  assert.equal(match?.match.text, "host needle snippet");
+});
+
+test("search deduplicates repeated Host candidates by session id", async () => {
+  const app = headlessApp(); app.sessions = [{ sessionId: "dup", projections: { values: { title: "D" } } }];
+  let histories = 0;
+  app.api.call = async (method) => {
+    if (method === "session.search") return { items: [{ sessionId: "dup", snippet: "first" }, { sessionId: "dup", snippet: "second" }], hasMore: false };
+    histories++;
+    return { events: [{ event: { type: "user/message", seq: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "needle" }] } } }], hasMore: false };
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(histories, 1);
+  assert.equal(app.searchState.rows.filter((row) => row.key === "s:dup").length, 1);
+  assert.equal(new Set(app.searchState.rows.map((row) => row.key)).size, app.searchState.rows.length, "every rendered row has a unique identity");
 });
 
 test("search combines tool args and results and stops non-progressing duplicate pages", async () => {
@@ -3224,10 +3457,11 @@ test("search Enter selects the exact block and preserves the query highlight", a
   app.onEvent({ type: "key", name: "enter" }); await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(app.currentSession, "s"); assert.equal(app.searchQuery, "needle");
   assert.equal(app.chat.blockItems[app.chat.blockSel]?.nodeKey, "a-match");
+  assert.deepEqual(app.searchQueryTarget, { nodeKey: "a-match", blockIdx: 0 });
   assert.equal(app.chat.cursorMode, "block");
 });
 
-test("search approximate rows expose the 40-page cap and explain tail-only open", async () => {
+test("search approximate rows are labelled and the Host-cap text stays honest", async () => {
   const app = headlessApp(); app.sessions = [{ sessionId: "s", projections: { values: { title: "S" } } }];
   let historyCalls = 0;
   app.api.call = async (method) => {
@@ -3248,8 +3482,48 @@ test("search approximate rows expose the 40-page cap and explain tail-only open"
   const matchIndex = app.searchState.rows.findIndex((row) => row.kind === "match");
   assert.equal(app.searchState.rows[matchIndex].match.kind, "snippet");
   assert.equal(app.searchState.rows[matchIndex].match.approximate, true);
+  app.renderFrame();
+  assert.match(app.screen.toPlain(), /仅 摘 要/);
   app.searchState.selected = matchIndex; app.onEvent({ type: "key", name: "enter" }); await new Promise((resolve) => setTimeout(resolve, 0));
   assert.match(String(app.toastMsg), /未定位到精确正文/);
+});
+
+test("search list pages with PgUp/PgDn/Home/End and session rows show match counts", async () => {
+  const app = headlessApp();
+  app.api.call = async (method, payload) => {
+    if (method === "session.search") return { items: Array.from({ length: 12 }, (_, i) => ({ sessionId: `s${i}`, snippet: `match ${i}` })), hasMore: false };
+    if (method === "session.history") return { events: [
+      { event: { type: "user/message", seq: 1, data: { id: "u1", source: { kind: "user" }, content: [{ type: "text", text: `match old ${payload.sessionId}` }] } } },
+      { event: { type: "user/message", seq: 2, data: { id: "u2", source: { kind: "user" }, content: [{ type: "text", text: `match new ${payload.sessionId}` }] } } },
+    ], hasMore: false };
+    return {};
+  };
+  app.startSearch(); app.searchInput.setValue("match"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const total = app.searchState.rows.length;
+  app.onEvent({ type: "key", name: "pgdn", ctrl: false });
+  assert.ok(app.searchState.selected > 0 && app.searchState.selected < total - 1, "PgDn pages the list");
+  app.onEvent({ type: "key", name: "end", ctrl: false });
+  assert.equal(app.searchState.selected, total - 1);
+  app.onEvent({ type: "key", name: "home", ctrl: false });
+  assert.equal(app.searchState.selected, 0);
+  app.renderFrame();
+  assert.match(app.screen.toPlain(), /\(2\)/, "session rows show their match count");
+});
+
+test("search rows and preview highlight the query term", async () => {
+  const app = headlessApp();
+  app.api.call = async (method) => {
+    if (method === "session.search") return { items: [{ sessionId: "s", snippet: "needle" }], hasMore: false };
+    if (method === "session.history") return { events: [{ event: { type: "user/message", seq: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "before needle after" }] } } }], hasMore: false };
+    return {};
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  app.renderFrame();
+  const frame = app.screen.prev ?? app.screen.cells;
+  const warnCells = frame.flat().filter((cell) => cell.bg === T.WARN);
+  assert.ok(warnCells.length > 0, "the query term renders with the highlight background");
 });
 
 test("search jump reports when a resolved seq cannot be reopened", async () => {
