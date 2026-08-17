@@ -30,6 +30,7 @@ export class Term {
     this.onResize = onResize ?? (() => {});
     this.kitty = kitty;
     this.kittyActive = false;  // set when the terminal answers the CSI ? u query
+    this.handoff = process.env.DSH_TUI_RESTART_HANDOFF === "1";
     this.escTimer = null;      // pending lone-ESC fallback (split-sequence safety)
     this.decoder = new StringDecoder("utf8");
     this.buf = "";
@@ -90,7 +91,7 @@ export class Term {
     }
   }
 
-  #emit(ev) { this.onEvent(ev); }
+  #emit(ev) { this.handoff = false; this.onEvent(ev); }
 
   /** A lone ESC waits briefly for the rest of its sequence; if nothing
    *  arrives it becomes the standalone Escape key. */
@@ -144,13 +145,12 @@ export class Term {
         continue;
       }
       const ch = buf[i];
-      // Restart handoff recovery: a terminal can split ESC from the remainder
-      // of an SGR mouse/kitty reply while the old process is relinquishing the
-      // tty. The new process must discard these orphaned control tails rather
-      // than insert them as user text.
-      if (ch === "[" && (buf.startsWith("[<", i) || /^\[\d+(?:;\d+)*[uMm]/.test(buf.slice(i)))) {
+      // Only a deliberately restarted process may discard one leading tail
+      // whose ESC belonged to its predecessor. Normal typed text beginning
+      // with "[99;5u" or "[<…M" must always survive.
+      if (this.handoff && i === 0 && ch === "[") {
         const tail = /^(?:\[<\d+;\d+;\d+[Mm]|\[\d+(?:;\d+)*u)/.exec(buf.slice(i));
-        if (tail) { i += tail[0].length; continue; }
+        if (tail) { this.handoff = false; i += tail[0].length; continue; }
       }
       if (ch === "\x1b") {
         // escape sequence
@@ -278,7 +278,10 @@ export class Term {
       // CSI ? flags u — the terminal answered our kitty-protocol query, so
       // it DOES honor the protocol (WezTerm etc. reply with the flags it
       // supports; terminals with the feature off reply nothing at all).
-      if (final === "u") this.kittyActive = true;
+      if (final === "u") {
+        const flags = Number(params.split(";")[0] || 0);
+        if (flags & 1) this.kittyActive = true;
+      }
       return; // other private responses (cursor pos) stay ignored
     }
     if (prefix === ">") return;
@@ -297,6 +300,8 @@ export class Term {
         const code = nums[2] ?? 0;
         const mod = nums[1] ?? 1;
         const ctrl = !!(mod - 1 & 4), alt = !!(mod - 1 & 2), shift = !!(mod - 1 & 1);
+        const special = TILDE_NAMES[code];
+        if (special) { this.#emit({ type: "key", name: special, ctrl, alt, shift }); return; }
         let text = "";
         try { text = String.fromCodePoint(code); } catch { return; }
         this.#emit({ type: "key", name: "char", key: text.toLowerCase(), text, ctrl, alt, shift });
@@ -318,8 +323,11 @@ export class Term {
     }
     const name = KEY_NAMES[final];
     if (!name) return;
-    // modifier is the last param before the final byte (e.g. CSI 1;5A)
-    const mod = nums.length > 1 ? nums[nums.length - 1] : 1;
+    // Modifier is normally the last param (CSI 1;5A). Some terminals emit
+    // count-only CSI 5C/D for Ctrl+Right/Left; 2..8 are xterm modifier values
+    // and must not silently degrade to an unmodified pane switch.
+    const countOnlyModifier = nums.length === 1 && nums[0] >= 2 && nums[0] <= 8;
+    const mod = nums.length > 1 ? nums[nums.length - 1] : countOnlyModifier ? nums[0] : 1;
     const ctrl = !!(mod - 1 & 4), alt = !!(mod - 1 & 2), shift = !!(mod - 1 & 1);
     this.#emit({ type: "key", name, ctrl, alt, shift });
   }

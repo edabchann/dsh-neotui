@@ -34,9 +34,17 @@ export function graphemes(s) {
 }
 
 export function graphemeWidth(g) {
-  const widths = Array.from(g, (ch) => wcwidth(ch.codePointAt(0)));
-  // Emoji joined by ZWJ occupy one glyph cell-pair, not the sum of members.
-  return g.includes("\u200d") ? Math.max(0, ...widths) : widths.reduce((a, b) => a + b, 0);
+  const cps = Array.from(g, (ch) => ch.codePointAt(0));
+  const widths = cps.map(wcwidth);
+  // A grapheme cluster is rendered as one terminal glyph. Emoji joined by ZWJ,
+  // skin-tone modifiers, flags, keycaps, and base+combining clusters therefore
+  // occupy the widest constituent width, not the sum of every code point.
+  const clustered = cps.length > 1 && (
+    g.includes("\u200d") || cps.some((cp) => cp >= 0x1f3fb && cp <= 0x1f3ff) ||
+    cps.every((cp) => cp >= 0x1f1e6 && cp <= 0x1f1ff) || cps.includes(0x20e3) ||
+    widths.some((width) => width === 0)
+  );
+  return clustered ? Math.max(0, ...widths) : widths.reduce((a, b) => a + b, 0);
 }
 
 export function strWidth(s) {

@@ -190,16 +190,20 @@ if toolpos:
         check("jumped step auto-expanded (▾)", any("▾ step" in l for l in lines), repr([l for l in lines if "▾ step" in l][:1]))
         check("expanded step shows inline events", any(re.search(r"#\s+\d+", l) for l in lines))
 
-        # left-click a step row: must do nothing
+        # left-click a step row toggles inline detail without opening a popup
         steppos = g.find("▾ step")
-        before = g.row(steppos[1]) if steppos else ""
         if steppos:
             left(steppos[0] + 2, steppos[1])
             g2 = snapshot()
-            after = g2.row(steppos[1])
-            check("left click on step changes nothing (no popup)", after == before and "轨迹详情" not in "\n".join(g2.lines()))
+            check("left click toggles step inline detail (no popup)", g2.find("▸ step") is not None and "轨迹详情" not in "\n".join(g2.lines()))
+            # restore expanded state for the context-menu checks below
+            steppos = g2.find("▸ step")
+            if steppos:
+                left(steppos[0] + 2, steppos[1])
+                g = snapshot()
+                steppos = g.find("▾ step")
 
-        # right-click a step: menu with 展开（详细）/折叠（简略）/转跳对话/查看详情
+        # right-click a step: menu with 展开（详细）/折叠（简略） and 转跳对话
         if steppos:
             right(steppos[0] + 2, steppos[1])
             g3 = snapshot()

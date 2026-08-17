@@ -12,11 +12,12 @@ function check(name, got, want) {
   else { fail++; console.log(`  ✗ ${name}\n    got  ${g}\n    want ${w}`); }
 }
 
-function harness(bytes, kitty = false) {
+function harness(bytes, kitty = false, opts = {}) {
   const input = new PassThrough();
   const output = { write: () => true };
   const events = [];
   const term = track(new Term({ input, output, onEvent: (e) => events.push(e), kitty }));
+  if (opts.handoff) term.handoff = true;
   term.start();
   input.write(Buffer.from(bytes, "utf8"));
   // All ordinary decoder cases settle synchronously; release their process
@@ -112,8 +113,61 @@ console.log("term.js decoder tests:");
   check("bracketed paste passes text", events[0], { type: "paste", text: "paste me" });
 }
 {
-  const { events } = harness("[<32;68;35M[<0;70;35m[99;5u");
-  check("orphan restart control tails discarded", events.length, 0);
+  const { events } = harness("[99;5u");
+  check("literal bracket text resembling a kitty tail is preserved", events[0], { type: "text", text: "[99;5u" });
+}
+{
+  const { events } = harness("[<0;11;6M", false, { handoff: true });
+  check("explicit restart handoff drops one leading orphan tail", events.length, 0);
+}
+{
+  const input = new PassThrough(), events = [], term = track(new Term({ input, output: { write: () => true }, onEvent: (event) => events.push(event) }));
+  term.handoff = true; term.start(); input.write("x"); input.write("[99;5u"); term.stop(); activeTerms.delete(term);
+  check("handoff discard disables after the first real event", events, [{ type: "text", text: "x" }, { type: "text", text: "[99;5u" }]);
+}
+{
+  const { events } = harness("\x1b[5C");
+  check("count-only ctrl+right", events[0], { type: "key", name: "right", ctrl: true, alt: false, shift: false });
+}
+{
+  const { events } = harness("\x1b[5D");
+  check("count-only ctrl+left", events[0], { type: "key", name: "left", ctrl: true, alt: false, shift: false });
+}
+{
+  const { events } = harness("\x1b[5A");
+  check("count-only ctrl+up", events[0], { type: "key", name: "up", ctrl: true, alt: false, shift: false });
+}
+{
+  const { events } = harness("\x1b[5B");
+  check("count-only ctrl+down", events[0], { type: "key", name: "down", ctrl: true, alt: false, shift: false });
+}
+{
+  const { events } = harness("\x1b[5H");
+  check("count-only ctrl+home", events[0], { type: "key", name: "home", ctrl: true, alt: false, shift: false });
+}
+{
+  const { events } = harness("\x1b[5F");
+  check("count-only ctrl+end", events[0], { type: "key", name: "end", ctrl: true, alt: false, shift: false });
+}
+{
+  const { events } = harness("\x1b[3C");
+  check("count-only alt+right", events[0], { type: "key", name: "right", ctrl: false, alt: true, shift: false });
+}
+{
+  const { events } = harness("\x1b[2A");
+  check("count-only shift+up", events[0], { type: "key", name: "up", ctrl: false, alt: false, shift: true });
+}
+{
+  const { events } = harness("\x1b[27;5;1~");
+  check("modifyOtherKeys ctrl+home maps special key", events[0], { type: "key", name: "home", ctrl: true, alt: false, shift: false });
+}
+{
+  const { events } = harness("\x1b[27;5;15~");
+  check("modifyOtherKeys ctrl+f5 maps special key", events[0], { type: "key", name: "f5", ctrl: true, alt: false, shift: false });
+}
+{
+  const { events } = harness("\x1b[27;5;97~");
+  check("modifyOtherKeys ctrl+a keeps printable path", events[0], { type: "key", name: "char", key: "a", text: "a", ctrl: true, alt: false, shift: false });
 }
 {
   const { events } = harness("\x1b[97;5u", true);
@@ -142,6 +196,10 @@ console.log("term.js decoder tests:");
 {
   const { term } = harness("\x1b[?5u", true);
   check("kitty flags query reply marks protocol active", term.kittyActive, true);
+}
+{
+  const { term } = harness("\x1b[?0u", true);
+  check("kitty zero-flags reply stays inactive", term.kittyActive, false);
 }
 {
   const { term } = harness("plain", true);

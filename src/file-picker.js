@@ -1,4 +1,4 @@
-import { Widget, Input, Popup } from './widgets.js';
+import { Widget, Input, Popup, wrapIndex } from './widgets.js';
 import { truncate } from './text.js';
 import { T } from './theme.js';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
@@ -183,8 +183,8 @@ export class UploadPicker extends Widget {
     if (ev.ctrl && ev.key === '.') { const name=this.current()?.name; this.showHidden=!this.showHidden; this.load(name); this.app.toast(this.showHidden?'已显示隐藏文件':'已隐藏隐藏文件'); return true; }
     if (ev.ctrl && (ev.key === '/' || ev.key === '_')) { this.filter = ''; this.load(); return true; }
     if (ev.name === 'escape') { this.clearKitty(); this.onCancel?.(); return true; }
-    if (ev.name === 'up') { this.clearKitty(); this.sel = Math.max(0, this.sel - 1); return true; }
-    if (ev.name === 'down') { this.clearKitty(); this.sel = Math.min(this.items().length - 1, this.sel + 1); return true; }
+    if (ev.name === 'up') { this.clearKitty(); this.sel = wrapIndex(this.sel - 1, this.items().length); return true; }
+    if (ev.name === 'down') { this.clearKitty(); this.sel = wrapIndex(this.sel + 1, this.items().length); return true; }
     if (ev.name === 'left') { this.goParent(); return true; }
     if (ev.name === 'right') { this.enterDir(); return true; }
     if (ev.name === 'enter') { this.confirmUpload(); return true; }
@@ -192,5 +192,5 @@ export class UploadPicker extends Widget {
     if (ev.name === 'char' && ev.key === '/') { this.startFilter(); return true; }
     return false;
   }
-  onMouse(ev) { if (ev.kind === 'wheel-up') { this.sel = Math.max(0, this.sel - 1); return true; } if (ev.kind === 'wheel-down') { this.sel = Math.min(this.items().length - 1, this.sel + 1); return true; } return true; }
+  onMouse(ev) { if (ev.kind === 'wheel-up') { this.sel = wrapIndex(this.sel - 1, this.items().length); return true; } if (ev.kind === 'wheel-down') { this.sel = wrapIndex(this.sel + 1, this.items().length); return true; } return true; }
 }

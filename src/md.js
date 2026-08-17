@@ -2,7 +2,7 @@
 // Segments: { t: string, fg?, bg?, bold, italic, underline, strike, code, link? }
 // Links use OSC 8 (clickable in most terminals, emitted by Screen.render).
 
-import { hexRgb, strWidth, truncate } from "./text.js";
+import { hexRgb, strWidth, truncate, graphemes } from "./text.js";
 
 import { T } from "./theme.js";
 
@@ -255,31 +255,39 @@ export function renderMd(text, width, sink = null, opts = {}) {
         const lang = inCode || "text";
         const hw = Math.max(2, width - 4);
         const codeLines = codeBuf.length === 0 ? [""] : codeBuf;
-        if (sink?.codeBlocks) sink.codeBlocks.push({ text: codeBuf.join("\n"), lineIdx: lines.length, lang });
+        const codeMeta = { text: codeBuf.join("\n"), lineIdx: lines.length, lang };
+        if (sink?.codeBlocks) sink.codeBlocks.push(codeMeta);
         // Fixed-width box: EVERY row is exactly (hw + 4) columns wide —
-        // top `┌…[复制]…┐`, content `│ … │`, bottom `└…┘` — so the corners
-        // always sit above the vertical bars, never above the code text.
+        // top `┌─ [tag] [复制…] ───┐`, content `│ … │`, bottom `└…┘` — so the
+        // corners always sit above the vertical bars, never above the code.
         const btn = "[复制]";
+        const activeBtn = "[按y复制]";
         const btnW = strWidth(btn);
+        // The tag sits INSIDE the box, before the button: the button field is
+        // padded to a fixed reserve width so the NORMAL-mode [按y复制] swap
+        // never shifts the right corner. Nothing extends past the box.
+        const tagPart = lang && lang !== "text" ? lang + " " : "";
+        const tagW = strWidth(tagPart);
+        const reserveW = Math.max(btnW, Math.min(strWidth(activeBtn), Math.max(0, hw - tagW)));
+        const btnField = btn + " ".repeat(Math.max(0, reserveW - btnW));
+        const tailPad = Math.max(1, hw + 1 - tagW - reserveW);
         const inner = hw + 2;                       // columns between the corners
-        const leftLen = Math.max(1, inner - btnW - 2);
-        const tag = lang && lang !== "text" ? " " + lang : "";
         lines.push([
-          SEG("┌" + "─".repeat(leftLen) + " ", { fg: C.hr }),
-          SEG(btn, { fg: C.link, bold: true, copyCode: codeBuf.join("\n") }),
-          SEG(" ┐" + tag, { fg: C.hr }),
+          SEG("┌─" + tagPart, { fg: C.hr, codeBlock: codeMeta }),
+          SEG(btnField, { fg: C.link, bold: true, copyCode: codeBuf.join("\n"), codeBlock: codeMeta }),
+          SEG("─".repeat(tailPad) + "┐", { fg: C.hr, codeBlock: codeMeta }),
         ]);
         for (const cl of codeLines) {
           const hls = highlightLine(cl, lang);
           for (const row of wrapSegs(hls, hw)) {
             const rowW = strWidth(row.map((g) => g.t ?? "").join(""));
-            const segs = [SEG("│ ", { fg: C.hr }), ...row];
+            const segs = [SEG("│ ", { fg: C.hr, codeBlock: codeMeta }), ...row.map((seg) => ({ ...seg, codeBlock: codeMeta }))];
             if (rowW < hw) segs.push(SEG(" ".repeat(hw - rowW)));
-            segs.push(SEG(" │", { fg: C.hr }));
+            segs.push(SEG(" │", { fg: C.hr, codeBlock: codeMeta }));
             lines.push(segs);
           }
         }
-        lines.push([SEG("└" + "─".repeat(inner) + "┘", { fg: C.hr })]);
+        lines.push([SEG("└" + "─".repeat(inner) + "┘", { fg: C.hr, codeBlock: codeMeta })]);
         inCode = null;
       }
       i++;
@@ -368,13 +376,12 @@ export function wrapSegs(segs, width, { pad: padLines = false } = {}) {
       while (strWidth(rest) > width) {
         let cut = "";
         let cw = 0;
-        for (const ch of rest) {
-          const c = ch.codePointAt(0);
-          const cwc = wcwidthFor(c);
+        for (const ch of graphemes(rest)) {
+          const cwc = strWidth(ch);
           if (cw + cwc > width) break;
           cut += ch; cw += cwc;
         }
-        if (!cut) cut = rest[0];
+        if (!cut) cut = graphemes(rest)[0] ?? "";
         if (curW > 0) { lines.push(cur); cur = []; curW = 0; }
         lines.push([{ ...seg, t: cut }]);
         rest = rest.slice(cut.length);
@@ -394,9 +401,4 @@ export function wrapSegs(segs, width, { pad: padLines = false } = {}) {
   if (cur.length) lines.push(cur);
   if (lines.length === 0) lines.push([SEG("")]);
   return lines;
-}
-
-function wcwidthFor(cp) {
-  // local import to avoid cycles
-  return strWidth(String.fromCodePoint(cp));
 }

@@ -3,6 +3,9 @@
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { userInfo } from "node:os";
+import { DEFAULT_KEYBINDINGS, normalizeKeyBinding, validateKeySpec } from "./keybindings.js";
+
+export { DEFAULT_KEYBINDINGS };
 
 export function tuiConfigFile() {
   const base = process.env.DSH_HOME ?? (process.env.XDG_CONFIG_HOME ?? join(process.env.HOME ?? ".", ".config"));
@@ -69,20 +72,51 @@ export function busyEnter() {
   return loadTuiConfig().busyEnter === "steer" ? "steer" : "queue";
 }
 
-export const DEFAULT_KEYBINDINGS = {
-  think: { mode: "normal", key: "t" }, tools: { mode: "normal", key: "b" }, insert: { mode: "normal", key: "i" },
-  leaveInsert: { mode: "insert", key: "Esc" }, sessionFilter: { mode: "normal", key: "/" }, newSession: { mode: "normal", key: "n" },
-  top: { mode: "normal", key: "g g" }, bottom: { mode: "normal", key: "G" }, prevQuestion: { mode: "normal", key: "[" }, nextQuestion: { mode: "normal", key: "]" },
-  expandInput: { mode: "insert", key: "Ctrl+L" }, copyInput: { mode: "insert", key: "Ctrl+Shift+C" }, panel: { mode: "all", key: "Ctrl+Space" },
-  model: { mode: "normal", key: "Ctrl+M" }, trajectory: { mode: "normal", key: "Ctrl+T" }, homeSwitch: { mode: "normal", key: "Tab" },
-  permissionRotate: { mode: "normal", key: "Shift+Tab" },
-  workspace: { mode: "normal", key: "Ctrl+W" }, settings: { mode: "normal", key: "Ctrl+S" }, subagent: { mode: "normal", key: "Ctrl+A" },
-  skills: { mode: "normal", key: "Ctrl+K" }, goal: { mode: "normal", key: "Ctrl+G" }, jobs: { mode: "normal", key: "Ctrl+J" },
-  stepJump: { mode: "normal", key: "Ctrl+E" }, sidebar: { mode: "normal", key: "Ctrl+B" }, quit: { mode: "all", key: "Ctrl+Q" },
+/** Pre-registry one-slot defaults that would silently kill the new two-slot
+ *  bindings (e.g. an old sessionFilter "/" override removes Ctrl+F). */
+const LEGACY_KEY_VALUES = {
+  sessionFilter: { mode: "normal", key: "/" },
+  homeSwitch: { mode: "normal", key: "Ctrl+Left/Right" },
+  skills: { mode: "normal", key: "Ctrl+K" },
 };
-export function keyBindings() { return { ...DEFAULT_KEYBINDINGS, ...(loadTuiConfig().keyBindings ?? {}) }; }
-export function setKeyBinding(id, value) { const all = { ...(loadTuiConfig().keyBindings ?? {}) }; all[id] = value; return saveTuiConfig({ keyBindings: all }); }
+
+/** Effective two-slot keybindings: defaults merged per id with user overrides. */
+export function keyBindings() {
+  const overrides = loadTuiConfig().keyBindings ?? {};
+  const merged = {};
+  for (const id of Object.keys(DEFAULT_KEYBINDINGS)) {
+    const def = DEFAULT_KEYBINDINGS[id];
+    const raw = overrides[id];
+    if (!raw) { merged[id] = { ...def }; continue; }
+    const normalized = normalizeKeyBinding(raw);
+    // A saved legacy default value maps back onto the current defaults so
+    // remapped chords (Ctrl+F, Ctrl+Left/Right, Ctrl+H) keep working.
+    const legacy = LEGACY_KEY_VALUES[id];
+    if (legacy && !Object.hasOwn(raw, "key2") && normalized.mode === legacy.mode && normalized.key === legacy.key) {
+      merged[id] = { ...def };
+      continue;
+    }
+    if (!normalized.key || !validateKeySpec(normalized.key).ok) { merged[id] = { ...def }; continue; }
+    const key2 = Object.hasOwn(raw, "key2")
+      ? (normalized.key2 && validateKeySpec(normalized.key2).ok ? normalized.key2 : "")
+      : def.key2;
+    merged[id] = { mode: normalized.mode, key: normalized.key, key2 };
+  }
+  return merged;
+}
+export function setKeyBinding(id, value) {
+  if (!Object.hasOwn(DEFAULT_KEYBINDINGS, id)) return false;
+  const normalized = normalizeKeyBinding(value);
+  if (!normalized.key || !validateKeySpec(normalized.key).ok) return false;
+  if (normalized.key2 && !validateKeySpec(normalized.key2).ok) return false;
+  const all = { ...(loadTuiConfig().keyBindings ?? {}) };
+  all[id] = normalized;
+  return saveTuiConfig({ keyBindings: all });
+}
 export function resetKeyBinding(id) { const all = { ...(loadTuiConfig().keyBindings ?? {}) }; delete all[id]; return saveTuiConfig({ keyBindings: all }); }
+
+/** Drop the 1s read cache so an external editor's changes apply immediately. */
+export function reloadTuiConfig() { cache = { file: null, data: null, at: 0 }; }
 
 export function foldDefaults() {
   const fd = loadTuiConfig().foldDefaults ?? {};

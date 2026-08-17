@@ -1,8 +1,8 @@
 // panels.js — Command palette, model picker, workspace browser, trajectory
 // timeline, jobs/goal panels, and the terminal image viewer (kitty graphics
 // protocol with external-viewer / chafa fallbacks).
-import { Widget, ScrollView, Input, Popup } from "./widgets.js";
-import { strWidth, truncate, pad } from "./text.js";
+import { Widget, ScrollView, Input, Popup, wrapIndex } from "./widgets.js";
+import { strWidth, truncate, pad, graphemes, graphemeWidth } from "./text.js";
 import { renderMd, C } from "./md.js";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,6 +11,7 @@ import { spawn, spawnSync, execFileSync } from "node:child_process";
 
 import { T, cycleTheme, themeName } from "./theme.js";
 import { loadTuiConfig, saveTuiConfig, userPrefix, userName, foldDefaults, keyBindings, setKeyBinding, resetKeyBinding } from "./config.js";
+import { validateKeySpec, describeSpec } from "./keybindings.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
 const K = new Proxy({}, { get(_k, key) { return T[key]; } });
 
@@ -61,6 +62,7 @@ export class Picker extends Widget {
     return scored;
   }
   render(screen) {
+    if (this.input.value !== this.query) this.input.setValue(this.query);
     screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.BG2 });
     screen.box(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, { fg: K.ACCENT, bg: T.BG2 }, this.title);
     this.input.render(screen);
@@ -88,16 +90,16 @@ export class Picker extends Widget {
       if (idx >= 0 && idx < list.length) { this.onPick?.(list[idx]); return true; }
       return true;
     }
-    if (ev.kind === "wheel-up") { this.sel = Math.max(0, this.sel - 1); return true; }
-    if (ev.kind === "wheel-down") { this.sel = Math.min(Math.max(0, this.filtered().length - 1), this.sel + 1); return true; }
+    if (ev.kind === "wheel-up") { this.sel = wrapIndex(this.sel - 1, this.filtered().length); return true; }
+    if (ev.kind === "wheel-down") { this.sel = wrapIndex(this.sel + 1, this.filtered().length); return true; }
     return true;
   }
   onKey(ev) {
     if (ev.type === "text") { this.query += ev.text; this.sel = 0; return true; }
     if (ev.type !== "key") return false;
     switch (ev.name) {
-      case "up": this.sel = Math.max(0, this.sel - 1); return true;
-      case "down": this.sel = Math.min(Math.max(0, this.filtered().length - 1), this.sel + 1); return true;
+      case "up": this.sel = wrapIndex(this.sel - 1, this.filtered().length); return true;
+      case "down": this.sel = wrapIndex(this.sel + 1, this.filtered().length); return true;
       case "enter": { const l = this.filtered(); if (l[this.sel]) { this.onPick?.(l[this.sel]); } return true; }
       case "escape": this.onCancel?.(); return true;
       case "backspace": this.query = this.query.slice(0, -1); this.sel = 0; return true;
@@ -107,69 +109,205 @@ export class Picker extends Widget {
   }
 }
 
-// ---- Model picker ----
+// ---- Model picker: provider folders → model files ----
+
+export class ModelPickerBuffer extends Widget {
+  constructor(app) {
+    const w = Math.max(1, Math.min(88, app.screen.w - 4)), h = Math.max(1, Math.min(28, app.screen.h - 4));
+    super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h });
+    this.app = app;
+    this.title = "选择模型";
+    this.query = "";
+    this.filtering = false;      // "/" enters filter mode, Ctrl+/ exits (like the other buffers)
+    this.sel = 0;
+    this.scroll = 0;
+    this.collapsed = new Set(); // folded provider ids
+    this.items = [];            // provider groups [{provider,name,models:[…]}]
+    this.rows = [];             // flattened tree rows ({kind:"provider"|"model"|"manage"})
+    this.loading = false;
+    this.manageRow = { kind: "manage" };
+    this.input = new Input({ x: this.x + 1, y: this.y + 1, w: this.w - 2, h: 1, prompt: "❯ ", placeholder: "输入以筛选模型…", bg: T.BG2 });
+    this.#load();
+  }
+  async #load() {
+    this.loading = true;
+    try {
+      const { groups } = await this.app.api.call("llm.models");
+      this.items = (groups ?? []).map((g) => ({
+        provider: g.id, name: g.name ?? g.id,
+        models: (g.models ?? []).map((m) => ({ id: m.id, name: m.name ?? m.id, description: m.description ?? "", efforts: m.reasoning?.efforts ?? [], defaultEffort: m.reasoning?.defaultEffort, provider: g.id })),
+      }));
+      const cur = this.app.currentModel;
+      this.collapsed = new Set(this.items.map((g) => g.provider).filter((p) => p !== cur?.provider));
+      this.#rebuildRows();
+      const idx = this.rows.findIndex((r) => r.kind === "model" && r.model.provider === cur?.provider && r.model.id === cur?.model);
+      this.sel = idx >= 0 ? idx : 0;
+    } catch (e) { this.app.toast?.(`模型列表失败: ${e.message}`); }
+    this.loading = false;
+    this.#clampScroll();
+    this.app.redraw?.();
+  }
+  filteredMatches() {
+    if (!this.query) return null;
+    const q = this.query.toLowerCase();
+    return this.items.flatMap((g) => g.models.filter((m) => fuzzyScore(q, `${m.id} ${m.name} ${m.description}`) > 0).map((model) => ({ group: g, model })));
+  }
+  #rebuildRows() {
+    const rows = [];
+    const filtered = this.filteredMatches();
+    if (filtered) {
+      // Filter mode: every provider with a hit renders expanded.
+      const byProvider = new Map();
+      for (const { group, model } of filtered) {
+        if (!byProvider.has(group.provider)) byProvider.set(group.provider, []);
+        byProvider.get(group.provider).push(model);
+      }
+      for (const group of this.items) {
+        const models = byProvider.get(group.provider);
+        if (!models) continue;
+        rows.push({ kind: "provider", group, count: models.length });
+        for (const model of models) rows.push({ kind: "model", group, model });
+      }
+    } else {
+      for (const group of this.items) {
+        const open = !this.collapsed.has(group.provider);
+        rows.push({ kind: "provider", group, count: group.models.length });
+        if (open) for (const model of group.models) rows.push({ kind: "model", group, model });
+      }
+      rows.push(this.manageRow);
+    }
+    this.rows = rows;
+    if (this.sel >= rows.length) this.sel = Math.max(0, rows.length - 1);
+  }
+  #clampScroll() {
+    const lh = Math.max(1, this.h - 3);
+    if (this.sel < this.scroll) this.scroll = this.sel;
+    else if (this.sel >= this.scroll + lh) this.scroll = this.sel - lh + 1;
+    this.scroll = Math.max(0, this.scroll);
+  }
+  #toggleGroup(provider) {
+    if (this.query) return; // filter mode is always expanded
+    if (this.collapsed.has(provider)) this.collapsed.delete(provider);
+    else this.collapsed.add(provider);
+    this.#rebuildRows();
+    const idx = this.rows.findIndex((r) => r.kind === "provider" && r.group.provider === provider);
+    if (idx >= 0) this.sel = idx; // keep the cursor on the folder so Space toggles in place
+    this.#clampScroll();
+    this.app.redraw?.();
+  }
+  async #selectModel(entry) {
+    const it = { provider: entry.model.provider, model: entry.model.id, efforts: entry.model.efforts, defaultEffort: entry.model.defaultEffort };
+    const efforts = it.efforts ?? [];
+    if (efforts.length > 0) {
+      const w2 = Math.max(1, Math.min(60, this.app.screen.w - 4)), h2 = Math.max(1, Math.min(efforts.length + 4, this.app.screen.h - 4));
+      this.app.overlay = new Picker({
+        x: Math.floor((this.app.screen.w - w2) / 2), y: Math.floor((this.app.screen.h - h2) / 2),
+        w: w2, h: h2, title: `思考强度 — ${it.model}`,
+        items: efforts.map((e) => ({ label: e.name ?? e.id, hint: e.id === it.defaultEffort ? "默认" : (e.description ?? "").slice(0, 28), provider: it.provider, model: it.model, effort: e.id })),
+        onCancel: () => { this.app.overlay = this; this.app.redraw(); },
+        onPick: (eff) => this.#commitModel({ provider: eff.provider, model: eff.model, effort: eff.effort }),
+      });
+      this.app.redraw();
+      return;
+    }
+    await this.#commitModel(it);
+  }
+  async #commitModel(it) {
+    this.app.overlay = null; this.app.redraw?.();
+    if (!this.app.currentSession) { this.app.toast?.("先打开一个会话"); return; }
+    try {
+      await this.app.api.call("session.selectModel", { sessionId: this.app.currentSession, provider: it.provider, model: it.model, ...(it.effort ? { reasoningEffort: it.effort } : {}) });
+      this.app.updateModel?.();
+      this.app.toast?.(`已切换 ${it.provider}/${it.model}${it.effort ? ` (${it.effort})` : ""}`);
+    } catch (e) { this.app.toast?.(`切换失败: ${e.message}`); }
+  }
+  #activate() {
+    const row = this.rows[this.sel];
+    if (!row) return;
+    if (row.kind === "manage") {
+      this.app.overlay = null;
+      (typeof this.app.showModelsBuffer === "function" ? this.app.showModelsBuffer() : this.app.setMode?.("models"));
+      return;
+    }
+    if (row.kind === "provider") { this.#toggleGroup(row.group.provider); return; }
+    if (row.kind === "model") void this.#selectModel(row);
+  }
+  render(screen) {
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.BG2 });
+    screen.box(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, { fg: K.ACCENT, bg: T.BG2 }, this.w >= 44 ? " 选择模型 · / 筛选 · Ctrl+/ 退出 · Space 展开 · Enter 确认 " : " 选择模型 ");
+    this.input.prompt = this.filtering ? "/ " : "❯ ";
+    this.input.setValue(this.filtering ? this.query : "");
+    this.input.render(screen);
+    const lh = Math.max(1, this.h - 3);
+    this.#clampScroll();
+    for (let i = 0; i < lh; i++) {
+      const idx = this.scroll + i;
+      const row = this.rows[idx];
+      const y = this.y + 2 + i;
+      if (!row) { screen.hline(this.x + 1, this.x + this.w - 2, y, " ", { bg: T.BG2 }); continue; }
+      const sel = idx === this.sel;
+      const cur = this.app.currentModel;
+      screen.fillRect(this.x + 1, y, this.x + this.w - 2, y, " ", { bg: sel ? T.MENUSEL : T.BG2 });
+      const style = { fg: sel ? 0xffffff : K.TXT, bg: sel ? T.MENUSEL : T.BG2, attrs: sel ? 1 : 0 };
+      let text;
+      if (row.kind === "manage") text = "⚙ 管理供应商…";
+      else if (row.kind === "provider") {
+        const open = this.query ? true : !this.collapsed.has(row.group.provider);
+        text = `${open ? "▾" : "▸"} 📁 ${row.group.name} (${row.count})`;
+      } else {
+        const mark = cur?.provider === row.model.provider && cur?.model === row.model.id ? "●" : "○";
+        text = `    ${mark} ${row.model.id}${row.model.name !== row.model.id ? `  ${row.model.name}` : ""}`;
+      }
+      screen.text(this.x + 2, y, truncate(text, this.w - 4), row.kind === "provider" ? { fg: K.ACCENT, bg: sel ? T.MENUSEL : T.BG2, attrs: sel ? 1 : 0 } : style);
+    }
+  }
+  onMouse(ev) {
+    if (ev.kind === "press" && ev.button === 0) {
+      if (ev.y === this.y + 1) { this.input.onMouse(ev); return true; }
+      const idx = this.scroll + (ev.y - this.y - 2);
+      if (idx >= 0 && idx < this.rows.length) { this.sel = idx; this.#activate(); }
+      return true;
+    }
+    if (ev.kind === "wheel-up") { this.sel = wrapIndex(this.sel - 1, this.rows.length); this.#clampScroll(); this.app.redraw?.(); return true; }
+    if (ev.kind === "wheel-down") { this.sel = wrapIndex(this.sel + 1, this.rows.length); this.#clampScroll(); this.app.redraw?.(); return true; }
+    return true;
+  }
+  onKey(ev) {
+    if (ev.type === "text") {
+      // Legacy terminals: "/" as text enters filter mode; typed text filters.
+      if (this.filtering) { this.query += ev.text; this.sel = 0; this.#rebuildRows(); this.app.redraw?.(); return true; }
+      if (ev.text === "/") { this.filtering = true; this.query = ""; this.#rebuildRows(); this.app.redraw?.(); return true; }
+      return true;
+    }
+    if (ev.type !== "key") return false;
+    if (ev.ctrl && ev.name === "char" && ev.key === "/") { this.filtering = false; this.query = ""; this.#rebuildRows(); this.app.redraw?.(); return true; }
+    switch (ev.name) {
+      case "up": this.sel = wrapIndex(this.sel - 1, this.rows.length); this.#clampScroll(); this.app.redraw?.(); return true;
+      case "down": this.sel = wrapIndex(this.sel + 1, this.rows.length); this.#clampScroll(); this.app.redraw?.(); return true;
+      case "pgup": this.scroll = Math.max(0, this.scroll - Math.max(1, this.h - 3)); return true;
+      case "pgdn": this.scroll = this.scroll + Math.max(1, this.h - 3); return true;
+      case "enter": this.#activate(); return true;
+      case "escape":
+        if (this.filtering) { this.filtering = false; this.query = ""; this.#rebuildRows(); this.app.redraw?.(); return true; }
+        this.app.overlay = null; this.app.redraw?.(); return true;
+      case "backspace":
+        if (!this.filtering) return true;
+        this.query = this.query.slice(0, -1); this.sel = 0; this.#rebuildRows(); this.app.redraw?.(); return true;
+      case "char":
+        if (ev.key === " " && !ev.ctrl) { const row = this.rows[this.sel]; if (row?.kind === "provider") this.#toggleGroup(row.group.provider); else if (row?.kind === "model") this.#toggleGroup(row.group.provider); return true; }
+        if (!ev.ctrl) {
+          if (ev.key === "/") { this.filtering = true; this.query = ""; this.sel = 0; this.#rebuildRows(); this.app.redraw?.(); return true; }
+          if (this.filtering) { this.query += ev.text ?? ev.key; this.sel = 0; this.#rebuildRows(); this.app.redraw?.(); }
+          return true;
+        }
+        return false;
+    }
+    return false;
+  }
+}
 
 export function buildModelPicker(app) {
-  const w = Math.min(70, app.screen.w - 4), h = Math.min(24, app.screen.h - 4);
-  const manageProviders = {
-    label: "⚙ 管理供应商…", hint: "M",
-    provider: null, model: null,
-    action: () => { app.overlay = null; app.setMode("models"); },
-  };
-  const selectModel = async (it) => {
-    app.overlay = null; app.redraw();
-    if (!app.currentSession) { app.toast("先打开一个会话"); return; }
-    try {
-      await app.api.call("session.selectModel", { sessionId: app.currentSession, provider: it.provider, model: it.model, ...(it.effort ? { reasoningEffort: it.effort } : {}) });
-      app.updateModel();
-      app.toast(`已切换 ${it.provider}/${it.model}${it.effort ? ` (${it.effort})` : ""}`);
-    } catch (e) { app.toast(`切换失败: ${e.message}`); }
-  };
-  const picker = new Picker({
-    x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2),
-    w, h, title: "选择模型",
-    items: [],
-    onCancel: () => { app.overlay = null; app.redraw(); },
-    onPick: (it) => {
-      if (it === manageProviders) { manageProviders.action(); return; }
-      const efforts = it.efforts ?? [];
-      if (efforts.length > 0) {
-        // second step: reasoning effort
-        const w2 = Math.min(60, app.screen.w - 4), h2 = Math.min(efforts.length + 4, app.screen.h - 4);
-        app.overlay = new Picker({
-          x: Math.floor((app.screen.w - w2) / 2), y: Math.floor((app.screen.h - h2) / 2),
-          w: w2, h: h2, title: `思考强度 — ${it.model}`,
-          items: efforts.map((e) => ({
-            label: e.name ?? e.id, hint: e.id === it.defaultEffort ? "默认" : (e.description ?? "").slice(0, 28),
-            provider: it.provider, model: it.model, effort: e.id,
-          })),
-          onCancel: () => { app.overlay = picker; app.redraw(); },
-          onPick: (eff) => selectModel(eff),
-        });
-        app.redraw();
-      } else {
-        selectModel(it);
-      }
-    },
-  });
-  app.api.call("llm.models").then(({ groups, failures }) => {
-    const items = [];
-    for (const g of groups) {
-      for (const m of g.models) {
-        items.push({
-          label: `${g.id}/${m.id}`,
-          hint: m.name ?? m.id,
-          provider: g.id, model: m.id,
-          efforts: m.reasoning?.efforts ?? [],
-          defaultEffort: m.reasoning?.defaultEffort,
-          keywords: `${m.description ?? ""} ${g.name}`,
-        });
-      }
-    }
-    picker.items = [manageProviders, ...items];
-    app.redraw();
-  }).catch((e) => app.toast(`模型列表失败: ${e.message}`));
-  return picker;
+  return new ModelPickerBuffer(app);
 }
 
 // ---- Mode (agent preset) & permission pickers ----
@@ -182,7 +320,7 @@ export function permName(id) { return PERM_NAMES[id] ?? id; }
 
 /** Four-mode selector: the shipped agent presets (standard/code/minimal/cordis). */
 export function buildModePicker(app) {
-  const w = Math.min(66, app.screen.w - 4), h = Math.min(18, app.screen.h - 4);
+  const w = Math.max(1, Math.min(66, app.screen.w - 4)), h = Math.max(1, Math.min(18, app.screen.h - 4));
   const picker = new Picker({
     x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2),
     w, h, title: "模式（Agent 预设）",
@@ -208,7 +346,7 @@ export function buildPermissionPicker(app) {
   const perms = app.projections.permissions;
   const options = (perms?.options ?? []).filter((o) => o.value !== "custom");
   const current = perms?.currentValue;
-  const w = Math.min(60, app.screen.w - 4), h = Math.min(options.length + 4, 16);
+  const w = Math.max(1, Math.min(60, app.screen.w - 4)), h = Math.max(1, Math.min(options.length + 4, 16, app.screen.h - 4));
   return new Picker({
     x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2),
     w, h, title: "权限（沙箱 + 审批）",
@@ -237,8 +375,8 @@ export class ArchivePanel extends Popup {
   onKey(ev) {
     if (ev.type !== "key") return false; const items = this.items(), item = items[this.sel];
     if (ev.name === "escape") { this.app.closeOverlay(); return true; }
-    if (ev.name === "up" || (ev.name === "char" && ev.key === "k")) { this.sel = Math.max(0, this.sel - 1); this.rebuild(); return true; }
-    if (ev.name === "down" || (ev.name === "char" && ev.key === "j")) { this.sel = Math.min(items.length - 1, this.sel + 1); this.rebuild(); return true; }
+    if (ev.name === "up" || (ev.name === "char" && ev.key === "k")) { this.sel = wrapIndex(this.sel - 1, items.length); this.rebuild(); return true; }
+    if (ev.name === "down" || (ev.name === "char" && ev.key === "j")) { this.sel = wrapIndex(this.sel + 1, items.length); this.rebuild(); return true; }
     if (ev.name === "enter" && item) { this.app.closeOverlay(); this.app.openSession(item.sessionId); return true; }
     if (ev.name === "char" && ev.key === "y" && item) { this.app.copyText(item.sessionId); return true; }
     if (ev.name === "char" && ev.key === "e" && item) { this.app.exportSession(item); return true; }
@@ -284,8 +422,8 @@ export class PresetPanel extends Popup {
   onKey(ev) {
     if (ev.type !== "key") return false;
     if (ev.name === "escape") { this.app.closeOverlay(); return true; }
-    if (ev.name === "up" || (ev.name === "char" && ev.key === "k")) { this.sel = Math.max(0, this.sel - 1); this.read(); return true; }
-    if (ev.name === "down" || (ev.name === "char" && ev.key === "j")) { this.sel = Math.min(this.items.length - 1, this.sel + 1); this.read(); return true; }
+    if (ev.name === "up" || (ev.name === "char" && ev.key === "k")) { this.sel = wrapIndex(this.sel - 1, this.items.length); this.read(); return true; }
+    if (ev.name === "down" || (ev.name === "char" && ev.key === "j")) { this.sel = wrapIndex(this.sel + 1, this.items.length); this.read(); return true; }
     if (ev.name === "enter") { this.read(); return true; }
     if (ev.name === "char" && ev.key === "c") { this.#copy(); return true; }
     if (ev.name === "char" && ev.key === "o") { this.#open(); return true; }
@@ -302,13 +440,13 @@ export function buildCommandPalette(app) {
     { label: "新建会话", hint: "n", action: () => app.newSession(), keywords: "new session create" },
     { label: "新建工作区…", action: () => app.addWorkspace(), keywords: "new workspace create directory" },
     { label: "打开会话…", hint: "o", action: () => app.openSessionPicker(), keywords: "open session" },
-    { label: "搜索会话", hint: "/", action: () => app.startSearch(), keywords: "search find" },
+    { label: "跨会话全文搜索", hint: "Ctrl+F /", action: () => app.startSearch(), keywords: "search find full text" },
     { label: "重命名当前会话", action: () => app.renameCurrent(), keywords: "rename title" },
     { label: "切换模型", hint: "m", action: () => { app.overlay = buildModelPicker(app); app.redraw(); }, keywords: "model provider llm" },
     { label: "模式（Agent 预设）", action: () => app.showModePicker(), keywords: "mode preset standard code minimal cordis" },
     { label: "管理 Agent 预设", action: () => { app.overlay = new PresetPanel(app); app.redraw(); }, keywords: "preset inspect copy edit delete" },
     { label: "权限（沙箱 + 审批）", action: () => app.showPermissionPicker(), keywords: "permission sandbox read-only write full access" },
-    { label: "工作区文件", hint: "w", action: () => app.setMode("workspace"), keywords: "workspace files tree" },
+    { label: "工作区文件", hint: "w", action: () => (app.showWorkspaceBuffer ? app.showWorkspaceBuffer() : app.setMode?.("workspace")), keywords: "workspace files tree" },
     { label: "轨迹视图", hint: "t", action: () => app.setMode("trajectory"), keywords: "trajectory timeline trace" },
     { label: "任务列表", hint: "j", action: () => app.showJobs(), keywords: "jobs tasks" },
     { label: "目标状态", hint: "g", action: () => app.showGoal(), keywords: "goal objective" },
@@ -338,6 +476,10 @@ export class WorkspacePanel extends Widget {
     this.treeScroll = new ScrollView({ x: this.x + 1, y: this.y + 1, w: Math.floor(this.w / 2), h: this.h - 2, showScrollbar: true });
     this.preview = new ScrollView({ x: this.x + Math.floor(this.w / 2) + 1, y: this.y + 1, w: this.w - Math.floor(this.w / 2) - 2, h: this.h - 2, showScrollbar: true });
     this.previewPath = null;
+    this.query = "";
+    this.searchSel = 0;
+    this.searchResults = [];
+    this.searchScroll = 0;
   }
   relayout(x, y, w, h) {
     this.x = x; this.y = y; this.w = w; this.h = h;
@@ -360,7 +502,7 @@ export class WorkspacePanel extends Widget {
       this.rebuildTree();
     } catch (e) {
       this.app.toast(`工作区加载失败: ${e.message}`);
-      this.app.setMode("chat");
+      this.app.closeFullBuffer?.() ?? this.app.setMode?.("chat");
     }
   }
   expand(node) {
@@ -516,12 +658,12 @@ export class WorkspacePanel extends Widget {
     if (ev.type !== "key") return false;
     if (ev.name === "escape") {
       if (this.query) { this.query = ""; this.app.redraw(); return true; }
-      this.app.setMode("chat");
+      this.app.closeFullBuffer?.() ?? this.app.setMode?.("chat");
       return true;
     }
     if (ev.name === "backspace") { this.query = this.query.slice(0, -1); this.app.redraw(); return true; }
-    if (ev.name === "down" && this.query) { this.searchSel = Math.min((this.searchResults?.length ?? 1) - 1, (this.searchSel ?? 0) + 1); this.app.redraw(); return true; }
-    if (ev.name === "up" && this.query) { this.searchSel = Math.max(0, (this.searchSel ?? 0) - 1); this.app.redraw(); return true; }
+    if (ev.name === "down" && this.query) { this.searchSel = wrapIndex((this.searchSel ?? 0) + 1, this.searchResults?.length ?? 0); this.app.redraw(); return true; }
+    if (ev.name === "up" && this.query) { this.searchSel = wrapIndex((this.searchSel ?? 0) - 1, this.searchResults?.length ?? 0); this.app.redraw(); return true; }
     if (ev.name === "enter" && this.query && this.searchResults?.length) { this.previewFile(this.searchResults[this.searchSel ?? 0]); return true; }
     if (ev.name === "up" || ev.name === "down" || ev.name === "pgup" || ev.name === "pgdn") return this.treeScroll.onKey?.(ev) ?? false;
     return false;
@@ -591,8 +733,8 @@ export class DirPicker extends Widget {
     if (ev.type !== "key") return false;
     const items = this.#items();
     switch (ev.name) {
-      case "up": this.sel = Math.max(0, this.sel - 1); return true;
-      case "down": this.sel = Math.min(items.length - 1, this.sel + 1); return true;
+      case "up": this.sel = wrapIndex(this.sel - 1, items.length); return true;
+      case "down": this.sel = wrapIndex(this.sel + 1, items.length); return true;
       case "enter": {
         const it = items[this.sel];
         if (it.kind === "pick") { this.onPick?.(this.path); return true; }
@@ -601,8 +743,8 @@ export class DirPicker extends Widget {
       }
       case "backspace": if (this.parentPath) { this.path = this.parentPath; this.load(); } return true;
       case "char":
-        if (ev.key === "j" && !ev.ctrl) { this.sel = Math.min(items.length - 1, this.sel + 1); return true; }
-        if (ev.key === "k" && !ev.ctrl) { this.sel = Math.max(0, this.sel - 1); return true; }
+        if (ev.key === "j" && !ev.ctrl) { this.sel = wrapIndex(this.sel + 1, items.length); return true; }
+        if (ev.key === "k" && !ev.ctrl) { this.sel = wrapIndex(this.sel - 1, items.length); return true; }
         if (ev.key === "h" && !ev.ctrl) { if (this.parentPath) { this.path = this.parentPath; this.load(); } return true; }
         if (ev.key === "l" && !ev.ctrl) {
           const it = items[this.sel];
@@ -627,8 +769,8 @@ export class DirPicker extends Widget {
       }
       return true;
     }
-    if (ev.kind === "wheel-up") { this.sel = Math.max(0, this.sel - 1); return true; }
-    if (ev.kind === "wheel-down") { this.sel = Math.min(this.#items().length - 1, this.sel + 1); return true; }
+    if (ev.kind === "wheel-up") { this.sel = wrapIndex(this.sel - 1, this.#items().length); return true; }
+    if (ev.kind === "wheel-down") { this.sel = wrapIndex(this.sel + 1, this.#items().length); return true; }
     return true;
   }
 }
@@ -640,7 +782,7 @@ export class AttachmentPanel extends Widget {
   openItem(external=false){const a=this.items()[this.sel];if(!a)return;if(external){if(!a.path){this.app.toast("这不是本地文件，无法用默认程序定位");return;}try{const cmd=process.platform==="darwin"?"open":"xdg-open";spawn(cmd,[a.path],{detached:true,stdio:"ignore"}).unref();}catch(e){this.app.toast(`打开失败: ${e.message}`);}return;}if(a.mediaType?.startsWith("image/"))this.app.openImage(a,{all:this.items(),index:this.sel,returnTo:this});else this.app.toast(a.path?`文件: ${a.path}`:"这不是本地文件");}
   remove(){const a=this.items()[this.sel];if(!a)return;this.app.chat.attachments.splice(this.sel,1);this.app.chat.clipboardImages=this.app.chat.clipboardImages.filter(x=>x.id!==a.id);this.sel=Math.max(0,Math.min(this.sel,this.items().length-1));this.app.chat.inputChanged();this.app.redraw();}
   render(s){s.fillRect(this.x,this.y,this.x+this.w-1,this.y+this.h-1," ",{bg:T.BG2});s.box(this.x,this.y,this.x+this.w-1,this.y+this.h-1,{fg:K.ACCENT,bg:T.BG2},"附件管理器");const items=this.items();for(let i=0;i<Math.min(items.length,this.h-3);i++){const a=items[i],on=i===this.sel,y=this.y+1+i;s.fillRect(this.x+1,y,this.x+this.w-2,y," ",{bg:on?T.MENUSEL:T.BG2});s.text(this.x+2,y,truncate(`${a.mediaType?.startsWith("image/")?"󰋩":"󰈔"} ${a.name}`,this.w-6),{fg:on?T.SELFG:K.TXT,bg:on?T.MENUSEL:T.BG2});}if(!items.length)s.text(this.x+2,this.y+2,"暂无附件",{fg:K.FAINT,bg:T.BG2});s.text(this.x+2,this.y+this.h-1,"Enter 查看 · Shift+Enter/双击 默认程序 · dd 移除 · Esc 退出",{fg:K.FAINT,bg:T.BG2});}
-  onKey(ev){const ch=ev.type==="text"?ev.text:ev.type==="key"&&ev.name==="char"?ev.key:null;if(ch==="d"){if(this.dArmed){this.dArmed=false;this.remove();}else{this.dArmed=true;this.app.toast("再按 d 删除附件");}return true;}if(ev.type!=="key"){this.dArmed=false;return false;}if(ev.name==="escape"){this.close();return true;}if(ev.name==="up"||(ev.name==="char"&&ev.key==="k")){this.dArmed=false;this.sel=Math.max(0,this.sel-1);return true;}if(ev.name==="down"||(ev.name==="char"&&ev.key==="j")){this.dArmed=false;this.sel=Math.min(this.items().length-1,this.sel+1);return true;}if(ev.name==="enter"){this.dArmed=false;this.openItem(!!ev.shift);return true;}this.dArmed=false;return false;}
+  onKey(ev){const ch=ev.type==="text"?ev.text:ev.type==="key"&&ev.name==="char"?ev.key:null;if(ch==="d"){if(this.dArmed){this.dArmed=false;this.remove();}else{this.dArmed=true;this.app.toast("再按 d 删除附件");}return true;}if(ev.type!=="key"){this.dArmed=false;return false;}if(ev.name==="escape"){this.close();return true;}if(ev.name==="up"||(ev.name==="char"&&ev.key==="k")){this.dArmed=false;this.sel=wrapIndex(this.sel-1,this.items().length);return true;}if(ev.name==="down"||(ev.name==="char"&&ev.key==="j")){this.dArmed=false;this.sel=wrapIndex(this.sel+1,this.items().length);return true;}if(ev.name==="enter"){this.dArmed=false;this.openItem(!!ev.shift);return true;}this.dArmed=false;return false;}
   onMouse(ev){if(ev.kind==="press"&&ev.button===0){const i=ev.y-this.y-1;if(i>=0&&i<this.items().length){const now=Date.now();this.sel=i;if(this.lastClick&&now-this.lastClick<400)this.openItem(true);this.lastClick=now;}return true;}return false;}
 }
 
@@ -653,8 +795,8 @@ export class FilePicker extends Widget {
   items() { return [{ name: "..", dir: true }, ...this.entries.map((e) => ({ name: e.name, dir: e.isDirectory() }))]; }
   activate() { const it = this.items()[this.sel]; if (!it) return; const path = it.name === ".." ? dirname(this.path) : join(this.path, it.name); if (it.dir) { this.path = path; this.load(); } else this.onPick?.(path); }
   render(s) { s.fillRect(this.x,this.y,this.x+this.w-1,this.y+this.h-1," ",{bg:T.BG2}); s.box(this.x,this.y,this.x+this.w-1,this.y+this.h-1,{fg:K.ACCENT,bg:T.BG2},"Yazi 风格文件选择"); s.text(this.x+2,this.y+1,truncate(this.path,this.w-4),{fg:K.DIM,bg:T.BG2}); const items=this.items(), n=this.h-4; if(this.sel<this.scroll)this.scroll=this.sel; if(this.sel>=this.scroll+n)this.scroll=this.sel-n+1; for(let i=0;i<n;i++){const idx=this.scroll+i,it=items[idx];if(!it)continue;const on=idx===this.sel,y=this.y+2+i;s.fillRect(this.x+1,y,this.x+this.w-2,y," ",{bg:on?T.MENUSEL:T.BG2});s.text(this.x+2,y,`${it.dir?"▸":"·"} ${truncate(it.name,this.w-7)}${it.dir?"/":""}`,{fg:on?T.SELFG:it.dir?K.ACCENT:K.TXT,bg:on?T.MENUSEL:T.BG2});} s.text(this.x+2,this.y+this.h-1,"↑↓/jk 选择 · Enter/l 打开 · h上级 · Esc取消",{fg:K.FAINT,bg:T.BG2}); }
-  onKey(ev){if(ev.type!=="key")return false;const n=this.items().length;if(ev.name==="escape"){this.onCancel?.();return true;}if(ev.name==="up"||(ev.name==="char"&&ev.key==="k")){this.sel=Math.max(0,this.sel-1);return true;}if(ev.name==="down"||(ev.name==="char"&&ev.key==="j")){this.sel=Math.min(n-1,this.sel+1);return true;}if(ev.name==="enter"||(ev.name==="char"&&ev.key==="l")){this.activate();return true;}if(ev.name==="backspace"||(ev.name==="char"&&ev.key==="h")){this.path=dirname(this.path);this.load();return true;}return false;}
-  onMouse(ev){if(ev.kind==="press"&&ev.button===0){const idx=this.scroll+ev.y-this.y-2;if(idx>=0&&idx<this.items().length){this.sel=idx;this.activate();}return true;}if(ev.kind==="wheel-up"){this.sel=Math.max(0,this.sel-1);return true;}if(ev.kind==="wheel-down"){this.sel=Math.min(this.items().length-1,this.sel+1);return true;}return false;}
+  onKey(ev){if(ev.type!=="key")return false;const n=this.items().length;if(ev.name==="escape"){this.onCancel?.();return true;}if(ev.name==="up"||(ev.name==="char"&&ev.key==="k")){this.sel=wrapIndex(this.sel-1,n);return true;}if(ev.name==="down"||(ev.name==="char"&&ev.key==="j")){this.sel=wrapIndex(this.sel+1,n);return true;}if(ev.name==="enter"||(ev.name==="char"&&ev.key==="l")){this.activate();return true;}if(ev.name==="backspace"||(ev.name==="char"&&ev.key==="h")){this.path=dirname(this.path);this.load();return true;}return false;}
+  onMouse(ev){if(ev.kind==="press"&&ev.button===0){const idx=this.scroll+ev.y-this.y-2;if(idx>=0&&idx<this.items().length){this.sel=idx;this.activate();}return true;}if(ev.kind==="wheel-up"){this.sel=wrapIndex(this.sel-1,this.items().length);return true;}if(ev.kind==="wheel-down"){this.sel=wrapIndex(this.sel+1,this.items().length);return true;}return false;}
 }
 
 // ---- Trajectory view ----
@@ -672,6 +814,8 @@ export class TrajectoryPanel extends Widget {
     this.allEvents = [];
     this.sessionId = null;
     this.expandedSteps = new Set(); // step identity keys rendered 详细 (expanded)
+    this.selectedStepKey = null;    // stable first-event seq of the keyboard-selected step
+    this.visibleStepIndices = [];   // current render order for circular ↑/↓ navigation
     this.flashKey = null;           // step key just jumped to (brief highlight)
     this.flashUntil = 0;
     this.loadPromise = null;        // dedupes concurrent load(currentSession)
@@ -714,42 +858,46 @@ export class TrajectoryPanel extends Widget {
     return e.type;
   }
 
-  /** Right-click menu entry: the old event-detail picker for one step. */
-  #showDetail(si) {
-    const step = this.steps[si];
-    if (!step) return;
-    const t0 = step.events[0]?.time, t1 = step.events[step.events.length - 1]?.time;
-    const items = step.events.map((e, i) => ({ label: truncate(this.#eventSummary(e), 60), hint: `#${e.seq}`, idx: i, event: e }));
-    if (t0 && t1) items.unshift({ label: `⏱ 步骤 ${step.step} · ${step.events.length} 事件 · ${fmtMs(t1 - t0)}`, hint: "", idx: -1, event: null });
-    const w = Math.min(78, this.app.screen.w - 8), h = Math.min(22, this.app.screen.h - 4);
-    this.app.overlay = new Picker({
-      x: Math.floor((this.app.screen.w - w) / 2), y: Math.floor((this.app.screen.h - h) / 2),
-      w, h, title: "轨迹详情", items,
-      onCancel: () => this.app.closeOverlay(),
-      onPick: (it) => {
-        if (!it.event) { this.app.closeOverlay(); return; }
-        const e = it.event;
-        const d = e.data ?? {};
-        let body = "";
-        if (e.type === "tool/result") body = String(d.message?.content?.[0]?.content?.map((c) => c.text ?? "").join("\n") ?? JSON.stringify(d));
-        else if (e.type === "tool/call") body = String(d.arguments ?? "");
-        else if (e.type === "assistant/message") body = String(d.message?.content?.map((c) => c.text ?? "").join("\n") ?? "");
-        else body = JSON.stringify(d, null, 2);
-        const lines = body.split("\n").slice(0, 40).map((l) => [{ t: truncate(l, w - 6), fg: K.TXT }]);
-        const pw = Math.min(80, this.app.screen.w - 4);
-        const ph = Math.min(lines.length + 5, 24);
-        this.app.overlay = new Popup({
-          x: Math.floor((this.app.screen.w - pw) / 2), y: Math.floor((this.app.screen.h - ph) / 2),
-          w: pw, h: ph, title: `#${e.seq} ${e.type}`,
-          lines: [[{ t: "" }], ...lines], buttons: [{ label: "关闭", action: "close" }],
-          onAction: () => this.app.closeOverlay(),
-        });
-        this.app.redraw();
-      },
-    });
-    this.app.redraw();
+  #selectedIndex() {
+    if (this.steps.length === 0) return -1;
+    let index = this.steps.findIndex((step) => this.stepKey(step) === this.selectedStepKey);
+    if (index < 0) {
+      index = this.visibleStepIndices[0] ?? this.steps.length - 1;
+      this.selectedStepKey = this.stepKey(this.steps[index]);
+    }
+    return index;
   }
-
+  #moveSelection(delta) {
+    if (this.visibleStepIndices.length === 0) return false;
+    const current = this.#selectedIndex();
+    let pos = this.visibleStepIndices.indexOf(current);
+    if (pos < 0) pos = this.visibleStepIndices.length - 1;
+    const index = this.visibleStepIndices[wrapIndex(pos + delta, this.visibleStepIndices.length)];
+    this.selectedStepKey = this.stepKey(this.steps[index]);
+    const line = this.stepLines.indexOf(index);
+    if (line < this.view.scrollY) this.view.scrollY = line;
+    else if (line >= this.view.scrollY + this.view.h) this.view.scrollY = Math.max(0, line - this.view.h + 1);
+    this.buildLines();
+    this.app.redraw();
+    return true;
+  }
+  #menuItems(si) {
+    const step = this.steps[si];
+    const key = step ? this.stepKey(step) : null;
+    const currentIndex = () => this.steps.findIndex((candidate) => this.stepKey(candidate) === key);
+    const open = step && this.expandedSteps.has(key);
+    return step ? [
+      { label: open ? "折叠（简略）" : "展开（详细）", action: () => { const index = currentIndex(); if (index >= 0) this.#toggleStep(index); } },
+      { label: "转跳对话", action: () => { const index = currentIndex(); if (index >= 0) this.app.jumpToChatStep(index); } },
+    ] : [];
+  }
+  openSelectedMenu() {
+    const si = this.#selectedIndex();
+    if (si < 0) return false;
+    const line = this.stepLines.indexOf(si);
+    this.app.openMenu(this.#menuItems(si), { x: this.view.x + 4, y: this.view.y + Math.max(0, line - this.view.scrollY) });
+    return true;
+  }
   #toggleStep(si) {
     const step = this.steps[si];
     if (!step) return;
@@ -768,9 +916,10 @@ export class TrajectoryPanel extends Widget {
     this.app.redraw();
   }
 
-  /** Stable identity of a step across loadOlder re-segmentation: the seq of
-   *  its first event (step indexes shift when older steps are prepended). */
-  stepKey(step) { return step.events[0]?.seq ?? `step-${step.step}`; }
+  /** Stable identity across prepends: prefer the step/turn start sequence.
+   *  A history page may begin in the middle of a step; its leading fragment
+   *  then merges into the real start when the previous page arrives. */
+  stepKey(step) { return step.startSeq ?? step.events[0]?.seq ?? `step-${step.step}`; }
 
   /** Step index whose events carry the given message id (-1 when absent). */
   indexOfMessage(messageId) {
@@ -831,6 +980,7 @@ export class TrajectoryPanel extends Widget {
     if (si < 0 || si >= this.steps.length) return;
     const key = this.stepKey(this.steps[si]);
     this.expandedSteps.add(key);
+    this.selectedStepKey = key;
     this.flashKey = key;
     this.flashUntil = Date.now() + 3000;
     // load older pages until at least 20 steps sit above the target
@@ -966,6 +1116,13 @@ export class TrajectoryPanel extends Widget {
     this.stats = null;
     this.hasMore = false;
     this.minSeq = null;
+    this.expandedSteps.clear();
+    this.selectedStepKey = null;
+    this.visibleStepIndices = [];
+    this.flashKey = null; this.flashUntil = 0;
+    this.winSeqLo = null; this.winSeqHi = null;
+    this.query = "";
+    this.view.scrollY = 0;
     this.app.setStatus("加载轨迹…");
     try {
       // One bounded call for the recent steps (maxMessages = model messages =
@@ -975,7 +1132,9 @@ export class TrajectoryPanel extends Widget {
       this.stats = h.projections?.values?.sessionStats ?? null;
       this.minSeq = h.events[0]?.event?.seq ?? null;
       this.hasMore = h.hasMore;
-      this.allEvents = h.events;
+      const bySeq = new Map();
+      for (const wrapped of h.events ?? []) { const seq = wrapped?.event?.seq; if (seq != null) bySeq.set(seq, wrapped); }
+      this.allEvents = [...bySeq.values()].sort((a, b) => a.event.seq - b.event.seq);
       this.build();
     } catch (e) { this.app.toast(`轨迹加载失败: ${e.message}`); }
     this.loading = false;
@@ -994,10 +1153,22 @@ export class TrajectoryPanel extends Widget {
       if (this.sessionId !== sessionId || this.loadToken !== token) { this.loadingOlder = false; return; }
       if (h.events.length === 0) { this.hasMore = false; }
       else {
+        const previousMinSeq = this.minSeq;
         this.minSeq = h.events[0]?.event?.seq ?? this.minSeq;
-        this.hasMore = h.hasMore;
-        this.allEvents = [...h.events, ...this.allEvents].sort((a, b) => a.event.seq - b.event.seq);
+        this.hasMore = h.hasMore && this.minSeq < previousMinSeq;
+        const bySeq = new Map();
+        for (const wrapped of [...h.events, ...this.allEvents]) {
+          const seq = wrapped?.event?.seq;
+          if (seq == null) continue;
+          bySeq.set(seq, wrapped);
+        }
+        const selectedEventSeq = this.steps.find((step) => this.stepKey(step) === this.selectedStepKey)?.events[0]?.seq ?? null;
+        const expandedEventSeqs = [...this.expandedSteps].map((key) => this.steps.find((step) => this.stepKey(step) === key)?.events[0]?.seq).filter((seq) => seq != null);
+        this.allEvents = [...bySeq.values()].sort((a, b) => a.event.seq - b.event.seq);
         this.build();
+        const keyForEvent = (seq) => { const step = this.steps.find((candidate) => candidate.events.some((event) => event.seq === seq)); return step ? this.stepKey(step) : null; };
+        if (selectedEventSeq != null) this.selectedStepKey = keyForEvent(selectedEventSeq);
+        this.expandedSteps = new Set(expandedEventSeqs.map(keyForEvent).filter((key) => key != null));
       }
     } catch (e) { this.app.toast(`加载更早失败: ${e.message}`); }
     this.loadingOlder = false;
@@ -1006,18 +1177,33 @@ export class TrajectoryPanel extends Widget {
     this.app.redraw();
   }
   build() {
-    // Segment on step/start: each model message is one step (the web view's
-    // trajectory node), which is what maxMessages actually pages over.
+    // Segment on step/start: turn/start is turn metadata, not a model step.
+    // Keep leading pre-step/page fragments so events remain inspectable and
+    // merge them into the first real step rather than fabricating phantom rows.
     const steps = [];
     let cur = null;
+    let pending = [];
     for (const { event } of this.allEvents) {
       const d = event.data ?? {};
-      if (event.type === "step/start" || event.type === "turn/start") {
+      if (event.type === "turn/start") {
         if (cur && cur.events.length) steps.push(cur);
-        cur = { events: [], step: d.step ?? steps.length + 1, turn: d.turn };
+        else if (pending.length) steps.push({ events: pending, step: "?", startSeq: null, partial: true });
+        cur = null; pending = [event];
+      } else if (event.type === "step/start") {
+        if (cur && cur.events.length) steps.push(cur);
+        if (pending.length && pending[0]?.type !== "turn/start") {
+          steps.push({ events: pending, step: "?", startSeq: null, partial: true });
+          pending = [];
+        }
+        cur = { events: [...pending, event], step: d.step ?? steps.length + 1, turn: d.turn ?? pending[0]?.data?.turn, startSeq: event.seq };
+        pending = [];
+      } else if (!cur) {
+        pending.push(event);
+      } else {
+        cur.events.push(event);
       }
-      if (cur) cur.events.push(event);
     }
+    if (!cur && pending.length) cur = { events: pending, step: "?", turn: pending.find((event) => event.type === "turn/start")?.data?.turn, startSeq: null, partial: true };
     if (cur && cur.events.length) steps.push(cur);
     // Keep every loaded step: Home/End navigation pages across the whole
     // session, so older steps must survive until `r` re-fetches fresh.
@@ -1035,19 +1221,26 @@ export class TrajectoryPanel extends Widget {
     }
     const winIdxLo = this.steps.findIndex((s) => this.stepKey(s) === loSeq);
     const winIdxHi = this.steps.findIndex((s) => this.stepKey(s) === hiSeq);
-    const loStepNum = this.steps[winIdxLo]?.step ?? "?";
-    const hiStepNum = this.steps[winIdxHi]?.step ?? "?";
+    if (this.steps.length && (winIdxLo < 0 || winIdxHi < 0)) {
+      loSeq = this.stepKey(this.steps[Math.max(0, this.steps.length - 20)]);
+      hiSeq = this.stepKey(this.steps[this.steps.length - 1]);
+      this.winSeqLo = loSeq; this.winSeqHi = hiSeq;
+    }
+    const safeLo = this.steps.findIndex((s) => this.stepKey(s) === loSeq);
+    const safeHi = this.steps.findIndex((s) => this.stepKey(s) === hiSeq);
+    const loStepNum = this.steps[safeLo]?.step ?? "?";
+    const hiStepNum = this.steps[safeHi]?.step ?? "?";
     const lines = [];
-    lines.push([{ t: "轨迹 — 步骤时间轴（左键展开/折叠 · PgUp/PgDn 上下加载 · Home/End 首尾 · Ctrl+E 转跳 · r 刷新）", fg: K.ACCENT, bold: true }]);
+    lines.push([{ t: "轨迹 — ↑↓ 选择 · Ctrl+↑↓ 滚动 · Space 展开 · Enter 转跳对话 · Ctrl+R 菜单 · PgUp/PgDn 加载", fg: K.ACCENT, bold: true }]);
     if (this.hasMore) lines.push([{ t: "▲ 更早步骤（点击 / PgUp 向上加载 10 步）", fg: K.FAINT }]);
     else lines.push([{ t: "" }]);
     const st = this.stats;
     if (st) {
       lines.push([{ t: `回合 ${st.turns} · 步骤 ${st.steps} · LLM ${fmtMs(st.llmMs)} · 工具 ${fmtMs(st.toolMs)}`, fg: K.DIM }]);
     }
-    lines.push([{ t: `窗口 #${winIdxLo + 1}–#${winIdxHi + 1}（已加载 ${this.steps.length}${this.hasMore ? "+" : ""}）· step ${loStepNum}–${hiStepNum}${this.winSeqLo == null ? "（跟随最新）" : ""}：`, fg: K.DIM, underline: true }]);
+    lines.push([{ t: `窗口 #${safeLo + 1}–#${safeHi + 1}（已加载 ${this.steps.length}${this.hasMore ? "+" : ""}）· step ${loStepNum}–${hiStepNum}${this.winSeqLo == null ? "（跟随最新）" : ""}：`, fg: K.DIM, underline: true }]);
     this.stepLines = [];
-    const list = this.query
+    const list = (this.query
       ? this.steps.filter((t) => t.events.some((e) => {
         const d = e.data ?? {};
         const hay = `${e.type} ${d.name ?? ""} ${typeof d.content === "string" ? d.content : ""}`.toLowerCase();
@@ -1056,22 +1249,29 @@ export class TrajectoryPanel extends Widget {
       : this.steps.filter((s) => {
         const k = this.stepKey(s);
         return k >= loSeq && k <= hiSeq;
-      });
-    for (const step of list.reverse()) {
+      })).reverse();
+    this.visibleStepIndices = list.map((step) => this.steps.indexOf(step));
+    if (this.visibleStepIndices.length && !this.visibleStepIndices.some((si) => this.stepKey(this.steps[si]) === this.selectedStepKey)) {
+      // The newest step is the first rendered row because trajectory is reverse chronological.
+      this.selectedStepKey = this.stepKey(this.steps[this.visibleStepIndices[0]]);
+    }
+    for (const step of list) {
       const si = this.steps.indexOf(step);
       const tools = [...new Set(step.events.filter((e) => e.type === "tool/call").map((e) => e.data?.name))];
-      const hasResult = step.events.some((e) => e.type === "tool/result");
       const hasReasoning = step.events.some((e) => e.type === "assistant/chunk" && e.data?.chunk?.blockType === "reasoning");
       const t0 = step.events[0]?.time, t1 = step.events[step.events.length - 1]?.time;
       // deep-dive style live timer: the newest step ticks while the turn runs
       const isLiveTail = this.app.chat?.running && this.winSeqLo == null && si === this.steps.length - 1;
       const dur = isLiveTail ? `⏱${fmtMs(Date.now() - (t0 ?? Date.now()))}` : (t0 && t1 ? fmtMs(t1 - t0) : "—");
-      const bg = tools.length ? (hasResult ? T.TOOLOK : T.TOOLBG) : hasReasoning ? T.THINKBG : T.CARD;
+      // Tool-heavy timelines stay neutral: gray reveals the clickable step
+      // range without turning every successful bash call into a green slab.
+      const bg = tools.length ? T.CARD : hasReasoning ? T.THINKBG : T.CARD;
       const summary = tools.slice(0, 3).join(",") || (hasReasoning ? "模型推理" : "纯文本");
       const open = this.expandedSteps.has(this.stepKey(step));       // 详细
       const flash = this.flashKey === this.stepKey(step) && Date.now() < this.flashUntil;
       const rowBg = flash ? T.ACCENT : bg;
-      const label = `${open ? "▾" : "▸"} step ${String(step.step).padStart(3)}  ${pad(dur, 8)}  ${summary}  ${open ? "[折叠]" : "[展开]"}`;
+      const selected = this.stepKey(step) === this.selectedStepKey;
+      const label = `${selected ? "=>" : "  "} ${open ? "▾" : "▸"} step ${String(step.step).padStart(3)}  ${pad(dur, 8)}  ${summary}  ${open ? "[折叠]" : "[展开]"}`;
       const segs = [{ t: label, fg: flash ? T.SELFG : K.TXT, bg: rowBg, bold: true }];
       const fill = w - strWidth(label);
       if (fill > 0) segs.push({ t: " ".repeat(fill), bg: rowBg });
@@ -1081,17 +1281,15 @@ export class TrajectoryPanel extends Widget {
         // 详细 mode = deep dive: the step's events inline under its color
         // block, each with its OWN duration (web-style Δ timer: time since
         // the previous event; the first is measured from the step start).
-        const evs = step.events.slice(0, 12);
+        // Expanded means complete: every event stays reachable by ordinary
+        // viewport scrolling, replacing the removed duplicate detail picker.
+        const evs = step.events;
         let prev = null;
         for (const e of evs) {
           const dt = prev != null && e.time != null ? ` Δ${fmtMs(e.time - prev)}` : "";
           lines.push([{ t: `    #${String(e.seq).padStart(4)}${dt} ${truncate(this.#eventSummary(e), w - 12 - strWidth(dt))}`, fg: K.DIM, bg }]);
           this.stepLines[lines.length - 1] = si;
           prev = e.time;
-        }
-        if (step.events.length > evs.length) {
-          lines.push([{ t: `    …共 ${step.events.length} 个事件（右键 → 查看详情）`, fg: K.FAINT, bg }]);
-          this.stepLines[lines.length - 1] = si;
         }
       }
     }
@@ -1120,15 +1318,18 @@ export class TrajectoryPanel extends Widget {
   }
   /** Re-fetch the tail window while following the live turn. */
   async #refreshTail() {
-    if (!this.sessionId) return;
+    if (!this.sessionId || this.loadingOlder) return;
     const sessionId = this.sessionId;
     const token = this.loadToken;
     this.refreshing = true;
     try {
       const h = await this.app.api.call("session.history", { sessionId, maxMessages: 20 });
       if (this.sessionId !== sessionId || this.loadToken !== token) { this.refreshing = false; return; }
-      this.allEvents = h.events;
-      this.minSeq = h.events[0]?.event?.seq ?? this.minSeq;
+      if (this.loadingOlder || this.winSeqLo != null) { this.refreshing = false; return; }
+      const bySeq = new Map();
+      for (const wrapped of h.events ?? []) { const seq = wrapped?.event?.seq; if (seq != null) bySeq.set(seq, wrapped); }
+      this.allEvents = [...bySeq.values()].sort((a, b) => a.event.seq - b.event.seq);
+      this.minSeq = this.allEvents[0]?.event?.seq ?? this.minSeq;
       this.hasMore = h.hasMore;
       this.stats = h.projections?.values?.sessionStats ?? this.stats;
       this.build();
@@ -1144,12 +1345,9 @@ export class TrajectoryPanel extends Widget {
       const si = this.stepLines[y];
       const step = si !== undefined ? this.steps[si] : null;
       if (step) {
-        const open = this.expandedSteps.has(this.stepKey(step));
-        this.app.openMenu([
-          { label: open ? "折叠（简略）" : "展开（详细）", action: () => this.#toggleStep(si) },
-          { label: "转跳对话", action: () => this.app.jumpToChatStep(si) },
-          { label: "查看详情", action: () => this.#showDetail(si) },
-        ], ev);
+        this.selectedStepKey = this.stepKey(step);
+        this.buildLines();
+        this.app.openMenu(this.#menuItems(si), ev);
         return true;
       }
       if (this.hasMore && y === 1) {
@@ -1168,6 +1366,9 @@ export class TrajectoryPanel extends Widget {
     return false;
   }
   onKey(ev) {
+    // Legacy terminals deliver an unmodified Space as text rather than a key
+    // event. It is a trajectory action, not a hidden-query character.
+    if (ev.type === "text" && ev.text === " ") { const si = this.#selectedIndex(); if (si >= 0) this.#toggleStep(si); return true; }
     if (ev.type === "text") { this.query += ev.text; this.buildLines(); this.app.redraw(); return true; }
     if (ev.type !== "key") return false;
     if (ev.name === "escape") {
@@ -1176,9 +1377,15 @@ export class TrajectoryPanel extends Widget {
       return true;
     }
     if (ev.name === "backspace") { this.query = this.query.slice(0, -1); this.buildLines(); this.app.redraw(); return true; }
+    if (ev.ctrl && (ev.name === "up" || ev.name === "down")) { this.view.scroll(ev.name === "up" ? -1 : 1); this.app.redraw(); return true; }
+    if (ev.name === "up" || ev.name === "down") return this.#moveSelection(ev.name === "up" ? -1 : 1);
+    if (ev.name === "char" && ev.key === " " && !ev.ctrl) { const si = this.#selectedIndex(); if (si >= 0) this.#toggleStep(si); return true; }
+    if (ev.name === "enter") { const si = this.#selectedIndex(); if (si >= 0) this.app.jumpToChatStep(si); return true; }
+    if (ev.name === "char" && ev.key === "r" && ev.ctrl) return this.openSelectedMenu();
     if (ev.name === "char" && ev.key === "r" && !ev.ctrl) {
       this.winSeqLo = this.winSeqHi = null;
       this.steps = [];
+      this.selectedStepKey = null;
       this.load(this.sessionId);
       return true;
     }
@@ -1186,7 +1393,6 @@ export class TrajectoryPanel extends Widget {
     if (ev.name === "pgdn") { this.extendDown(); return true; }
     if (ev.name === "home") { this.gotoHome(); return true; }
     if (ev.name === "end") { this.gotoEnd(); return true; }
-    if (ev.name === "up" || ev.name === "down") return this.view.onKey(ev);
     return false;
   }
 }
@@ -1431,7 +1637,7 @@ export class ControlPanel extends Widget {
     this.loadCommands();
     this.loadPlugins();
   }
-  editShortcut(id){const back=this,b=keyBindings()[id];const input=new Input({x:this.x+8,y:this.y+7,w:this.w-16,h:1,prompt:'JSON: ',allowEmptyEnter:true,onEnter(value){try{const parsed=JSON.parse(value);if(!["normal","insert","all"].includes(parsed.mode)||typeof parsed.key!=="string"||!parsed.key.trim())throw new Error('需要 {"mode":"normal|insert|all","key":"..."}');if(!setKeyBinding(id,parsed))throw new Error('写入配置失败');back.app.overlay=back;back.app.focus(back);back.app.toast('快捷键已保存');}catch(e){input.setValue(value);back.app.toast(`语法错误: ${e.message}`);}}});input.setValue(JSON.stringify(b));const pop=new Popup({x:this.x+6,y:this.y+5,w:this.w-12,h:6,title:`编辑 tui-config.json · keyBindings.${id}`,lines:[`配置项: keyBindings.${id}`],buttons:[]});pop.render=(s)=>{Popup.prototype.render.call(pop,s);input.render(s);};pop.onKey=(ev)=>{if(ev.type==='key'&&ev.name==='escape'){back.app.overlay=back;back.app.focus(back);return true;}return input.onKey(ev);};this.app.overlay=pop;this.app.focus(input);}
+  editShortcut(id){const back=this,b=keyBindings()[id];const input=new Input({x:this.x+8,y:this.y+7,w:this.w-16,h:1,prompt:'JSON: ',allowEmptyEnter:true,onEnter(value){try{const parsed=JSON.parse(value);if(!["normal","insert","all"].includes(parsed.mode)||typeof parsed.key!=="string"||!parsed.key.trim())throw new Error('需要 {"mode":"normal|insert|all","key":"..."[, "key2":"..."]}');const k2=typeof parsed.key2==="string"?parsed.key2.trim():"";const vk=validateKeySpec(parsed.key);if(!vk.ok)throw new Error(`key: ${vk.reason}`);if(k2){const vk2=validateKeySpec(k2);if(!vk2.ok)throw new Error(`key2: ${vk2.reason}`);}if(!setKeyBinding(id,{mode:parsed.mode,key:parsed.key.trim(),key2:k2}))throw new Error('写入配置失败');back.app.overlay=back;back.app.focus(back);back.app.toast('快捷键已保存');}catch(e){input.setValue(value);back.app.toast(`语法错误: ${e.message}`);}}});input.setValue(JSON.stringify(b));const pop=new Popup({x:this.x+6,y:this.y+5,w:this.w-12,h:7,title:`编辑 tui-config.json · keyBindings.${id}`,lines:[`配置项: keyBindings.${id} · 两个槽位 key（主）/ key2（备）`,`示例: {"mode":"normal","key":"Ctrl+F","key2":"/"}`],buttons:[]});pop.render=(s)=>{Popup.prototype.render.call(pop,s);input.render(s);};pop.onKey=(ev)=>{if(ev.type==='key'&&ev.name==='escape'){back.app.overlay=back;back.app.focus(back);return true;}return input.onKey(ev);};this.app.overlay=pop;this.app.focus(input);}
   async loadCommands() {
     try {
       const agentId = this.app.currentSession;
@@ -1451,9 +1657,9 @@ export class ControlPanel extends Widget {
   }
   shortcutItems() {
     const b=keyBindings();
-    const row=(id,desc)=>[`${(b[id]?.mode??"all").toUpperCase()}\t${b[id]?.key??""}`,desc,null,id];
+    const row=(id,desc)=>[`${(b[id]?.mode??"all").toUpperCase()}\t${describeSpec(b[id]?.key)}\t${describeSpec(b[id]?.key2)}`,desc,null,id];
     return [
-      row("think","思考块 展开/折叠"),row("tools","工具块 展开/折叠"),row("insert","进入输入"),row("leaveInsert","退出输入"),row("sessionFilter","筛选会话"),row("newSession","新建会话"),row("top","滚动到顶"),row("bottom","滚动到底"),row("prevQuestion","上一提问的终点"),row("nextQuestion","下一提问的终点"),row("expandInput","输入栏 展开/折叠"),row("copyInput","复制输入栏选区"),row("panel","控制面板"),row("model","切换模型"),row("trajectory","轨迹视图"),row("homeSwitch","对话/轨迹切换"),row("permissionRotate","权限模式轮换"),row("workspace","工作区"),row("settings","设置"),row("subagent","子代理"),row("skills","技能"),row("goal","目标"),row("jobs","后台任务"),row("stepJump","步骤转跳"),row("sidebar","侧栏显示/隐藏"),row("quit","退出"),
+      row("think","思考块 展开/折叠"),row("tools","工具块 展开/折叠"),row("insert","进入输入"),row("leaveInsert","退出输入"),row("sessionFilter","跨会话搜索"),row("newSession","新建会话"),row("top","跳到首个正文块"),row("bottom","跳到最新正文块"),row("prevQuestion","上一提问的终点"),row("nextQuestion","下一提问的终点"),row("expandInput","输入栏 展开/折叠"),row("copyInput","复制输入栏选区"),row("panel","控制面板"),row("model","切换模型"),row("trajectory","轨迹视图"),row("homeSwitch","pane 焦点切换"),row("permissionRotate","权限模式轮换"),row("workspace","工作区"),row("settings","设置"),row("subagent","子代理"),row("skills","技能"),row("goal","目标"),row("jobs","后台任务"),row("queue","后台队列"),row("busyEnter","运行中 Enter 策略"),row("attachments","附件管理"),row("stepJump","步骤转跳"),row("sidebar","侧栏显示/隐藏"),row("editConfig","编辑配置文件（默认编辑器）"),row("quit","退出"),
     ];
   }
   items() {
@@ -1475,7 +1681,7 @@ export class ControlPanel extends Widget {
         ["模型管理（含思考强度）", "切换模型并选择思考强度", () => { this.app.overlay = buildModelPicker(this.app); }],
         ["模式（Agent 预设）", "标准 / PTC / 极简 / 创造", () => { this.app.overlay = buildModePicker(this.app); this.app.redraw(); }],
         ["权限（沙箱 + 审批）", "只读 / 工作区写入 / 完全访问", () => { this.app.overlay = buildPermissionPicker(this.app); this.app.redraw(); }],
-        ["完整设置（JSON 编辑器）", "所有命名空间的原始值", () => { this.app.closeOverlay(); this.app.setMode("settings"); }],
+        ["完整设置（JSON 编辑器）", "所有命名空间的原始值", () => { this.app.closeOverlay(); this.app.showSettingsBuffer ? this.app.showSettingsBuffer() : this.app.setMode?.("settings"); }],
         ["切换主题", "dark / light / gruvbox", () => { cycleTheme(); this.app.toast(`主题: ${themeName()}`); }],
         ["侧栏显示/隐藏", "nvim 式整体收起", () => this.app.toggleSidebar()],
         ["导出当前会话日志", "下载 ZIP", () => { const sess = this.app.sessions.find((x) => x.sessionId === this.app.currentSession); if (sess) { this.app.closeOverlay(); this.app.exportSession(sess); } }],
@@ -1505,7 +1711,7 @@ export class ControlPanel extends Widget {
     if (this.sel < this.scroll) this.scroll = this.sel;
     else if (this.sel >= this.scroll + visible) this.scroll = this.sel - visible + 1;
     this.scroll = Math.max(0, Math.min(Math.max(0, items.length - visible), this.scroll));
-    if(this.page===0){s.text(this.x+2,this.y+1,"MODE",{fg:T.PURPLE,bg:T.PANEL,attrs:1});s.text(this.x+13,this.y+1,"KEY",{fg:T.ACCENT,bg:T.PANEL,attrs:1});s.text(this.x+32,this.y+1,"FUNCTION",{fg:T.OK,bg:T.PANEL,attrs:1});}
+    if(this.page===0){s.text(this.x+2,this.y+1,"MODE",{fg:T.PURPLE,bg:T.PANEL,attrs:1});s.text(this.x+13,this.y+1,"KEY1",{fg:T.ACCENT,bg:T.PANEL,attrs:1});s.text(this.x+31,this.y+1,"KEY2",{fg:T.ACCENT,bg:T.PANEL,attrs:1});s.text(this.x+49,this.y+1,"FUNCTION",{fg:T.OK,bg:T.PANEL,attrs:1});}
     if(this.page===3&&this.pluginFilter){s.text(this.x+2,this.y+1,`/ ${this.pluginQuery}`,{fg:T.ACCENT,bg:T.PANEL,attrs:1});}
     for (let i = 0; i < visible; i++) {
       const idx = this.scroll + i;
@@ -1514,7 +1720,7 @@ export class ControlPanel extends Widget {
       const sel = idx === this.sel;
       s.fillRect(this.x + 1, this.y + 2 + i, this.x + this.w - 2, this.y + 2 + i, " ", { bg: sel ? T.MENUSEL : T.PANEL });
       const label = it[0];
-      if(this.page===0){const [mode,key]=label.split("\t");s.text(this.x+2,this.y+2+i,pad(mode,9),{fg:T.PURPLE,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+13,this.y+2+i,pad(truncate(key,17),18),{fg:T.ACCENT,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+32,this.y+2+i,truncate(it[1],this.w-35),{fg:T.OK,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});}
+      if(this.page===0){const [mode,key1,key2]=label.split("\t");s.text(this.x+2,this.y+2+i,pad(mode,9),{fg:T.PURPLE,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+13,this.y+2+i,pad(truncate(key1,16),17),{fg:T.ACCENT,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+31,this.y+2+i,pad(truncate(key2,16),17),{fg:T.ACCENT,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+49,this.y+2+i,truncate(it[1],this.w-52),{fg:T.OK,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});}
       else{s.text(this.x + 2, this.y + 2 + i, truncate(label, this.w - 34), { fg: sel ? T.BOLD : T.TXT, bg: sel ? T.MENUSEL : T.PANEL, attrs: sel ? 1 : 0 });if (it[1]) s.text(this.x + this.w - 30, this.y + 2 + i, truncate(it[1], 28), { fg: T.FAINT, bg: sel ? T.MENUSEL : T.PANEL });}
     }
     s.text(this.x + 2, this.y + this.h - 1, this.page===0?"↑↓ 选择 · Enter 编辑 · Shift+Tab 轮换模式 · Alt+Enter 恢复默认 · Esc 关闭":this.page===3?`/ 筛选插件 · Ctrl+/ 清除 · ↑↓ 选择 · Esc 关闭${this.pluginQuery?` · ${this.pluginQuery}`:""}`:"↑↓ 选择 · Enter 执行 · Esc 关闭", { fg: T.FAINT });
@@ -1537,8 +1743,8 @@ export class ControlPanel extends Widget {
     if (ev.name === "backtab" || ev.name === "left") { this.page = (this.page + this.pages.length - 1) % this.pages.length; this.sel = 0; this.app.redraw(); return true; }
     if (ev.name === "pgup" || ev.name === "home") { this.sel = 0; this.app.redraw(); return true; }
     if (ev.name === "pgdn" || ev.name === "end") { this.sel = this.items().length - 1; this.app.redraw(); return true; }
-    if (ev.name === "up") { this.sel = Math.max(0, this.sel - 1); this.app.redraw(); return true; }
-    if (ev.name === "down") { this.sel = Math.min(this.items().length - 1, this.sel + 1); this.app.redraw(); return true; }
+    if (ev.name === "up") { this.sel = wrapIndex(this.sel - 1, this.items().length); this.app.redraw(); return true; }
+    if (ev.name === "down") { this.sel = wrapIndex(this.sel + 1, this.items().length); this.app.redraw(); return true; }
     if (ev.name === "enter") {
       const it = this.items()[this.sel];
       if(this.page===0&&it?.[3]){this.editShortcut(it[3]);return true;}
@@ -1558,7 +1764,7 @@ export class ControlPanel extends Widget {
           tx += wTab;
         }
         // sub-page tabs (on 设置)
-        if (this.page === 2) {
+        if (this.page === 2 && Array.isArray(this.subPages)) {
           let sx = this.x + 2 + strWidth(" 快捷键   命令   设置 ");
           for (let i = 0; i < this.subPages.length; i++) {
             const wTab = strWidth(` ${this.subPages[i]} `);
@@ -1578,8 +1784,8 @@ export class ControlPanel extends Widget {
         return true;
       }
     }
-    if (ev.kind === "wheel-up") { this.sel = Math.max(0, this.sel - 1); this.app.redraw(); return true; }
-    if (ev.kind === "wheel-down") { this.sel = Math.min(this.items().length - 1, this.sel + 1); this.app.redraw(); return true; }
+    if (ev.kind === "wheel-up") { this.sel = wrapIndex(this.sel - 1, this.items().length); this.app.redraw(); return true; }
+    if (ev.kind === "wheel-down") { this.sel = wrapIndex(this.sel + 1, this.items().length); this.app.redraw(); return true; }
     return true;
   }
 }
@@ -1670,7 +1876,7 @@ export class JobsPanel extends Popup {
         const child = this.subagents[i], bg = i === this.sel ? T.MENUSEL : T.BG2;
         const status = child.activity ?? child.status ?? child.mode ?? "idle";
         const open = this.expanded.has(i);
-        lines.push([{ t: ` ${open ? "▾" : "▸"} 🛰 ${truncate(child.label ?? child.sessionId ?? child.id ?? "子代理", 42)} `, fg: K.TXT, bg, bold: i === this.sel }, { t: status, fg: status === "running" ? K.WARN : K.DIM, bg }]); rowOf.push(i);
+        lines.push([{ t: ` ${open ? "▾" : "▸"} ◇ ${truncate(child.label ?? child.sessionId ?? child.id ?? "子代理", 42)} `, fg: K.TXT, bg, bold: i === this.sel }, { t: status, fg: status === "running" ? K.WARN : K.DIM, bg }]); rowOf.push(i);
         if (this.expanded.has(i)) for (const [key, value] of Object.entries(child)) { lines.push([{ t: `      ${key}: ${truncate(typeof value === "object" ? JSON.stringify(value) : value, this.w - 16)}`, fg: K.DIM }]); rowOf.push(-1); }
       }
       this.lines = lines; this.rowOf = rowOf; this.#ensureVisible(); return;
@@ -1721,10 +1927,10 @@ export class JobsPanel extends Popup {
       const current = this.page === "jobs" ? this.jobs : this.subagents;
       if (current.length === 0) return super.onKey(ev);
       if (ev.name === "up" || (ev.name === "char" && ev.key === "k" && !ev.ctrl)) {
-        this.sel = Math.max(0, this.sel - 1); this.rebuild(); return true;
+        this.sel = wrapIndex(this.sel - 1, current.length); this.rebuild(); return true;
       }
       if (ev.name === "down" || (ev.name === "char" && ev.key === "j" && !ev.ctrl)) {
-        this.sel = Math.min(current.length - 1, this.sel + 1); this.rebuild(); return true;
+        this.sel = wrapIndex(this.sel + 1, current.length); this.rebuild(); return true;
       }
       if (ev.name === "enter" || (ev.name === "char" && ev.key === "l" && !ev.ctrl)) {
         if (current[this.sel]) { if (this.expanded.has(this.sel)) this.expanded.delete(this.sel); else this.expanded.add(this.sel); this.rebuild(); } return true;
@@ -1752,25 +1958,157 @@ export class QueuePanel extends Popup {
     const items = app.queueItems ?? [];
     const w = Math.max(24, Math.min(84, app.screen.w - 4));
     const h = Math.max(7, Math.min(24, app.screen.h - 4));
-    super({ x: Math.max(0, Math.floor((app.screen.w - w) / 2)), y: Math.max(0, Math.floor((app.screen.h - h) / 2)), w, h, title: "排队命令 · ↑↓ 选择 · dd 删除 · Esc 关闭", lines: [], buttons: [], scrollable: true });
-    this.app = app; this.items = items; this.sel = 0; this.pending = false; this.dArmed=false; this.rebuild();
+    super({
+      x: Math.max(0, Math.floor((app.screen.w - w) / 2)), y: Math.max(0, Math.floor((app.screen.h - h) / 2)), w, h,
+      title: "排队命令 · j/k 选择 · Enter 展开 · PgUp/PgDn 滚动 · ? 帮助",
+      lines: [], buttons: [], scrollable: true,
+    });
+    this.app = app;
+    this.items = items;
+    this.sel = 0;
+    this.pending = false;
+    this.dArmed = false;
+    this.helpVisible = false;
+    this.expanded = new Set(); // stable queue item keys, survives mux refresh/reorder
+    this.rowOf = [];           // rendered line → queue item index
+    this.rebuild();
+  }
+  #itemKey(item, index = this.items.indexOf(item)) {
+    return String(item?.id ?? item?.message?.id ?? `${item?.placement ?? "queue"}:${index}:${partsText(item?.message?.content).slice(0, 80)}`);
+  }
+  #wrap(label, value, fg = K.TXT) {
+    const rows = [];
+    const firstHead = `    ${label}: `;
+    const nextHead = " ".repeat(strWidth(firstHead));
+    const width = Math.max(8, this.w - 4 - strWidth(firstHead));
+    let first = true;
+    for (const raw of String(value ?? "").split("\n")) {
+      if (raw === "") {
+        rows.push([{ t: first ? firstHead : nextHead, fg: K.DIM }]);
+        first = false;
+        continue;
+      }
+      let line = "", used = 0;
+      for (const ch of graphemes(raw)) {
+        const cw = graphemeWidth(ch);
+        if (line && used + cw > width) {
+          rows.push([{ t: first ? firstHead : nextHead, fg: K.DIM }, { t: line, fg }]);
+          first = false; line = ""; used = 0;
+        }
+        line += ch; used += cw;
+      }
+      rows.push([{ t: first ? firstHead : nextHead, fg: K.DIM }, { t: line, fg }]);
+      first = false;
+      if (rows.length >= 180) break;
+    }
+    return rows;
+  }
+  #content(item) {
+    const texts = [], extras = [];
+    const walk = (content) => {
+      if (typeof content === "string") { texts.push(content); return; }
+      if (!Array.isArray(content)) return;
+      for (const part of content) {
+        if (!part || typeof part !== "object") continue;
+        if (part.type === "text" && typeof part.text === "string") texts.push(part.text);
+        else {
+          const identity = part.name ?? part.fileName ?? part.attachmentId ?? part.id ?? part.mediaType ?? part.url ?? "";
+          extras.push(`[${part.type ?? "内容"}]${identity ? ` ${identity}` : ""}`);
+        }
+        if (Array.isArray(part.content)) walk(part.content);
+      }
+    };
+    walk(item?.message?.content);
+    return { text: texts.join("\n"), extras };
+  }
+  #detailLines(item) {
+    const lines = [];
+    const placement = item.placement === "queued" ? "排队（下一回合）"
+      : item.placement === "steering" ? "追加到当前回合"
+      : item.placement === "context" ? "只读上下文" : (item.placement ?? "未知");
+    lines.push(...this.#wrap("ID", item.id ?? "（无）", K.DIM));
+    lines.push(...this.#wrap("位置", placement, K.DIM));
+    const source = item.message?.source?.kind ?? item.source?.kind;
+    if (source) lines.push(...this.#wrap("来源", source, K.DIM));
+    for (const key of ["createdAt", "updatedAt", "clientTimeZone"]) {
+      if (item[key] != null) lines.push(...this.#wrap(key, item[key], K.DIM));
+    }
+    const content = this.#content(item);
+    lines.push(...this.#wrap("内容", content.text || "（无文本内容）"));
+    for (const extra of content.extras) lines.push(...this.#wrap("附件", extra, K.ACCENT));
+    if (lines.length > 200) return [...lines.slice(0, 200), [{ t: "    …详情超过 200 行，已截断", fg: K.FAINT }]];
+    return lines;
   }
   rebuild() {
-    const lines = [];
+    const lines = [], rowOf = [];
+    if (this.helpVisible) {
+      for (const text of [
+        " 键盘优先：j/k 或 ↑/↓ 选择命令；Enter/→/l 展开；←/h 折叠",
+        " PgUp/PgDn 或 Ctrl+B/F 整页滚动；Ctrl+U/D 半页滚动",
+        " Ctrl+Y/E 或 Shift+↑/↓ 逐行滚动；Home/End 到详情首尾",
+        " dd 删除当前命令；? 隐藏帮助；q/Esc 关闭",
+      ]) { lines.push([{ t: text, fg: K.DIM }]); rowOf.push(-1); }
+      lines.push([{ t: "" }]); rowOf.push(-1);
+    }
     for (let i = 0; i < this.items.length; i++) {
       const item = this.items[i];
+      const key = this.#itemKey(item, i);
+      const open = this.expanded.has(key);
+      const selected = i === this.sel;
       const text = partsText(item.message?.content).replace(/\s+/g, " ");
-      lines.push([{ t: `${i === this.sel ? "▸" : " "} ${item.placement === "queued" ? "⏳" : item.placement === "steering" ? "↪" : "ℹ"} ${truncate(text || item.id, this.w - 8)}`, fg: i === this.sel ? T.SELFG : K.TXT, bg: i === this.sel ? T.MENUSEL : -1 }]);
+      const placement = item.placement === "queued" ? "⏳" : item.placement === "steering" ? "↪" : "ℹ";
+      lines.push([{
+        t: `${selected ? "▸" : " "} ${open ? "▾" : "▸"} ${placement} ${truncate(text || item.id, this.w - 10)}`,
+        fg: selected ? T.SELFG : K.TXT, bg: selected ? T.MENUSEL : -1, bold: selected,
+      }]);
+      rowOf.push(i);
+      if (open) {
+        for (const line of this.#detailLines(item)) {
+          lines.push(line.map((seg) => ({ ...seg, bg: selected ? T.MENUSEL : seg.bg })));
+          rowOf.push(i);
+        }
+      }
     }
-    if (!this.items.length) lines.push([{ t: " （队列为空）", fg: K.FAINT }]);
+    if (!this.items.length) { lines.push([{ t: " （队列为空）", fg: K.FAINT }]); rowOf.push(-1); }
     this.lines = lines;
+    this.rowOf = rowOf;
+    this.scrollY = Math.max(0, Math.min(this.scrollY, this.maxScroll()));
+  }
+  #ensureSelected() {
+    const row = this.rowOf.findIndex((idx) => idx === this.sel);
+    if (row < 0) return;
+    if (row < this.scrollY) this.scrollY = row;
+    else if (row >= this.scrollY + this.contentRows()) this.scrollY = Math.max(0, row - this.contentRows() + 1);
+  }
+  /** Detail scrolling is intentionally independent from queue selection.
+   * j/k chooses a command; these operations move only the viewport. */
+  #scrollBy(delta) {
+    this.dArmed = false;
+    this.scrollY = Math.max(0, Math.min(this.maxScroll(), this.scrollY + delta));
+    this.app.redraw();
+    return true;
+  }
+  #scrollTo(position) {
+    this.dArmed = false;
+    this.scrollY = position === "end" ? this.maxScroll() : 0;
+    this.app.redraw();
+    return true;
+  }
+  #toggle(index = this.sel) {
+    const item = this.items[index];
+    if (!item) return;
+    const key = this.#itemKey(item, index);
+    if (this.expanded.has(key)) this.expanded.delete(key); else this.expanded.add(key);
+    this.rebuild(); this.#ensureSelected(); this.app.redraw();
   }
   syncItems(items) {
     const selectedId = this.items[this.sel]?.id;
     this.items = items ?? [];
+    const live = new Set(this.items.map((item, i) => this.#itemKey(item, i)));
+    for (const key of [...this.expanded]) if (!live.has(key)) this.expanded.delete(key);
     const next = selectedId ? this.items.findIndex((item) => item.id === selectedId) : -1;
     this.sel = next >= 0 ? next : Math.min(this.sel, Math.max(0, this.items.length - 1));
-    this.rebuild();
+    this.rebuild(); this.#ensureSelected();
   }
   #errorCode(error) { return error?.code ?? error?.details?.code ?? error?.cause?.code; }
   async #mutate(kind, content) {
@@ -1793,21 +2131,58 @@ export class QueuePanel extends Popup {
     } finally { this.pending = false; this.rebuild(); this.app.redraw(); }
   }
   onKey(ev) {
-    const ch=ev.type==="text"?ev.text:ev.type==="key"&&ev.name==="char"?ev.key:null;
-    if(ch==="d"){if(this.dArmed){this.dArmed=false;this.#mutate("remove");}else{this.dArmed=true;this.app.toast("再按 d 删除这条排队命令");}return true;}
+    const ch = ev.type === "text" ? ev.text : ev.type === "key" && ev.name === "char" ? ev.key : null;
+    // Plain character bindings only. Modified d belongs to Ctrl+D half-page
+    // scrolling and must never arm the destructive dd sequence.
+    const plain = !ev.ctrl && !ev.alt && !ev.shift;
+    if (plain && ch === "q") { this.app.closeOverlay(); return true; }
+    if (!ev.ctrl && !ev.alt && ch === "?") {
+      this.helpVisible = !this.helpVisible;
+      this.dArmed = false;
+      this.rebuild(); this.scrollY = 0; this.app.redraw();
+      return true;
+    }
+    if (plain && ch === "d") {
+      if (this.dArmed) { this.dArmed = false; this.#mutate("remove"); }
+      else { this.dArmed = true; this.app.toast("再按 d 删除这条排队命令"); }
+      return true;
+    }
     if (ev.type === "key") {
       if (ev.name === "escape") { this.app.closeOverlay(); return true; }
-      if (ev.name === "up") { this.dArmed=false;this.sel = Math.max(0, this.sel - 1); this.rebuild(); return true; }
-      if (ev.name === "down") { this.dArmed=false;this.sel = Math.min(this.items.length - 1, this.sel + 1); this.rebuild(); return true; }
+      // Keyboard-first detail scrolling. Selection is intentionally unchanged.
+      if (ev.name === "pgup" || (ev.ctrl && ev.key === "b")) return this.#scrollBy(-this.contentRows());
+      if (ev.name === "pgdn" || (ev.ctrl && ev.key === "f")) return this.#scrollBy(this.contentRows());
+      if (ev.ctrl && ev.key === "u") return this.#scrollBy(-Math.max(1, Math.floor(this.contentRows() / 2)));
+      if (ev.ctrl && ev.key === "d") return this.#scrollBy(Math.max(1, Math.floor(this.contentRows() / 2)));
+      if ((ev.ctrl && ev.key === "y") || (ev.name === "up" && ev.shift)) return this.#scrollBy(-1);
+      if ((ev.ctrl && ev.key === "e") || (ev.name === "down" && ev.shift)) return this.#scrollBy(1);
+      if (ev.name === "home") return this.#scrollTo("home");
+      if (ev.name === "end") return this.#scrollTo("end");
+      if (ev.name === "enter" || ev.name === "right" || (ev.name === "char" && ev.key === "l" && plain)) { this.dArmed = false; this.#toggle(); return true; }
+      if (ev.name === "left" || (ev.name === "char" && ev.key === "h" && plain)) {
+        this.dArmed = false;
+        const item = this.items[this.sel], key = this.#itemKey(item, this.sel);
+        if (item && this.expanded.delete(key)) { this.rebuild(); this.#ensureSelected(); this.app.redraw(); }
+        return true;
+      }
+      if ((ev.name === "up" && !ev.shift) || (ev.name === "char" && ev.key === "k" && plain)) {
+        this.dArmed = false; this.sel = wrapIndex(this.sel - 1, this.items.length); this.rebuild(); this.#ensureSelected(); return true;
+      }
+      if ((ev.name === "down" && !ev.shift) || (ev.name === "char" && ev.key === "j" && plain)) {
+        this.dArmed = false; this.sel = wrapIndex(this.sel + 1, this.items.length); this.rebuild(); this.#ensureSelected(); return true;
+      }
     }
-    this.dArmed=false;return false;
+    this.dArmed = false;
+    return false;
   }
   onMouse(ev) {
+    if (super.onMouse(ev)) return true;
     if (ev.kind === "press" && ev.button === 0) {
-      const idx = ev.y - this.y - 1;
-      if (idx >= 0 && idx < this.items.length) { this.sel = idx; this.rebuild(); this.app.redraw(); return true; }
+      const row = ev.y - this.y - 1 + this.scrollY;
+      const idx = this.rowOf[row];
+      if (idx >= 0) { this.sel = idx; this.#toggle(idx); return true; }
     }
-    return super.onMouse(ev);
+    return false;
   }
 }
 
@@ -1893,8 +2268,8 @@ export class GoalPanel extends Popup {
   onKey(ev) {
     if (ev.type === "key") {
       if (ev.name === "escape") { this.app.closeOverlay(); return true; }
-      if (ev.name === "up") { this.actionSel = Math.max(0, this.actionSel - 1); this.rebuild(); return true; }
-      if (ev.name === "down") { this.actionSel = Math.min(this.actions.length - 1, this.actionSel + 1); this.rebuild(); return true; }
+      if (ev.name === "up") { this.actionSel = wrapIndex(this.actionSel - 1, this.actions.length); this.rebuild(); return true; }
+      if (ev.name === "down") { this.actionSel = wrapIndex(this.actionSel + 1, this.actions.length); this.rebuild(); return true; }
       if (ev.name === "enter") { this.actions[this.actionSel]?.run(); return true; }
     }
     return super.onKey(ev);
@@ -1950,7 +2325,7 @@ export class SettingsPanel extends Widget {
       this.writable = d.writable;
     } catch (e) {
       this.app.toast(`设置加载失败: ${e.message}`);
-      this.app.setMode("chat");
+      this.app.closeFullBuffer?.() ?? this.app.setMode?.("chat");
       return;
     }
     // TUI-local settings ride the same tree editor, but persist to the TUI
@@ -1979,7 +2354,7 @@ export class SettingsPanel extends Widget {
     this.pendingOps = [];
     this.editing = false;
     const ns = this.namespaces[this.nsIdx];
-    if (ns.modelsEntry) { this.app.setMode("models"); return; }
+    if (ns.modelsEntry) { (this.app.showModelsBuffer ? this.app.showModelsBuffer() : this.app.setMode?.("models")); return; }
     this.secrets = new Set((ns.secrets ?? []).map((s) => JSON.stringify(s.path ?? [])));
     this.rebuildRows();
     const items = this.namespaces.map((n) => ({
@@ -2082,7 +2457,7 @@ export class SettingsPanel extends Widget {
       return true;
     }
     if (ev.type !== "key") return false;
-    if (ev.name === "escape") { this.app.setMode("chat"); return true; }
+    if (ev.name === "escape") { this.app.closeFullBuffer?.() ?? this.app.setMode?.("chat"); return true; }
     if (ev.ctrl && ev.key === "s") { this.save(); return true; }
     if (ev.name === "up" || ev.name === "down" || ev.name === "pgup" || ev.name === "pgdn") return this.tree.scroll(ev.name === "up" || ev.name === "pgup" ? -3 : 3);
     if (ev.name === "enter") {
@@ -2210,7 +2585,7 @@ export class EditPopup extends Popup {
     this.input.render(screen);
   }
   onKey(ev) {
-    if (ev.type === "key" && ev.name === "escape") { this.app.closeOverlay(); this.app.focus(this.app.chat); return true; }
+    if (ev.type === "key" && ev.name === "escape") { this.app.closeOverlay(); this.app.focus(this.app.fullBuffer ?? this.app.chat); return true; }
     if (ev.type === "key" && ev.name === "tab" && this.completions?.length) {
       // Tab 选取/补全: an exact current value cycles to the next candidate,
       // anything else completes to the first prefix match
@@ -2231,7 +2606,7 @@ export class EditPopup extends Popup {
     if (ev.type === "key" && ev.name === "enter") {
       const v = this.input.value;
       this.app.closeOverlay();
-      this.app.focus(this.app.chat);
+      this.app.focus(this.app.fullBuffer ?? this.app.chat);
       this.onCommit?.(v);
       return true;
     }
@@ -2305,6 +2680,28 @@ function mergeConfig(inherited, draft) {
   return result;
 }
 
+/** Read one settings subtree without enumerating or serializing Host objects. */
+function configAt(value, path) {
+  let current = value;
+  for (const key of path ?? []) {
+    if (!isRecord(current) && !Array.isArray(current)) return undefined;
+    current = current[key];
+  }
+  return current;
+}
+
+/** Minimal field operations rooted at an arbitrary provider settings address. */
+function profileOps(base, before, after) {
+  const previous = isRecord(before) ? before : {};
+  const next = isRecord(after) ? after : {};
+  const ops = [];
+  for (const [field, value] of Object.entries(next)) {
+    if (JSON.stringify(previous[field]) !== JSON.stringify(value)) ops.push({ op: "set", path: [...base, field], value });
+  }
+  for (const field of Object.keys(previous)) if (!(field in next)) ops.push({ op: "unset", path: [...base, field] });
+  return ops;
+}
+
 /** Minimal user-layer operations for the provider fields this panel changed. */
 function providerOps(before, after, wholeRoutes = new Set()) {
   const ops = [];
@@ -2331,16 +2728,30 @@ function providerOps(before, after, wholeRoutes = new Set()) {
 
 export class ModelPanel extends Widget {
   constructor(app) {
-    super({ x: 30, y: 0, w: app.screen.w - 30, h: app.screen.h - 1 });
+    super({ x: Math.min(30, Math.max(0, app.screen.w - 1)), y: 0, w: Math.max(1, app.screen.w - 30), h: Math.max(1, app.screen.h - 1) });
     this.app = app;
-    this.providers = {};         // route → user-layer profile draft
-    this.resolvedProviders = {};  // route → effective profile received from Host
-    this.inheritedProviders = {}; // route → effective fields not owned by loaded user layer
-    this.baseProviders = {};      // route → composition-owned profile (not removable here)
-    this.revision = 0;
+    this.providers = {};         // llm-pi-ai route → user-layer profile draft
+    this.resolvedProviders = {};  // llm-pi-ai route → effective profile received from Host
+    this.inheritedProviders = {}; // llm-pi-ai fields not owned by loaded user layer
+    this.baseProviders = {};      // composition-owned llm-pi-ai profiles
+    this.directory = [];          // Host llm.providers entries (official + catalog + declared)
+    this.namespaceViews = new Map(); // every settings namespace addressed by the directory
+    this.configuredDirectory = new Set(); // configured provider identities in this draft
+    this.initialConfiguredDirectory = new Set(); // discard target
+    this.externalDrafts = new Map(); // non-pi-ai provider → user-layer profile draft
+    this.externalInherited = new Map(); // non-pi-ai provider → effective fields below user layer
+    this.externalUserConfigured = new Set(); // routes with an actual user-layer settings subtree
+    this.externalSnapshots = new Map(); // provider → fully successful save point
+    this.externalHostSnapshots = new Map(); // provider → settings confirmed by Host
+    this.revisions = new Map();   // settings namespace → CAS revision
+    this.revision = 0;            // llm-pi-ai compatibility alias used by existing paths
     this.loaded = false;
     this.writable = true;
     this.routes = [];
+    this.addMode = false;   // Host-directory chooser; custom is its final row
+    this.addItems = [];
+    this.addCursor = 0;
+    this.materializeRoutes = new Set(); // dormant catalog routes selected but not saved
     this.sel = 0;          // list cursor (routes.length = the ＋ 添加供应商 row)
     this.mode = "list";    // list | form
     this.formIdx = 0;      // form item cursor
@@ -2355,8 +2766,8 @@ export class ModelPanel extends Widget {
     this.scanSel = new Set();
     this.scanCursor = 0;
     this.scanning = false;
-    this.savedSnapshot = "{}"; // last fully successful providers+credentials save point
-    this.hostSnapshot = "{}";  // provider settings last confirmed by the Host
+    this.savedSnapshot = "{}"; // last fully successful llm-pi-ai providers+credentials save point
+    this.hostSnapshot = "{}";  // llm-pi-ai provider settings last confirmed by the Host
     this.keyStatus = {};       // ref → {configured, writable, source} from credentials.describe
     this.pendingProbeKeys = new Map(); // route → write-only key draft for discovery and save
     // Journal managed cleanup on the App and in tui-config before provider
@@ -2380,15 +2791,15 @@ export class ModelPanel extends Widget {
     }
     this.pendingCredentialCleanups = app.pendingModelCredentialCleanups; // ref → {route, error}
     this.formClickMap = [];    // rendered form line → item, scan result, or cleanup action
-    const listW = 26;
-    this.listView = new ScrollView({ x: this.x + 1, y: this.y + 1, w: listW, h: this.h - 2, showScrollbar: true });
-    this.formView = new ScrollView({ x: this.x + listW + 1, y: this.y + 1, w: this.w - listW - 2, h: this.h - 2, showScrollbar: true });
+    const listW = Math.max(1, Math.min(26, this.w - 3));
+    this.listView = new ScrollView({ x: this.x + 1, y: this.y + 1, w: listW, h: Math.max(1, this.h - 2), showScrollbar: true });
+    this.formView = new ScrollView({ x: this.x + listW + 1, y: this.y + 1, w: Math.max(1, this.w - listW - 2), h: Math.max(1, this.h - 2), showScrollbar: true });
   }
   relayout(x, y, w, h) {
-    this.x = x; this.y = y; this.w = w; this.h = h;
-    const listW = 26;
-    this.listView.x = x + 1; this.listView.y = y + 1; this.listView.w = listW; this.listView.h = h - 2;
-    this.formView.x = x + listW + 1; this.formView.y = y + 1; this.formView.w = w - listW - 2; this.formView.h = h - 2;
+    this.x = x; this.y = y; this.w = Math.max(1, w); this.h = Math.max(1, h);
+    const listW = Math.max(1, Math.min(26, this.w - 3));
+    this.listView.x = x + 1; this.listView.y = y + 1; this.listView.w = listW; this.listView.h = Math.max(1, this.h - 2);
+    this.formView.x = x + listW + 1; this.formView.y = y + 1; this.formView.w = Math.max(1, this.w - listW - 2); this.formView.h = Math.max(1, this.h - 2);
   }
   async load() {
     if (this.loaded && this.#dirty()) {
@@ -2401,8 +2812,17 @@ export class ModelPanel extends Widget {
     let described = false;
     let providerState = null;
     try {
-      const d = await this.app.api.call("settings.describe");
-      const ns = (d.namespaces ?? []).find((n) => n.ns === "llm-pi-ai");
+      // WebUI parity: the Host directory is the source of truth for official,
+      // catalog, and declared provider identities. settings.describe alone can
+      // only reveal routes that are already configured.
+      const [d, listing] = await Promise.all([
+        this.app.api.call("settings.describe"),
+        this.app.api.call("llm.providers").catch(() => ({ providers: [] })),
+      ]);
+      this.directory = (listing?.providers ?? []).filter((entry) => entry && typeof entry.provider === "string");
+      this.namespaceViews = new Map((d.namespaces ?? []).map((view) => [view.ns, view]));
+      this.revisions = new Map((d.namespaces ?? []).map((view) => [view.ns, view.revision ?? 0]));
+      const ns = this.namespaceViews.get("llm-pi-ai");
       const hasLayerView = ns && (Object.hasOwn(ns, "user") || Object.hasOwn(ns, "base"));
       const configured = hasLayerView ? ns.user?.providers : ns?.value?.providers;
       this.providers = { ...(configured ?? {}) };
@@ -2412,8 +2832,32 @@ export class ModelPanel extends Widget {
         route,
         mergeConfig(withoutOwned(profile, this.providers[route]), this.baseProviders[route]),
       ]));
+      this.configuredDirectory.clear();
+      this.configuredDirectory = new Set(this.directory.filter((entry) => this.#configuredEntry(entry)).map((entry) => entry.provider));
+      this.initialConfiguredDirectory = new Set(this.configuredDirectory);
+      this.externalDrafts = new Map();
+      this.externalInherited = new Map();
+      this.externalUserConfigured = new Set();
+      this.externalSnapshots = new Map();
+      this.externalHostSnapshots = new Map();
+      for (const entry of this.directory) {
+        if (entry.settingsNs === "llm-pi-ai") continue;
+        const view = this.namespaceViews.get(entry.settingsNs);
+        if (!view) continue;
+        const stored = configAt(view.user, entry.settingsPath);
+        if (stored !== undefined && entry.settingsPath.length > 0) this.externalUserConfigured.add(entry.provider);
+        const draft = cloneConfig(stored ?? {});
+        const inherited = mergeConfig(withoutOwned(configAt(view.value, entry.settingsPath), stored), configAt(view.base, entry.settingsPath));
+        const snapshot = JSON.stringify(draft);
+        this.externalDrafts.set(entry.provider, draft);
+        this.externalInherited.set(entry.provider, inherited);
+        this.externalSnapshots.set(entry.provider, snapshot);
+        this.externalHostSnapshots.set(entry.provider, snapshot);
+      }
       this.revision = ns?.revision ?? 0;
       this.writable = d.writable !== false;
+      this.materializeRoutes.clear();
+      this.addMode = false;
       this.#syncRoutes();
       this.sel = Math.max(0, Math.min(this.sel, this.routes.length));
       providerState = this.#providerStateFromDescription(d);
@@ -2586,11 +3030,26 @@ export class ModelPanel extends Widget {
       // only well-formed references can cross the wire (the describe payload
       // validates each name); an ill-formed derived ref is skipped here and
       // reported by the row's edit guard instead
-      const refs = [...new Set(this.routes.map((r) => this.#keyRef(r)).filter((ref) => KEY_REF_OK.test(ref)))];
+      const refs = [...new Set([
+        ...this.routes.map((r) => this.#keyRef(r)),
+        ...this.directory.filter((entry) => this.configuredDirectory.has(entry.provider)).map((entry) => this.#keyRef(entry.provider)),
+      ].filter((ref) => KEY_REF_OK.test(ref)))];
       if (refs.length === 0) { this.keyStatus = {}; return; }
       const res = await this.app.api.call("credentials.describe", { refs });
       this.keyStatus = res?.credentials ?? {};
     } catch (e) { this.keyStatus = {}; }
+  }
+  #entry(route) { return this.directory.find((entry) => entry.provider === route); }
+  #namespace(route) { return this.#entry(route)?.settingsNs ?? "llm-pi-ai"; }
+  #configuredEntry(entry) {
+    if (this.configuredDirectory.has(entry.provider)) return true;
+    const view = this.namespaceViews.get(entry.settingsNs);
+    if (!view) return false;
+    // A root-addressed adapter is not automatically configured merely because
+    // its namespace exists. Official/active rows are host-owned; optional root
+    // adapters need an actual user-layer section before they leave the chooser.
+    if (entry.settingsPath.length === 0) return entry.active === true || configAt(view.user, entry.settingsPath) !== undefined;
+    return configAt(view.value, entry.settingsPath) !== undefined;
   }
   /** The credential reference a profile names, or the web's derived default. */
   #keyRef(route) {
@@ -2598,24 +3057,34 @@ export class ModelPanel extends Widget {
     return (p.apiKeyEnv && p.apiKeyEnv.length > 0) ? p.apiKeyEnv : deriveKeyRef(route);
   }
   #syncRoutes() {
-    this.routes = [...new Set([...Object.keys(this.resolvedProviders), ...Object.keys(this.providers)])];
+    const configuredDirectory = this.directory.filter((entry) => this.configuredDirectory.has(entry.provider)).map((entry) => entry.provider);
+    this.routes = [...new Set([...configuredDirectory, ...Object.keys(this.resolvedProviders), ...Object.keys(this.providers)])];
   }
   #route() { return this.routes[this.sel] ?? null; }
   #draftProfile(route) {
     if (route == null) return null;
+    if (this.externalDrafts.has(route)) return this.externalDrafts.get(route);
     this.providers[route] ??= {};
     return this.providers[route];
   }
   #profile(route) {
     if (route == null) return null;
-    return mergeConfig(this.inheritedProviders[route], this.providers[route]);
+    if (this.externalDrafts.has(route)) return mergeConfig(this.externalInherited.get(route), this.externalDrafts.get(route));
+    const effective = mergeConfig(this.inheritedProviders[route], this.providers[route]);
+    const entry = this.#entry(route);
+    // Dormant Host catalog entries are intentionally absent from settings, but
+    // the directory still owns their display identity. Do not materialize this
+    // fallback into the saved profile.
+    if (!effective.displayName && entry?.declared !== true) effective.displayName = entry?.displayName;
+    return effective;
   }
   #models(route, { mutable = false } = {}) {
-    const draft = mutable ? this.#draftProfile(route) : this.providers[route];
+    const draft = mutable ? this.#draftProfile(route) : (this.externalDrafts.has(route) ? this.externalDrafts.get(route) : this.providers[route]);
     if (mutable && !Array.isArray(draft.models)) draft.models = cloneConfig(this.#profile(route).models ?? []);
     return draft?.models ?? this.#profile(route).models ?? [];
   }
   #pruneEmptyDraft(route) {
+    if (this.externalDrafts.has(route) || this.materializeRoutes.has(route)) return;
     if (!Object.hasOwn(JSON.parse(this.hostSnapshot), route) && Object.keys(this.providers[route] ?? {}).length === 0) {
       delete this.providers[route];
     }
@@ -2631,33 +3100,38 @@ export class ModelPanel extends Widget {
     const route = this.#route();
     if (route == null) return [];
     const p = this.#profile(route);
+    const entry = this.#entry(route);
+    const officialDeepSeek = entry?.settingsNs === "llm-deepseek";
+    const catalogRoute = entry?.settingsNs === "llm-pi-ai" && entry.declared !== true;
+    const ownsIdentity = !officialDeepSeek && !catalogRoute;
     const items = [];
-    // the route key only appears for a brand-new draft (rename once)
+    // Only hand-declared custom routes own their route identity/display name.
     if (this.draftRoute === route) items.push({ kind: "field", key: "route", label: "路由名", value: route });
-    items.push({ kind: "field", key: "displayName", label: "显示名", value: p.displayName ?? "" });
+    if (ownsIdentity) items.push({ kind: "field", key: "displayName", label: "显示名", value: p.displayName ?? "" });
     // the api protocol is a CHOICE in the web UI (a select over the namespace
     // schema's union), so here Tab cycles the options in the form and Enter
     // opens an edit buffer with every candidate shown as an autocomplete hint
     const api = p.api ?? "";
-    items.push({
-      kind: "field", key: "api", label: "协议 api", value: api,
-      cycle: API_PROTOCOLS.includes(api) ? API_PROTOCOLS : ["", ...(api ? [api] : []), ...API_PROTOCOLS],
-      completions: API_PROTOCOLS, note: "目录路由可留空继承 · Tab 切换",
-    });
-    items.push({ kind: "field", key: "baseURL", label: "baseURL", value: p.baseURL ?? "" });
-    items.push({ kind: "field", key: "reasoning", label: "默认思考强度", value: p.reasoning ?? "", cycle: ["", ...THINKING_LEVELS], completions: THINKING_LEVELS, note: "留空=模型默认 · Tab 切换" });
-    items.push({ kind: "field", key: "defaultContextWindow", label: "默认上下文", value: p.defaultContextWindow ?? "", numeric: true });
-    items.push({ kind: "field", key: "defaultMaxTokens", label: "默认最大输出", value: p.defaultMaxTokens ?? "", numeric: true });
-    // route-level input fallback: only the modalities the pi-ai adapter schema
-    // accepts exist here (audio is absent on purpose).
-    for (const modality of INPUT_MODALITIES) {
-      items.push({ kind: "choice", key: `defaultInput.${modality}`, label: `默认输入 ${modality}`, value: (p.defaultInput ?? DEFAULT_INPUT_MODALITIES).includes(modality) ? "✓" : "·" });
+    if (ownsIdentity) {
+      items.push({
+        kind: "field", key: "api", label: "协议 api", value: api,
+        cycle: API_PROTOCOLS.includes(api) ? API_PROTOCOLS : ["", ...(api ? [api] : []), ...API_PROTOCOLS],
+        completions: API_PROTOCOLS, note: "Tab 切换",
+      });
     }
-    // The adapter only applies these switches to openai-completions. Hiding
-    // them on other route protocols prevents a configuration the Host rejects.
-    if (api === "openai-completions") {
-      items.push({ kind: "field", key: "compat.thinkingFormat", label: "compat.thinkingFormat", value: p.compat?.thinkingFormat ?? "", completions: THINKING_FORMATS, note: "可选 · Tab 补全" });
-      items.push({ kind: "field", key: "compat.supportsReasoningEffort", label: "compat.supportsReasoningEffort", value: p.compat?.supportsReasoningEffort == null ? "" : String(p.compat.supportsReasoningEffort), completions: ["true", "false"], note: "可选 · true/false" });
+    items.push({ kind: "field", key: "baseURL", label: "baseURL", value: p.baseURL ?? "", note: officialDeepSeek ? "留空=https://api.deepseek.com" : catalogRoute ? "留空=提供方默认" : undefined });
+    if (ownsIdentity) {
+      items.push({ kind: "field", key: "reasoning", label: "默认思考强度", value: p.reasoning ?? "", cycle: ["", ...THINKING_LEVELS], completions: THINKING_LEVELS, note: "留空=模型默认 · Tab 切换" });
+      items.push({ kind: "field", key: "defaultContextWindow", label: "默认上下文", value: p.defaultContextWindow ?? "", numeric: true });
+      items.push({ kind: "field", key: "defaultMaxTokens", label: "默认最大输出", value: p.defaultMaxTokens ?? "", numeric: true });
+      // route-level input fallback: only the modalities the pi-ai adapter schema accepts.
+      for (const modality of INPUT_MODALITIES) {
+        items.push({ kind: "choice", key: `defaultInput.${modality}`, label: `默认输入 ${modality}`, value: (p.defaultInput ?? DEFAULT_INPUT_MODALITIES).includes(modality) ? "✓" : "·" });
+      }
+      if (api === "openai-completions") {
+        items.push({ kind: "field", key: "compat.thinkingFormat", label: "compat.thinkingFormat", value: p.compat?.thinkingFormat ?? "", completions: THINKING_FORMATS, note: "可选 · Tab 补全" });
+        items.push({ kind: "field", key: "compat.supportsReasoningEffort", label: "compat.supportsReasoningEffort", value: p.compat?.supportsReasoningEffort == null ? "" : String(p.compat.supportsReasoningEffort), completions: ["true", "false"], note: "可选 · true/false" });
+      }
     }
     // the api key: web-synced handling — the stored value is NEVER shown
     // (credentials.describe is structurally value-free), only its status dot;
@@ -2670,10 +3144,14 @@ export class ModelPanel extends Widget {
     // five, which opens its own sub-buffer (scan on top, model form below)
     const models = p.models ?? [];
     const names = models.slice(0, 5).map((m) => inlineLabel(m.id || "（未命名）")).join(" · ");
-    items.push({ kind: "button", label: "模型管理", sub: names + (models.length > 5 ? " · …" : ""), action: () => this.#openModels() });
+    const inheritedCatalog = models.length === 0 && (officialDeepSeek || catalogRoute);
+    items.push({ kind: "button", label: "模型管理", sub: inheritedCatalog ? "使用 Host 内置模型目录" : names + (models.length > 5 ? " · …" : ""), action: () => this.#openModels() });
     items.push({ kind: "button", label: "💾 保存配置", action: () => this.#save() });
-    if (Object.hasOwn(this.providers, route) && !Object.hasOwn(this.baseProviders, route)) {
-      items.push({ kind: "button", label: "🗑 删除供应商", action: () => this.#deleteProvider() });
+    const externalUserConfig = !officialDeepSeek && this.externalUserConfigured.has(route);
+    if (externalUserConfig) {
+      items.push({ kind: "button", label: "🗑 取消配置提供方", action: () => this.#unconfigureExternalProvider() });
+    } else if (!officialDeepSeek && Object.hasOwn(this.providers, route) && !Object.hasOwn(this.baseProviders, route)) {
+      items.push({ kind: "button", label: catalogRoute ? "🗑 取消配置提供方" : "🗑 删除供应商", action: () => this.#deleteProvider() });
     }
     return items;
   }
@@ -2682,8 +3160,14 @@ export class ModelPanel extends Widget {
     const route = this.#route();
     if (route == null) return [];
     const p = this.#profile(route);
+    const entry = this.#entry(route);
+    const officialDeepSeek = entry?.settingsNs === "llm-deepseek";
+    const catalogRoute = entry?.settingsNs === "llm-pi-ai" && entry.declared !== true;
     const items = [];
-    items.push({ kind: "button", label: "🔄 自动发现可用模型", action: () => this.#scan() });
+    if (!officialDeepSeek) items.push({ kind: "button", label: "🔄 自动发现可用模型", action: () => this.#scan() });
+    if ((officialDeepSeek || catalogRoute) && Object.hasOwn(this.#draftProfile(route), "models")) {
+      items.push({ kind: "button", label: "↺ 恢复 Host 内置模型目录", action: () => this.#resetModels() });
+    }
     const models = p.models ?? [];
     for (let mi = 0; mi < models.length; mi++) {
       const m = models[mi];
@@ -2693,23 +3177,25 @@ export class ModelPanel extends Widget {
         items.push({ kind: "field", key: `model.${mi}.name`, label: "  模型名", value: m.name ?? "" });
         items.push({ kind: "field", key: `model.${mi}.contextWindow`, label: "  上下文窗口", value: m.contextWindow ?? "", numeric: true });
         items.push({ kind: "field", key: `model.${mi}.maxTokens`, label: "  最大输出", value: m.maxTokens ?? "", numeric: true });
-        const reasoningState = m.reasoningEfforts === undefined ? "继承" : m.reasoningEfforts === false ? "关闭" : "自定义";
-        items.push({ kind: "choice", key: `model.${mi}.reasoningMode`, label: "  思考能力", value: reasoningState, cycle: ["继承", "关闭", "自定义"] });
-        if (reasoningState === "自定义") {
-          for (const level of THINKING_LEVELS) {
-            const declared = Object.hasOwn(m.reasoningEfforts, level);
-            const value = declared && m.reasoningEfforts[level] === null ? "null" : declared ? m.reasoningEfforts[level] : "";
-            items.push({ kind: "field", key: `model.${mi}.reasoning.${level}`, label: `    ${level}`, value, note: level === "off" ? "null 表示关闭" : "至少填写一种非 off 强度" });
+        if (!officialDeepSeek && !catalogRoute) {
+          const reasoningState = m.reasoningEfforts === undefined ? "继承" : m.reasoningEfforts === false ? "关闭" : "自定义";
+          items.push({ kind: "choice", key: `model.${mi}.reasoningMode`, label: "  思考能力", value: reasoningState, cycle: ["继承", "关闭", "自定义"] });
+          if (reasoningState === "自定义") {
+            for (const level of THINKING_LEVELS) {
+              const declared = Object.hasOwn(m.reasoningEfforts, level);
+              const value = declared && m.reasoningEfforts[level] === null ? "null" : declared ? m.reasoningEfforts[level] : "";
+              items.push({ kind: "field", key: `model.${mi}.reasoning.${level}`, label: `    ${level}`, value, note: level === "off" ? "null 表示关闭" : "至少填写一种非 off 强度" });
+            }
           }
-        }
-        const inputState = m.input === undefined || m.input.length === 0 ? "继承" : "自定义";
-        items.push({ kind: "choice", key: `model.${mi}.inputMode`, label: "  输入能力", value: inputState, cycle: ["继承", "自定义"] });
-        if (inputState === "自定义") {
-          for (const modality of INPUT_MODALITIES) items.push({ kind: "choice", key: `model.${mi}.input.${modality}`, label: `    ${modality}`, value: m.input.includes(modality) ? "✓" : "·", cycle: ["✓", "·"] });
-        }
-        if (p.api === "openai-completions") {
-          items.push({ kind: "field", key: `model.${mi}.compat.thinkingFormat`, label: "  compat.thinkingFormat", value: m.compat?.thinkingFormat ?? "", completions: THINKING_FORMATS, note: "可选 · Tab 补全" });
-          items.push({ kind: "field", key: `model.${mi}.compat.supportsReasoningEffort`, label: "  compat.supportsReasoningEffort", value: m.compat?.supportsReasoningEffort == null ? "" : String(m.compat.supportsReasoningEffort), completions: ["true", "false"], note: "可选 · true/false" });
+          const inputState = m.input === undefined || m.input.length === 0 ? "继承" : "自定义";
+          items.push({ kind: "choice", key: `model.${mi}.inputMode`, label: "  输入能力", value: inputState, cycle: ["继承", "自定义"] });
+          if (inputState === "自定义") {
+            for (const modality of INPUT_MODALITIES) items.push({ kind: "choice", key: `model.${mi}.input.${modality}`, label: `    ${modality}`, value: m.input.includes(modality) ? "✓" : "·", cycle: ["✓", "·"] });
+          }
+          if (p.api === "openai-completions") {
+            items.push({ kind: "field", key: `model.${mi}.compat.thinkingFormat`, label: "  compat.thinkingFormat", value: m.compat?.thinkingFormat ?? "", completions: THINKING_FORMATS, note: "可选 · Tab 补全" });
+            items.push({ kind: "field", key: `model.${mi}.compat.supportsReasoningEffort`, label: "  compat.supportsReasoningEffort", value: m.compat?.supportsReasoningEffort == null ? "" : String(m.compat.supportsReasoningEffort), completions: ["true", "false"], note: "可选 · true/false" });
+          }
         }
       }
     }
@@ -2731,16 +3217,18 @@ export class ModelPanel extends Widget {
     for (let i = 0; i < this.routes.length; i++) {
       const r = this.routes[i];
       const p = this.#profile(r);
+      const entry = this.#entry(r);
       const cur = i === this.sel;
       const editing = cur && this.mode === "form";
       listLines.push([{
-        t: ` ${cur ? "●" : " "} ${truncate(inlineLabel(p.displayName || r), 18)}${editing ? " ✎" : ""}`,
+        t: ` ${cur ? "●" : " "} ${truncate(inlineLabel(p.displayName || entry?.displayName || r), 18)}${editing ? " ✎" : ""}`,
         fg: cur ? T.SELFG : T.TXT, bg: cur ? (editing ? T.MENUSEL : T.SELBG) : T.BG2, bold: cur,
       }]);
     }
     const addCur = this.sel === this.routes.length;
     listLines.push([{ t: ` ${addCur ? "●" : " "} ＋ 添加供应商`, fg: addCur ? T.SELFG : T.ACCENT, bg: addCur ? T.MENUSEL : T.BG2, bold: true }]);
     this.listView.setLines(listLines);
+    this.listView.scrollY = Math.max(0, Math.min(this.listView.maxScroll(), this.sel < this.listView.scrollY ? this.sel : this.sel >= this.listView.scrollY + this.listView.h ? this.sel - this.listView.h + 1 : this.listView.scrollY));
 
     // Keep a target beside every rendered row. Titles, previews and help text
     // deliberately map to null, so extra visual rows cannot shift mouse clicks
@@ -2758,23 +3246,59 @@ export class ModelPanel extends Widget {
         fg: K.WARN, bold: true,
       }], { type: "cleanup", ref });
     }
-    if (route == null) {
+    if (this.addMode) {
+      const selectedAdd = this.addItems[this.addCursor];
+      pushForm([{ t: "  添加提供方 — Host 可用目录", fg: K.ACCENT, bold: true }]);
+      pushForm([{ t: "  ↑/↓ 或 j/k 循环选择 · Enter 添加 · Esc 返回", fg: K.FAINT }]);
+      // Fixed preview: selection changes never require opening a provider just
+      // to learn whether it is official, catalog-backed, or fully custom.
+      if (selectedAdd?.custom) {
+        pushForm([{ t: "  预览  自定义提供方", fg: K.ACCENT, bold: true }]);
+        pushForm([{ t: "        手动填写路由、协议、baseURL 与至少一个模型", fg: K.TXT }]);
+        pushForm([{ t: "        API 密钥写入 <ROUTE>_API_KEY；支持模型发现（协议允许时）", fg: K.DIM }]);
+      } else if (selectedAdd?.entry) {
+        const entry = selectedAdd.entry;
+        const kind = entry.settingsNs === "llm-deepseek" ? "官方适配器" : entry.declared === true ? "已声明提供方" : "Host 内置目录";
+        const address = `${entry.settingsNs}${entry.settingsPath.length ? ` · ${entry.settingsPath.join(".")}` : " · 根配置"}`;
+        pushForm([{ t: `  预览  ${truncate(inlineLabel(entry.displayName || entry.provider), 32)}  [${kind}]`, fg: entry.settingsNs === "llm-deepseek" ? K.OK : K.ACCENT, bold: true }]);
+        pushForm([{ t: `        路由 ${truncate(inlineLabel(entry.provider), 30)} · ${entry.active ? "当前已激活" : "添加后激活"}`, fg: K.TXT }]);
+        pushForm([{ t: `        ${truncate(address, Math.max(20, this.formView.w - 10))}`, fg: K.DIM }]);
+        const resolvedProfile = isRecord(configAt(this.namespaceViews.get(entry.settingsNs)?.value, entry.settingsPath)) ? configAt(this.namespaceViews.get(entry.settingsNs)?.value, entry.settingsPath) : {};
+        const credentialRef = typeof resolvedProfile.apiKeyEnv === "string" && resolvedProfile.apiKeyEnv ? resolvedProfile.apiKeyEnv : deriveKeyRef(entry.provider);
+        pushForm([{ t: `        模型/协议/默认端点由 Host 提供 · 密钥 ${credentialRef}`, fg: K.FAINT }]);
+      }
+      pushForm([{ t: "" }]);
+      const addStartLine = formLines.length;
+      for (let i = 0; i < this.addItems.length; i++) {
+        const item = this.addItems[i], cur = i === this.addCursor;
+        const meta = item.custom ? "手动填写端点/协议/模型" : item.entry.settingsNs === "llm-deepseek" ? "官方" : "内置目录";
+        pushForm([{ t: `  ${cur ? "▸" : " "} ${truncate(inlineLabel(item.label), 30)}  [${meta}]`, fg: cur ? T.SELFG : item.custom ? K.ACCENT : T.TXT, bg: cur ? T.MENUSEL : T.BG2, bold: cur }], { type: "add", index: i });
+      }
+      this.formItems = [];
+      const cursorLine = addStartLine + this.addCursor;
+      if (cursorLine < this.formView.scrollY) this.formView.scrollY = cursorLine;
+      else if (cursorLine >= this.formView.scrollY + this.formView.h) this.formView.scrollY = Math.max(0, cursorLine - this.formView.h + 1);
+    } else if (route == null) {
       pushForm([{ t: "  左侧 ↑/↓ 选择供应商,Enter 打开编辑", fg: K.FAINT }]);
-      pushForm([{ t: "  把光标移到底部的“＋ 添加供应商”回车即可新建", fg: K.FAINT }]);
-      pushForm([{ t: "  高级字段(modelOverrides/headers/重试/超时/transport)在 设置 → llm-pi-ai 编辑", fg: K.FAINT }]);
+      pushForm([{ t: "  “＋ 添加供应商”先显示 Host 官方/内置目录，末项为自定义提供方", fg: K.FAINT }]);
+      pushForm([{ t: "  高级字段(modelOverrides/headers/重试/超时/transport)在 设置 中编辑", fg: K.FAINT }]);
       pushForm([{ t: "  Esc 退出供应商配置", fg: K.FAINT }]);
       this.formItems = [];
     } else if (this.scanMode) {
       pushForm([{ t: `  扫描 ${truncate(inlineLabel(this.#profile(route).baseURL), 44)} — 空格勾选,Enter 添加,↑/↓ 移动`, fg: K.ACCENT, bold: true }]);
       if (this.scanning) pushForm([{ t: "  扫描中…", fg: K.WARN }]);
+      let cursorLine = null;
       for (let i = 0; i < this.scanItems.length; i++) {
         const m = this.scanItems[i];
         const on = this.scanSel.has(m.id);
         const cur = i === this.scanCursor;
+        if (cur) cursorLine = formLines.length;
         pushForm([{ t: `  ${cur ? "▸" : " "} [${on ? "x" : " "}] ${truncate(inlineLabel(m.id), this.formView.w - 10)}`, fg: on ? K.OK : cur ? T.TXT : K.DIM, bg: cur ? T.MENUSEL : T.BG2 }], { type: "scan", index: i });
       }
       pushForm([{ t: "  Enter 添加选中 · Esc 取消扫描", fg: K.FAINT }]);
       this.formItems = [];
+      if (cursorLine != null && cursorLine < this.formView.scrollY) this.formView.scrollY = cursorLine;
+      else if (cursorLine != null && cursorLine >= this.formView.scrollY + this.formView.h) this.formView.scrollY = Math.max(0, cursorLine - this.formView.h + 1);
     } else {
       const isSub = this.sub != null;
       const items = isSub ? this.#subItems() : this.#formRows();
@@ -2782,6 +3306,7 @@ export class ModelPanel extends Widget {
       else this.formItems = items;
       const w = Math.max(30, this.formView.w - 4);
       const cursor = isSub ? this.sub.cursor : this.formIdx;
+      let cursorLine = null;
       if (isSub) pushForm([{ t: `  模型管理 — ${truncate(inlineLabel(this.#profile(route).displayName || route), 30)}  (Esc 返回)`, fg: K.ACCENT, bold: true }]);
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
@@ -2790,6 +3315,8 @@ export class ModelPanel extends Widget {
         if (it.kind === "field" || it.kind === "choice") {
           const v = it.value === "" || it.value == null ? "（空）" : inlineLabel(it.value);
           t = ` ${cur ? "▸" : " "} ${it.label}: ${truncate(v, w - strWidth(it.label) - 6)}${it.note ? `  [${it.note}]` : ""}`;
+        } else if (it.kind === "notice") {
+          t = `   ${it.label}: ${truncate(inlineLabel(it.value), w - strWidth(it.label) - 6)}`;
         } else if (it.kind === "key") {
           // status dot + reference, NEVER the value (web-synced posture)
           const st = this.keyStatus?.[it.ref];
@@ -2802,6 +3329,7 @@ export class ModelPanel extends Widget {
         } else {
           t = ` ${cur ? "▸" : " "} ${it.label}`;
         }
+        if (cur) cursorLine = formLines.length;
         pushForm([{ t: truncate(t, w), fg: cur ? T.SELFG : T.TXT, bg: cur ? T.MENUSEL : T.BG2 }], { type: "item", index: i, sub: isSub });
         // the 模型管理 preview: an indented, non-focusable summary line
         if (!isSub && it.kind === "button" && it.sub) {
@@ -2811,13 +3339,16 @@ export class ModelPanel extends Widget {
       pushForm([{ t: isSub
         ? "  ↑/↓ 移动 · Enter 编辑或执行 · Esc 返回供应商"
         : "  ↑/↓ 移动 · → 进入选项 · ← 返回列表 · Enter 编辑或执行 · Tab 切换选项 · Esc 返回列表", fg: K.FAINT }]);
+      if (cursorLine != null && cursorLine < this.formView.scrollY) this.formView.scrollY = cursorLine;
+      else if (cursorLine != null && cursorLine >= this.formView.scrollY + this.formView.h) this.formView.scrollY = Math.max(0, cursorLine - this.formView.h + 1);
     }
     if (!this.writable) pushForm([{ t: "  模型配置只读 · 可浏览、发现模型和切换当前会话模型", fg: K.WARN }]);
     this.formView.setLines(formLines);
+    this.formView.scrollY = Math.max(0, Math.min(this.formView.scrollY, this.formView.maxScroll()));
   }
   render(screen) {
     screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", {});
-    const mid = this.x + 26;
+    const mid = this.formView.x - 1;
     screen.vline(mid, this.y, this.y + this.h - 1, "│", { fg: T.BORDER });
     screen.text(this.x + 1, this.y, " 模型供应商", { fg: K.DIM });
     this.listView.render(screen);
@@ -2904,9 +3435,7 @@ export class ModelPanel extends Widget {
         // Like the web editor, keep the typed value only in this write-only
         // draft. #save persists settings first, then writes the credential.
         this.pendingProbeKeys.set(route, v);
-        if (!this.providers[route]?.apiKeyEnv && !this.inheritedProviders[route]?.apiKeyEnv) {
-          this.#draftProfile(route).apiKeyEnv = ref;
-        }
+        if (!this.#profile(route)?.apiKeyEnv) this.#draftProfile(route).apiKeyEnv = ref;
         this.app.toast(`密钥待保存到 ${ref} · 可先用于自动发现`);
         this.#rebuild();
         this.app.redraw();
@@ -2916,12 +3445,27 @@ export class ModelPanel extends Widget {
     this.app.focus(popup.input);
     this.app.redraw();
   }
-  #addProvider() {
+  #openAddProvider() {
     if (!this.writable) { this.app.toast("模型配置为只读"); return; }
+    const configured = new Set(this.routes);
+    const entries = this.directory.filter((entry) => entry.settingsNs && !configured.has(entry.provider));
+    this.addItems = [
+      ...entries.map((entry) => ({ entry, label: entry.displayName || entry.provider })),
+      { custom: true, label: "自定义提供方" },
+    ];
+    this.addCursor = 0;
+    this.addMode = true;
+    this.mode = "list";
+    this.#rebuild();
+    this.app.redraw();
+  }
+  #addCustomProvider() {
     let name = "new-provider", i = 2;
     while (this.routes.includes(name) || this.#cleanupRouteReserved(name) || this.pendingCredentialCleanups.has(deriveKeyRef(name))) name = `new-provider-${i++}`;
     this.providers[name] = { api: "openai-completions", defaultInput: [...DEFAULT_INPUT_MODALITIES], models: [] };
+    this.configuredDirectory.add(name);
     this.draftRoute = name;
+    this.addMode = false;
     this.#syncRoutes();
     this.sel = this.routes.indexOf(name);
     this.mode = "form";
@@ -2931,9 +3475,45 @@ export class ModelPanel extends Widget {
     this.#rebuild();
     this.app.redraw();
   }
+  #addDirectoryProvider(entry) {
+    if (!entry || !this.namespaceViews.has(entry.settingsNs)) {
+      this.app.toast("该提供方的设置 namespace 当前不可用");
+      return;
+    }
+    this.configuredDirectory.add(entry.provider);
+    if (entry.settingsNs === "llm-pi-ai") {
+      this.providers[entry.provider] ??= {};
+      this.inheritedProviders[entry.provider] = {};
+      this.materializeRoutes.add(entry.provider);
+    } else {
+      const view = this.namespaceViews.get(entry.settingsNs);
+      const stored = configAt(view?.user, entry.settingsPath);
+      this.externalDrafts.set(entry.provider, cloneConfig(stored ?? {}));
+      if (stored !== undefined && entry.settingsPath.length > 0) this.externalUserConfigured.add(entry.provider);
+      this.externalInherited.set(entry.provider, mergeConfig(withoutOwned(configAt(view?.value, entry.settingsPath), stored), configAt(view?.base, entry.settingsPath)));
+      this.externalSnapshots.set(entry.provider, JSON.stringify(this.externalDrafts.get(entry.provider)));
+      this.externalHostSnapshots.set(entry.provider, JSON.stringify(this.externalDrafts.get(entry.provider)));
+    }
+    this.addMode = false;
+    this.#syncRoutes();
+    this.sel = this.routes.indexOf(entry.provider);
+    this.mode = "form";
+    this.formIdx = 0;
+    this.modelsSel = -1;
+    this.sub = null;
+    this.#rebuild();
+    this.app.redraw();
+  }
+  #activateAddItem() {
+    const item = this.addItems[this.addCursor];
+    if (!item) return;
+    if (item.custom) this.#addCustomProvider();
+    else this.#addDirectoryProvider(item.entry);
+  }
   #activateItem() {
     if (this.mode === "list") {
-      if (this.sel === this.routes.length) { this.#addProvider(); return; }
+      if (this.sel === this.routes.length) { this.#openAddProvider(); return; }
+      this.addMode = false;
       this.mode = "form";
       this.formIdx = 0;
       this.modelsSel = -1;
@@ -2949,7 +3529,7 @@ export class ModelPanel extends Widget {
     const route = this.#route();
     const effective = this.#profile(route);
     const settingsMutation = it.kind === "field" || it.kind === "choice" || it.kind === "key"
-      || (it.kind === "button" && /保存配置|删除供应商|添加模型|删除选中模型|清除 API 密钥/.test(it.label));
+      || (it.kind === "button" && /保存配置|删除供应商|取消配置提供方|添加模型|删除选中模型|恢复 Host 内置模型目录|清除 API 密钥/.test(it.label));
     if (!this.writable && settingsMutation) { this.app.toast("模型配置为只读"); return; }
     if (it.kind === "field") {
       // Enter always opens the standalone edit buffer; Tab (handled in onKey)
@@ -3091,6 +3671,17 @@ export class ModelPanel extends Widget {
       return;
     }
   }
+  #resetModels() {
+    const route = this.#route();
+    if (!route) return;
+    if (!this.writable) { this.app.toast("模型配置为只读"); return; }
+    const profile = this.#draftProfile(route);
+    delete profile.models;
+    this.modelsSel = -1;
+    this.app.toast("已恢复 Host 内置模型目录（保存后生效）");
+    this.#rebuild();
+    this.app.redraw();
+  }
   #addModel() {
     const route = this.#route();
     if (!route) return;
@@ -3124,17 +3715,32 @@ export class ModelPanel extends Widget {
   }
   async #save({ savePendingKeys = true } = {}) {
     if (!this.writable) { this.app.toast("模型配置为只读"); return false; }
+    const route = this.#route();
+    // Official/non-pi providers own their own settings namespace. Save their
+    // minimal profile ops there, then persist the write-only credential using
+    // the same two-step posture as the WebUI.
+    if (route && this.externalDrafts.has(route)) return this.#saveExternal(route, { savePendingKeys });
     const persisted = JSON.parse(this.hostSnapshot);
     for (const [route, profile] of Object.entries(this.providers)) {
-      if (!Object.hasOwn(persisted, route) && Object.keys(profile).length === 0 && !this.pendingProbeKeys.has(route)) delete this.providers[route];
+      // An empty profile is meaningful for a Host catalog route: it activates
+      // the provider while inheriting protocol, endpoint, and models.
+      if (!Object.hasOwn(persisted, route) && Object.keys(profile).length === 0 && !this.pendingProbeKeys.has(route) && !this.materializeRoutes.has(route)) delete this.providers[route];
     }
     for (const [route, profile] of Object.entries(this.providers)) {
       if (!route.trim()) { this.app.toast("保存失败:供应商路由名不能为空"); return false; }
       if (this.draftRoute === route && !ROUTE_PATTERN.test(route)) { this.app.toast("保存失败:新供应商路由名格式无效"); return false; }
+      const entry = this.#entry(route);
+      // declared is advisory; absent/unknown must not be guessed as custom.
+      const declared = entry?.declared === true || this.draftRoute === route;
       if (profile.displayName !== undefined && !String(profile.displayName).trim()) { this.app.toast(`保存失败:${route} 的显示名不能为空`); return false; }
       if (profile.baseURL !== undefined && !String(profile.baseURL).trim()) { this.app.toast(`保存失败:${route} 的 baseURL 不能为空`); return false; }
       if (profile.apiKeyEnv !== undefined && !KEY_REF_OK.test(profile.apiKeyEnv)) { this.app.toast(`保存失败:${route} 的密钥引用无效`); return false; }
       if (profile.api !== undefined && !API_PROTOCOLS.includes(profile.api)) { this.app.toast(`保存失败:${route} 的协议不受支持`); return false; }
+      // Like WebUI's CustomProviderCard, a hand-declared route cannot inherit
+      // these three facts from the installed catalog.
+      if (declared && !API_PROTOCOLS.includes(profile.api)) { this.app.toast(`保存失败:${route} 的自定义提供方必须选择 API 协议`); return false; }
+      if (declared && !String(profile.baseURL ?? "").trim()) { this.app.toast(`保存失败:${route} 的自定义提供方必须填写 baseURL`); return false; }
+      if (declared && (!Array.isArray(profile.models) || profile.models.length === 0)) { this.app.toast(`保存失败:${route} 的自定义提供方至少需要一个模型`); return false; }
       for (const model of profile.models ?? []) {
         if (!String(model.id ?? "").trim()) { this.app.toast(`保存失败:${route} 有未填写 id 的模型`); return false; }
         if (model.reasoningEfforts && model.reasoningEfforts !== false) {
@@ -3150,9 +3756,10 @@ export class ModelPanel extends Widget {
     }
     let settingsChanged = false;
     const confirmed = JSON.parse(this.savedSnapshot);
-    if (JSON.stringify(this.providers) !== this.hostSnapshot) {
+    if (JSON.stringify(this.providers) !== this.hostSnapshot || this.materializeRoutes.size > 0) {
       try {
-        const ops = providerOps(JSON.parse(this.hostSnapshot), this.providers, new Set(this.draftRoute ? [this.draftRoute] : []));
+        const wholeRoutes = new Set([...(this.draftRoute ? [this.draftRoute] : []), ...this.materializeRoutes]);
+        const ops = providerOps(JSON.parse(this.hostSnapshot), this.providers, wholeRoutes);
         const res = await this.app.api.call("settings.mutate", {
           ns: "llm-pi-ai",
           ops,
@@ -3160,7 +3767,9 @@ export class ModelPanel extends Widget {
         });
         this.revision = res?.revision ?? this.revision;
         this.draftRoute = null;
+        this.materializeRoutes.clear();
         this.hostSnapshot = JSON.stringify(this.providers);
+        this.initialConfiguredDirectory = new Set(this.configuredDirectory);
         settingsChanged = true;
       } catch (e) { this.app.toast(`保存失败: ${e.message}`); return false; }
     }
@@ -3192,9 +3801,83 @@ export class ModelPanel extends Widget {
       return false;
     }
   }
-  #dirty() { return JSON.stringify(this.providers) !== this.savedSnapshot || this.pendingProbeKeys.size > 0; }
+  async #saveExternal(route, { savePendingKeys = true } = {}) {
+    const entry = this.#entry(route);
+    const draft = this.externalDrafts.get(route) ?? {};
+    const hostSnapshot = this.externalHostSnapshots.get(route) ?? "{}";
+    const savedSnapshot = this.externalSnapshots.get(route) ?? "{}";
+    for (const model of draft.models ?? []) {
+      if (!String(model.id ?? "").trim()) { this.app.toast(`保存失败:${route} 有未填写 id 的模型`); return false; }
+      for (const field of ["contextWindow", "maxTokens"]) {
+        if (model[field] !== undefined && (!Number.isInteger(model[field]) || model[field] <= 0)) {
+          this.app.toast(`保存失败:${route}/${model.id} 的 ${field} 必须是正整数`); return false;
+        }
+      }
+    }
+    let settingsChanged = false;
+    if (JSON.stringify(draft) !== hostSnapshot) {
+      try {
+        const ops = profileOps(entry.settingsPath, JSON.parse(hostSnapshot), draft);
+        if (ops.length > 0) {
+          const res = await this.app.api.call("settings.mutate", {
+            ns: entry.settingsNs,
+            ops,
+            expectedRevision: this.revisions.get(entry.settingsNs) ?? 0,
+          });
+          this.revisions.set(entry.settingsNs, res?.revision ?? this.revisions.get(entry.settingsNs) ?? 0);
+        }
+        this.externalHostSnapshots.set(route, JSON.stringify(draft));
+        settingsChanged = true;
+      } catch (e) { this.app.toast(`保存失败: ${e.message}`); return false; }
+    }
+    try {
+      if (savePendingKeys && this.pendingProbeKeys.has(route)) {
+        await this.app.api.call("credentials.set", { ref: this.#keyRef(route), value: this.pendingProbeKeys.get(route) });
+        this.pendingProbeKeys.delete(route);
+      }
+      this.externalSnapshots.set(route, JSON.stringify(draft));
+      this.initialConfiguredDirectory.add(route);
+      await this.#refreshKeys();
+      this.app.toast(settingsChanged ? `已保存 ${entry.displayName || route}` : savePendingKeys ? "API 密钥已保存" : "配置未变化");
+      return true;
+    } catch (e) {
+      // Profile changes already confirmed by Host remain the host snapshot, but
+      // the fully successful save point waits for the credential write.
+      this.externalSnapshots.set(route, savedSnapshot);
+      await this.#refreshKeys();
+      this.app.toast(`${settingsChanged ? "供应商已保存；" : ""}API 密钥保存失败: ${e.message}`);
+      return false;
+    }
+  }
+  #dirty() {
+    if (JSON.stringify(this.providers) !== this.savedSnapshot || this.materializeRoutes.size > 0 || this.pendingProbeKeys.size > 0) return true;
+    for (const [route, draft] of this.externalDrafts) if (JSON.stringify(draft) !== (this.externalSnapshots.get(route) ?? "{}")) return true;
+    return false;
+  }
   /** Throw away the in-memory edits and restore the last fully successful state. */
   async #discard() {
+    // Compensate any external namespace whose profile write succeeded before a
+    // credential write failed, mirroring the pi-ai rollback below.
+    for (const [route, hostSnapshot] of this.externalHostSnapshots) {
+      const savedSnapshot = this.externalSnapshots.get(route) ?? "{}";
+      if (hostSnapshot === savedSnapshot) continue;
+      const entry = this.#entry(route);
+      try {
+        const ops = profileOps(entry.settingsPath, JSON.parse(hostSnapshot), JSON.parse(savedSnapshot));
+        if (ops.length > 0) {
+          const res = await this.app.api.call("settings.mutate", {
+            ns: entry.settingsNs,
+            ops,
+            expectedRevision: this.revisions.get(entry.settingsNs) ?? 0,
+          });
+          this.revisions.set(entry.settingsNs, res?.revision ?? this.revisions.get(entry.settingsNs) ?? 0);
+        }
+        this.externalHostSnapshots.set(route, savedSnapshot);
+      } catch (e) {
+        this.app.toast(`放弃修改失败: ${e.message}`);
+        return false;
+      }
+    }
     if (this.hostSnapshot !== this.savedSnapshot) {
       try {
         const target = JSON.parse(this.savedSnapshot);
@@ -3210,9 +3893,19 @@ export class ModelPanel extends Widget {
       }
     }
     this.providers = JSON.parse(this.savedSnapshot);
+    // External namespaces are normally credential-only edits; restore their
+    // fully successful in-memory save points as well. (A compensated Host
+    // rollback is only needed for the legacy pi-ai partial-save path above.)
+    for (const [route, snapshot] of this.externalSnapshots) {
+      this.externalDrafts.set(route, JSON.parse(snapshot));
+      this.externalHostSnapshots.set(route, snapshot);
+    }
+    this.configuredDirectory = new Set(this.initialConfiguredDirectory);
+    this.materializeRoutes.clear();
     this.pendingProbeKeys.clear();
     this.#syncRoutes();
     this.draftRoute = null;
+    this.addMode = false;
     this.modelsSel = -1;
     this.sub = null;
     this.sel = this.routes.length === 0 ? 0 : Math.min(this.sel, this.routes.length - 1);
@@ -3239,7 +3932,7 @@ export class ModelPanel extends Widget {
       ],
       onAction: async (btn) => {
         this.app.closeOverlay();
-        this.app.focus(this.app.chat);
+        this.app.focus(this.app.fullBuffer ?? this.app.chat);
         if (btn?.action === "cancel") return;      // stay on the form
         if (btn?.action === "save") {
           const ok = await this.#save();
@@ -3266,6 +3959,36 @@ export class ModelPanel extends Widget {
       onAction: (btn) => { this.app.closeOverlay(); if (btn?.action === "delete") return action(); },
     });
     this.app.redraw();
+  }
+  async #unconfigureExternalProvider() {
+    const route = this.#route();
+    const entry = this.#entry(route);
+    if (!route || !entry || entry.settingsNs === "llm-pi-ai" || entry.settingsPath.length === 0 || !this.externalUserConfigured.has(route)) return;
+    if (this.#dirty()) { this.app.toast("请先保存或放弃其他修改，再取消配置提供方"); return; }
+    this.#confirmDelete(`取消配置 ${entry.displayName || route}？这会移除该提供方的用户层设置，但不会清除全局 API 密钥。`, async () => {
+      try {
+        const res = await this.app.api.call("settings.mutate", {
+          ns: entry.settingsNs,
+          ops: [{ op: "unset", path: entry.settingsPath }],
+          expectedRevision: this.revisions.get(entry.settingsNs) ?? 0,
+        });
+        this.revisions.set(entry.settingsNs, res?.revision ?? this.revisions.get(entry.settingsNs) ?? 0);
+      } catch (e) { this.app.toast(`取消配置失败: ${e.message}`); return; }
+      this.externalUserConfigured.delete(route);
+      this.externalDrafts.set(route, {});
+      this.externalSnapshots.set(route, "{}");
+      this.externalHostSnapshots.set(route, "{}");
+      this.externalInherited.set(route, {});
+      this.configuredDirectory.delete(route);
+      this.initialConfiguredDirectory.delete(route);
+      this.pendingProbeKeys.delete(route);
+      this.#syncRoutes();
+      this.sel = this.routes.length === 0 ? 0 : Math.min(this.sel, this.routes.length - 1);
+      this.modelsSel = -1; this.sub = null;
+      await this.#refreshKeys();
+      this.app.toast(`已取消配置 ${entry.displayName || route}；全局 API 密钥未改变`);
+      this.#rebuild(); this.app.redraw();
+    });
   }
   async #deleteProvider() {
     const route = this.#route();
@@ -3347,6 +4070,9 @@ export class ModelPanel extends Widget {
       delete this.providers[route];
       delete this.resolvedProviders[route];
       delete this.inheritedProviders[route];
+      this.configuredDirectory.delete(route);
+      this.initialConfiguredDirectory.delete(route);
+      this.materializeRoutes.delete(route);
       this.pendingProbeKeys.delete(route);
       this.#syncRoutes();
       this.sel = this.routes.length === 0 ? 0 : Math.min(this.sel, this.routes.length - 1);
@@ -3370,6 +4096,12 @@ export class ModelPanel extends Widget {
     const route = this.#route();
     if (!route) return;
     const p = this.#profile(route);
+    const entry = this.#entry(route);
+    const declared = entry?.declared === true || this.draftRoute === route;
+    if (declared && p.api === "anthropic-messages") {
+      this.app.toast("anthropic-messages 不支持自动列出模型，请手动添加模型 ID");
+      return;
+    }
     const base = String(p.baseURL ?? "").replace(/\/+$/, "");
     this.scanning = true;
     this.scanMode = true;
@@ -3381,7 +4113,7 @@ export class ModelPanel extends Widget {
       // The Host owns protocol handling and stored credentials. Keeping the
       // request on this path avoids exposing secrets or weakening TLS locally.
       const res = await this.app.api.call("llm.discoverModels", {
-        settingsNs: "llm-pi-ai",
+        settingsNs: this.#namespace(route),
         provider: route,
         ...(p.api ? { api: p.api } : {}),
         ...(base ? { baseURL: base } : {}),
@@ -3439,10 +4171,21 @@ export class ModelPanel extends Widget {
       this.#showCredentialCleanupFailure({ ref, ...task });
       return true;
     }
+    if (this.addMode) {
+      if (ev.name === "escape") { this.addMode = false; this.#rebuild(); this.app.redraw(); return true; }
+      if (ev.name === "up" || (ev.name === "char" && ev.key === "k" && !ev.ctrl)) {
+        this.addCursor = wrapIndex(this.addCursor - 1, this.addItems.length); this.#rebuild(); this.app.redraw(); return true;
+      }
+      if (ev.name === "down" || (ev.name === "char" && ev.key === "j" && !ev.ctrl)) {
+        this.addCursor = wrapIndex(this.addCursor + 1, this.addItems.length); this.#rebuild(); this.app.redraw(); return true;
+      }
+      if (ev.name === "enter") { this.#activateAddItem(); return true; }
+      return false;
+    }
     if (this.scanMode) {
       if (ev.name === "escape") { this.scanMode = false; this.#rebuild(); return true; }
-      if (ev.name === "up") { this.scanCursor = Math.max(0, this.scanCursor - 1); this.#rebuild(); this.app.redraw(); return true; }
-      if (ev.name === "down") { this.scanCursor = Math.min(this.scanItems.length - 1, this.scanCursor + 1); this.#rebuild(); this.app.redraw(); return true; }
+      if (ev.name === "up") { this.scanCursor = wrapIndex(this.scanCursor - 1, this.scanItems.length); this.#rebuild(); this.app.redraw(); return true; }
+      if (ev.name === "down") { this.scanCursor = wrapIndex(this.scanCursor + 1, this.scanItems.length); this.#rebuild(); this.app.redraw(); return true; }
       if (ev.name === "char" && ev.key === " " && !ev.ctrl) {
         const m = this.scanItems[this.scanCursor];
         if (m) { if (this.scanSel.has(m.id)) this.scanSel.delete(m.id); else this.scanSel.add(m.id); }
@@ -3457,13 +4200,13 @@ export class ModelPanel extends Widget {
       // inside the 模型管理 sub-buffer: ↑/↓ walk its rows; Esc returns
       if (ev.name === "escape") { this.sub = null; this.#rebuild(); return true; }
       if (ev.name === "up" || (ev.name === "char" && ev.key === "k" && !ev.ctrl)) {
-        this.sub.cursor = Math.max(0, this.sub.cursor - 1);
+        this.sub.cursor = wrapIndex(this.sub.cursor - 1, this.#subItems().length);
         this.#rebuild();
         this.app.redraw();
         return true;
       }
       if (ev.name === "down" || (ev.name === "char" && ev.key === "j" && !ev.ctrl)) {
-        this.sub.cursor = Math.min(Math.max(0, this.#subItems().length - 1), this.sub.cursor + 1);
+        this.sub.cursor = wrapIndex(this.sub.cursor + 1, this.#subItems().length);
         this.#rebuild();
         this.app.redraw();
         return true;
@@ -3479,21 +4222,21 @@ export class ModelPanel extends Widget {
         this.#leaveForm(() => { this.mode = "list"; this.sub = null; this.#rebuild(); this.app.redraw(); });
         return true;
       }
-      return false; // list level: App falls back to the upper window (chat/settings)
+      return false; // list level: App closes the full-screen buffer on the unhandled Escape
     }
     // dual-focus navigation: ↑/↓ move the cursor INSIDE the focused region —
     // the provider column in list focus, the option rows in form focus.
     // → enters the form, ← returns to the list.
     if (ev.name === "up" || (ev.name === "char" && ev.key === "k" && !ev.ctrl)) {
-      if (this.mode === "list") this.sel = Math.max(0, this.sel - 1);
-      else this.formIdx = Math.max(0, this.formIdx - 1);
+      if (this.mode === "list") this.sel = wrapIndex(this.sel - 1, this.routes.length + 1);
+      else this.formIdx = wrapIndex(this.formIdx - 1, this.formItems.length);
       this.#rebuild();
       this.app.redraw();
       return true;
     }
     if (ev.name === "down" || (ev.name === "char" && ev.key === "j" && !ev.ctrl)) {
-      if (this.mode === "list") this.sel = Math.min(this.routes.length, this.sel + 1);
-      else this.formIdx = Math.min(Math.max(0, this.formItems.length - 1), this.formIdx + 1);
+      if (this.mode === "list") this.sel = wrapIndex(this.sel + 1, this.routes.length + 1);
+      else this.formIdx = wrapIndex(this.formIdx + 1, this.formItems.length);
       this.#rebuild();
       this.app.redraw();
       return true;
@@ -3513,7 +4256,7 @@ export class ModelPanel extends Widget {
         else profile[it.key] = value;
         if (it.key === "api" && value !== "openai-completions") this.#stripCompat(this.#route());
       } else if (this.formItems.length > 0) {
-        this.formIdx = Math.min(this.formItems.length - 1, this.formIdx + 1);
+        this.formIdx = wrapIndex(this.formIdx + 1, this.formItems.length);
       }
       this.#rebuild();
       this.app.redraw();
@@ -3546,7 +4289,7 @@ export class ModelPanel extends Widget {
         if (this.mode === "form") {
           if (idx === this.sel) return true; // already editing this provider
           if (idx === this.routes.length) {
-            this.#leaveForm(() => this.#addProvider());
+            this.#leaveForm(() => this.#openAddProvider());
           } else {
             this.#leaveForm(() => {
               this.sel = idx;
@@ -3570,6 +4313,11 @@ export class ModelPanel extends Widget {
     const line = ev.y - this.formView.y + this.formView.scrollY;
     const target = this.formClickMap[line];
     if (!target) return true;
+    if (target.type === "add" && this.addMode) {
+      this.addCursor = target.index;
+      this.#activateAddItem();
+      return true;
+    }
     if (target.type === "cleanup") {
       const task = this.pendingCredentialCleanups.get(target.ref);
       if (task) this.#showCredentialCleanupFailure({ ref: target.ref, ...task });
@@ -3793,13 +4541,13 @@ export class SubagentPanel extends Widget {
   onKey(ev) {
     if (ev.type === "text") { this.input.insert(ev.text); this.app.redraw(); return true; }
     if (ev.type !== "key") return false;
-    if (ev.name === "escape") { this.app.setMode("chat"); return true; }
+    if (ev.name === "escape") { this.app.closeFullBuffer?.() ?? this.app.setMode?.("chat"); return true; }
     if (ev.name === "char" && ev.key === "x" && !ev.ctrl) { this.interrupt(); return true; }
     if (ev.name === "char" && ev.key === "r" && !ev.ctrl) { this.selectChild(this.selIdx); return true; }
     if (ev.name === "up" || ev.name === "down") {
       if (this.entries.length === 0) return false;
-      const next = this.selIdx + (ev.name === "up" ? -1 : 1);
-      if (next >= 0 && next < this.entries.length) { this.selectChild(next); }
+      const next = wrapIndex(this.selIdx + (ev.name === "up" ? -1 : 1), this.entries.length);
+      this.selectChild(next);
       return true;
     }
     if (this.input.onKey(ev)) { this.app.redraw(); return true; }
@@ -3890,11 +4638,11 @@ export class SkillsPanel extends Widget {
   }
   onKey(ev) {
     if (ev.type !== "key") return false;
-    if (ev.name === "escape") { this.app.setMode("chat"); return true; }
+    if (ev.name === "escape") { this.app.closeFullBuffer?.() ?? this.app.setMode?.("chat"); return true; }
     if (ev.name === "up" || ev.name === "down") {
       if (this.skills.length === 0) return false;
-      const next = this.selIdx + (ev.name === "up" ? -1 : 1);
-      if (next >= 0 && next < this.skills.length) this.select(next);
+      const next = wrapIndex(this.selIdx + (ev.name === "up" ? -1 : 1), this.skills.length);
+      this.select(next);
       return true;
     }
     if (ev.name === "char" && ev.key === "c" && !ev.ctrl && this.skills[this.selIdx]) {

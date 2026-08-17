@@ -1,7 +1,14 @@
 // widgets.js — Minimal widget layer: hit-testing, lists, scroll views, input,
-// popups, context menus, status bar. All mouse-driven (nvim-style) with key equivalents.
-import { truncate, pad, strWidth } from "./text.js";
+// popups, context menus, status bar. Keyboard-first, with mouse hit-testing as an auxiliary path.
+import { truncate, pad, strWidth, graphemes } from "./text.js";
 import { T } from "./theme.js";
+
+/** Circular cursor movement shared by every finite choice list. Text cursors
+ * and scroll offsets deliberately do not use this helper. */
+export function wrapIndex(index, length) {
+  if (!Number.isFinite(length) || length <= 0) return 0;
+  return ((index % length) + length) % length;
+}
 
 export class Widget {
   constructor({ x = 0, y = 0, w = 0, h = 0 } = {}) {
@@ -148,7 +155,8 @@ export class List extends ScrollView {
     this.selBg = opts.selBg ?? T.ACCENT2;
     this.cursorFg = opts.cursorFg ?? T.CURSORFG;
     this.cursorBg = opts.cursorBg ?? T.CURSORBG;
-    this.wrap = opts.wrap ?? false;
+    // Finite option lists wrap by default (↑ on the first reaches the last).
+    this.wrap = opts.wrap ?? true;
   }
   setItems(items, { keepSelection = false } = {}) {
     this.items = items;
@@ -169,8 +177,11 @@ export class List extends ScrollView {
     return segs;
   }
   scrollToSelected() {
+    if (this.items.length === 0) { this.selected = 0; this.scrollY = 0; return; }
+    this.selected = Math.max(0, Math.min(this.items.length - 1, this.selected));
     if (this.selected < this.scrollY) this.scrollY = this.selected;
     else if (this.selected >= this.scrollY + this.h) this.scrollY = this.selected - this.h + 1;
+    this.scrollY = Math.max(0, Math.min(this.maxScroll(), this.scrollY));
   }
   render(screen) {
     super.render(screen);
@@ -195,7 +206,7 @@ export class List extends ScrollView {
     if (this.items.length === 0) return false;
     const next = this.selected + delta;
     if (next < 0 || next >= this.items.length) {
-      if (this.wrap) this.selected = (next + this.items.length) % this.items.length;
+      if (this.wrap) this.selected = wrapIndex(next, this.items.length);
       else return false;
     } else this.selected = next;
     this.scrollToSelected();
@@ -230,7 +241,7 @@ export class List extends ScrollView {
       case "pgup": return this.scroll(-this.h);
       case "pgdn": return this.scroll(this.h);
       case "home": this.selected = 0; this.scrollToSelected(); return true;
-      case "end": this.selected = this.items.length - 1; this.scrollToSelected(); return true;
+      case "end": this.selected = Math.max(0, this.items.length - 1); this.scrollToSelected(); return true;
       case "enter": if (this.items[this.selected]) this.onSelect?.(this.items[this.selected], ev); return true;
     }
     return false;
@@ -243,7 +254,7 @@ export class Input extends Widget {
   constructor(opts = {}) {
     super(opts);
     this.value = "";
-    this.cursor = 0;             // code-point index into value
+    this.cursor = 0;             // grapheme index into value
     this.prompt = opts.prompt ?? "❯ ";
     this.onEnter = opts.onEnter ?? null;
     this.onChange = null;
@@ -271,13 +282,13 @@ export class Input extends Widget {
     this.histIdx = -1;
     this.masked = opts.masked ?? false;  // secret fields render •••• instead of the value
   }
-  #cps() { return Array.from(this.value); }            // code points
+  #cps() { return graphemes(this.value); }             // user-perceived characters
   /** Visual rows for multi-line input: logical lines wrapped at the width. */
   #visualRows() {
     const inner0 = Math.max(1, this.w - strWidth(this.prompt) - 2);
     const innerN = Math.max(1, this.w - 2);
     const rows = [];
-    const cps = Array.from(this.value);
+    const cps = this.#cps();
     let text = "", width = 0, limit = inner0, start = 0;
     for (let i = 0; i < cps.length; i++) {
       const ch = cps[i];
@@ -299,11 +310,11 @@ export class Input extends Widget {
   /** [visualRow, display-col] of the cursor in wrapped coordinates. */
   #cursorVisual() {
     const rows = this.#visualRows();
-    const cursor = Math.max(0, Math.min(this.cursor, Array.from(this.value).length));
+    const cursor = Math.max(0, Math.min(this.cursor, this.#cps().length));
     for (let ri = 0; ri < rows.length; ri++) {
       const r = rows[ri];
       if (cursor >= r.start && cursor <= r.end) {
-        const before = Array.from(r.text).slice(0, cursor - r.start);
+        const before = graphemes(r.text).slice(0, cursor - r.start);
         return { row: ri, col: before.reduce((w, ch) => w + strWidth(ch), 0) };
       }
     }
@@ -314,7 +325,7 @@ export class Input extends Widget {
   #indexAtVisual(row, col) {
     const rows = this.#visualRows();
     const r = rows[Math.max(0, Math.min(row, rows.length - 1))];
-    const cps = Array.from(r.text);
+    const cps = graphemes(r.text);
     let w = 0, j = 0;
     for (; j < cps.length; j++) {
       const cw = strWidth(cps[j]);
@@ -336,7 +347,7 @@ export class Input extends Widget {
   insertAtomic(text, id = null) {
     const at = this.selectAll ? 0 : this.cursor;
     this.insert(text);
-    this.atomicMarks.push({ start: at, end: at + Array.from(text).length, id });
+    this.atomicMarks.push({ start: at, end: at + graphemes(text).length, id });
     this.#snapCursor(1);
   }
   removeAtomic(id) {
@@ -375,10 +386,10 @@ export class Input extends Widget {
   #edit(from, to, text = "") {
     this.selStart = this.selEnd = null; // edits consume the selection
     const cps = this.#cps();
-    const t = Array.from(text);
+    const t = graphemes(text);
     const atomic = this.atomicMarks.find((x) => to > x.start && from < x.end);
     if (atomic) { from = Math.min(from, atomic.start); to = Math.max(to, atomic.end); this.atomicMarks = this.atomicMarks.filter((x) => x !== atomic); }
-    for (const mark of this.atomicMarks) { if (to <= mark.start) { const delta = Array.from(text).length - (to - from); mark.start += delta; mark.end += delta; } }
+    for (const mark of this.atomicMarks) { if (to <= mark.start) { const delta = graphemes(text).length - (to - from); mark.start += delta; mark.end += delta; } }
     const m = this.pasteMark;
     if (m && to > m.start && from < m.end) {
       // the edit touches the token: apply it over the whole token span
@@ -430,7 +441,7 @@ export class Input extends Widget {
         this.cursorCell = { x: this.x + promptW, y: this.y };
         return;
       }
-      const cps = Array.from(this.value);
+      const cps = this.#cps();
       const before = cps.slice(0, this.cursor).join("");
       const cx = strWidth(before);
       const desiredCol = Math.max(0, cx - Math.max(1, inner - 1));
@@ -440,7 +451,7 @@ export class Input extends Widget {
         startIdx++;
       }
       const visible = truncate(cps.slice(startIdx).join(""), inner);
-      const drawn = this.masked ? "•".repeat(Array.from(visible).length) : visible;
+      const drawn = this.masked ? "•".repeat(graphemes(visible).length) : visible;
       screen.text(this.x + promptW, this.y, drawn, { fg: this.fg, bg: this.bg });
       this.cursorCell = { x: this.x + promptW + Math.min(inner, Math.max(0, cx - startCol)), y: this.y };
       return;
@@ -460,7 +471,7 @@ export class Input extends Widget {
     for (let ri = start; ri < Math.min(rows.length, start + h); ri++) {
       const r = rows[ri];
       const y = this.y + (ri - start);
-      const drawn = this.masked ? "•".repeat(Array.from(r.text).length) : r.text;
+      const drawn = this.masked ? "•".repeat(graphemes(r.text).length) : r.text;
       if (ri === 0) {
         screen.text(this.x, y, this.prompt, { fg: T.ACCENT, bg: this.bg });
         screen.text(this.x + strWidth(this.prompt), y, drawn, { fg: this.fg, bg: this.bg });
@@ -476,7 +487,7 @@ export class Input extends Widget {
         const hi = Math.min(r.end, this.selEnd);
         if (lo >= hi) continue;
         const rowY = this.y + (ri - start);
-        const text = Array.from(r.text);
+        const text = graphemes(r.text);
         const preW = strWidth(text.slice(0, lo - r.start).join(""));
         const selW = strWidth(text.slice(lo - r.start, hi - r.start).join(""));
         const x0 = this.x + (ri === 0 ? strWidth(this.prompt) : 1) + preW;
@@ -501,7 +512,7 @@ export class Input extends Widget {
       } else {
         const rx = ev.x - this.x - strWidth(this.prompt);
         let w = 0, idx = 0;
-        for (const ch of Array.from(this.value)) {
+        for (const ch of this.#cps()) {
           const cw = strWidth(ch);
           if (rx < w + cw / 2) break;
           w += cw;
@@ -526,7 +537,7 @@ export class Input extends Widget {
       } else {
         const rx = ev.x - this.x - strWidth(this.prompt);
         let w = 0, idx = 0;
-        for (const ch of Array.from(this.value)) {
+        for (const ch of this.#cps()) {
           const cw = strWidth(ch);
           if (rx < w + cw / 2) break;
           w += cw;
@@ -578,7 +589,7 @@ export class Input extends Widget {
       const placeholder = `[已复制 ${lines} 行内容]`;
       const at = this.selectAll ? 0 : this.cursor;
       this.insert(placeholder);
-      this.pasteMark = { start: at, end: at + Array.from(placeholder).length };
+      this.pasteMark = { start: at, end: at + graphemes(placeholder).length };
       this.pendingPaste = { text };
       this.app?.toast?.("再次 Ctrl+Shift+V 粘贴完整内容（Ctrl+L 展开输入栏）");
       return true;
@@ -669,7 +680,7 @@ export class Input extends Widget {
               if (ev.shift) {
                 // Ctrl+Shift+C: copy the drag-selection (if any)
                 if (this.selStart !== null && this.selEnd !== null && this.selEnd > this.selStart) {
-                  const text = Array.from(this.value).slice(this.selStart, this.selEnd).join("");
+                  const text = this.#cps().slice(this.selStart, this.selEnd).join("");
                   this.selStart = this.selEnd = null;
                   this.app?.copyText?.(text);
                 } else {
@@ -838,9 +849,8 @@ export class Popup extends Widget {
       if (ev.name === "pgdn") { this.scrollY = Math.min(this.maxScroll(), this.scrollY + this.contentRows()); return true; }
     }
     if (ev.name === "escape") { this.onAction?.({ label: "__cancel__", action: "__cancel__" }, -1); return true; }
-    if (ev.name === "tab") { this.btnIdx = (this.btnIdx + 1) % Math.max(1, this.buttons.length); return true; }
-    if (ev.name === "left") { this.btnIdx = Math.max(0, this.btnIdx - 1); return true; }
-    if (ev.name === "right") { this.btnIdx = Math.min(this.buttons.length - 1, this.btnIdx + 1); return true; }
+    if (ev.name === "tab" || ev.name === "right") { this.btnIdx = wrapIndex(this.btnIdx + 1, this.buttons.length); return true; }
+    if (ev.name === "backtab" || ev.name === "left") { this.btnIdx = wrapIndex(this.btnIdx - 1, this.buttons.length); return true; }
     if (ev.name === "enter" && this.buttons[this.btnIdx]) { this.onAction?.(this.buttons[this.btnIdx], this.btnIdx); return true; }
     return false;
   }
@@ -879,8 +889,8 @@ export class Menu extends Widget {
   onKey(ev) {
     if (ev.type !== "key") return false;
     switch (ev.name) {
-      case "up": this.sel = Math.max(0, this.sel - 1); return true;
-      case "down": this.sel = Math.min(this.items.length - 1, this.sel + 1); return true;
+      case "up": this.sel = wrapIndex(this.sel - 1, this.items.length); return true;
+      case "down": this.sel = wrapIndex(this.sel + 1, this.items.length); return true;
       case "enter": if (this.items[this.sel]) { this.onAction?.(this.items[this.sel], this.sel); return true; } return false;
       case "escape": this.onAction?.(null, -1); return true;
     }

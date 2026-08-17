@@ -1,14 +1,15 @@
 // views.js — App composition: session list + chat timeline + approvals + status.
 import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
-import { truncate, strWidth, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth } from "./text.js";
+import { truncate, strWidth, pad, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth } from "./text.js";
 import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { Widget, List, ScrollView, Input, Popup, Menu, StatusBar } from "./widgets.js";
+import { Widget, ScrollView, Input, Popup, Menu, StatusBar, wrapIndex } from "./widgets.js";
 import { UploadPicker } from "./file-picker.js";
-import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, keyBindings, DEFAULT_KEYBINDINGS } from "./config.js";
+import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, keyBindings, tuiConfigFile, reloadTuiConfig } from "./config.js";
+import { bindingMatchFor, matchKeyBinding, CHAT_BINDING_ORDER, SIDEBAR_BINDING_ORDER, KEYBINDING_ORDER } from "./keybindings.js";
 export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
@@ -108,9 +109,14 @@ function renderToolCard(view, width, expanded) {
       const rows = output.split("\n");
       const cap = expanded ? 200 : 8;
       for (const row of rows.slice(0, cap)) lines.push([{ t: "  " + truncate(row, width - 4), fg: K.TXT, code: true }]);
-      if (rows.length > cap) lines.push([{ t: `  …隐藏 ${rows.length - cap} 行（点击展开）`, fg: K.FAINT }]);
-      if (card.signal) lines.push([{ t: `  signal ${card.signal}`, fg: K.ERR, bold: true }]);
-      else if (card.exitCode != null) lines.push([{ t: `  exit ${card.exitCode}`, fg: card.exitCode === 0 ? K.OK : K.ERR, bold: card.exitCode !== 0 }]);
+      if (rows.length > cap) lines.push([{ t: expanded
+        ? `  …其余 ${rows.length - cap} 行超过详情上限`
+        : `  …隐藏 ${rows.length - cap} 行（点击展开）`, fg: K.FAINT }]);
+      // Keep terminal cards visually neutral at high tool-call frequency: a
+      // non-zero exit is still explicit text, but no longer introduces a red
+      // block/label that dominates the transcript.
+      if (card.signal) lines.push([{ t: `  signal ${card.signal}`, fg: K.WARN, bold: true }]);
+      else if (card.exitCode != null) lines.push([{ t: `  exit ${card.exitCode}`, fg: card.exitCode === 0 ? K.OK : K.WARN, bold: card.exitCode !== 0 }]);
       else if (card.running) lines.push([{ t: "  ● 运行中", fg: K.WARN }]);
       break;
     }
@@ -483,7 +489,25 @@ function applyEvent(nodes, event, view, log, state = null) {
 export function nodeForEvents(events, log) {
   const nodes = [];
   const state = { step: null };
-  for (const { event, view } of events) applyEvent(nodes, event, view, log, state);
+  for (const { event, view } of events) {
+    const before = nodes.length;
+    applyEvent(nodes, event, view, log, state);
+    // Durable search/jump anchor: the event that created each derived node.
+    const seq = event?.seq;
+    if (Number.isFinite(seq)) {
+      if (nodes.length > before) {
+        // The event appended one or more sibling nodes: never leak its seq into
+        // the previous sibling (that would make search jumps land one early).
+        for (let i = before; i < nodes.length; i++) {
+          if (nodes[i].firstSeq == null) nodes[i].firstSeq = seq;
+          nodes[i].lastSeq = seq;
+        }
+      }
+      // Mutation-only events keep the node's original anchor. A later tool
+      // result or turn/end may mutate a non-tail node, so assigning that seq to
+      // the array tail would create another false jump range.
+    }
+  }
   return nodes;
 }
 
@@ -767,6 +791,8 @@ class SidebarTree extends Widget {
     this.groups = groups;
     this.#flatten();
     this.sel = Math.min(this.sel, Math.max(0, this.rows.length - 1));
+    this.scrollY = Math.max(0, Math.min(this.scrollY, this.maxScroll()));
+    this.#scrollToSel();
     this.app.redraw();
   }
   #flatten() {
@@ -783,17 +809,21 @@ class SidebarTree extends Widget {
     if (this.collapsed.has(group.key)) this.collapsed.delete(group.key);
     else this.collapsed.add(group.key);
     this.#flatten();
+    this.sel = Math.min(this.sel, Math.max(0, this.rows.length - 1));
+    this.scrollY = Math.max(0, Math.min(this.scrollY, this.maxScroll()));
+    this.#scrollToSel();
   }
-  collapseAll() { for (const g of this.groups) this.collapsed.add(g.key); this.#flatten(); }
-  expandAll() { this.collapsed.clear(); this.#flatten(); }
+  collapseAll() { for (const g of this.groups) this.collapsed.add(g.key); this.#flatten(); this.sel = Math.min(this.sel, Math.max(0, this.rows.length - 1)); this.scrollY = Math.max(0, Math.min(this.scrollY, this.maxScroll())); this.#scrollToSel(); }
+  expandAll() { this.collapsed.clear(); this.#flatten(); this.sel = Math.min(this.sel, Math.max(0, this.rows.length - 1)); this.scrollY = Math.max(0, Math.min(this.scrollY, this.maxScroll())); this.#scrollToSel(); }
   #rowTitle(sess) {
     return sess.projections?.values?.title ?? (sess.blank ? "（空白会话）" : sess.sessionId.slice(0, 8));
   }
   render(screen) {
     screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", {});
     const w = this.w - 1;
-    // header: workspace title
-    screen.text(this.x, this.y, truncate("▣ 工作区", w - 2), { fg: T.ACCENT, attrs: 1 });
+    // Header itself becomes the pane-focus badge. When focused, chat/trajectory
+    // tabs deliberately relinquish their highlight to this label.
+    screen.text(this.x, this.y, truncate("▣ 工作区", w - 2), { fg: this.focused ? T.SELFG : T.ACCENT, bg: this.focused ? T.ACCENT : -1, attrs: 1 });
     screen.hline(this.x, this.x + w, this.y + 1, "─", { fg: T.BORDER });
     const listTop = this.y + 2;
     for (let i = 0; i < this.h - 2; i++) {
@@ -849,13 +879,37 @@ class SidebarTree extends Widget {
   }
   move(delta) {
     if (this.rows.length === 0) return false;
-    const next = Math.max(0, Math.min(this.rows.length - 1, this.sel + delta));
-    if (next === this.sel) return false;
+    const next = wrapIndex(this.sel + delta, this.rows.length);
     this.sel = next;
     this.#scrollToSel();
     return true;
   }
   currentRow() { return this.rows[this.sel] ?? null; }
+  #menuFor(row) {
+    if (!row) return [
+      { label: "新建工作区…", action: () => this.app.addWorkspace() },
+      { label: "新建会话", action: () => this.app.newSessionIn(null) },
+    ];
+    if (row.kind === "session") return null;
+    const items = [
+      { label: "新建会话", action: () => this.app.newSessionIn(row.group) },
+      { label: "新建工作区…", action: () => this.app.addWorkspace() },
+      { label: "折叠全部", action: () => { this.collapseAll(); this.app.redraw(); } },
+      { label: "展开全部", action: () => { this.expandAll(); this.app.redraw(); } },
+    ];
+    if (row.group.workspaceId) {
+      items.push({ label: "重命名工作区", action: () => this.app.renameWorkspace(row.group) });
+      items.push({ label: "删除工作区…", action: () => this.app.deleteWorkspace(row.group) });
+    }
+    return items;
+  }
+  openCurrentMenu() {
+    const row = this.currentRow();
+    const ev = { x: this.x + 2, y: this.y + 2 + Math.max(0, this.sel - this.scrollY) };
+    if (row?.kind === "session") this.app.sessionMenu({ data: row.session }, ev);
+    else this.app.openMenu(this.#menuFor(row), ev);
+    return true;
+  }
   onMouse(ev) {
     if (ev.kind === "wheel-up") { this.scroll(-3); return true; }
     if (ev.kind === "wheel-down") { this.scroll(3); return true; }
@@ -875,30 +929,10 @@ class SidebarTree extends Widget {
     if (ev.kind === "press" && ev.button === 2) {
       const idx = this.scrollY + (ev.y - this.y - 2);
       const row = this.rows[idx];
-      if (!row) {
-        // right-click on empty sidebar space → workspace-level actions
-        this.app.openMenu([
-          { label: "新建工作区…", action: () => this.app.addWorkspace() },
-          { label: "新建会话", action: () => this.app.newSessionIn(null) },
-        ], ev);
-        return true;
-      }
+      if (!row) { this.app.openMenu(this.#menuFor(null), ev); return true; }
       this.sel = idx;
-      if (row.kind === "group") {
-        const items = [
-          { label: "新建会话", action: () => this.app.newSessionIn(row.group) },
-          { label: "新建工作区…", action: () => this.app.addWorkspace() },
-          { label: "折叠全部", action: () => { this.collapseAll(); this.app.redraw(); } },
-          { label: "展开全部", action: () => { this.expandAll(); this.app.redraw(); } },
-        ];
-        if (row.group.workspaceId) {
-          items.push({ label: "重命名工作区", action: () => this.app.renameWorkspace(row.group) });
-          items.push({ label: "删除工作区…", action: () => this.app.deleteWorkspace(row.group) });
-        }
-        this.app.openMenu(items, ev);
-      } else {
-        this.app.sessionMenu({ data: row.session }, ev);
-      }
+      if (row.kind === "session") this.app.sessionMenu({ data: row.session }, ev);
+      else this.app.openMenu(this.#menuFor(row), ev);
       return true;
     }
     return false;
@@ -911,28 +945,45 @@ class SidebarTree extends Widget {
       case "pgup": this.scroll(-this.h); return true;
       case "pgdn": this.scroll(this.h); return true;
       case "home": this.sel = 0; this.#scrollToSel(); return true;
-      case "end": this.sel = this.rows.length - 1; this.#scrollToSel(); return true;
+      case "end": this.sel = Math.max(0, this.rows.length - 1); this.#scrollToSel(); return true;
       case "enter": {
         const row = this.currentRow();
         if (!row) return false;
         if (row.kind === "group") { this.toggle(row.group); this.app.redraw(); }
-        else this.app.openSession(row.session.sessionId);
+        else this.app.openSession(row.session.sessionId); // pane focus intentionally stays here
         return true;
       }
       case "left": {
+        if (ev.ctrl) return false;
         const row = this.currentRow();
         if (row?.kind === "group" && !this.collapsed.has(row.group.key)) { this.toggle(row.group); this.app.redraw(); return true; }
         if (row?.kind === "session") { this.sel = this.rows.findLastIndex((r, i) => i <= this.sel && r.kind === "group"); this.#scrollToSel(); return true; }
         return false;
       }
       case "right": {
+        if (ev.ctrl) return false;
         const row = this.currentRow();
         if (row?.kind === "group" && this.collapsed.has(row.group.key)) { this.toggle(row.group); this.app.redraw(); return true; }
         if (row?.kind === "group") { this.sel = Math.min(this.rows.length - 1, this.sel + 1); this.#scrollToSel(); return true; }
         return false;
       }
       case "char":
-        if (!ev.ctrl && ev.key === "n") { const r = this.currentRow(); if (r?.kind === "group") { this.app.newSessionIn(r.group); return true; } return false; }
+        if (ev.ctrl && ev.key === "r") return this.openCurrentMenu();
+        if (ev.ctrl) return false;
+        {
+          const sbHit = bindingMatchFor(ev, keyBindings(), false, SIDEBAR_BINDING_ORDER);
+          if (sbHit?.id === "insert") { this.app.focus(this.app.chat.input); this.app.redraw(); return true; }
+          if (sbHit?.id === "newSession") { const r = this.currentRow(); if (r?.kind === "group") this.app.newSessionIn(r.group); else this.app.newSession(); return true; }
+        }
+        if (ev.key === " ") {
+          const row = this.currentRow();
+          if (row?.kind === "group") { this.toggle(row.group); this.app.redraw(); return true; }
+          if (row?.kind === "session") {
+            const groupIndex = this.rows.findLastIndex((candidate, index) => index <= this.sel && candidate.kind === "group");
+            this.toggle(row.group); this.sel = Math.max(0, groupIndex); this.#scrollToSel(); this.app.redraw(); return true;
+          }
+          return false;
+        }
         if (!ev.ctrl && (ev.key === "[" || ev.key === "]")) {
           const r = this.currentRow();
           if (r?.kind === "session") { this.app.moveSession(r.session, ev.key === "[" ? -1 : 1); return true; }
@@ -969,7 +1020,6 @@ export class ChatView extends Widget {
     this.nodes = [];
     this.lines = [];
     this.expanded = new Set();   // node indexes (user-message full text)
-    this.expandedTools = new Set();
     this.collapsedBlocks = new Set(); // per-block COLLAPSE (default expanded): `${realIdx}:${bi}`
     const fd = foldDefaults();
     this.thinkMode = fd.think ? "expanded" : "collapsed";   // t toggles
@@ -998,6 +1048,8 @@ export class ChatView extends Widget {
     this.cache = new Map();   // node render cache: key → { lines, marks }
     this.cardRanges = [];     // absolute line ranges of card-backed message blocks
     this.welcomeModes = [];   // absolute row y → agent preset id (welcome screen)
+    this.welcomeModeIds = ["standard", "code", "minimal", "cordis"];
+    this.welcomeModeSel = 0;
     this.pressY = null;
     this.pressInfo = null;  // hit identity locked at press time
     this.pressCtx = null;
@@ -1006,7 +1058,14 @@ export class ChatView extends Widget {
     this.selEnd = null;
     this.selAnchor = null;
     this.selFocus = null;
-    this.selectionMode = "character";
+    // Mouse selection is permanently free/character-based. Keyboard selection
+    // has its own Vim-like read-only cursor modes.
+    this.blockItems = [];
+    this.blockSel = -1;
+    this.cursorMode = "block"; // block | normal | visual | visual-line
+    this.cursor = { line: 0, col: 0 };
+    this.visualAnchor = null;
+    this.bindingPending = null; // in-progress two-press chord ({id, slot, part})
     this.clipboardImages = [];
     this.attachments = [];
     this.stepState = { step: null }; // step/start tracking for the mux merge path
@@ -1146,6 +1205,8 @@ export class ChatView extends Widget {
     for (let li = 0; li < this.lineMap.length; li++) {
       if (this.lineMap[li]?.nodeIdx === idx) {
         this.view.anchorLock = null; this.view.follow = false; this.view.scrollY = Math.max(0, li - 2);
+        const block = this.blockItems.findIndex((item) => item.nodeIdx === idx);
+        if (block >= 0) { this.blockSel = block; this.cursor = { line: this.blockItems[block].headerLine, col: 0 }; }
         this.app.redraw();
         return true;
       }
@@ -1199,18 +1260,21 @@ export class ChatView extends Widget {
     this.#rebuild();
   }
 
-  async open(sessionId, epoch = this.app.sessionEpoch) {
+  async open(sessionId, epoch = this.app.sessionEpoch, maxMessages = 80) {
     this.sessionId = sessionId;
     this.nodes = [];
+    this.welcomeModeSel = 0;
+    this.blockSel = -1;
+    this.cursorMode = "block";
+    this.visualAnchor = null;
     this.expanded.clear();
-    this.expandedTools.clear();
     this.collapsedBlocks.clear();
     this.hasMore = false;
     this.minSeq = null;
     this.cache.clear();
     this.app.setStatus(`加载会话 ${sessionId.slice(0, 8)}…`);
     try {
-      const hist = await this.app.api.call("session.history", { sessionId });
+      const hist = await this.app.api.call("session.history", { sessionId, maxMessages });
       if (this.sessionId !== sessionId || this.app.sessionEpoch !== epoch) return;
       this.minSeq = hist.events[0]?.event?.seq ?? null;
       this.lastSeq = hist.events[hist.events.length - 1]?.event?.seq ?? null;
@@ -1234,7 +1298,7 @@ export class ChatView extends Widget {
     this.view.follow = true;
   }
 
-  async loadOlder(onDone = null) {
+  async loadOlder(onDone = null, maxMessages = 20) {
     if (!this.hasMore || this.loadingOlder || this.minSeq == null) { if (!this.hasMore) this.app.toast("已加载到会话开头"); if (onDone) queueMicrotask(onDone); return; }
     const sessionId = this.sessionId;
     const epoch = this.app.sessionEpoch;
@@ -1243,7 +1307,7 @@ export class ChatView extends Widget {
     const oldLength = this.lines.length;
     this.app.setStatus("加载更早记录…");
     try {
-      const hist = await this.app.api.call("session.history", { sessionId, beforeSeq: this.minSeq, maxMessages: 20 });
+      const hist = await this.app.api.call("session.history", { sessionId, beforeSeq: this.minSeq, maxMessages });
       if (this.sessionId !== sessionId || this.app.sessionEpoch !== epoch) { this.loadingOlder = false; return; }
       if (hist.events.length === 0) { this.hasMore = false; }
       else {
@@ -1254,6 +1318,24 @@ export class ChatView extends Widget {
         this.hasMore = hist.hasMore && this.minSeq < previousMinSeq;
         this.#noteEarliest(hist.events);
         const more = nodeForEvents(hist.events, this.app.log);
+        const shift = more.length;
+        if (shift > 0) {
+          const shiftedExpanded = new Set();
+          for (const key of this.expanded) {
+            if (typeof key === "number") shiftedExpanded.add(key + shift);
+            else if (typeof key === "string" && /^(\d+):(\d+)$/.test(key)) {
+              const [, ni, bi] = /^(\d+):(\d+)$/.exec(key); shiftedExpanded.add(`${Number(ni) + shift}:${bi}`);
+            } else shiftedExpanded.add(key); // dispatch ids are stable callIds
+          }
+          const shiftedCollapsed = new Set();
+          for (const key of this.collapsedBlocks) {
+            const match = /^(\d+):(\d+)$/.exec(String(key));
+            shiftedCollapsed.add(match ? `${Number(match[1]) + shift}:${match[2]}` : key);
+          }
+          this.expanded = shiftedExpanded;
+          this.collapsedBlocks = shiftedCollapsed;
+          this.cache.clear();
+        }
         this.nodes = [...more, ...this.nodes];
       }
     } catch (e) {
@@ -1360,7 +1442,7 @@ export class ChatView extends Widget {
     const trimmed = text.trim();
     if (trimmed === "/reload") { this.app.softReload(); return; }
     if (trimmed === "/restart") { this.app.restartApp(); return; }
-    if (trimmed === "/model") { this.app.showModePicker(); return; }
+    if (trimmed === "/model") { this.app.overlay = buildModelPicker(this.app); this.app.redraw(); return; }
     if (trimmed === "/theme") { cycleTheme(); this.queueRebuild(); this.app.toast(`主题已切换: ${themeName()}`); return; }
     if (trimmed === "/permission") { this.app.showPermissionPicker(); return; }
     if (trimmed === "/goal") { this.app.showGoal(); return; }
@@ -1601,7 +1683,11 @@ export class ChatView extends Widget {
         return true;
       }
     }
-    if (node.kind === "assistant" || node.kind === "user") {
+    // Node-level folds: user messages plus the notice/context cards that
+    // explicitly render [点击展开]/[点击折叠]. They all use the same stable
+    // node index key, so clicking any marked row (header, preview, or hint)
+    // toggles the exact card the user saw.
+    if (["assistant", "user", "context", "goal-round", "subagent-receipt"].includes(node.kind)) {
       if (this.expanded.has(info.nodeIdx)) this.expanded.delete(info.nodeIdx);
       else this.expanded.add(info.nodeIdx);
       this.#rebuild();
@@ -1612,6 +1698,8 @@ export class ChatView extends Widget {
   }
 
   #rebuild() {
+    const oldBlock = this.blockItems?.[this.blockSel] ?? null;
+    const oldIdentity = oldBlock ? `${oldBlock.nodeKey}:${oldBlock.blockIdx ?? "n"}:${oldBlock.kind}:${oldBlock.codeIndex ?? "-"}` : null;
     const w = Math.max(20, this.view.w - 2);
     const lines = [];
     const lineMap = [];
@@ -1701,7 +1789,7 @@ export class ChatView extends Widget {
           const text = node.text ?? "";
           const summary = node.source?.summary;
           const label = node.kind === "goal-round" ? `🎯 目标续轮 ${node.source?.round ?? ""}`
-            : node.kind === "subagent-receipt" ? (node.source?.kind === "subagent-settled" ? "🛰 子代理状态" : "🛰 子代理回执")
+            : node.kind === "subagent-receipt" ? (node.source?.kind === "subagent-settled" ? "◇ 子代理状态" : "◇ 子代理回执")
             : `ℹ 上下文 · ${node.source?.kind ?? "注入"}`;
           beginCard(node.kind === "goal-round" ? "THINKBG" : "CARD");
           lines.push([{ t: `  ${label}${summary ? ` — ${truncate(summary, w - strWidth(label) - 8)}` : ""}`, fg: node.kind === "subagent-receipt" ? T.PURPLE : K.DIM, bold: true }]);
@@ -1811,8 +1899,12 @@ export class ChatView extends Widget {
               // failed exit code.
               const stopped = !running && (b.stopped || signal === "SIGTERM" || signal === "SIGINT");
               const failed = !orphan && !stopped && (b.isError || signal || (exitCode !== undefined && exitCode !== 0));
-              const status = running ? "TOOLBG" : failed ? "TOOLERR" : stopped ? "TOOLBG" : "TOOLOK";
-              const glyph = running ? "⏳" : failed ? "✗" : stopped ? "⏸" : orphan ? "◌" : "✓";
+              // High-frequency tool calls need a quiet hierarchy: the same
+              // neutral gray CARD used by ordinary output marks the clickable
+              // range; green is reserved for the formal assistant output below.
+              // Failed tools remain explicit text but never paint a red block.
+              const status = "CARD";
+              const glyph = running ? "⏳" : failed ? "!" : stopped ? "⏸" : orphan ? "◌" : "✓";
               const card = cardView ? renderToolCard(cardView, w, open) : [];
               beginCard(status);
               let timing = "";
@@ -1829,7 +1921,7 @@ export class ChatView extends Widget {
               lines.push([
                 { t: open ? "▾ " : "▸ ", fg: K.ACCENT },
                 { t: ` ${b.name ?? "tool"}`, fg: K.TXT, bold: true },
-                { t: ` ${glyph}`, fg: failed ? K.ERR : status === "TOOLOK" ? K.OK : K.WARN },
+                { t: ` ${glyph}`, fg: failed ? K.WARN : running ? K.DIM : K.OK },
                 { t: stepTag + timing, fg: K.DIM },
                 { t: open ? " [b 折叠]" : " [b 展开]", fg: K.FAINT },
               ]);
@@ -1938,7 +2030,10 @@ export class ChatView extends Widget {
               mark(realIdx, bi);
               sep();
             } else {
-              beginCard("CARD");
+              // Swap the previous visual priority: completed assistant output
+              // gets the restrained green background, while high-frequency
+              // tool cards use neutral gray only to reveal their click range.
+              beginCard("TOOLOK");
               // FORMAL text output is NOT collapsible — the user's message
               // content must stay readable; only think/tool blocks fold.
               // A neutral assistant glyph identifies model output without
@@ -2023,10 +2118,198 @@ export class ChatView extends Widget {
     }
     this.lines = lines;
     this.lineMap = lineMap;
+    this.#rebuildBlockItems(oldIdentity);
     if (process.env.DSH_TUI_DEBUG_CLICK && lineMap.length !== lines.length) {
       this.#clickLog(`INVARIANT BROKEN: lines=${lines.length} lineMap=${lineMap.length}`);
     }
     this.view.setLines(lines);
+  }
+
+  #rebuildBlockItems(oldIdentity = null) {
+    const items = [];
+    const nonBlank = (line) => (this.lines[line] ?? []).some((seg) => (seg.t ?? "").trim() !== "");
+    const keyOf = (mark) => {
+      if (!mark || mark.nodeIdx == null || mark.nodeIdx < 0) return null;
+      if (mark.imgIdx !== undefined) return `${mark.nodeIdx}:img:${mark.imgIdx}`;
+      if (mark.dispatchId != null) return `${mark.nodeIdx}:${mark.blockIdx}:dispatch:${mark.dispatchId}`;
+      return `${mark.nodeIdx}:${mark.blockIdx ?? "node"}`;
+    };
+    for (let start = 0; start < this.lineMap.length;) {
+      const key = keyOf(this.lineMap[start]);
+      if (key === null) { start++; continue; }
+      let end = start + 1;
+      while (end < this.lineMap.length && keyOf(this.lineMap[end]) === key) end++;
+      const mark = this.lineMap[start];
+      const node = this.nodes[mark.nodeIdx];
+      let first = -1, last = -1;
+      for (let line = start; line < end; line++) if (nonBlank(line)) { if (first < 0) first = line; last = line; }
+      if (first >= 0 && node) {
+        const block = mark.blockIdx != null ? node.blocks?.[mark.blockIdx] : null;
+        const baseKind = mark.imgIdx !== undefined ? "image" : mark.dispatchId != null ? "tool" : block?.kind ?? node.kind;
+        const nodeKey = node.id ?? `seq:${node.firstSeq ?? "?"}:${node.kind}`;
+        const base = { first, last, headerLine: first, nodeIdx: mark.nodeIdx, nodeKey, blockIdx: mark.blockIdx ?? null, kind: baseKind, foldable: false, code: null };
+        if (block?.kind === "reasoning" || block?.kind === "tool" || mark.dispatchId != null) base.foldable = true;
+        else if (!block && ["user", "context", "goal-round", "subagent-receipt"].includes(node.kind)) base.foldable = true;
+        if (block?.kind === "text") {
+          const ranges = [];
+          let codeIndex = 0;
+          for (let line = first; line <= last; line++) {
+            const codeSeg = (this.lines[line] ?? []).find((seg) => seg.codeBlock || seg.copyCode);
+            const meta = codeSeg?.codeBlock;
+            if (!meta) continue;
+            const prev = ranges.at(-1);
+            if (prev?.meta === meta && line === prev.last + 1) prev.last = line;
+            else ranges.push({ first: line, last: line, meta, codeIndex: codeIndex++ });
+          }
+          let cursor = first;
+          for (const range of ranges) {
+            let proseEnd = range.first - 1;
+            while (proseEnd >= cursor && !nonBlank(proseEnd)) proseEnd--;
+            if (proseEnd >= cursor) items.push({ ...base, first: cursor, last: proseEnd, headerLine: cursor, kind: "text" });
+            items.push({ ...base, first: range.first, last: range.last, headerLine: range.first, kind: "code", codeIndex: range.codeIndex, code: { text: range.meta.text ?? "", lang: range.meta.lang ?? "text" } });
+            cursor = range.last + 1;
+          }
+          while (cursor <= last && !nonBlank(cursor)) cursor++;
+          if (cursor <= last) items.push({ ...base, first: cursor, last, headerLine: cursor, kind: "text" });
+          if (ranges.length === 0) items.push(base);
+        } else items.push(base);
+      }
+      start = end;
+    }
+    this.blockItems = items;
+    let next = oldIdentity == null ? -1 : items.findIndex((item) => `${item.nodeKey}:${item.blockIdx ?? "n"}:${item.kind}:${item.codeIndex ?? "-"}` === oldIdentity);
+    if (next < 0) {
+      // New/opened sessions land on the latest textual conversation block,
+      // not on an incidental retry/status/image row after it.
+      for (let i = items.length - 1; i >= 0; i--) {
+        if (["text", "code", "user"].includes(items[i].kind)) { next = i; break; }
+      }
+      if (next < 0) next = items.length - 1;
+    }
+    this.blockSel = next;
+    const selected = items[next];
+    if (selected && this.cursorMode === "block") this.cursor = { line: selected.headerLine, col: Math.max(0, strWidth(this.#lineText(selected.headerLine)) - 1) };
+  }
+
+  #lineText(line) { return (this.lines[line] ?? []).map((seg) => seg.t ?? "").join(""); }
+
+  #scrollToTranscriptLine(line) {
+    this.view.follow = false;
+    this.view.anchorLock = null;
+    if (line < this.view.scrollY) this.view.scrollY = line;
+    else if (line >= this.view.scrollY + this.view.h) this.view.scrollY = Math.max(0, line - this.view.h + 1);
+  }
+
+  #moveBlock(delta) {
+    if (this.blockItems.length === 0) return false;
+    // Bounded, Vim-style: the block cursor stops at the ends instead of
+    // wrapping. Wrapping from the newest block to the oldest felt like a jump,
+    // not navigation.
+    const base = this.blockSel < 0 ? (delta > 0 ? -1 : 0) : this.blockSel;
+    const next = base + delta;
+    if (next < 0 || next >= this.blockItems.length) return true;
+    this.blockSel = next;
+    const item = this.blockItems[this.blockSel];
+    this.cursor = { line: item.headerLine, col: 0 };
+    if (this.cursorMode !== "block") this.#syncKeyboardSelection();
+    this.#scrollToTranscriptLine(item.headerLine);
+    this.app.redraw();
+    return true;
+  }
+
+  #syncKeyboardSelection() {
+    if (this.cursorMode !== "visual" && this.cursorMode !== "visual-line") {
+      this.selStart = this.selEnd = null;
+      this.selAnchor = this.selFocus = null;
+      return;
+    }
+    const anchor = this.visualAnchor ?? this.cursor;
+    let a = { ...anchor }, b = { ...this.cursor };
+    if (this.cursorMode === "visual-line") {
+      a.col = 0;
+      b.col = Math.max(0, strWidth(this.#lineText(b.line)) - 1);
+    }
+    this.selAnchor = a; this.selFocus = b;
+    this.selStart = Math.min(a.line, b.line); this.selEnd = Math.max(a.line, b.line);
+  }
+
+  #cursorStops(line = this.cursor.line) {
+    const chars = graphemes(this.#lineText(line));
+    const stops = [];
+    let col = 0;
+    for (const char of chars) { stops.push({ char, col, width: Math.max(1, graphemeWidth(char)) }); col += graphemeWidth(char); }
+    if (stops.length === 0) stops.push({ char: "", col: 0, width: 1 });
+    return stops;
+  }
+
+  #cursorStopIndex(stops = this.#cursorStops()) {
+    let index = 0;
+    for (let i = 0; i < stops.length; i++) { if (stops[i].col <= this.cursor.col) index = i; else break; }
+    return index;
+  }
+
+  #moveCursorHorizontal(delta) {
+    const stops = this.#cursorStops();
+    const index = Math.max(0, Math.min(stops.length - 1, this.#cursorStopIndex(stops) + delta));
+    this.cursor.col = stops[index].col;
+    this.#syncKeyboardSelection(); this.app.redraw(); return true;
+  }
+
+  #wordMotion(kind) {
+    const stops = this.#cursorStops();
+    let pos = this.#cursorStopIndex(stops);
+    const word = (entry) => /[\p{L}\p{N}_]/u.test(entry?.char ?? "");
+    if (kind === "w") { while (pos < stops.length && word(stops[pos])) pos++; while (pos < stops.length && !word(stops[pos])) pos++; }
+    else if (kind === "b") { pos = Math.max(0, pos - 1); while (pos > 0 && !word(stops[pos])) pos--; while (pos > 0 && word(stops[pos - 1])) pos--; }
+    else { while (pos + 1 < stops.length && !word(stops[pos])) pos++; while (pos + 1 < stops.length && word(stops[pos + 1])) pos++; }
+    this.cursor.col = stops[Math.max(0, Math.min(stops.length - 1, pos))].col;
+    this.#syncKeyboardSelection(); this.app.redraw(); return true;
+  }
+
+  #selectedTranscriptText() {
+    if (this.cursorMode === "block" || this.cursorMode === "normal") {
+      const item = this.blockItems[this.blockSel];
+      if (!item) return "";
+      if (item.kind === "code") return item.code?.text ?? "";
+      const node = this.nodes[item.nodeIdx];
+      const block = item.blockIdx != null ? node?.blocks?.[item.blockIdx] : null;
+      if (block) return [block.text ?? block.args ?? "", block.kind === "tool" && block.result != null ? block.result : ""].filter(Boolean).join("\n");
+      return node?.text ?? "";
+    }
+    const a = this.selAnchor, b = this.selFocus;
+    if (!a || !b) return "";
+    const first = a.line < b.line || (a.line === b.line && a.col <= b.col) ? a : b;
+    const last = first === a ? b : a;
+    const cut = (text, from, to) => { let out = "", col = 0; for (const g of graphemes(text)) { const next = col + graphemeWidth(g); if (next > from && col <= to) out += g; col = next; } return out; };
+    return this.lines.slice(first.line, last.line + 1).map((line, index, all) => cut(line.map((seg) => seg.t ?? "").join(""), index === 0 ? first.col : 0, index === all.length - 1 ? last.col : Infinity)).join("\n");
+  }
+
+  #yankTranscript() {
+    const text = this.#selectedTranscriptText();
+    if (!text) { this.app.toast("未选中可复制内容"); return true; }
+    this.app.copyText(text);
+    this.app.toast((this.cursorMode === "block" || this.cursorMode === "normal") ? (this.blockItems[this.blockSel]?.kind === "code" ? "已复制代码块" : "已复制正文块") : "已复制选区");
+    if (this.cursorMode === "visual" || this.cursorMode === "visual-line") { this.cursorMode = "normal"; this.visualAnchor = null; this.selStart = this.selEnd = null; this.selAnchor = this.selFocus = null; }
+    return true;
+  }
+
+  #toggleSelectedBlock() {
+    const item = this.blockItems[this.blockSel];
+    if (!item?.foldable) return false;
+    return this.#toggleAt({ nodeIdx: item.nodeIdx, blockIdx: item.blockIdx });
+  }
+
+  #openSelectedContextMenu() {
+    const item = this.blockItems[this.blockSel];
+    if (!item) return false;
+    const info = { nodeIdx: item.nodeIdx, blockIdx: item.blockIdx };
+    const node = this.nodes[item.nodeIdx];
+    const entries = [{ label: "复制消息", action: () => this.app.copyText(this.#selectedTranscriptText()) }];
+    if (item.foldable) entries.push({ label: "展开 / 折叠", action: () => this.#toggleAt(info) });
+    if (node?.id) entries.push({ label: "转跳轨迹", action: () => this.app.jumpToTrajectoryNode(item.nodeIdx) });
+    entries.push({ label: "加载更早记录", action: () => this.loadOlder() });
+    this.app.openMenu(entries, { x: this.view.x + 2, y: this.view.y + Math.max(0, item.headerLine - this.view.scrollY) });
+    return true;
   }
 
   /** Blank session: whale logo + mode selection prompt (no conversation yet). */
@@ -2065,12 +2348,16 @@ export class ChatView extends Widget {
       ["minimal", "极简模式", "仅持久 bash 与 str_replace_editor 双工具"],
       ["cordis", "创造模式", "标准模式 + 运行时检查/插件实验/预设创作"],
     ];
-    for (const [id, name, desc] of presets) {
+    const currentIdx = presets.findIndex(([id]) => id === currentPreset);
+    if (this.welcomeModeSel == null || this.welcomeModeSel >= presets.length) this.welcomeModeSel = currentIdx >= 0 ? currentIdx : 0;
+    for (let i = 0; i < presets.length; i++) {
+      const [id, name, desc] = presets[i];
       if (y < this.view.y + this.view.h) {
-        const selected = id === currentPreset;
-        const label = `${selected ? "●" : "○"} ${name}${selected ? " [当前]" : ""}`;
-        screen.text(cx, y, `  ${label}`, { fg: selected ? T.OK : T.ACCENT, bg: selected ? T.MENUSEL : -1, attrs: 1 });
-        screen.text(cx + 2 + strWidth(label) + 1, y, truncate(desc, Math.max(1, this.view.w - strWidth(label) - 8)), { fg: selected ? T.TXT : T.DIM, bg: selected ? T.MENUSEL : -1 });
+        const active = id === currentPreset;
+        const cursor = this.app.focused === this && i === this.welcomeModeSel;
+        const label = `${cursor ? "=>" : "  "} ${active ? "●" : "○"} ${name}${active ? " [当前]" : ""}`;
+        screen.text(cx, y, `  ${label}`, { fg: active ? T.OK : cursor ? T.ACCENT : T.DIM, bg: cursor ? T.MENUSEL : -1, attrs: active || cursor ? 1 : 0 });
+        screen.text(cx + 2 + strWidth(label) + 1, y, truncate(desc, Math.max(1, this.view.w - strWidth(label) - 8)), { fg: cursor ? T.TXT : T.DIM, bg: cursor ? T.MENUSEL : -1 });
         this.welcomeModes[y] = id;
       }
       y++;
@@ -2098,7 +2385,38 @@ export class ChatView extends Widget {
         }
       }
     }
+    // A focused atomic code box advertises its keyboard action. The source
+    // line is restored immediately so cache/render data stays immutable.
+    const selectedBlock = this.app.focused === this ? this.blockItems[this.blockSel] : null;
+    let savedCodeLine = null;
+    let codeCaretCol = null;
+    if (selectedBlock?.kind === "code" && this.cursorMode === "normal") {
+      savedCodeLine = this.lines[selectedBlock.headerLine];
+      // Width-neutral swap: [按y复制] replaces [复制] padded to the exact
+      // reserved field, so the right corner/border never shifts.
+      this.lines[selectedBlock.headerLine] = savedCodeLine.map((seg) => seg.copyCode ? { ...seg, t: pad("[按y复制]", strWidth(seg.t ?? "")), fg: T.SELFG, bg: T.ACCENT } : seg);
+      let col = 0;
+      for (const seg of this.lines[selectedBlock.headerLine]) { col += strWidth(seg.t ?? ""); if (seg.copyCode) { codeCaretCol = col; break; } }
+    }
     this.view.render(screen);
+    if (savedCodeLine) this.lines[selectedBlock.headerLine] = savedCodeLine;
+    // Block mode has a two-cell gutter marker; cursor modes draw a one-cell
+    // caret to the right of the current grapheme/code atom.
+    if (this.app.focused === this && selectedBlock) {
+      if (this.cursorMode === "block") {
+        const row = selectedBlock.headerLine - this.view.scrollY;
+        if (row >= 0 && row < this.view.h) screen.text(this.view.x, this.view.y + row, "=>", { fg: T.SELFG, bg: T.ACCENT, attrs: 1 });
+      } else {
+        const caretLine = selectedBlock.kind === "code" && this.cursorMode === "normal" ? selectedBlock.headerLine : this.cursor.line;
+        const row = caretLine - this.view.scrollY;
+        if (row >= 0 && row < this.view.h) {
+          const stops = this.#cursorStops(caretLine);
+          const stop = stops[this.#cursorStopIndex(stops)];
+          const codeCol = selectedBlock.kind === "code" ? Math.min(this.view.w - 2, codeCaretCol ?? 0) : this.cursor.col + (stop?.width ?? 1);
+          screen.put(this.view.x + Math.max(0, Math.min(this.view.w - 2, codeCol)), this.view.y + row, "|", { fg: T.SELFG, bg: T.ACCENT, attrs: 1 });
+        }
+      }
+    }
     this.#renderDiving(screen);
     if (this.selStart !== null && this.selEnd !== null) {
       const y0 = Math.max(this.view.scrollY, this.selStart);
@@ -2106,7 +2424,7 @@ export class ChatView extends Widget {
       if (y1 >= y0) {
         for (let line = y0; line <= y1; line++) {
           let x0 = this.view.x, x1 = this.view.x + this.view.w - 2;
-          if (this.selectionMode === "character" && this.selAnchor && this.selFocus) {
+          if (this.selAnchor && this.selFocus) {
             const a = this.selAnchor, b = this.selFocus;
             const first = a.line < b.line || (a.line === b.line && a.col <= b.col) ? a : b;
             const last = first === a ? b : a;
@@ -2170,7 +2488,7 @@ export class ChatView extends Widget {
     if (subagent) {
       const timing = this.app.projections.subagentTiming;
       const ms = (timing?.settledMs ?? 0) + (timing?.active ? Math.max(0, Date.now() - timing.active.since) : 0);
-      screen.text(this.x, row++, ` 🛰 子代理 · ${subagent.label ?? subagent.mode}${ms ? ` · ${fmtDuration(ms)}` : ""}`, { fg: T.PURPLE, bg: T.STATUSBG, bold: true });
+      screen.text(this.x, row++, ` ◇ 子代理 · ${subagent.label ?? subagent.mode}${ms ? ` · ${fmtDuration(ms)}` : ""}`, { fg: T.PURPLE, bg: T.STATUSBG, bold: true });
     }
     if (!todos.length) return;
     const done = todos.filter((t) => t.status === "completed").length;
@@ -2260,7 +2578,7 @@ export class ChatView extends Widget {
           this.pressInfo = null; this.pressCtx = null;
           const rows = this.selEnd - this.selStart + 1;
           let text;
-          if (this.selectionMode === "character" && this.selAnchor && this.selFocus) {
+          if (this.selAnchor && this.selFocus) {
             const a = this.selAnchor, b = this.selFocus;
             const first = a.line < b.line || (a.line === b.line && a.col <= b.col) ? a : b;
             const last = first === a ? b : a;
@@ -2311,63 +2629,72 @@ export class ChatView extends Widget {
     return false;
   }
 
+  /** Match one event against the editable transcript bindings. Two-press
+   *  chords arm `bindingPending`; any other key disarms it. */
+  #matchChatBinding(ev) {
+    if (ev.type !== "key" || this.app.focused !== this) { this.bindingPending = null; return null; }
+    const bindings = keyBindings();
+    for (const id of CHAT_BINDING_ORDER) {
+      const spec = bindings[id];
+      if (!spec || spec.mode === "insert") continue;
+      const pending = this.bindingPending?.id === id ? this.bindingPending : null;
+      const hit = matchKeyBinding(ev, spec, pending);
+      if (hit?.kind === "pending") {
+        this.bindingPending = { id, slot: hit.slot, part: hit.part };
+        this.app.toast("再按一次完成组合键");
+        return null;
+      }
+      if (hit?.kind === "full") { this.bindingPending = null; return { id }; }
+    }
+    this.bindingPending = null;
+    return null;
+  }
+
   onKey(ev) {
+    const blankWelcome = this.nodes.length === 0 && (this.app.sessions.find((s) => s.sessionId === this.sessionId)?.blank ?? false);
+    if (blankWelcome && ev.type === "key" && (ev.name === "up" || ev.name === "down")) {
+      this.welcomeModeSel = wrapIndex(this.welcomeModeSel + (ev.name === "up" ? -1 : 1), this.welcomeModeIds.length);
+      return true;
+    }
+    if (blankWelcome && ev.type === "key" && ev.name === "enter") {
+      this.app.selectPreset(this.welcomeModeIds[this.welcomeModeSel]);
+      return true;
+    }
     if (ev.type === "text" || ev.type === "paste") {
+      // In cursor/Visual modes text is never inserted into the transcript or
+      // silently redirected to INSERT. Only explicit i enters the input editor.
+      if (this.cursorMode !== "block") return true;
       this.app.focus(this.input);
       this.input.insert(ev.text);
       return true;
     }
     if (ev.type !== "key") return false;
     if (this.app.focused === this.input) return false;
-    if (ev.name !== "char" || ev.key !== "g") this.gKey = false;
-    switch (ev.name) {
-      case "up": return this.view.scroll(-3);
-      case "down": return this.view.scroll(3);
-      case "pgup": {
-        if (this.view.scrollY <= this.view.h) { void this.loadOlder(); return true; }
-        return this.view.scroll(-this.view.h);
-      }
-      case "pgdn": return this.view.scroll(this.view.h);
+    if (ev.ctrl && (ev.name === "up" || ev.name === "down")) { this.view.scroll(ev.name === "up" ? -3 : 3); this.app.redraw(); return true; }
+    if (ev.name === "up" || ev.name === "down") return this.#moveBlock(ev.name === "up" ? -1 : 1);
+    if (ev.name === "pgup") { if (this.view.scrollY <= this.view.h) { void this.loadOlder(); return true; } return this.view.scroll(-this.view.h); }
+    if (ev.name === "pgdn") return this.view.scroll(this.view.h);
+    // Editable transcript bindings (two slots each): think/tools/insert/
+    // top/bottom/prevQuestion/nextQuestion/sessionFilter.
+    const chatHit = this.#matchChatBinding(ev);
+    if (chatHit?.id === "top") {
+      this.blockSel = 0; const item = this.blockItems[0]; if (item) { this.cursor = { line: item.headerLine, col: 0 }; this.#scrollToTranscriptLine(item.headerLine); } return true;
     }
-    if (ev.name === "char" && ev.key === "g" && !ev.ctrl && !ev.alt && !ev.shift) {
-      if (this.gKey) { this.gKey = false; this.view.anchorLock = null; this.view.follow = false; this.view.scrollY = 0; return true; }
-      this.gKey = true;
-      this.app.toast("再按 g 回顶");
-      return true;
+    if (chatHit?.id === "bottom") {
+      if (this.blockItems.length === 0) return true;
+      // Vim G: the newest block gets the cursor, and its header lands at the
+      // bottom of the viewport so the arrow is always visible with the tail.
+      this.blockSel = this.blockItems.length - 1;
+      const item = this.blockItems[this.blockSel];
+      this.cursor = { line: item.headerLine, col: 0 };
+      this.view.follow = false; this.view.anchorLock = null;
+      this.view.scrollY = Math.max(0, Math.min(this.view.maxScroll(), item.headerLine - Math.max(1, this.view.h - 2)));
+      this.app.redraw(); return true;
     }
-    if (ev.name === "char" && ev.key === "g" && ev.shift && !ev.alt) { this.view.anchorLock = null; this.view.follow = true; this.view.scrollY = this.view.maxScroll(); return true; }
-    // [ / ] — jump to the end of the previous / next user question. Guarded by
-    // focus so the sidebar's session-move [ ] keys keep working there.
-    if (ev.name === "char" && (ev.key === "[" || ev.key === "]") && !ev.ctrl && !ev.shift && this.app.focused === this) {
-      return this.#jumpQuestion(ev.key === "[" ? -1 : 1);
-    }
-    if (ev.name === "escape" && this.app.searchQuery) { this.app.searchQuery = null; this.queueRebuild(); return true; }
-    if (ev.name === "escape" && this.selStart !== null) { this.selStart = this.selEnd = null; this.selAnchor = this.selFocus = null; this.app.redraw(); return true; }
-    if (ev.name === "char" && ev.key === "v" && !ev.ctrl && !ev.alt) { this.selectionMode = this.selectionMode === "character" ? "line" : "character"; this.app.toast(`正文选择：${this.selectionMode === "character" ? "字符自由选择" : "整行选择"}（v 切换）`); return true; }
-    if (ev.name === "char" && ev.key === "i" && !ev.ctrl && !ev.alt) { this.app.focus(this.input); return true; }
-    if (ev.name === "char" && ev.key === "/" && !ev.ctrl && !ev.alt) { this.app.startSearch(); return true; }
-    if (ev.name === "char" && ev.key === "b" && !ev.ctrl && !ev.alt) {
-      this.bashMode = this.bashMode === "collapsed" ? "expanded" : "collapsed";
-      this.expanded.clear();
-      this.collapsedBlocks.clear();
-      this.app.toast(this.bashMode === "collapsed" ? "工具块：折叠（b 展开）" : "工具块：展开（b 折叠）");
-      this.queueRebuild();
-      return true;
-    }
-    if (ev.name === "char" && ev.key === "t" && !ev.ctrl && !ev.alt) {
-      if (ev.shift) {
-        const wasPinned = this.view.follow || this.view.scrollY >= this.view.maxScroll();
-        const oldMax = this.view.maxScroll();
-        this.todosVisible = !this.todosVisible;
-        this.app.toast(this.todosVisible ? "任务块：已展开（Shift+T 最小化）" : "任务块：已最小化（Shift+T 展开）");
-        this.inputChanged();
-        // Re-anchor immediately: tail readers stay at the tail; readers higher
-        // in history keep the same visible transcript row without a manual nudge.
-        if (wasPinned) { this.view.scrollY = this.view.maxScroll(); this.view.follow = true; }
-        else this.view.scrollY = Math.max(0, Math.min(this.view.maxScroll(), this.view.scrollY + (this.view.maxScroll() - oldMax)));
-        this.app.redraw();
-        return true;
-      }
+    if (chatHit?.id === "prevQuestion" || chatHit?.id === "nextQuestion") return this.#jumpQuestion(chatHit.id === "prevQuestion" ? -1 : 1);
+    if (chatHit?.id === "insert") { this.app.focus(this.input); return true; }
+    if (chatHit?.id === "sessionFilter") { this.app.startSearch(); return true; }
+    if (chatHit?.id === "think" && this.cursorMode === "block") {
       this.thinkMode = this.thinkMode === "collapsed" ? "expanded" : "collapsed";
       this.expanded.clear();
       this.collapsedBlocks.clear();
@@ -2375,6 +2702,43 @@ export class ChatView extends Widget {
       this.queueRebuild();
       return true;
     }
+    if (chatHit?.id === "tools" && this.cursorMode === "block") {
+      this.bashMode = this.bashMode === "collapsed" ? "expanded" : "collapsed";
+      this.expanded.clear();
+      this.collapsedBlocks.clear();
+      this.app.toast(this.bashMode === "collapsed" ? "工具块：折叠（b 展开）" : "工具块：展开（b 折叠）");
+      this.queueRebuild();
+      return true;
+    }
+    if (ev.name === "char" && ev.key === "t" && ev.shift && !ev.ctrl && !ev.alt && this.cursorMode === "block") {
+      const wasPinned = this.view.follow || this.view.scrollY >= this.view.maxScroll();
+      const oldMax = this.view.maxScroll();
+      this.todosVisible = !this.todosVisible;
+      this.app.toast(this.todosVisible ? "任务块：已展开（Shift+T 最小化）" : "任务块：已最小化（Shift+T 展开）");
+      this.inputChanged();
+      // Re-anchor immediately: tail readers stay at the tail; readers higher
+      // in history keep the same visible transcript row without a manual nudge.
+      if (wasPinned) { this.view.scrollY = this.view.maxScroll(); this.view.follow = true; }
+      else this.view.scrollY = Math.max(0, Math.min(this.view.maxScroll(), this.view.scrollY + (this.view.maxScroll() - oldMax)));
+      this.app.redraw();
+      return true;
+    }
+    if (ev.name === "escape" && this.app.searchQuery) { this.app.searchQuery = null; this.queueRebuild(); return true; }
+    if (ev.name === "escape" && this.cursorMode !== "block") { this.cursorMode = "block"; this.visualAnchor = null; this.#syncKeyboardSelection(); this.app.redraw(); return true; }
+    if (ev.name === "escape" && this.selStart !== null) { this.selStart = this.selEnd = null; this.selAnchor = this.selFocus = null; this.app.redraw(); return true; }
+    if (ev.name === "enter" && this.blockItems[this.blockSel]) { this.cursorMode = "normal"; const item = this.blockItems[this.blockSel]; this.cursor = { line: item.headerLine, col: Math.max(0, strWidth(this.#lineText(item.headerLine)) - 1) }; this.app.redraw(); return true; }
+    if (ev.name === "char" && ev.key === "j" && !ev.ctrl && !ev.alt) return this.#moveBlock(1);
+    if (ev.name === "char" && ev.key === "k" && !ev.ctrl && !ev.alt) return this.#moveBlock(-1);
+    if (ev.name === "char" && ev.key === "h" && !ev.ctrl && !ev.alt && this.cursorMode !== "block") { if (this.cursorMode === "normal" && this.blockItems[this.blockSel]?.kind === "code") return true; return this.#moveCursorHorizontal(-1); }
+    if (ev.name === "char" && ev.key === "l" && !ev.ctrl && !ev.alt && this.cursorMode !== "block") { if (this.cursorMode === "normal" && this.blockItems[this.blockSel]?.kind === "code") return true; return this.#moveCursorHorizontal(1); }
+    if (ev.name === "char" && ["w", "b", "e"].includes(ev.key) && !ev.ctrl && !ev.alt && this.cursorMode !== "block") { if (this.cursorMode === "normal" && this.blockItems[this.blockSel]?.kind === "code") return true; return this.#wordMotion(ev.key); }
+    if (ev.name === "char" && ev.key === "0" && !ev.ctrl && !ev.alt && this.cursorMode !== "block") { this.cursor.col = 0; this.#syncKeyboardSelection(); this.app.redraw(); return true; }
+    if (ev.name === "char" && ev.key === "$" && !ev.ctrl && !ev.alt && this.cursorMode !== "block") { const stops = this.#cursorStops(); this.cursor.col = stops[stops.length - 1].col; this.#syncKeyboardSelection(); this.app.redraw(); return true; }
+    if (ev.name === "char" && ev.key === "v" && !ev.ctrl && !ev.alt) { this.cursorMode = ev.shift ? "visual-line" : "visual"; this.visualAnchor = { ...this.cursor }; this.#syncKeyboardSelection(); this.app.toast(ev.shift ? "VISUAL LINE（只读）" : "VISUAL（只读）"); return true; }
+    if (ev.name === "char" && ev.key === "y" && !ev.ctrl && !ev.alt) return this.#yankTranscript();
+    if (ev.name === "char" && ev.key === "c" && ev.ctrl && ev.shift) return this.#yankTranscript();
+    if (ev.name === "char" && ev.key === " " && !ev.ctrl && !ev.alt) { this.#toggleSelectedBlock(); return true; }
+    if (ev.name === "char" && ev.key === "r" && ev.ctrl) return this.#openSelectedContextMenu();
     return false;
   }
 }
@@ -2574,8 +2938,8 @@ export class QuestionPopup extends Popup {
     if(this.customEditing&&ev.name==="right"){this.customCursor=Math.min(Array.from(draft.custom).length,this.customCursor+1);return true;}
     if(this.customEditing&&ev.name==="home"){this.customCursor=0;return true;}
     if(this.customEditing&&ev.name==="end"){this.customCursor=Array.from(draft.custom).length;return true;}
-    if (ev.name === "up") { this.customEditing=false;this.selIdx = Math.max(0, this.selIdx - 1); return true; }
-    if (ev.name === "down") { this.customEditing=false;this.selIdx = Math.min(Math.max(0, choices - 1), this.selIdx + 1); return true; }
+    if (ev.name === "up") { this.customEditing=false;this.selIdx = wrapIndex(this.selIdx - 1, choices); return true; }
+    if (ev.name === "down") { this.customEditing=false;this.selIdx = wrapIndex(this.selIdx + 1, choices); return true; }
     if (ev.name === "char" && ev.key === " " && count && this.selIdx<count) { this.#choose(this.selIdx); return true; }
     if (ev.name === "backspace" && this.customEditing && this.customCursor>0) {const chars=Array.from(draft.custom);chars.splice(this.customCursor-1,1);draft.custom=chars.join("");this.customCursor--;return true;}
     if(ev.name==="delete"&&this.customEditing){const chars=Array.from(draft.custom);if(this.customCursor<chars.length){chars.splice(this.customCursor,1);draft.custom=chars.join("");}return true;}
@@ -2695,7 +3059,6 @@ export class App {
     this.sessionEpoch = 0;
     this.refreshSessionsSeq = 0;
     this.searchSeq = 0;
-    this.searchSelected = 0;
     this.connState = "connecting";
     this.tokenUsage = null;
     this.sessions = [];
@@ -2707,6 +3070,7 @@ export class App {
     };
     this.searchActive = false;
     this.overlay = null;       // Picker / Popup / ImagePopup modal
+    this.fullBuffer = null;    // full-screen panel buffer (workspace/settings/models/subagent/skills)
     this.mode = "chat";        // chat | workspace | trajectory
     this.sidebarWanted = true;
     this.sidebarVisible = true; // auto-collapses on narrow terminals
@@ -2729,7 +3093,8 @@ export class App {
     this.sidebar = new SidebarTree(this);
     this.sidebar.w = this.sidebarWidth;
     this.sidebar.h = screen.h - 1;
-    this.searchInput = new Input({ x: 0, y: 0, w: this.sidebarWidth, h: 1, prompt: "/ ", placeholder: "搜索会话…" });
+    this.searchInput = new Input({ x: 0, y: 0, w: this.sidebarWidth, h: 1, prompt: "/ ", placeholder: "输入跨会话全文查询，Enter 执行…" });
+    this.searchState = null;
     this.chat = new ChatView({ x: this.sidebarWidth, y: 0, w: screen.w - this.sidebarWidth, h: screen.h - 1, app: this });
     this.status = new StatusBar({ x: 0, y: screen.h - 1, w: screen.w, h: 1 });
     this.focus(this.chat);
@@ -2753,9 +3118,8 @@ export class App {
     this.sidebar.x = 0; this.sidebar.y = 0; this.sidebar.w = this.sidebarWidth; this.sidebar.h = this.screen.h - 1;
     this.searchInput.w = this.sidebarWidth;
     this.chat.resize(x, 1, w, mainH);
-    for (const p of [this.workspacePanel, this.trajectoryPanel, this.settingsPanel, this.modelPanel, this.subagentPanel, this.skillsPanel]) {
-      if (p?.relayout) p.relayout(x, 1, w, mainH);
-    }
+    if (this.trajectoryPanel?.relayout) this.trajectoryPanel.relayout(x, 1, w, mainH);
+    if (this.fullBuffer?.relayout) this.fullBuffer.relayout(0, 0, this.screen.w, this.screen.h);
     this.status.y = this.screen.h - footerH;
     this.status.h = footerH;
     this.status.w = this.screen.w;
@@ -2770,6 +3134,27 @@ export class App {
   toggleChatTrajectory() {
     if (!this.currentSession) { this.toast("先打开一个会话"); return; }
     this.setMode(this.mode === "trajectory" ? "chat" : "trajectory");
+  }
+
+  /** tmux-style pane focus. The sequence wraps and skips unavailable panes. */
+  focusPane(delta) {
+    const panes = [];
+    if (this.sidebarVisible) panes.push("sidebar");
+    panes.push("chat");
+    if (this.currentSession) panes.push("trajectory");
+    const current = this.focused === this.sidebar ? "sidebar" : this.mode === "trajectory" ? "trajectory" : "chat";
+    const next = panes[wrapIndex(Math.max(0, panes.indexOf(current)) + delta, panes.length)];
+    if (next === "sidebar") {
+      this.focus(this.sidebar);
+    } else if (next === "trajectory") {
+      this.setMode("trajectory");
+      this.focus(this.trajectoryPanel ?? this.chat);
+    } else {
+      this.setMode("chat");
+      this.focus(this.chat);
+    }
+    this.redraw();
+    return true;
   }
 
   async checkUpdates(target = null, notify = false) {
@@ -3342,6 +3727,7 @@ export class App {
         ? { workspaceId: group.workspaceId }
         : { cwd: group?.path ?? process.cwd() };
       const { sessionId } = await this.api.call("session.create", payload);
+      if (typeof sessionId !== "string" || !sessionId) throw new Error("Host 未返回会话 ID");
       await this.refreshSessions();
       this.openSession(sessionId);
     } catch (e) { this.toast(`创建失败: ${e.message}`); }
@@ -3355,6 +3741,7 @@ export class App {
   async newSession() { return this.newSessionIn(null); }
 
   async openSession(sessionId) {
+    if (typeof sessionId !== "string" || !sessionId) { this.toast("无法打开会话：缺少会话 ID"); return; }
     const epoch = ++this.sessionEpoch;
     this.currentSession = sessionId;
     this.projections = { ...(this.projectionsBySession.get(sessionId) ?? {}) };
@@ -3373,6 +3760,12 @@ export class App {
       this.api.refreshMux();
     }
     await this.chat.open(sessionId, epoch);
+    if (epoch !== this.sessionEpoch || sessionId !== this.currentSession) return;
+    // A sidebar Enter intentionally preserves sidebar focus, but every
+    // session-scoped panel must immediately follow the newly opened session.
+    if (this.mode === "trajectory" && this.trajectoryPanel) await this.trajectoryPanel.load(sessionId);
+    else if (this.fullBuffer && this.fullBuffer === this.subagentPanel) this.subagentPanel.load(sessionId);
+    else if (this.fullBuffer && this.fullBuffer === this.skillsPanel) this.skillsPanel.load?.(sessionId);
     if (epoch !== this.sessionEpoch || sessionId !== this.currentSession) return;
     this.loadFeedback(sessionId, epoch);
     this.updateModel(sessionId, epoch);
@@ -3412,47 +3805,50 @@ export class App {
   }
 
   setMode(mode) {
-    this.mode = mode;
-    if (mode === "workspace") {
-      if (!this.workspacePanel) {
-        this.workspacePanel = new WorkspacePanel(this);
-        this.workspacePanel.load();
-      } else {
-        this.workspacePanel.load();
-      }
-    } else if (mode === "trajectory") {
+    this.mode = mode === "trajectory" ? "trajectory" : "chat";
+    if (this.mode === "trajectory") {
       if (!this.currentSession) { this.toast("先打开一个会话"); this.mode = "chat"; this.redraw(); return; }
       if (!this.trajectoryPanel) this.trajectoryPanel = new TrajectoryPanel(this);
       this.trajectoryPanel.load(this.currentSession);
-    } else if (mode === "settings") {
-      if (!this.settingsPanel) this.settingsPanel = new SettingsPanel(this);
-      this.settingsPanel.load();
-    } else if (mode === "models") {
-      if (!this.modelPanel) this.modelPanel = new ModelPanel(this);
-      this.modelPanel.load();
-    } else if (mode === "subagent") {
-      if (!this.currentSession) { this.toast("先打开一个会话"); this.mode = "chat"; this.redraw(); return; }
-      if (!this.subagentPanel) this.subagentPanel = new SubagentPanel(this);
-      this.subagentPanel.load(this.currentSession);
-    } else if (mode === "skills") {
-      if (!this.currentSession) { this.toast("先打开一个会话"); this.mode = "chat"; this.redraw(); return; }
-      if (!this.skillsPanel) this.skillsPanel = new SkillsPanel(this);
-      this.skillsPanel.load();
     }
+    const panel = this.panelForMode();
+    if (panel && this.focused !== this.sidebar) this.focus(panel);
+    else if (this.focused !== this.sidebar) this.focus(this.chat);
     this.layout();
     this.redraw();
   }
 
-  panelForMode() {
-    switch (this.mode) {
-      case "workspace": return this.workspacePanel;
-      case "trajectory": return this.trajectoryPanel;
-      case "settings": return this.settingsPanel;
-      case "models": return this.modelPanel;
-      case "subagent": return this.subagentPanel;
-      case "skills": return this.skillsPanel;
-      default: return null;
-    }
+  panelForMode() { return this.mode === "trajectory" ? this.trajectoryPanel : null; }
+
+  /** Full-screen modal buffers replace the old tab-page modes: they coexist
+   *  with the sidebar/chat/trajectory pane focus instead of fighting it. */
+  openFullBuffer(panel) {
+    if (!panel) return;
+    this.fullBuffer = panel;
+    panel.relayout(0, 0, this.screen.w, this.screen.h);
+    this.focus(panel);
+    this.redraw();
+  }
+  closeFullBuffer() {
+    if (!this.fullBuffer) return true;
+    this.fullBuffer = null;
+    this.focus(this.chat);
+    this.layout();
+    this.redraw();
+    return true;
+  }
+  showWorkspaceBuffer() { if (!this.workspacePanel) this.workspacePanel = new WorkspacePanel(this); this.openFullBuffer(this.workspacePanel); this.workspacePanel.load(); }
+  showSettingsBuffer() { if (!this.settingsPanel) this.settingsPanel = new SettingsPanel(this); this.openFullBuffer(this.settingsPanel); this.settingsPanel.load(); }
+  showModelsBuffer() { if (!this.modelPanel) this.modelPanel = new ModelPanel(this); this.openFullBuffer(this.modelPanel); this.modelPanel.load(); }
+  showSubagentBuffer() {
+    if (!this.currentSession) { this.toast("先打开一个会话"); return; }
+    if (!this.subagentPanel) this.subagentPanel = new SubagentPanel(this);
+    this.openFullBuffer(this.subagentPanel); this.subagentPanel.load(this.currentSession);
+  }
+  showSkillsBuffer() {
+    if (!this.currentSession) { this.toast("先打开一个会话"); return; }
+    if (!this.skillsPanel) this.skillsPanel = new SkillsPanel(this);
+    this.openFullBuffer(this.skillsPanel); this.skillsPanel.load();
   }
 
   closeOverlay() { this.overlay = null; this.redraw(); }
@@ -3514,7 +3910,6 @@ export class App {
     this.chat.nodes = [];
     this.chat.collapsedBlocks.clear();
     this.chat.expanded.clear();
-    this.chat.expandedTools.clear();
     this.chat.queueRebuild();
     this.chat.view.anchorLock = null;
     this.mode = "chat";
@@ -3542,7 +3937,7 @@ export class App {
       const argv = process.argv.slice(1);
       // hand the CURRENT session to the new instance so it reopens it instead
       // of minting a fresh blank session (the "strange new session" in 未分组)
-      const env = { ...process.env, DSH_TUI_RESUME_SESSION: this.currentSession ?? "", DSH_TUI_RESUME_SCROLL: String(this.chat?.view?.scrollY ?? 0), DSH_TUI_RESUME_FOLLOW: this.chat?.view?.follow ? "1" : "0" };
+      const env = { ...process.env, DSH_TUI_RESTART_HANDOFF: "1", DSH_TUI_RESUME_SESSION: this.currentSession ?? "", DSH_TUI_RESUME_SCROLL: String(this.chat?.view?.scrollY ?? 0), DSH_TUI_RESUME_FOLLOW: this.chat?.view?.follow ? "1" : "0" };
       const child = spawn("sh", ["-c", 'sleep 1; exec "$@"', "sh", ...argv], { detached: true, stdio: "inherit", env });
       child.unref();
     } catch (e) {
@@ -3654,13 +4049,65 @@ export class App {
     } catch (e) { this.toast(`权限切换失败: ${e.message}`); }
   }
 
-  /** Shift+Tab/F8: cycle read-only → workspace-write → danger-full-access. */
+  /** F8: cycle read-only → workspace-write → danger-full-access. */
   rotatePermission() {
     const order = ["read-only", "workspace-write", "danger-full-access"];
     const cur = this.projections.permissions?.currentValue;
     const idx = order.indexOf(cur);
     const next = order[(idx + 1) % order.length];
     this.switchPermission(next);
+  }
+
+  /** Execute an editable global binding (two slots per id). */
+  #runBinding(id, slot) {
+    switch (id) {
+      case "sessionFilter": this.startSearch(); this.redraw(); return true;
+      case "panel": this.overlay = new ControlPanel(this, { startPage: 0 }); this.redraw(); return true;
+      case "homeSwitch": this.focusPane(slot === "key" ? -1 : 1); return true;
+      case "permissionRotate": this.rotatePermission(); return true;
+      case "editConfig": this.editConfigFile(); return true;
+      case "quit": this.stop(); return true;
+      case "model": this.overlay = buildModelPicker(this); this.redraw(); return true;
+      case "trajectory": this.setMode("trajectory"); return true;
+      case "workspace": this.showWorkspaceBuffer(); return true;
+      case "settings": this.showSettingsBuffer(); return true;
+      case "subagent": this.showSubagentBuffer(); return true;
+      case "skills": this.showSkillsBuffer(); return true;
+      case "goal": this.showGoal(); return true;
+      case "jobs": this.showJobs(); return true;
+      case "queue": this.showQueue(); return true;
+      case "busyEnter": {
+        const next = busyEnter() === "queue" ? "steer" : "queue";
+        saveTuiConfig({ busyEnter: next });
+        this.toast(`运行中 Enter：${next === "steer" ? "追加到当前回合" : "加入队列"}`);
+        return true;
+      }
+      case "attachments": this.overlay = new AttachmentPanel(this); this.focus(this.overlay); this.redraw(); return true;
+      case "stepJump": this.quickJumpStep(); return true;
+      case "sidebar": this.toggleSidebar(); return true;
+      default: return false;
+    }
+  }
+
+  /** Ctrl+K: open tui-config.json in $EDITOR (default editor). The terminal is
+   *  restored around the editor, then re-entered; the config cache is dropped
+   *  so the new bindings apply immediately. */
+  async editConfigFile() {
+    const file = tuiConfigFile();
+    const editor = process.env.EDITOR || process.env.VISUAL || "vi";
+    this.toast(`在 ${editor} 中打开 ${file}…`);
+    this.redraw();
+    await new Promise((r) => setTimeout(r, 150));
+    try { this.term?.stop?.(); } catch {}
+    try { this.spawnEditor(file, editor); } catch (e) { this.toast(`编辑器启动失败: ${e.message}`); }
+    try { this.term?.start?.(); } catch {}
+    reloadTuiConfig();
+    this.layout(); this.redraw();
+    this.toast("配置编辑完成；快捷键已重新加载");
+  }
+  spawnEditor(file, editor) {
+    const [cmd, ...args] = String(editor).split(/\s+/).filter(Boolean);
+    spawnSync(cmd, [...args, file], { stdio: "inherit" });
   }
 
   showFilePicker() {
@@ -3689,15 +4136,11 @@ export class App {
   }
 
   #modeTabs() {
-    // The two Shift+Tab flip targets; panels surface as an extra active tab.
+    // Ctrl+Left/Right pane targets. The other panels are full-screen buffers.
     return [
       ["chat", "对话"],
       ["trajectory", "轨迹"],
     ];
-  }
-
-  #panelLabel(mode) {
-    return { workspace: "工作区", settings: "设置", models: "模型供应商", skills: "技能", subagent: "子代理" }[mode] ?? null;
   }
 
   #renderTabBar(s) {
@@ -3705,11 +4148,10 @@ export class App {
     const w = this.screen.w - x;
     s.fillRect(x, 0, x + w - 1, 0, " ", { bg: T.PANEL });
     const tabs = [...this.#modeTabs()];
-    const panelLabel = this.#panelLabel(this.mode);
-    if (panelLabel) tabs.push([this.mode, panelLabel]);
     let tx = x;
+    const sidebarFocused = this.focused === this.sidebar;
     for (const [id, label] of tabs) {
-      const sel = id === this.mode || (id === "chat" && this.mode !== "trajectory" && !panelLabel);
+      const sel = !sidebarFocused && id === this.mode;
       const seg = ` ${label} `;
       s.text(tx, 0, seg, { fg: sel ? T.SELFG : T.DIM, bg: sel ? T.ACCENT : T.PANEL, attrs: sel ? 1 : 0 });
       tx += strWidth(seg);
@@ -3720,14 +4162,11 @@ export class App {
   #clickTab(px) {
     const x = this.sidebarVisible ? this.sidebarWidth : 0;
     const tabs = [...this.#modeTabs()];
-    const panelLabel = this.#panelLabel(this.mode);
-    if (panelLabel) tabs.push([this.mode, panelLabel]);
     let tx = x;
     for (const [id, label] of tabs) {
       const seg = ` ${label} `;
       if (px >= tx && px < tx + strWidth(seg)) {
-        if (id === this.mode && panelLabel && id !== "chat" && id !== "trajectory") { /* click active panel tab: stay */ return true; }
-        this.setMode(id === "chat" || id === "trajectory" || this.#panelLabel(id) ? id : "chat");
+        this.setMode(id);
         return true;
       }
       tx += strWidth(seg);
@@ -3808,6 +4247,21 @@ export class App {
       this.redraw();
       return;
     }
+    // Full-screen panel buffers (workspace/settings/models/subagent/skills)
+    // are modal surfaces over the main area. Pane cycling (Ctrl+Left/Right)
+    // works again the moment Esc closes the buffer.
+    if (this.fullBuffer) {
+      if (ev.type === "mouse") {
+        if (this.fullBuffer.onMouse?.(ev)) this.redraw();
+      } else {
+        const handled = this.fullBuffer.onKey?.(ev);
+        // Panels exit level by level; when the top level declines Escape the
+        // App closes the buffer, restoring the main area's pane focus.
+        if (ev.type === "key" && ev.name === "escape" && !handled) this.closeFullBuffer();
+        else this.redraw();
+      }
+      return;
+    }
 
     // tab bar clicks (row 0 of the main area)
     if (ev.type === "mouse" && ev.kind === "press" && ev.button === 0 && ev.y === 0 && ev.x >= (this.sidebarVisible ? this.sidebarWidth : 0)) {
@@ -3821,11 +4275,15 @@ export class App {
         return;
       }
       const panel = this.panelForMode();
-      if (panel) {
-        const handled = ev.type === "key" || ev.type === "text" ? panel.onKey(ev) : panel.onMouse(ev);
+      const paneSwitch = ev.type === "key" && ev.ctrl && (ev.name === "left" || ev.name === "right");
+      if (panel && this.focused !== this.sidebar && !paneSwitch) {
+        const handled = ev.type === "key" || ev.type === "text" || ev.type === "paste" ? panel.onKey(ev) : panel.onMouse(ev);
         if (handled) { this.redraw(); return; }
+        // A visible modal panel owns non-global text/paste even when it declines
+        // the event; never leak it into the hidden chat/Input behind the panel.
+        if (ev.type === "text" || ev.type === "paste") { this.redraw(); return; }
       }
-      // unhandled keys fall through to global shortcuts
+      // unhandled key events fall through to global shortcuts
     }
     if (ev.type === "mouse") {
       // input drag-selection: the gesture continues across motion events
@@ -3881,7 +4339,7 @@ export class App {
       } else if (this.chat.inside(ev.x, ev.y)) {
         if (this.focused !== this.chat.input) this.focus(this.chat); // INSERT exits only via Esc
         if (this.chat.onMouse(ev)) this.redraw();
-      } else if (this.focused?.onMouse(ev)) {
+      } else if (this.focused?.onMouse?.(ev)) {
         this.redraw();
       }
       return;
@@ -3918,25 +4376,21 @@ export class App {
         this.redraw();
         return;
       }
-      if (this.searchActive && (ev.ctrl && ev.key === " " || ev.name === "f7")) {
-        this.overlay = new ControlPanel(this, { startPage: 0 });
-        this.redraw();
-        return;
-      }
       if (this.searchActive) {
         this.#onSearchKey(ev);
         this.redraw();
         return;
       }
-      if ((ev.ctrl && ev.key === " ") || ev.name === "f7") {
-        this.overlay = new ControlPanel(this, { startPage: 0 });
-        this.redraw();
-        return;
+      // Editable global bindings: two slots per function, resolved by the
+      // keybindings registry (tui-config.json keyBindings.<id>).
+      const hit = bindingMatchFor(ev, keyBindings(), false, KEYBINDING_ORDER);
+      if (hit && this.#runBinding(hit.id, hit.slot)) return;
+      if (ev.ctrl && ev.shift && ev.key === "c") {
+        if (this.focused === this.chat) this.chat.onKey(ev);
+        else this.toast("请先在正文中选择要复制的内容");
+        this.redraw(); return;
       }
-      if (ev.name === "tab" && !ev.ctrl) { this.toggleChatTrajectory(); return; }
-      if (ev.name === "backtab" && !ev.ctrl) { this.rotatePermission(); return; }
-      if (ev.ctrl && ev.key === "q") { this.stop(); return; }
-      if (ev.ctrl && ev.key === "c") {
+      if (ev.ctrl && ev.key === "c" && !ev.shift) {
         // NORMAL-mode Ctrl+C: two presses within the toast window exit the
         // process; the first press just warns (insert mode owns Ctrl+C for
         // clearing the input).
@@ -3947,33 +4401,9 @@ export class App {
         this.toast("再按一次 Ctrl+C 退出 TUI");
         return;
       }
-      if (ev.ctrl && ev.key === "o") { this.overlay = new AttachmentPanel(this); this.focus(this.overlay); this.redraw(); return; }
-      if (ev.ctrl && ev.key === "b") { this.toggleSidebar(); return; }
+      if (ev.ctrl && ev.shift && ev.key === "w") { this.addWorkspace(); return; }
       if (ev.ctrl && ev.key === "p") { this.overlay = new ControlPanel(this, { startPage: 1 }); this.redraw(); return; }
-      if (ev.ctrl && ev.key === "m") { this.overlay = buildModelPicker(this); this.redraw(); return; }
-      if (ev.name === "f8") { this.rotatePermission(); return; }
       if (ev.name === "f9") { this.showModePicker(); return; }
-      if (ev.ctrl && ev.key === "w") {
-        if (ev.shift) { this.addWorkspace(); return; }
-        this.setMode("workspace"); return;
-      }
-      if (ev.ctrl && ev.key === "t") { this.setMode("trajectory"); return; }
-      if (ev.ctrl && ev.key === "e") { this.quickJumpStep(); return; }
-      if (ev.ctrl && ev.key === "j") { this.showJobs(); return; }
-      if (ev.ctrl && ev.key === "n") { this.showQueue(); return; }
-      if (ev.ctrl && ev.key === "y") {
-        const next = busyEnter() === "queue" ? "steer" : "queue";
-        saveTuiConfig({ busyEnter: next });
-        this.toast(`运行中 Enter：${next === "steer" ? "追加到当前回合" : "加入队列"}`);
-        return;
-      }
-      if (ev.ctrl && ev.key === "g") { this.showGoal(); return; }
-      if (ev.ctrl && ev.key === "f") { this.startSearch(); return; }
-      if (ev.ctrl && ev.key === "s") { this.setMode("settings"); return; }
-      if (ev.ctrl && ev.key === "a") { this.setMode("subagent"); return; }
-      if (ev.ctrl && ev.key === "k") { this.setMode("skills"); return; }
-      if (ev.name === "char" && ev.key === "/" && !ev.ctrl && this.focused !== this.chat.input) { this.startSearch(); this.redraw(); return; }
-      if (ev.name === "char" && ev.key === "n" && !ev.ctrl && this.focused === this.sidebar) { this.newSession(); return; }
       if (ev.name === "escape") {
         // Esc in NORMAL mode interrupts a running turn (one press, regardless
         // of focus); otherwise it steps back toward the chat view.
@@ -3982,28 +4412,28 @@ export class App {
         else if (this.mode !== "chat") this.setMode("chat");
         return;
       }
-      if (ev.name === "char" && ev.key === "i" && this.focused === this.sidebar) { this.focus(this.chat.input); this.redraw(); return; }
     }
     // nvim-style normal mode: single chars are shortcuts (chat first, then the
     // focused pane). Multi-char text (paste/IME) still types into the input.
     if ((ev.type === "text" || ev.type === "paste") && this.focused !== this.chat.input) {
       if (this.searchActive) {
-        this.searchInput.onKey(ev);
-        this.#refreshSearch();
+        this.#onSearchKey(ev);
         this.redraw();
         return;
       }
-      if (ev.text.length === 1) {
-        // Legacy terminals deliver Shift+letter as the UPPERCASE char with no
-        // modifier info — recover the shift flag from the case so Shift+T
-        // (todo fold) and G (scroll bottom) work everywhere.
+      if (graphemes(ev.text).length === 1) {
+        // Legacy terminals deliver Shift+letter and Space as text. Route to
+        // the focused pane first — a focused sidebar must never mutate the
+        // hidden chat behind it — then fall back to transcript NORMAL keys.
+        const text = graphemes(ev.text)[0];
         const asKey = {
           type: "key", name: "char",
-          key: ev.text.toLowerCase(), text: ev.text,
-          ctrl: false, alt: false, shift: ev.text !== ev.text.toLowerCase(),
+          key: text.toLowerCase(), text,
+          ctrl: false, alt: false, shift: text !== text.toLowerCase(),
         };
+        if (this.focused && this.focused !== this.chat && this.focused !== this.chat.input && this.focused.onKey?.(asKey)) { this.redraw(); return; }
         if (this.chat.onKey(asKey)) { this.redraw(); return; }
-        if (this.focused && this.focused !== this.chat.input && this.focused.onKey(asKey)) { this.redraw(); return; }
+        if (this.focused && this.focused !== this.chat.input && this.focused.onKey?.(asKey)) { this.redraw(); return; }
         this.toast("按 i 进入输入");
         return;
       }
@@ -4014,47 +4444,249 @@ export class App {
     }
     // focused widget
     if (this.focused) {
-      const handled = ev.type === "mouse" ? this.focused.onMouse(ev) : this.focused.onKey(ev);
+      const handled = ev.type === "mouse" ? this.focused.onMouse?.(ev) : this.focused.onKey?.(ev);
       if (handled) this.redraw();
     }
   }
 
   startSearch() {
+    this.searchSeq++;
     this.searchActive = true;
     this.searchInput.setValue("");
-    this.searchResults = this.sessions.map((s) => ({ sessionId:s.sessionId, title:s.projections?.values?.title ?? s.sessionId.slice(0,8), snippet:s.cwd ?? "" }));
+    this.searchState = { phase: "input", query: "", rows: [], selected: 0, collapsed: new Set(), typeFold: new Set(), preview: [], previewScroll: 0, loading: false, hasMore: false, fallback: false, fallbackError: null };
     this.focus(this.searchInput);
+    this.redraw();
   }
 
-  #refreshSearch() {
-    const query = this.searchInput.value.trim().toLowerCase();
-    this.searchSelected = 0;
-    const fuzzy = (text) => { let i=0; for(const ch of String(text).toLowerCase()) if(ch===query[i]) i++; return i===query.length; };
-    this.searchResults = this.sessions.filter((s) => !query || fuzzy(`${s.projections?.values?.title ?? ""} ${s.cwd ?? ""} ${s.sessionId}`)).map((s) => ({ sessionId:s.sessionId, title:s.projections?.values?.title ?? s.sessionId.slice(0,8), snippet:s.cwd ?? "" }));
+  #searchWorkspaceFor(sessionId) {
+    const ws = (this.workspaceItems ?? []).find((item) => (item.sessionIds ?? []).includes(sessionId));
+    return ws ? { key: ws.workspaceId ?? ws.id ?? ws.path, title: ws.title ?? ws.name ?? ws.path ?? "工作区" } : { key: "ungrouped", title: "未分组" };
+  }
+
+  #searchBlockText(node, block = null) {
+    if (!block) return String(node?.text ?? "");
+    const fields = [block.name, block.text, block.args, block.result];
+    return fields.filter((value) => value != null && value !== "").map((value) => {
+      if (typeof value === "string") return value;
+      try { return JSON.stringify(value); } catch { return String(value); }
+    }).join("\n");
+  }
+
+  #mergeHistoryEvents(older, newer) {
+    const bySeq = new Map();
+    for (const wrapped of [...(older ?? []), ...(newer ?? [])]) {
+      const seq = wrapped?.event?.seq;
+      if (seq == null) continue;
+      bySeq.set(seq, wrapped);
+    }
+    return [...bySeq.values()].sort((a, b) => a.event.seq - b.event.seq);
+  }
+
+  /** Resolve one Host search hit into session-level matches. `deep` pages back
+   *  toward the FTS hit; fallback scans stay on the single tail page. */
+  async #resolveSearchSession(sessionId, snippet, lower, seq, state, { deep = true } = {}) {
+    let history;
+    try { history = await this.api.call("session.history", { sessionId, maxMessages: 80 }); }
+    catch { history = { events: [], hasMore: false }; }
+    if (seq !== this.searchSeq || !this.searchActive || this.searchState !== state) return null;
+    let allEvents = this.#mergeHistoryEvents([], history.events);
+    const contains = (list) => list.some((node) => node.kind === "assistant" ? (node.blocks ?? []).some((block) => this.#searchBlockText(node, block).toLowerCase().includes(lower)) : this.#searchBlockText(node).toLowerCase().includes(lower));
+    let resolved = contains(nodeForEvents(allEvents, this.log));
+    // Probe each bounded page independently, then derive the accumulated
+    // window once. Rebuilding an ever-growing history on every page made a
+    // deep search quadratic while adding no useful precision.
+    for (let page = 0; deep && !resolved && history.hasMore && page < 40; page++) {
+      const beforeSeq = allEvents[0]?.event?.seq;
+      if (beforeSeq == null) break;
+      const older = await this.api.call("session.history", { sessionId, beforeSeq, maxMessages: 80 });
+      if (seq !== this.searchSeq || !this.searchActive || this.searchState !== state) return null;
+      const merged = this.#mergeHistoryEvents(older.events, allEvents);
+      const newBeforeSeq = merged[0]?.event?.seq;
+      if (!older.events?.length || newBeforeSeq == null || newBeforeSeq >= beforeSeq) { history = { ...history, hasMore: false }; break; }
+      resolved = contains(nodeForEvents(older.events, this.log));
+      allEvents = merged; history = { ...older, events: allEvents };
+    }
+    const nodes = nodeForEvents(allEvents, this.log);
+    const matches = [];
+    for (let ni = 0; ni < nodes.length; ni++) {
+      const node = nodes[ni];
+      if (node.kind === "assistant") {
+        for (let bi = 0; bi < (node.blocks ?? []).length; bi++) {
+          const block = node.blocks[bi], text = this.#searchBlockText(node, block);
+          if (text.toLowerCase().includes(lower)) matches.push({ nodeIdx: ni, blockIdx: bi, kind: block.kind, text, seq: node.firstSeq ?? node.lastSeq });
+        }
+      } else {
+        const text = this.#searchBlockText(node);
+        if (text.toLowerCase().includes(lower)) matches.push({ nodeIdx: ni, blockIdx: null, kind: node.kind, text, seq: node.firstSeq ?? node.lastSeq });
+      }
+    }
+    if (!matches.length && deep) matches.push({ nodeIdx: -1, blockIdx: null, kind: "snippet", text: snippet ?? "", seq: null, approximate: true });
+    const session = this.sessions.find((item) => item.sessionId === sessionId);
+    return { sessionId, title: session?.projections?.values?.title ?? sessionId.slice(0, 8), snippet: snippet ?? "", nodes, matches, hasMore: history.hasMore, beforeSeq: allEvents[0]?.event?.seq ?? null };
+  }
+
+  /** Bounded local scan over loaded sessions when the Host FTS index is absent. */
+  async #localSearchFallback(query, lower, seq, state) {
+    const groups = new Map();
+    const candidates = (this.sessions ?? []).filter((session) => !session.blank).slice(0, 20);
+    for (const session of candidates) {
+      const entry = await this.#resolveSearchSession(session.sessionId, "", lower, seq, state, { deep: false });
+      if (entry === null) return null;
+      if (entry.matches.length === 0) continue;
+      const ws = this.#searchWorkspaceFor(session.sessionId);
+      if (!groups.has(ws.key)) groups.set(ws.key, { ...ws, sessions: [] });
+      groups.get(ws.key).sessions.push(entry);
+    }
+    return [...groups.values()];
+  }
+
+  async #executeSearch() {
+    const state = this.searchState;
+    const query = this.searchInput.value.trim();
+    if (!state || !query || state.loading) { if (!query) this.toast("请输入搜索内容"); return; }
+    state.loading = true; state.error = null; state.fallback = false; state.fallbackError = null; state.phase = "results"; state.query = query; state.rows = []; state.preview = []; state.selected = 0; this.focus(this); this.redraw();
+    const seq = ++this.searchSeq;
+    const lower = query.toLowerCase();
+    try {
+      const result = await this.api.call("session.search", { query });
+      const groups = new Map();
+      for (const hit of result.items ?? []) {
+        const entry = await this.#resolveSearchSession(hit.sessionId, hit.snippet ?? "", lower, seq, state, { deep: true });
+        if (entry === null) return;
+        const ws = this.#searchWorkspaceFor(hit.sessionId);
+        if (!groups.has(ws.key)) groups.set(ws.key, { ...ws, sessions: [] });
+        groups.get(ws.key).sessions.push(entry);
+      }
+      if (seq !== this.searchSeq || !this.searchActive || this.searchState !== state) return;
+      state.groups = [...groups.values()]; state.hasMore = !!result.hasMore; state.loading = false; this.#flattenSearchRows();
+    } catch (error) {
+      if (seq !== this.searchSeq || !this.searchActive || this.searchState !== state) return;
+      // Deployments without @deepseek-ai/dsh-session-query reject session.search.
+      // Degrade to a bounded local scan over the already-loaded sessions.
+      const groups = await this.#localSearchFallback(query, lower, seq, state);
+      if (groups === null) return;
+      state.groups = groups; state.hasMore = false; state.loading = false; state.fallback = true; state.fallbackError = error.message;
+      this.#flattenSearchRows();
+      this.toast("Host 搜索索引不可用；已改用本地有界扫描");
+    }
+    if (seq === this.searchSeq && this.searchState === state) this.redraw();
+  }
+
+  #flattenSearchRows() {
+    const state = this.searchState; if (!state) return;
+    const rows = [];
+    for (const group of state.groups ?? []) {
+      rows.push({ kind: "workspace", key: `w:${group.key}`, group });
+      if (state.collapsed.has(`w:${group.key}`)) continue;
+      for (const session of group.sessions) {
+        rows.push({ kind: "session", key: `s:${session.sessionId}`, session, group });
+        if (state.collapsed.has(`s:${session.sessionId}`)) continue;
+        for (let mi = 0; mi < session.matches.length; mi++) {
+          const match = session.matches[mi];
+          if (state.typeFold.has(match.kind)) continue;
+          rows.push({ kind: "match", key: `m:${session.sessionId}:${mi}`, session, group, match, matchIndex: mi });
+        }
+      }
+    }
+    state.rows = rows; state.selected = Math.min(state.selected, Math.max(0, rows.length - 1)); this.#updateSearchPreview();
+  }
+
+  #updateSearchPreview() {
+    const state = this.searchState; const row = state?.rows[state.selected]; if (!state) return;
+    if (row?.kind === "match" && row.match.nodeIdx >= 0) {
+      const from = Math.max(0, row.match.nodeIdx - 2), to = Math.min(row.session.nodes.length, row.match.nodeIdx + 3);
+      state.preview = row.session.nodes.slice(from, to).flatMap((node, offset) => node.kind === "assistant" ? (node.blocks ?? []).map((block) => ({ kind: block.kind, text: this.#searchBlockText(node, block), active: from + offset === row.match.nodeIdx && block === node.blocks?.[row.match.blockIdx] })) : [{ kind: node.kind, text: this.#searchBlockText(node), active: from + offset === row.match.nodeIdx }]);
+    } else if (row?.session) state.preview = [{ kind: "text", text: row.session.snippet }];
+    else state.preview = [];
+    state.previewScroll = 0;
+  }
+
+  async #jumpSearchResult(row) {
+    if (!row?.session) return;
+    const sessionId = row.session.sessionId;
+    const query = this.searchState?.query ?? "";
+    this.searchSeq++;
+    this.searchActive = false; this.searchState = null;
+    await this.openSession(sessionId);
+    this.setMode("chat"); this.focus(this.chat);
+    if (row.kind === "match" && row.match.approximate) {
+      this.toast("Host 找到该会话，但在解析预算内未定位到精确正文；已打开会话尾部");
+    } else if (row.kind === "match" && row.match.nodeIdx >= 0) {
+      const targetSeq = row.match.seq;
+      let index = targetSeq == null ? row.match.nodeIdx : this.chat.nodes.findIndex((node) => node.firstSeq <= targetSeq && node.lastSeq >= targetSeq);
+      // Search may have resolved up to forty 80-message pages; use the same
+      // page size and budget while opening the target conversation.
+      for (let i = 0; index < 0 && this.chat.hasMore && i < 40; i++) { await this.chat.loadOlder(null, 80); index = this.chat.nodes.findIndex((node) => node.firstSeq <= targetSeq && node.lastSeq >= targetSeq); }
+      if (index >= 0) {
+        this.chat.jumpToNode(index);
+        const block = this.chat.blockItems.findIndex((item) => item.nodeIdx === index && (row.match.blockIdx == null || item.blockIdx === row.match.blockIdx) && (row.match.kind !== "code" || item.kind === "code"));
+        if (block >= 0) {
+          const item = this.chat.blockItems[block]; this.chat.blockSel = block; this.chat.cursorMode = "block"; this.chat.cursor = { line: item.headerLine, col: 0 }; this.chat.view.scrollY = Math.max(0, item.headerLine - 2);
+          this.searchQuery = query || null;
+          this.chat.queueRebuild();
+        } else {
+          this.toast("已定位到消息，但匹配块当前不可见");
+        }
+      } else {
+        this.toast("在历史加载预算内未能定位该匹配；已打开会话尾部");
+      }
+    }
+    this.redraw();
   }
 
   #onSearchKey(ev) {
-    const input = this.searchInput;
-    if (ev.type === "key" && ((ev.name === "escape") || (ev.ctrl && (ev.key === "/" || ev.key === "_")))) { this.searchActive = false; this.searchResults = null; this.focus(this.sidebar); this.refreshSessions(); return; }
-    if (ev.type === "key" && ev.name === "up" && this.searchResults?.length) { this.searchSelected = Math.max(0, this.searchSelected - 1); return; }
-    if (ev.type === "key" && ev.name === "down" && this.searchResults?.length) { this.searchSelected = Math.min(this.searchResults.length - 1, this.searchSelected + 1); return; }
-    if (ev.type === "key" && ev.name === "enter") {
-      const selected = this.searchResults?.[this.searchSelected];
-      if (selected?.sessionId) this.openSession(selected.sessionId);
-      // Keep the filter active and its query fixed after opening.
-      this.focus(this.searchInput);
-      return;
+    const state = this.searchState; if (!state) return;
+    if (ev.type === "key" && ev.name === "escape") { this.searchSeq++; this.searchActive = false; this.searchState = null; this.focus(this.chat); this.layout(); return; }
+    if (state.phase === "input") {
+      if (ev.type === "key" && ev.name === "enter") { void this.#executeSearch(); return; }
+      this.searchInput.onKey(ev); return;
     }
-    const handled = input.onKey(ev);
-    if (handled) this.#refreshSearch();
+    if (ev.type === "text" && graphemes(ev.text ?? "").length === 1) {
+      const text = graphemes(ev.text)[0];
+      ev = { type: "key", name: "char", key: text.toLowerCase(), text, ctrl: false, alt: false, shift: text !== text.toLowerCase() };
+    }
+    if (ev.type !== "key") return;
+    if (ev.name === "char" && ev.key === "/" && !ev.ctrl) { state.phase = "input"; this.searchInput.setValue(state.query); this.focus(this.searchInput); return; }
+    if (ev.ctrl && (ev.name === "up" || ev.name === "down")) { state.previewScroll = Math.max(0, state.previewScroll + (ev.name === "up" ? -1 : 1)); return; }
+    if ((ev.name === "up" || ev.name === "down") && state.rows.length) { state.selected = wrapIndex(state.selected + (ev.name === "up" ? -1 : 1), state.rows.length); this.#updateSearchPreview(); return; }
+    const row = state.rows[state.selected];
+    if (ev.name === "char" && ev.key === " " && !ev.ctrl && row && row.kind !== "match") { const key = row.key; if (state.collapsed.has(key)) state.collapsed.delete(key); else state.collapsed.add(key); this.#flattenSearchRows(); return; }
+    if (ev.name === "char" && (ev.key === "t" || ev.key === "b") && !ev.ctrl && !ev.shift) { const kind = ev.key === "t" ? "reasoning" : "tool"; if (state.typeFold.has(kind)) state.typeFold.delete(kind); else state.typeFold.add(kind); this.#flattenSearchRows(); return; }
+    if (ev.name === "enter" && row) { if (row.kind === "match") void this.#jumpSearchResult(row); else { if (state.collapsed.has(row.key)) state.collapsed.delete(row.key); else state.collapsed.add(row.key); this.#flattenSearchRows(); } }
   }
 
-  #renderSearchResults(s) {
-    const ids=new Set((this.searchResults??[]).map(x=>x.sessionId));
-    const groups=this.sidebar.groups.map(g=>({...g,sessions:g.sessions.filter(x=>ids.has(x.sessionId))})).filter(g=>g.sessions.length);
-    let y=this.sidebar.y;
-    for(const g of groups){if(y>=this.sidebar.y+this.sidebar.h)break;s.text(this.sidebar.x,y++,truncate(`▾ ${g.title} (${g.sessions.length})`,this.sidebar.w-2),{fg:K.DIM});for(const sess of g.sessions){if(y>=this.sidebar.y+this.sidebar.h)break;const index=(this.searchResults??[]).findIndex(x=>x.sessionId===sess.sessionId),selected=index===this.searchSelected;s.fillRect(this.sidebar.x,y,this.sidebar.x+this.sidebar.w-2,y," ",{bg:selected?T.MENUSEL:T.BG});s.text(this.sidebar.x,y++,truncate(`  ${selected?"▸":" "} ${sess.projections?.values?.title??sess.sessionId.slice(0,8)}`,this.sidebar.w-2),{fg:selected?T.SELFG:K.TXT,bg:selected?T.MENUSEL:T.BG});}}
-    if(!groups.length)s.text(this.sidebar.x,this.sidebar.y,"无结果",{fg:K.FAINT});
+  #renderSearchBuffer(s) {
+    const state = this.searchState; if (!state) return;
+    s.fillRect(0, 0, s.w - 1, s.h - 1, " ", { bg: T.BG });
+    const split = Math.max(24, Math.min(Math.floor(s.w * 0.36), 48));
+    s.box(0, 0, s.w - 1, s.h - 1, { fg: T.BORDER2, bg: T.BG }, " 跨会话搜索 · Enter 执行 · / 编辑 · t/b 折叠类型 · Ctrl+↑↓ 预览 ");
+    s.vline(split, 1, s.h - 2, "│", { fg: T.BORDER2 });
+    this.searchInput.x = 2; this.searchInput.y = 1; this.searchInput.w = Math.max(8, s.w - 4); this.searchInput.render(s);
+    let y = 3;
+    if (state.phase === "input") {
+      s.text(2, y++, "执行搜索前仅显示工作区 / 会话结构；不会实时扫描历史。", { fg: K.FAINT });
+      for (const group of this.sidebar.groups) { if (y >= s.h - 2) break; s.text(2, y++, truncate(`▾ ${group.title} (${group.sessions.length})`, split - 3), { fg: K.DIM }); for (const session of group.sessions) { if (y >= s.h - 2) break; s.text(4, y++, truncate(session.projections?.values?.title ?? session.sessionId.slice(0, 8), split - 5), { fg: K.FAINT }); } }
+      return;
+    }
+    if (state.loading) { s.text(2, y, "正在搜索 Host 索引并解析候选会话…", { fg: K.ACCENT }); return; }
+    if (state.error) s.text(2, y++, `搜索失败: ${truncate(state.error, split - 8)}`, { fg: K.ERR });
+    if (state.fallback) s.text(2, y++, `Host 搜索索引不可用：已本地扫描最近 20 个会话的近期历史（${truncate(String(state.fallbackError ?? ""), Math.max(8, split - 30))}）`, { fg: K.WARN });
+    if (state.hasMore && state.rows.length) s.text(2, y++, "Host 候选已截断，请缩小查询", { fg: K.WARN });
+    const available = Math.max(1, s.h - y - 2), scroll = Math.max(0, Math.min(Math.max(0, state.rows.length - available), state.selected - Math.floor(available / 2)));
+    for (let i = 0; i < available; i++) {
+      const index = scroll + i, row = state.rows[index]; if (!row) break;
+      const selected = index === state.selected, folded = state.collapsed.has(row.key);
+      const label = row.kind === "workspace" ? `${folded ? "▸" : "▾"} ${row.group.title}` : row.kind === "session" ? `  ${folded ? "▸" : "▾"} ${row.session.title}` : `    ${selected ? "=>" : "  "} [${row.match.kind}] ${row.match.text.replace(/\s+/g, " ")}`;
+      s.text(1, y + i, truncate(label, split - 2), { fg: selected ? T.SELFG : row.kind === "match" ? K.TXT : K.DIM, bg: selected ? T.MENUSEL : -1, attrs: selected ? 1 : 0 });
+    }
+    let py = 3, logical = 0;
+    for (const item of state.preview) {
+      if (state.typeFold.has(item.kind)) continue;
+      const wrapped = wrapDisplayText(item.text || "（空）", Math.max(10, s.w - split - 5));
+      for (const line of wrapped) { if (logical++ < state.previewScroll) continue; if (py >= s.h - 2) break; s.text(split + 2, py++, truncate(`${item.active ? "=>" : "  "} [${item.kind}] ${line}`, s.w - split - 4), { fg: item.active ? T.ACCENT : K.TXT, attrs: item.active ? 1 : 0 }); }
+      if (py >= s.h - 2) break;
+    }
+    if (!state.rows.length) s.text(2, y, state.error ? `搜索失败: ${state.error}` : state.fallback ? "本地扫描没有匹配（仅最近 20 个会话的近期历史）" : state.hasMore ? "结果超过 Host 上限，请缩小查询" : "没有匹配", { fg: state.error ? K.BAD : K.FAINT });
   }
 
   redraw() {
@@ -4108,17 +4740,27 @@ export class App {
       this.term.output.write(s.render() + "\x1b[?25l");
       return;
     }
+    if (this.searchActive && this.searchState) {
+      this.#renderSearchBuffer(s);
+      this.term.output.write(s.render() + "\x1b[?25l");
+      return;
+    }
+    // Full-screen panel buffer: covers the whole surface; Esc returns to the
+    // main area where pane focus (Ctrl+Left/Right) works again.
+    if (this.fullBuffer) {
+      this.fullBuffer.relayout(0, 0, s.w, s.h);
+      this.fullBuffer.render(s);
+      if (this.popup) this.popup.render(s);
+      if (this.menu) this.menu.render(s);
+      if (this.overlay) this.overlay.render(s);
+      this.#renderToast(s);
+      this.term.output.write(s.render() + "\x1b[?25l");
+      return;
+    }
     this.#renderTabBar(s);
     if (this.sidebarVisible) {
-      if (this.searchActive) {
-        this.searchInput.render(s);
-        this.sidebar.y = 1; this.sidebar.h = s.h - 2;
-        if (this.searchResults !== null) this.#renderSearchResults(s);
-        else this.sidebar.render(s);
-      } else {
-        this.sidebar.y = 0; this.sidebar.h = s.h - 1;
-        this.sidebar.render(s);
-      }
+      this.sidebar.y = 0; this.sidebar.h = s.h - 1;
+      this.sidebar.render(s);
       s.put(this.sidebar.w - 1, 0, "│", { fg: T.BORDER });
       for (let y = 1; y < s.h - 1; y++) s.put(this.sidebar.w - 1, y, "│", { fg: T.BORDER });
     }
@@ -4152,7 +4794,7 @@ export class App {
     row0.left.push({ t: ` ${badge} `, fg: T.SELFG, bg: T.ACCENT, bold: true });
     const rawGoal = this.goalData?.goal ?? this.goalData;
     if (rawGoal && !["complete", "completed", "cleared"].includes(rawGoal.phase)) {
-      row0.left.push({ t: ` 🎯 ${truncate(rawGoal.objective ?? "目标", 14)} · Ctrl+G `, fg: T.SELFG, bg: T.WARN, bold: true });
+      row0.left.push({ t: ` 🎯 ${truncate(rawGoal.objective ?? "目标", 14)} · Ctrl+G `, fg: 0x000000, bg: T.WARN, bold: true });
     }
     if (this.sidebarVisible) row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });
     else row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });
@@ -4233,15 +4875,32 @@ export class App {
       const sub = this.projections.subagent;
       const subTiming = this.projections.subagentTiming;
       const subStats = this.subagentStatsBySession.get(this.currentSession) ?? { running: subTiming?.active ? 1 : 0, completed: 0 };
+      // Tasks and subagents use exactly the same two-part status grammar:
+      // WARN = currently running, OK = completed, FAINT = zero/idle.
       row2.left.push({
         t: ` ${running > 0 ? `${running} 个后台任务运行中` : "没有后台任务运行"} `,
-        fg: running > 0 ? T.WARN : T.FAINT, bg: T.STATUSBG,
+        fg: running > 0 ? T.WARN : T.FAINT, bg: T.STATUSBG, bold: running > 0,
       });
-      row2.left.push({ t: ` ${done}已完成${failed > 0 ? ` ${failed}失败` : ""} `, fg: done > 0 ? T.OK : T.FAINT, bg: T.STATUSBG });
-      row2.left.push({ t: ` ${subStats.running > 0 ? `${subStats.running} 个子代理运行中` : "没有子代理运行"} ${subStats.completed}已完成 `, fg: subStats.running > 0 ? T.PURPLE : T.FAINT, bg: T.STATUSBG, bold: subStats.running > 0 });
-      if (sub) row2.left.push({ t: ` 🛰 ${truncate(sub.label ?? sub.mode ?? "子代理", 20)} `, fg: T.PURPLE, bg: T.STATUSBG });
-      if(this.queueItems.length)row2.left.push({t:` 有${this.queueItems.length}条命令正在排队 Ctrl+N查看详情 `,fg:T.SELFG,bg:T.WARN,bold:true});
-      row2.right.push({ t: " Ctrl+J 任务/子代理 ", fg: T.DIM, bg: T.STATUSBG });
+      row2.left.push({
+        t: ` ${done}已完成${failed > 0 ? ` · ${failed}失败` : ""} `,
+        fg: done > 0 ? T.OK : failed > 0 ? T.WARN : T.FAINT, bg: T.STATUSBG,
+      });
+      row2.left.push({
+        t: ` ${subStats.running > 0 ? `${subStats.running} 个子代理运行中` : "没有子代理运行"} `,
+        fg: subStats.running > 0 ? T.WARN : T.FAINT, bg: T.STATUSBG, bold: subStats.running > 0,
+      });
+      row2.left.push({
+        t: ` ${subStats.completed}已完成 `,
+        fg: subStats.completed > 0 ? T.OK : T.FAINT, bg: T.STATUSBG,
+      });
+      // Ctrl+J belongs beside the two activity summaries it opens, not alone
+      // at the far-right edge (especially once the queue badge also appears).
+      row2.left.push({ t: " Ctrl+J 任务/子代理 ", fg: T.DIM, bg: T.STATUSBG });
+      if (sub) row2.left.push({
+        t: ` ◇ ${truncate(sub.label ?? sub.mode ?? "子代理", 20)} `,
+        fg: subStats.running > 0 ? T.WARN : subStats.completed > 0 ? T.OK : T.FAINT, bg: T.STATUSBG,
+      });
+      if(this.queueItems.length)row2.left.push({t:` 有${this.queueItems.length}条命令正在排队 Ctrl+N查看详情 `,fg:0x000000,bg:T.WARN,bold:true});
       rows.push(row2);
     }
     this.status.rows = rows;
@@ -4250,15 +4909,7 @@ export class App {
     if (this.popup) this.popup.render(s);
     if (this.menu) this.menu.render(s);
     if (this.overlay) this.overlay.render(s);
-    if (this.toastMsg) {
-      // Toasts land in the LOWER half (just above the input/footer) where the
-      // user's attention is while pressing shortcuts — a solid color block.
-      const w = Math.min(s.w - 4, strWidth(this.toastMsg) + 6);
-      const x0 = Math.max(2, Math.floor((s.w - w) / 2));
-      const y = Math.max(1, this.chat.input.y - this.chat.todoHeight() - 2);
-      s.fillRect(x0, y, x0 + w - 1, y, " ", { bg: T.ACCENT });
-      s.text(x0 + 1, y, truncate(this.toastMsg, w - 2), { fg: T.SELFG, bg: T.ACCENT, attrs: 1 });
-    }
+    this.#renderToast(s);
     if (this.renameInput && this.popup) this.renameInput.render(s);
 
     const out = s.render();
@@ -4274,6 +4925,17 @@ export class App {
     if (cell) tail = tail + `\x1b[?25h\x1b[${cell.y + 1};${cell.x + 1}H`;
     else tail = tail + "\x1b[?25l";
     this.term.output.write(out + tail);
+  }
+
+  #renderToast(s) {
+    if (!this.toastMsg) return;
+    // Toasts land in the LOWER half (just above the input/footer) where the
+    // user's attention is while pressing shortcuts — a solid color block.
+    const w = Math.min(s.w - 4, strWidth(this.toastMsg) + 6);
+    const x0 = Math.max(2, Math.floor((s.w - w) / 2));
+    const y = Math.max(1, this.chat.input.y - this.chat.todoHeight() - 2);
+    s.fillRect(x0, y, x0 + w - 1, y, " ", { bg: T.ACCENT });
+    s.text(x0 + 1, y, truncate(this.toastMsg, w - 2), { fg: T.SELFG, bg: T.ACCENT, attrs: 1 });
   }
 
   titleOf() {

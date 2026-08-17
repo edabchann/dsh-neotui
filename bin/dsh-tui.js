@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// dsh-tui — mouse-driven terminal client for DeepSeek Harness.
+// dsh-tui — keyboard-first terminal client for DeepSeek Harness.
 // Usage:
 //   dsh-tui                        interactive mode (needs a real terminal)
 //   dsh-tui --base http://host:port

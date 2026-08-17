@@ -1,6 +1,6 @@
 # dsh-neotui
 
-`dsh-neotui` 是 DeepSeek Harness 的终端客户端：以 Vim/Nvim 风格的 NORMAL / INSERT 模式、Yazi 风格文件选择器和鼠标交互，访问与 WebUI 相同的 Host 会话、工具、审批、任务和设置能力。
+`dsh-neotui` 是 DeepSeek Harness 的 keyboard-first 终端客户端：以 Vim/Nvim 风格的 NORMAL / INSERT / VISUAL 只读导航、tmux 风格 pane 焦点和 Yazi 风格文件选择器为主，鼠标作为辅助，访问与 WebUI 相同的 Host 会话、工具、审批、任务和设置能力。
 
 本仓库发布两个 npm 包：
 
@@ -13,8 +13,8 @@
 
 - 三栏 Yazi 风格文件与工作区选择器：路径编辑、模糊筛选、隐藏项、Nerd Font 图标和 Kitty 图片预览；
 - 图片附件栏、附件管理器、`dd` 删除和等比例 Kitty 预览；
-- 会话树筛选、跨会话模糊定位和稳定的历史分页；
-- NORMAL / INSERT 模式与可编辑的快捷键目录；
+- 全屏跨会话全文搜索：工作区→会话→匹配块树、附近内容预览和精确跳转；
+- NORMAL / INSERT / VISUAL 只读模式、正文块选择与可编辑的快捷键目录；
 - 独立的命令、设置和插件目录，插件支持即时筛选；
 - Queue / Steering、Goal、TODO、Plan Review、后台任务和 Subagent 状态；
 - grapheme-aware framebuffer、CJK/组合字符、Kitty keyboard、SGR mouse、OSC 8/52。
@@ -22,6 +22,8 @@
 完整变化见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ## 安装与启动
+
+需要 **Node.js 22 或更高版本**（客户端使用 Node 内置 `fetch`、`WebSocket`、`crypto.randomUUID` 和 `Intl.Segmenter`）。
 
 ### 独立 DSH profile
 
@@ -131,39 +133,49 @@ Kitty graphics 可用时，图片在文件选择器和附件预览中等比例�
 - `queue`：加入下一回合队列；
 - `steer`：追加到当前回合。
 
-`Ctrl+Y` 切换策略，`Ctrl+N` 打开排队命令详情。队列面板每条命令一行，使用 `↑/↓` 选择、`dd` 删除、`Esc` 关闭。
+`Ctrl+Y` 切换策略，`Ctrl+N` 打开排队命令详情。队列面板每条命令一行，使用 `↑/↓` 循环选择、`Enter` 展开详情、`Ctrl+↑/↓` 独立滚动详情、`dd` 删除、`Esc` 关闭。
 
 ## 快捷键
 
-以下是默认绑定。控制面板中的快捷键页以 `MODE / KEY / FUNCTION` 三列显示，并允许编辑用户覆盖；配置写入 `$DSH_HOME/tui-config.json`。
+以下是默认绑定。控制面板中的快捷键页以 `MODE / KEY1 / KEY2 / FUNCTION` 四列显示，每个功能拥有主/备两个槽位，并允许编辑用户覆盖；配置写入 `$DSH_HOME/tui-config.json`。这些绑定是运行时的唯一来源：修改后立即生效（无需重启），全部定义集中在 `src/keybindings.js`。
 
 | 模式 | 按键 | 功能 |
 |---|---|---|
 | ALL | `Ctrl+Space` / `F7` | 控制面板 |
-| NORMAL | `/` | 筛选会话树；`Ctrl+/` 退出 |
-| NORMAL | `Ctrl+F` | 跨会话模糊定位 |
+| NORMAL | `Ctrl+F` / `/` | 打开全屏跨会话全文搜索；Enter 执行，`/` 重新编辑 |
 | NORMAL | `Ctrl+B` | 显示/隐藏侧栏 |
 | NORMAL | `Ctrl+M` | 模型与思考强度 |
-| NORMAL | `Shift+Tab` / `F8` | 权限模式轮换 |
+| NORMAL | `F8` | 权限模式轮换 |
 | NORMAL | `F9` | Agent 模式 |
 | NORMAL | `Ctrl+W` | 工作区 |
 | NORMAL | `Ctrl+Shift+W` | 添加工作区 |
 | NORMAL | `Ctrl+T` | 轨迹视图 |
-| NORMAL | `Tab` | 对话/轨迹切换 |
+| NORMAL | `Ctrl+←` / `Ctrl+→` | 工作区栏 / 对话 / 轨迹 pane 循环聚焦 |
 | NORMAL | `Ctrl+E` | 按 step 快速跳转 |
 | NORMAL | `Ctrl+J` | 后台任务与 Subagent |
 | NORMAL | `Ctrl+N` | 排队命令详情 |
+| NORMAL | `Ctrl+Y` | 运行中 Enter 策略（追加 / 排队） |
+| NORMAL | `Ctrl+O` | 附件管理 |
 | NORMAL | `Ctrl+G` | Goal / TODO |
 | NORMAL | `Ctrl+S` | Settings |
 | NORMAL | `Ctrl+A` | Subagent |
-| NORMAL | `Ctrl+K` | Skills |
+| NORMAL | `Ctrl+H` | Skills |
+| NORMAL | `Ctrl+K` | 用默认编辑器（`$EDITOR` / `$VISUAL` / `vi`）打开 `tui-config.json`；编辑完成后快捷键立即重载 |
 | ALL | `Ctrl+Q` | 退出 |
-| NORMAL | `t` / `b` | 展开/折叠思考块 / 工具块 |
-| NORMAL | `g g` / `G` | 对话顶部 / 底部 |
+| 正文块 | `↑` / `↓`、`j` / `k` | 上下选择正文块，两端停留不环绕；`Ctrl+↑/↓` 只滚动视口 |
+| 正文块 | `Space` / `Enter` / `Ctrl+R` | 折叠块 / 进入只读光标 / 打开上下文菜单 |
+| NORMAL 光标 | `h l w b e 0 $`、`v` / `V` | Vim 式只读移动与字符/整行 VISUAL（无 `x` / `d`） |
+| NORMAL / VISUAL | `y` / `Ctrl+Shift+C` | 复制当前代码块/正文块或选区 |
+| 正文块 | `t` / `b` | 全局展开/折叠思考块 / 工具块 |
+| 正文块 | `g g` / `G` | 首个 / 最新正文块；`G` 选中最新块并让块头落在视口底部 |
 | NORMAL | `[` / `]` | 上一个 / 下一个提问终点 |
 | NORMAL | `PgUp` / `PgDn` | 翻页；到顶时加载更早历史 |
 
-快捷键目录中：`Enter` 编辑当前 JSON 配置项，`Shift+Tab` 在 NORMAL / INSERT / ALL 间轮换，`Alt+Enter` 恢复默认。保存前会校验 JSON、模式和按键字段；错误文本会保留以便继续修改。
+侧栏聚焦后，`↑/↓` 循环选择工作区或会话，`Space` 展开/折叠工作区，`Enter` 打开会话且保持侧栏焦点，`n` 新建会话，`i` 进入输入，`Ctrl+R` 打开当前项菜单。轨迹聚焦后，`↑/↓` 循环选择 step，`Space` 展开完整事件，`Enter` 跳回对话，`Ctrl+R` 打开 step 菜单。
+
+搜索 buffer 中，Enter 执行查询或跳转结果，`/` 返回查询编辑，`Space` 折叠工作区/会话，`t` / `b` 折叠思考/工具匹配，`Ctrl+↑/↓` 独立滚动右侧预览。若 Host 未挂载搜索索引（`session.search` 不可用），会自动降级为对最近 20 个会话近期历史的有界本地扫描，并在 buffer 顶部提示。
+
+快捷键目录中：`Enter` 编辑当前 JSON 配置项（`{"mode":"normal|insert|all","key":"…","key2":"…"}`，`key2` 可为空），`Shift+Tab` 在 NORMAL / INSERT / ALL 间轮换，`Alt+Enter` 恢复默认。保存前会校验 JSON、模式和两个按键槽位；错误文本会保留以便继续修改。两按组合键（如 `g g`）以空格分隔书写。
 
 ## Slash 命令
 
@@ -191,6 +203,10 @@ TUI 支持：
 - Goal、TODO、后台任务和 Subagent；
 - 独立插件清单及 `/` 筛选；
 - dark、light、gruvbox 主题。
+
+工作区（`Ctrl+W`）、设置（`Ctrl+S`）、模型供应商（模型选择器里的 `⚙ 管理供应商…`）、子代理（`Ctrl+A`）和技能（`Ctrl+H`）都是**全屏模态 Buffer**：打开后覆盖整个界面，`Esc` 逐级返回并最终关闭。它们不再占用“标签页模式”，因此关闭后 `Ctrl+←/→` 的 pane 聚焦立即恢复，两者互不冲突。轨迹仍是 pane 序列的一部分，由 `Ctrl+T` 或 `Ctrl+←/→` 进入。
+
+模型选择器（`Ctrl+M` / `/model`）是供应商文件夹 → 具体模型的层级结构：`Space` 展开/折叠文件夹，`↑/↓` 移动，`Enter` 确认具体模型（带思考强度时再选一档），当前模型以 `●` 标记并默认展开、默认选中。筛选与其他 buffer 一致：`/` 进入筛选、`Ctrl+/` 退出筛选，普通字符在浏览模式下不会误触发筛选。
 
 所有 Buffer 都是模态的：点击外部只会吞掉事件，不会关闭 Buffer。退出必须使用界面明确提示的按键或操作。
 
@@ -255,6 +271,7 @@ src/term.js         raw mode、鼠标、paste、Kitty keyboard
 src/screen.js       cell framebuffer 与 ANSI diff
 src/text.js         grapheme、显示宽度和截断
 src/md.js           Markdown、代码块和 OSC 8
+src/keybindings.js  可编辑快捷键注册表（每个功能主/备两个槽位）
 src/widgets.js      Input、Popup、ScrollView、Menu、StatusBar
 src/views.js        App、ChatView、会话树和主路由
 src/panels.js       Workspace、Trajectory、Queue、Jobs、Settings

@@ -6,11 +6,14 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion } from "../src/views.js";
-import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel } from "../src/panels.js";
-import { fmtDuration, strWidth } from "../src/text.js";
-import { renderMd } from "../src/md.js";
-import { Input } from "../src/widgets.js";
+import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker } from "../src/panels.js";
+import { fmtDuration, strWidth, pad, graphemeWidth } from "../src/text.js";
+import { renderMd, wrapSegs } from "../src/md.js";
+import { Input, List } from "../src/widgets.js";
 import { Screen } from "../src/screen.js";
+import { T } from "../src/theme.js";
+import { keyBindings, setKeyBinding, resetKeyBinding, tuiConfigFile } from "../src/config.js";
+import { matchKeyPart, matchKeyBinding, bindingMatchFor, describeSpec, validateKeySpec, KEYBINDING_ORDER } from "../src/keybindings.js";
 
 // isolate TUI config writes from the real ~/.dsh/tui-config.json
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), "tui-test-"));
@@ -69,6 +72,25 @@ test("left-click on tool header toggles block collapse", () => {
   chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y: y2 + 1 });
   chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y: y2 + 1 });
   assert.equal(chat.collapsedBlocks.has(key), false, "left-click expanded block again");
+});
+
+test("context, goal-round, and subagent receipts really toggle their 点击展开 hints", () => {
+  for (const node of [
+    { kind: "context", text: "FULL-CONTEXT-DETAIL ".repeat(60), source: { kind: "request-context", form: "notice", summary: "context preview" } },
+    { kind: "goal-round", text: "FULL-GOAL-DETAIL ".repeat(60), source: { round: 2, form: "notice", summary: "goal preview" } },
+    { kind: "subagent-receipt", text: "FULL-SUBAGENT-DETAIL ".repeat(60), source: { kind: "subagent-report", form: "notice", summary: "worker preview" } },
+  ]) {
+    const { chat, lines } = render([node]);
+    const hint = lines.findIndex((line) => line.includes("[点击展开]"));
+    assert.ok(hint >= 0, `${node.kind}: collapsed hint rendered`);
+    const y = chat.view.y + (hint - chat.view.scrollY);
+    chat.onMouse({ type: "mouse", kind: "press", button: 0, x: 2, y });
+    chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 2, y });
+    const expanded = chat.lines.map((line) => line.map((seg) => seg.t).join("")).join("\n");
+    assert.ok(chat.expanded.has(0), `${node.kind}: click entered expanded state`);
+    assert.ok(expanded.includes("[点击折叠]"), `${node.kind}: hint changed to collapse`);
+    assert.ok(expanded.includes(node.text.split(" ")[0]), `${node.kind}: full detail became visible`);
+  }
 });
 
 test("right-click menu 展开/折叠 item toggles block collapse", () => {
@@ -155,6 +177,107 @@ test("code block [复制] button copies the raw code without toggling", () => {
   assert.equal(chat.collapsedBlocks.size, 0, "still nothing collapsed");
 });
 
+test("chat keyboard block cursor, read-only Visual mode, and atomic code yank", () => {
+  const code = "const x = 1;\nconsole.log(x);";
+  const { app, chat } = render([
+    { kind: "user", id: "u", text: "alpha beta" },
+    { kind: "assistant", id: "a", blocks: [{ kind: "text", text: `before\n\n\`\`\`js\n${code}\n\`\`\`\n\nafter` }] },
+  ]);
+  app.sessions = []; app.focus(chat);
+  assert.ok(chat.blockItems.length >= 4, chat.blockItems.map((item) => item.kind).join(","));
+  assert.equal(chat.blockItems[chat.blockSel].kind, "text", "latest text block selected by default");
+  chat.onKey({ type: "key", name: "up", ctrl: false });
+  assert.equal(chat.blockItems[chat.blockSel].kind, "code");
+  assert.equal(chat.onKey({ type: "key", name: "enter" }), true);
+  assert.equal(chat.cursorMode, "normal");
+  const oldCursor = { ...chat.cursor };
+  chat.onKey({ type: "key", name: "char", key: "h", ctrl: false, alt: false });
+  assert.deepEqual(chat.cursor, oldCursor, "code block is atomic in normal cursor mode");
+  chat.onKey({ type: "key", name: "char", key: "y", ctrl: false, alt: false });
+  assert.equal(app.copied, code, "y copies raw code block");
+  const screen = new Screen(80, 24); chat.render(screen);
+  const plain = screen.cells.map((row) => row.map((cell) => cell.ch).join("")).join("\n");
+  assert.ok(plain.includes("[按y复制]"), plain);
+  assert.ok(plain.includes("|"), "atomic cursor appears beside code action");
+
+  chat.onKey({ type: "key", name: "char", key: "v", ctrl: false, alt: false, shift: false });
+  assert.equal(chat.cursorMode, "visual");
+  chat.onKey({ type: "key", name: "char", key: "l", ctrl: false, alt: false });
+  chat.onKey({ type: "key", name: "char", key: "y", ctrl: false, alt: false });
+  assert.equal(chat.cursorMode, "normal", "y exits visual selection but remains read-only cursor mode");
+  assert.ok(typeof app.copied === "string" && app.copied.length > 0);
+  chat.onKey({ type: "key", name: "escape" });
+  assert.equal(chat.cursorMode, "block");
+  assert.equal(chat.onKey({ type: "key", name: "char", key: "x", ctrl: false, alt: false }), false, "destructive x command is absent");
+  assert.equal(chat.onKey({ type: "key", name: "char", key: "d", ctrl: false, alt: false }), false, "destructive d command is absent");
+});
+
+test("chat block selection clamps at the ends, Ctrl+scroll preserves it, Space and Ctrl+R act on selected block", () => {
+  const { app, chat } = render([toolNode()]); app.focus(chat);
+  chat.blockSel = 0;
+  chat.onKey({ type: "key", name: "up", ctrl: false });
+  assert.equal(chat.blockSel, 0, "Up at the first block stays there instead of wrapping to the last");
+  chat.onKey({ type: "key", name: "char", key: "k", ctrl: false, alt: false });
+  assert.equal(chat.blockSel, 0, "k at the top block also stays");
+  chat.blockSel = chat.blockItems.length - 1;
+  chat.onKey({ type: "key", name: "down", ctrl: false });
+  assert.equal(chat.blockSel, chat.blockItems.length - 1, "Down at the newest block stays instead of jumping to the top");
+  chat.onKey({ type: "key", name: "char", key: "j", ctrl: false, alt: false });
+  assert.equal(chat.blockSel, chat.blockItems.length - 1, "j at the newest block also stays");
+  const selected = chat.blockSel;
+  chat.onKey({ type: "key", name: "up", ctrl: true });
+  assert.equal(chat.blockSel, selected, "Ctrl+Up scrolls without moving selection");
+  const tool = chat.blockItems.findIndex((item) => item.kind === "tool");
+  chat.blockSel = tool;
+  const item = chat.blockItems[tool];
+  chat.onKey({ type: "key", name: "char", key: " ", ctrl: false, alt: false });
+  assert.ok(chat.collapsedBlocks.has(`${item.nodeIdx}:${item.blockIdx}`), "Space folds selected tool block");
+  chat.onKey({ type: "key", name: "char", key: "r", ctrl: true, shift: false });
+  assert.ok(app.lastMenu.items.some((entry) => entry.label === "展开 / 折叠"));
+});
+
+test("Shift+G selects the newest block with its header at the viewport bottom", () => {
+  const app = headlessApp(); app.currentSession = "s";
+  const nodes = Array.from({ length: 20 }, (_, i) => ({ kind: "user", id: `u${i}`, text: `message ${i}\n`.repeat(3) }));
+  app.chat.nodes = nodes; app.focus(app.chat);
+  app.chat.resize(0, 1, 100, 27); app.chat.queueRebuild(); app.chat.flushRebuild();
+  app.chat.blockSel = 3;
+  app.onEvent({ type: "text", text: "G" });
+  const last = app.chat.blockItems.at(-1);
+  assert.equal(app.chat.blockSel, app.chat.blockItems.length - 1, "G points the cursor at the newest block");
+  assert.equal(app.chat.cursor.line, last.headerLine);
+  assert.equal(app.chat.view.follow, false, "G leaves tail-follow");
+  assert.ok(last.headerLine - app.chat.view.scrollY >= 0 && last.headerLine - app.chat.view.scrollY < app.chat.view.h, "newest block header is inside the viewport");
+  assert.equal(app.chat.view.scrollY, Math.max(0, Math.min(app.chat.view.maxScroll(), last.headerLine - Math.max(1, app.chat.view.h - 2))), "Vim-style bottom anchoring");
+  // kitty-style Shift+G key event behaves identically
+  app.chat.blockSel = 0;
+  app.onEvent({ type: "key", name: "char", key: "g", text: "G", ctrl: false, shift: true });
+  assert.equal(app.chat.blockSel, app.chat.blockItems.length - 1);
+});
+
+test("Unicode clusters keep terminal width, wrapping, and Vim cursor columns consistent", () => {
+  assert.equal(graphemeWidth("👍🏽"), 2);
+  assert.equal(strWidth("A👍🏽B"), 4);
+  assert.equal(strWidth("e\u0301"), 1);
+  const wrapped = wrapSegs([{ t: "👍🏽👍🏽X" }], 2).map((line) => line.map((seg) => seg.t).join(""));
+  assert.deepEqual(wrapped, ["👍🏽", "👍🏽", "X"], "hard wrap never splits an emoji modifier cluster");
+
+  const { app, chat } = render([{ kind: "user", id: "u", text: "A中👍🏽B" }]);
+  app.sessions = []; app.focus(chat); chat.blockSel = chat.blockItems.findIndex((item) => item.kind === "user");
+  chat.onKey({ type: "key", name: "enter" });
+  chat.onKey({ type: "key", name: "char", key: "0", ctrl: false, alt: false });
+  const line = chat.blockItems[chat.blockSel].headerLine;
+  const text = chat.lines[line].map((seg) => seg.t).join("");
+  const cjk = text.indexOf("中"), emoji = text.indexOf("👍🏽"), tail = text.lastIndexOf("B");
+  const expected = [0, strWidth(text.slice(0, cjk)), strWidth(text.slice(0, emoji)), strWidth(text.slice(0, tail))];
+  chat.cursor.col = expected[0];
+  const cols = [chat.cursor.col];
+  for (let i = 0; i < expected.length - 1; i++) { while (chat.cursor.col < expected[i + 1]) chat.onKey({ type: "key", name: "char", key: "l", ctrl: false, alt: false }); cols.push(chat.cursor.col); }
+  assert.deepEqual(cols, expected, "h/l follow display columns of ASCII, CJK, and emoji clusters");
+  chat.onKey({ type: "key", name: "char", key: "$", ctrl: false, alt: false });
+  assert.equal(chat.cursor.col, expected.at(-1));
+});
+
 test("code block box corners align with the vertical bars (fixed row width)", () => {
   const code = "return { enable_kitty_keyboard = true }";
   const md = renderMd("```lua\n" + code + "\n```", 63);
@@ -179,6 +302,28 @@ test("code block box corners align with the vertical bars (fixed row width)", ()
   const cContent = rows.find((r) => r.includes("│")) ?? "";
   assert.equal(strWidth(cTop.slice(0, cTop.indexOf("┌"))), strWidth(cContent.slice(0, cContent.indexOf("│"))), "chat: left border aligned with the content indent");
   assert.equal(strWidth(cTop.slice(0, cTop.indexOf("┐"))), strWidth(cContent.slice(0, cContent.lastIndexOf("│"))), "chat: top-right corner above the right border");
+});
+
+test("tool cards use neutral gray while formal output gets the restrained green background", () => {
+  const successTool = toolNode({ blocks: [{
+    kind: "tool", name: "bash", args: { command: "echo ok" }, result: "ok", done: true,
+    view: { card: "terminal", command: "echo ok", output: "ok", exitCode: 0 },
+  }] });
+  const failedTool = toolNode({ blocks: [{
+    kind: "tool", name: "bash", args: { command: "false" }, result: "failed", done: true, isError: true,
+    view: { card: "terminal", command: "false", output: "failed", exitCode: 1 },
+  }] });
+  for (const node of [successTool, failedTool]) {
+    const { chat } = render([node]);
+    const row = chat.lines.findIndex((line) => line.some((seg) => seg.t.includes("bash")));
+    assert.ok(row >= 0, "tool header rendered");
+    const range = chat.cardRanges.find(([start, end]) => row >= start && row <= end);
+    assert.equal(range?.[2], T.CARD, "tool click range uses neutral gray, never green/red");
+  }
+  const formal = render([{ kind: "assistant", id: "formal", blocks: [{ kind: "text", text: "important final answer" }] }]);
+  const row = formal.chat.lines.findIndex((line) => line.map((seg) => seg.t).join("").includes("important final answer"));
+  assert.ok(row >= 0, "formal output row found across markdown segments");
+  assert.ok(formal.chat.lines[row].every((seg) => seg.bg === T.TOOLOK), "formal output uses restrained green background");
 });
 
 test("formal text blocks use a neutral ◆ assistant marker (vs 💭 think)", () => {
@@ -332,6 +477,54 @@ test("[ and ] jump to the previous/next question's end", () => {
   assert.equal(app.toastMsg, "已到最后的问题");
 });
 
+test("empty List End and pre-load WorkspacePanel backspace keep bounded state", () => {
+  const list = new List({ x: 0, y: 0, w: 10, h: 4 });
+  list.onKey({ type: "key", name: "end" });
+  assert.equal(list.selected, 0); assert.equal(list.scrollY, 0);
+  const app = fakeApp(); app.screen = { w: 60, h: 20 };
+  const panel = new WorkspacePanel(app);
+  assert.doesNotThrow(() => panel.onKey({ type: "key", name: "backspace" }));
+  assert.equal(panel.query, "");
+});
+
+test("sidebar keyboard wraps, folds with Space, keeps focus on Enter, and Ctrl+R opens menu", async () => {
+  const app = headlessApp();
+  const sessions = [{ sessionId: "s1", projections: { values: { title: "One" } } }];
+  app.sidebar.setData([{ workspaceId: "w", title: "Work", path: "/w", sessionIds: ["s1"] }], sessions, [], null);
+  app.focus(app.sidebar);
+  app.sidebar.sel = 0;
+  app.sidebar.onKey({ type: "key", name: "up" });
+  assert.equal(app.sidebar.currentRow()?.kind, "session", "up from first wraps to final session");
+  app.sidebar.onKey({ type: "key", name: "down" });
+  assert.equal(app.sidebar.currentRow()?.kind, "group", "down wraps back to workspace");
+  app.onEvent({ type: "text", text: " " });
+  assert.equal(app.sidebar.rows.length, 1, "legacy text Space collapses focused workspace through App routing");
+  app.onEvent({ type: "text", text: " " });
+  assert.equal(app.sidebar.rows.length, 2, "legacy text Space expands focused workspace");
+  app.sidebar.sel = 1;
+  app.onEvent({ type: "text", text: " " });
+  assert.equal(app.sidebar.rows.length, 1, "Space on a session folds its parent workspace");
+  assert.equal(app.sidebar.currentRow()?.kind, "group", "selection moves to the surviving parent row");
+  app.onEvent({ type: "text", text: " " });
+  app.sidebar.sel = 1;
+  let opened = null; app.openSession = async (id) => { opened = id; };
+  app.sidebar.onKey({ type: "key", name: "enter" });
+  assert.equal(opened, "s1"); assert.equal(app.focused, app.sidebar, "Enter does not steal sidebar pane focus");
+  app.sidebar.onKey({ type: "key", name: "char", key: "r", ctrl: true });
+  assert.ok(app.menu || app.lastMenu, "Ctrl+R opens selected session context menu");
+});
+
+test("sidebar refresh and collapse clamp stale scroll positions", () => {
+  const app = headlessApp();
+  const many = Array.from({ length: 60 }, (_, i) => ({ sessionId: `s${i}`, projections: { values: { title: `Session ${i}` } } }));
+  app.sidebar.setData([{ workspaceId: "w", title: "Work", sessionIds: many.map((s) => s.sessionId) }], many, [], null);
+  app.sidebar.sel = app.sidebar.rows.length - 1; app.sidebar.scrollY = 50;
+  app.sidebar.setData([{ workspaceId: "w", title: "Work", sessionIds: ["s0"] }], many.slice(0, 1), [], null);
+  assert.ok(app.sidebar.scrollY <= app.sidebar.maxScroll());
+  app.sidebar.sel = 0; app.sidebar.onKey({ type: "key", name: "char", key: " ", ctrl: false });
+  assert.ok(app.sidebar.scrollY <= app.sidebar.maxScroll());
+});
+
 test("the sidebar divider drags to resize the session pane", () => {
   const app = headlessApp();
   app.layout();
@@ -407,6 +600,15 @@ test("session/jobs snapshots buffered before the session opens survive (footer c
   assert.equal(app.jobs.length, 0, "no stale counts leak across sessions");
 });
 
+test("new-session and open-session reject missing Host session IDs without async crashes", async () => {
+  const app = headlessApp(); app.api.call = async (method) => method === "session.create" ? {} : { items: [] };
+  await app.newSession();
+  assert.match(String(app.toastMsg), /创建失败/);
+  const epoch = app.sessionEpoch;
+  await app.openSession(undefined);
+  assert.equal(app.sessionEpoch, epoch); assert.match(String(app.toastMsg), /缺少会话 ID/);
+});
+
 test("a /restart handoff resumes the session instead of minting a new one", async () => {
   const saved = process.env.DSH_TUI_RESUME_SESSION;
   process.env.DSH_TUI_RESUME_SESSION = "s-resume";
@@ -446,6 +648,17 @@ test("single-line horizontal drag selects transcript instead of toggling block",
   chat.onMouse({ type: "mouse", kind: "release", button: 0, x: 12, y: chat.view.y });
   assert.equal(typeof app.copied, "string", "horizontal drag completed the selection/copy path");
   assert.ok(!app.copied.includes("select this line") || app.copied.length < "  edabchann > select this line".length, "character mode copies a range rather than whole line");
+});
+
+test("Input cursor and deletion treat emoji/combining graphemes atomically", () => {
+  const input = new Input({ x: 0, y: 0, w: 30, h: 1 });
+  input.setValue("A👍🏽e\u0301B");
+  assert.equal(input.cursor, 4);
+  input.onKey({ type: "key", name: "left" });
+  input.onKey({ type: "key", name: "backspace" });
+  assert.equal(input.value, "A👍🏽B", "Backspace removes one combining grapheme, not only its mark");
+  input.onKey({ type: "key", name: "backspace" });
+  assert.equal(input.value, "AB", "skin-tone emoji remains one edit unit");
 });
 
 test("the input supports drag-selection and Ctrl+Shift+C copy", () => {
@@ -580,6 +793,38 @@ test("a mouse report split across chunks never becomes input text", async () => 
   await new Promise((r) => setTimeout(r, 80));
   assert.deepEqual(events2, [{ type: "key", name: "escape", ctrl: false, alt: false, shift: false }], "lone ESC still emits escape");
   term.stop(); term2.stop();
+});
+
+test("Ctrl+Shift+C outside chat never arms or triggers the Ctrl+C exit path", () => {
+  const app = headlessApp(); let stopped = 0; app.stop = () => { stopped++; };
+  app.focus(app.sidebar);
+  app.onEvent({ type: "key", name: "char", key: "c", text: "C", ctrl: true, shift: true, alt: false });
+  app.onEvent({ type: "key", name: "char", key: "c", text: "C", ctrl: true, shift: true, alt: false });
+  assert.equal(stopped, 0); assert.equal(app.ctrlCUntil, null);
+  assert.ok(String(app.toastMsg).includes("正文"));
+});
+
+test("mouse/key routing tolerates focus owners without widget handlers", () => {
+  const app = headlessApp(); app.focus(app);
+  assert.doesNotThrow(() => app.onEvent({ type: "mouse", kind: "press", button: 0, x: app.screen.w - 1, y: app.screen.h - 1, ctrl: false, shift: false, alt: false, motion: false }));
+  assert.doesNotThrow(() => app.onEvent({ type: "text", text: "x" }));
+  assert.doesNotThrow(() => app.onEvent({ type: "key", name: "up", ctrl: false, shift: false }));
+});
+
+test("full-screen buffers own focus and never leak text or paste into hidden chat input", () => {
+  const app = headlessApp(); app.currentSession = "s";
+  app.showSettingsBuffer();
+  assert.equal(app.fullBuffer, app.settingsPanel);
+  assert.equal(app.focused, app.settingsPanel);
+  assert.equal(app.mode, "chat", "buffers never hijack the chat/trajectory pane mode");
+  app.chat.input.setValue("");
+  app.onEvent({ type: "text", text: "secret" });
+  app.onEvent({ type: "paste", text: "hidden paste" });
+  assert.equal(app.chat.input.value, "");
+  assert.equal(app.focused, app.settingsPanel);
+  app.onEvent({ type: "key", name: "escape", ctrl: false });
+  assert.equal(app.fullBuffer, null, "Esc closes the buffer");
+  assert.equal(app.focused, app.chat);
 });
 
 test("Ctrl+C clears the input in insert mode and double-press exits in normal mode", () => {
@@ -803,11 +1048,14 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
   const panel = new ModelPanel(app);
   await panel.load();
   assert.deepEqual(panel.routes, ["ucas"]);
-  // ＋ 添加供应商 creates a draft and opens the form
+  // ＋ 添加供应商 opens the Host-directory chooser; its final row is custom.
   panel.sel = panel.routes.length;
   panel.mode = "list";
   panel.onKey({ type: "key", name: "enter" });
-  assert.ok(panel.routes.includes("new-provider"), "draft route created");
+  assert.equal(panel.addMode, true, "provider directory opened first");
+  panel.addCursor = panel.addItems.length - 1;
+  panel.onKey({ type: "key", name: "enter" });
+  assert.ok(panel.routes.includes("new-provider"), "custom draft route created from the final chooser row");
   assert.equal(panel.mode, "form");
   const fieldIdx = (label) => panel.formItems.findIndex((it) => it.kind === "field" && it.label === label);
   // the api protocol field is a CHOICE: Tab cycles the options in the form
@@ -863,16 +1111,9 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
   app.overlay.onKey({ type: "text", text: "turbo" });
   app.overlay.onKey({ type: "key", name: "enter" });
   assert.equal(Object.hasOwn(panel.providers["new-provider"], "reasoning"), false, "unsupported reasoning level is rejected");
-  // save persists via settings.mutate
-  panel.formIdx = panel.formItems.findIndex((it) => it.kind === "button" && it.label.includes("保存配置"));
-  panel.onKey({ type: "key", name: "enter" });
-  const mutate = calls.find(([m]) => m === "settings.mutate");
-  assert.ok(mutate, "settings.mutate called");
-  assert.equal(mutate[1].ns, "llm-pi-ai");
-  assert.equal(mutate[1].expectedRevision, 3);
-  assert.deepEqual(mutate[1].ops[0].path, ["providers", "new-provider"]);
-  assert.equal(mutate[1].ops[0].value.displayName, "My GW");
-  // the 模型管理 entry opens a sub-buffer; its FIRST row is the auto-scan
+  // A custom provider must have a model before it can be saved. Switch back to
+  // a listable protocol, discover models from the unsaved draft, then save.
+  panel.providers["new-provider"].api = "openai-completions";
   panel.formIdx = panel.formItems.findIndex((it) => it.kind === "button" && it.label === "模型管理");
   panel.onKey({ type: "key", name: "enter" });
   assert.ok(panel.sub != null, "模型管理 sub-buffer opened");
@@ -893,6 +1134,383 @@ test("ModelPanel: CC Switch-style form adds a provider, saves, and scans models"
   // Esc closes the sub-buffer back to the provider form
   panel.onKey({ type: "key", name: "escape" });
   assert.equal(panel.sub, null, "Esc returned from the sub-buffer");
+  panel.formIdx = panel.formItems.findIndex((it) => it.kind === "button" && it.label.includes("保存配置"));
+  panel.onKey({ type: "key", name: "enter" });
+  const mutate = calls.find(([m]) => m === "settings.mutate");
+  assert.ok(mutate, "settings.mutate called after custom requirements are complete");
+  assert.equal(mutate[1].ns, "llm-pi-ai");
+  assert.equal(mutate[1].expectedRevision, 3);
+  assert.deepEqual(mutate[1].ops[0].path, ["providers", "new-provider"]);
+  assert.equal(mutate[1].ops[0].value.displayName, "My GW");
+  assert.deepEqual(mutate[1].ops[0].value.models.map((model) => model.id), ["m1", "m2"]);
+});
+
+test("ModelPanel: custom provider validation and non-listable protocol fail locally", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "llm.providers") return { providers: [] };
+    if (method === "settings.describe") return { writable: true, namespaces: [{ ns: "llm-pi-ai", revision: 1, user: { providers: {} }, base: { providers: {} }, value: { providers: {} } }] };
+    return {};
+  };
+  const panel = new ModelPanel(app); await panel.load();
+  panel.sel = 0; panel.onKey({ type: "key", name: "enter" }); panel.addCursor = panel.addItems.length - 1; panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("保存配置")); panel.onKey({ type: "key", name: "enter" });
+  assert.match(app.toastMsg, /baseURL/);
+  assert.equal(calls.some(([method]) => method === "settings.mutate"), false, "invalid custom draft never reaches Host");
+  panel.providers["new-provider"].baseURL = "https://anthropic.example";
+  panel.providers["new-provider"].api = "anthropic-messages";
+  panel.formIdx = panel.formItems.findIndex((item) => item.label === "模型管理"); panel.onKey({ type: "key", name: "enter" });
+  panel.sub.cursor = 0; panel.onKey({ type: "key", name: "enter" });
+  assert.match(app.toastMsg, /不支持自动列出模型/);
+  assert.equal(calls.some(([method]) => method === "llm.discoverModels"), false, "non-listable protocol never sends a doomed discovery call");
+});
+
+test("Picker renders the active query and ControlPanel settings header blank area is safe", () => {
+  const app = fakeApp(); app.screen = { w: 90, h: 24 };
+  const picker = new Picker({ x: 2, y: 2, w: 40, h: 10, title: "Pick", items: [{ label: "alpha" }], onPick() {}, onCancel() {} });
+  picker.onKey({ type: "text", text: "alp" });
+  const screen = new Screen(90, 24); picker.render(screen);
+  const plain = screen.cells.map((row) => row.map((cell) => cell.ch).join("")).join("\n");
+  assert.ok(plain.includes("alp"), plain);
+  const panel = new ControlPanel(app, { startPage: 2 });
+  assert.doesNotThrow(() => panel.onMouse({ type: "mouse", kind: "press", button: 0, x: panel.x + panel.w - 3, y: panel.y }));
+});
+
+test("slash /model opens the hierarchical model picker, not the Agent mode picker", () => {
+  const { app, chat } = render([]); app.currentSession = "s"; app.screen = { w: 100, h: 30 };
+  chat.sessionId = "s"; chat.input.setValue("/model"); chat.send("/model");
+  assert.ok(app.overlay instanceof ModelPickerBuffer);
+  assert.match(app.overlay.title, /模型/);
+  assert.doesNotMatch(app.overlay.title, /Agent 模式/);
+});
+
+test("finite choice lists wrap, provider chooser previews, and model picker selects current", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 20 };
+  app.currentModel = { provider: "anthropic", model: "claude-current" };
+  app.currentSession = "s";
+  app.api.call = async (method) => {
+    if (method === "llm.providers") return { providers: [
+      { provider: "anthropic", displayName: "Anthropic", settingsNs: "llm-pi-ai", settingsPath: ["providers", "anthropic"], active: false, declared: false },
+      { provider: "openrouter", displayName: "OpenRouter", settingsNs: "llm-pi-ai", settingsPath: ["providers", "openrouter"], active: false, declared: false },
+    ] };
+    if (method === "settings.describe") return { writable: true, namespaces: [{ ns: "llm-pi-ai", revision: 1, user: { providers: {} }, base: { providers: {} }, value: { providers: {} } }] };
+    if (method === "llm.models") return { groups: [{ id: "anthropic", name: "Anthropic", models: [{ id: "claude-old", name: "Old" }, { id: "claude-current", name: "Current" }] }], failures: [] };
+    return {};
+  };
+  const panel = new ModelPanel(app); await panel.load(); panel.sel = panel.routes.length;
+  panel.onKey({ type: "key", name: "enter" });
+  assert.equal(panel.addCursor, 0);
+  panel.onKey({ type: "key", name: "up" });
+  assert.equal(panel.addCursor, panel.addItems.length - 1, "up from first wraps to custom final row");
+  let preview = panel.formView.lines.flat().map((seg) => seg.t ?? "").join(" ");
+  assert.ok(preview.includes("自定义提供方") && preview.includes("baseURL"), preview);
+  panel.onKey({ type: "key", name: "down" });
+  assert.equal(panel.addCursor, 0, "down from final wraps to first");
+  preview = panel.formView.lines.flat().map((seg) => seg.t ?? "").join(" ");
+  assert.ok(preview.includes("Anthropic") && preview.includes("Host 内置目录") && preview.includes("ANTHROPIC_API_KEY"), preview);
+
+  const picker = buildModelPicker(app);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  // Tree structure: provider folder rows + indented model rows. The current
+  // model's provider starts expanded and the cursor rests on the current model.
+  assert.equal(picker.rows[0].kind, "provider");
+  assert.equal(picker.rows[0].group.provider, "anthropic");
+  const current = picker.rows.findIndex((row) => row.kind === "model" && row.model.id === "claude-current");
+  assert.equal(picker.sel, current, "current session model is selected by default");
+  // Space folds the current provider; the models disappear behind the folder.
+  picker.onKey({ type: "key", name: "char", key: " ", ctrl: false });
+  assert.equal(picker.rows.filter((row) => row.kind === "model").length, 0, "Space folds the provider folder");
+  assert.equal(picker.rows[0].group.provider, "anthropic");
+  picker.onKey({ type: "key", name: "char", key: " ", ctrl: false });
+  assert.ok(picker.rows.some((row) => row.kind === "model" && row.model.id === "claude-current"), "Space expands the provider again");
+  picker.onKey({ type: "key", name: "char", key: " ", ctrl: false }); // fold again
+  // Down wraps over the folded tree (folder + manage row); Up returns.
+  picker.onKey({ type: "key", name: "down" });
+  assert.equal(picker.rows[picker.sel].kind, "manage", "Down walks from the folder to the manage row");
+  picker.onKey({ type: "key", name: "down" });
+  assert.equal(picker.rows[picker.sel].kind, "provider", "Down wraps back to the first folder");
+  picker.onKey({ type: "key", name: "up" });
+  assert.equal(picker.rows[picker.sel].kind, "manage", "Up wraps to the last row");
+});
+
+test("ModelPanel degrades gracefully when the optional Host provider directory fails", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 30 };
+  app.api.call = async (method) => {
+    if (method === "llm.providers") throw new Error("unsupported");
+    if (method === "settings.describe") return { writable: true, namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: { configured: { displayName: "Configured" } } } }] };
+    return {};
+  };
+  const panel = new ModelPanel(app); await panel.load();
+  assert.deepEqual(panel.routes, ["configured"]); assert.deepEqual(panel.directory, []);
+});
+
+test("tiny screens keep pickers and ModelPanel geometry non-negative", () => {
+  const app = fakeApp(); app.screen = { w: 3, h: 3 }; app.sessions = []; app.projections = { permissions: { options: [] } };
+  const picker = buildModelPicker(app); assert.ok(picker.w >= 1 && picker.h >= 1);
+  const panel = new ModelPanel(app); panel.relayout(0, 0, 2, 2);
+  assert.ok(panel.listView.w >= 1 && panel.listView.h >= 1 && panel.formView.w >= 1 && panel.formView.h >= 1);
+});
+
+test("model picker Enter confirms a model and management row opens the providers buffer", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 26 };
+  app.currentModel = { provider: "anthropic", model: "claude-old" };
+  app.currentSession = "s";
+  app.updateModel = () => {};
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "llm.models") return { groups: [{ id: "anthropic", name: "Anthropic", models: [{ id: "claude-old" }, { id: "claude-new", name: "New" }] }], failures: [] };
+    return {};
+  };
+  const picker = buildModelPicker(app);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const target = picker.rows.findIndex((row) => row.kind === "model" && row.model.id === "claude-new");
+  picker.sel = target;
+  picker.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const select = calls.find(([method]) => method === "session.selectModel");
+  assert.deepEqual(select?.[1], { sessionId: "s", provider: "anthropic", model: "claude-new" });
+  assert.equal(app.overlay, null, "picker closes after confirming");
+});
+
+test("code block box rows share one exact width and the [按y复制] swap is width-neutral", () => {
+  const lines = renderMd("```bash\nls -la\necho 👍🏽\n```", 24);
+  const widths = lines.map((row) => strWidth(row.map((seg) => seg.t ?? "").join("")));
+  assert.ok(widths.every((w) => w === widths[0]), `uniform box rows: ${widths.join(",")}`);
+  const top = lines[0].map((seg) => seg.t ?? "").join("");
+  assert.ok(top.includes("bash"), "language tag sits inside the box");
+  assert.equal(top.at(-1), "┐", "top row ends at the corner, nothing extends past the box");
+  // the NORMAL-mode button swap keeps the row exactly as wide
+  const header = lines[0];
+  const swapped = header.map((seg) => seg.copyCode ? { ...seg, t: pad("[按y复制]", strWidth(seg.t)) } : seg);
+  assert.equal(strWidth(swapped.map((seg) => seg.t ?? "").join("")), widths[0], "button swap never shifts the right border");
+});
+
+test("model picker uses / filter mode with Ctrl+/ exit like the other buffers", async () => {
+  const app = fakeApp(); app.screen = { w: 90, h: 24 };
+  app.currentModel = null; app.currentSession = "s";
+  app.api.call = async (method) => method === "llm.models"
+    ? { groups: [{ id: "a", name: "Alpha", models: [{ id: "a-1", name: "One" }, { id: "b-2", name: "Beta two" }] }], failures: [] }
+    : {};
+  const picker = buildModelPicker(app);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  app.overlay = picker; // /model and Ctrl+M mount the buffer as the overlay
+  picker.onKey({ type: "key", name: "char", key: "x", ctrl: false });
+  assert.equal(picker.query, "", "browse mode ignores plain characters");
+  picker.onKey({ type: "text", text: "/" });
+  assert.equal(picker.filtering, true);
+  picker.onKey({ type: "text", text: "beta" });
+  assert.equal(picker.query, "beta");
+  assert.deepEqual(picker.rows.filter((row) => row.kind === "model").map((row) => row.model.id), ["b-2"], "filter matches models");
+  picker.onKey({ type: "key", name: "char", key: "/", ctrl: true });
+  assert.equal(picker.filtering, false); assert.equal(picker.query, "");
+  assert.ok(picker.rows.some((row) => row.kind === "provider"), "Ctrl+/ restores the full tree");
+  picker.onKey({ type: "text", text: "/" });
+  picker.onKey({ type: "key", name: "escape", ctrl: false });
+  assert.equal(picker.filtering, false, "Esc exits filter first");
+  assert.equal(app.overlay, picker, "picker stays open after exiting filter");
+  picker.onKey({ type: "key", name: "escape", ctrl: false });
+  assert.equal(app.overlay, null, "second Esc closes the picker");
+});
+
+test("model picker management row opens the providers full-screen buffer", async () => {
+  const app = headlessApp(); app.currentSession = "s";
+  app.api.call = async (method) => method === "llm.models"
+    ? { groups: [{ id: "a", name: "Alpha", models: [{ id: "a-1" }] }], failures: [] }
+    : method === "llm.providers" ? { providers: [] }
+    : method === "settings.describe" ? { writable: true, namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers: {} } }] }
+    : {};
+  const picker = buildModelPicker(app);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  picker.sel = picker.rows.findIndex((row) => row.kind === "manage");
+  picker.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(app.fullBuffer, app.modelPanel, "manage row opens the ModelPanel buffer");
+});
+
+test("legacy one-slot keybinding values migrate to the new two-slot defaults", async () => {
+  const app = headlessApp(); app.currentSession = "s"; app.focus(app.chat);
+  saveTuiConfig({ keyBindings: {
+    sessionFilter: { mode: "normal", key: "/" },
+    homeSwitch: { mode: "normal", key: "Ctrl+Left/Right" },
+    skills: { mode: "normal", key: "Ctrl+K" },
+  } });
+  const kb = keyBindings();
+  assert.deepEqual(kb.sessionFilter, { mode: "normal", key: "Ctrl+F", key2: "/" });
+  assert.deepEqual(kb.homeSwitch, { mode: "normal", key: "Ctrl+Left", key2: "Ctrl+Right" });
+  assert.equal(kb.skills.key, "Ctrl+H");
+  app.onEvent({ type: "key", name: "char", key: "f", ctrl: true, shift: false });
+  assert.equal(app.searchActive, true, "Ctrl+F works even with a legacy sessionFilter override in the config");
+  app.onEvent({ type: "key", name: "escape", ctrl: false });
+  app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
+  assert.equal(app.focused, app.sidebar, "Ctrl+Left works despite the legacy homeSwitch override");
+  saveTuiConfig({ keyBindings: {} });
+});
+
+test("ModelPanel top-level Escape closes the full-screen buffer through App routing", async () => {
+  const app = headlessApp(); app.currentSession = "s";
+  app.showModelsBuffer();
+  assert.equal(app.fullBuffer, app.modelPanel);
+  app.onEvent({ type: "key", name: "escape", ctrl: false });
+  assert.equal(app.fullBuffer, null, "unhandled list-level Escape closes the buffer");
+  assert.equal(app.focused, app.chat);
+});
+
+test("ModelPanel: Host directory adds official DeepSeek through its own namespace", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "llm.providers") return { providers: [
+      { provider: "deepseek-official", displayName: "DeepSeek", settingsNs: "llm-deepseek", settingsPath: [], active: true },
+      { provider: "anthropic", displayName: "Anthropic", settingsNs: "llm-pi-ai", settingsPath: ["providers", "anthropic"], active: false, declared: false },
+    ] };
+    if (method === "settings.describe") return { writable: true, namespaces: [
+      { ns: "llm-deepseek", revision: 4, user: undefined, base: { apiKeyEnv: "DEEPSEEK_API_KEY", models: [{ id: "deepseek-chat" }] }, value: { apiKeyEnv: "DEEPSEEK_API_KEY", models: [{ id: "deepseek-chat" }] } },
+      { ns: "llm-pi-ai", revision: 7, user: { providers: {} }, base: { providers: {} }, value: { providers: {} } },
+    ] };
+    if (method === "credentials.describe") return { credentials: { DEEPSEEK_API_KEY: { configured: false, writable: true } } };
+    if (method === "credentials.set") return {};
+    if (method === "settings.mutate") return { revision: 5 };
+    return {};
+  };
+  const panel = new ModelPanel(app); await panel.load();
+  assert.ok(panel.routes.includes("deepseek-official"), "official provider appears from Host directory");
+  panel.sel = panel.routes.indexOf("deepseek-official"); panel.onKey({ type: "key", name: "enter" });
+  assert.equal(panel.formItems.some((item) => item.label === "协议 api"), false, "official route does not expose custom protocol");
+  assert.equal(panel.formItems.find((item) => item.kind === "key")?.ref, "DEEPSEEK_API_KEY");
+  assert.ok(panel.formItems.find((item) => item.label === "模型管理")?.sub.includes("deepseek-chat"), "official catalog is visible");
+  panel.formIdx = panel.formItems.findIndex((item) => item.kind === "key"); panel.onKey({ type: "key", name: "enter" });
+  app.overlay.onKey({ type: "text", text: "sk-deepseek" }); app.overlay.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("保存配置")); panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls.find(([method]) => method === "credentials.set")?.[1], { ref: "DEEPSEEK_API_KEY", value: "sk-deepseek" });
+  assert.equal(calls.some(([method, payload]) => method === "settings.mutate" && payload.ns === "llm-pi-ai"), false, "official credential never writes pi-ai settings");
+});
+
+test("ModelPanel: external user-layer provider can unconfigure its own namespace without deleting credentials", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "llm.providers") return { providers: [{ provider: "gateway", displayName: "Gateway", settingsNs: "llm-gateway", settingsPath: ["provider"], active: false }] };
+    if (method === "settings.describe") return { writable: true, namespaces: [
+      { ns: "llm-pi-ai", revision: 1, user: { providers: {} }, base: { providers: {} }, value: { providers: {} } },
+      { ns: "llm-gateway", revision: 7, user: { provider: { baseURL: "https://gateway.example", apiKeyEnv: "GATEWAY_KEY" } }, base: {}, value: { provider: { baseURL: "https://gateway.example", apiKeyEnv: "GATEWAY_KEY" } } },
+    ] };
+    if (method === "credentials.describe") return { credentials: { GATEWAY_KEY: { configured: true, writable: true } } };
+    if (method === "settings.mutate") return { revision: 8 };
+    return {};
+  };
+  const panel = new ModelPanel(app); await panel.load();
+  assert.ok(panel.routes.includes("gateway"));
+  panel.sel = panel.routes.indexOf("gateway"); panel.onKey({ type: "key", name: "enter" });
+  const remove = panel.formItems.find((item) => item.label === "🗑 取消配置提供方");
+  assert.ok(remove, "external user-layer provider has an explicit unconfigure action");
+  panel.formIdx = panel.formItems.indexOf(remove); panel.onKey({ type: "key", name: "enter" });
+  await app.overlay.onAction({ action: "delete" });
+  const mutate = calls.find(([method, payload]) => method === "settings.mutate" && payload.ns === "llm-gateway");
+  assert.deepEqual(mutate?.[1].ops, [{ op: "unset", path: ["provider"] }]);
+  assert.equal(calls.some(([method]) => method === "credentials.unset"), false, "unconfiguring never deletes a possibly shared global key");
+  assert.ok(!panel.routes.includes("gateway"));
+});
+
+test("ModelPanel: optional root adapter remains addable until user configured", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 30 };
+  app.api.call = async (method) => {
+    if (method === "llm.providers") return { providers: [{ provider: "optional-root", displayName: "Optional Root", settingsNs: "llm-optional", settingsPath: [], active: false }] };
+    if (method === "settings.describe") return { writable: true, namespaces: [
+      { ns: "llm-pi-ai", revision: 1, user: { providers: {} }, value: { providers: {} } },
+      { ns: "llm-optional", revision: 1, user: undefined, base: {}, value: {} },
+    ] };
+    return {};
+  };
+  const panel = new ModelPanel(app); await panel.load();
+  assert.ok(!panel.routes.includes("optional-root"));
+  panel.sel = panel.routes.length; panel.onKey({ type: "key", name: "enter" });
+  assert.ok(panel.addItems.some((item) => item.entry?.provider === "optional-root"));
+});
+
+test("ModelPanel: official partial save is compensated when credential storage fails then user discards", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "llm.providers") return { providers: [{ provider: "deepseek-official", displayName: "DeepSeek", settingsNs: "llm-deepseek", settingsPath: [], active: true }] };
+    if (method === "settings.describe") return { writable: true, namespaces: [
+      { ns: "llm-deepseek", revision: 2, user: { baseURL: "https://old.example" }, base: { apiKeyEnv: "DEEPSEEK_API_KEY" }, value: { apiKeyEnv: "DEEPSEEK_API_KEY", baseURL: "https://old.example" } },
+      { ns: "llm-pi-ai", revision: 1, user: { providers: {} }, base: { providers: {} }, value: { providers: {} } },
+    ] };
+    if (method === "settings.mutate") return { revision: payload.expectedRevision + 1 };
+    if (method === "credentials.set") throw new Error("vault down");
+    return {};
+  };
+  const panel = new ModelPanel(app); await panel.load();
+  panel.sel = panel.routes.indexOf("deepseek-official"); panel.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label === "baseURL"); panel.onKey({ type: "key", name: "enter" });
+  app.overlay.input.value = "https://new.example"; app.overlay.input.caret = app.overlay.input.value.length; app.overlay.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.kind === "key"); panel.onKey({ type: "key", name: "enter" });
+  app.overlay.onKey({ type: "text", text: "sk-new" }); app.overlay.onKey({ type: "key", name: "enter" });
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("保存配置")); panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(app.toastMsg, /密钥保存失败/);
+  panel.onKey({ type: "key", name: "escape" });
+  const confirm = app.overlay; assert.ok(confirm, "unsuccessful two-step save remains dirty");
+  await confirm.onAction({ action: "discard" });
+  const mutations = calls.filter(([method]) => method === "settings.mutate").map(([, payload]) => payload);
+  assert.equal(mutations.length, 2, "discard compensates the confirmed official profile write");
+  assert.deepEqual(mutations[1].ops, [{ op: "set", path: ["baseURL"], value: "https://old.example" }]);
+});
+
+test("ModelPanel: Host directory materializes a catalog provider without custom endpoint fields", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 30 };
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "llm.providers") return { providers: [
+      { provider: "anthropic", displayName: "Anthropic", settingsNs: "llm-pi-ai", settingsPath: ["providers", "anthropic"], active: false, declared: false },
+      { provider: "openrouter", displayName: "OpenRouter", settingsNs: "llm-pi-ai", settingsPath: ["providers", "openrouter"], active: false, declared: false },
+    ] };
+    if (method === "settings.describe") return { writable: true, namespaces: [{ ns: "llm-pi-ai", revision: 8, user: { providers: {} }, base: { providers: {} }, value: { providers: {} } }] };
+    if (method === "settings.mutate") return { revision: 9, value: { providers: { anthropic: {} } } };
+    if (method === "llm.discoverModels") return { models: [{ id: "claude-sonnet", name: "Claude Sonnet" }] };
+    return {};
+  };
+  const panel = new ModelPanel(app); await panel.load();
+  panel.sel = panel.routes.length; panel.onKey({ type: "key", name: "enter" });
+  assert.deepEqual(panel.addItems.filter((item) => !item.custom).map((item) => item.entry.provider), ["anthropic", "openrouter"]);
+  assert.equal(panel.addItems.at(-1).custom, true, "custom provider remains a distinct final action");
+  panel.addCursor = panel.addItems.findIndex((item) => item.entry?.provider === "anthropic"); panel.onKey({ type: "key", name: "enter" });
+  assert.equal(panel.routes.includes("anthropic"), true);
+  assert.deepEqual(panel.providers.anthropic, {}, "catalog provider starts as an empty inherited profile");
+  assert.equal(panel.formItems.some((item) => item.label === "显示名" || item.label === "协议 api"), false, "catalog provider identity/protocol stay owned by Host");
+  assert.equal(panel.formItems.find((item) => item.label === "模型管理")?.sub, "使用 Host 内置模型目录");
+  panel.formIdx = panel.formItems.findIndex((item) => item.label.includes("保存配置")); panel.onKey({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const mutate = calls.find(([method]) => method === "settings.mutate");
+  assert.equal(mutate?.[1].ns, "llm-pi-ai");
+  assert.deepEqual(mutate?.[1].ops, [{ op: "set", path: ["providers", "anthropic"], value: {} }], "catalog provider is activated without guessed endpoint/protocol/model data");
+});
+
+test("ModelPanel: add chooser is keyboard-scrollable and closes when an existing provider is clicked", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 14 };
+  const catalog = Array.from({ length: 30 }, (_, i) => ({ provider: `catalog-${i}`, displayName: `Catalog ${i}`, settingsNs: "llm-pi-ai", settingsPath: ["providers", `catalog-${i}`], active: false, declared: false }));
+  app.api.call = async (method) => {
+    if (method === "llm.providers") return { providers: [{ provider: "active", displayName: "Active", settingsNs: "llm-pi-ai", settingsPath: ["providers", "active"], active: true, declared: true }, ...catalog] };
+    if (method === "settings.describe") return { writable: true, namespaces: [{ ns: "llm-pi-ai", revision: 1, user: { providers: { active: { displayName: "Active" } } }, base: { providers: {} }, value: { providers: { active: { displayName: "Active" } } } }] };
+    return {};
+  };
+  const panel = new ModelPanel(app); panel.relayout(0, 0, 100, 13); await panel.load();
+  panel.sel = panel.routes.length; panel.onKey({ type: "key", name: "enter" });
+  for (let i = 0; i < 25; i++) panel.onKey({ type: "key", name: "down" });
+  const targetLine = panel.formClickMap.findIndex((target) => target?.type === "add" && target.index === panel.addCursor);
+  assert.ok(targetLine >= panel.formView.scrollY && targetLine < panel.formView.scrollY + panel.formView.h, "keyboard selection remains visible in a long Host directory");
+  panel.onMouse({ type: "mouse", kind: "press", button: 0, x: panel.listView.x + 1, y: panel.listView.y });
+  assert.equal(panel.addMode, false, "clicking an existing provider closes the chooser");
+  assert.equal(panel.mode, "form");
+  assert.equal(panel.routes[panel.sel], "active");
 });
 
 test("ModelPanel: draft keys reach Host discovery once without local fetch", async () => {
@@ -909,6 +1527,8 @@ test("ModelPanel: draft keys reach Host discovery once without local fetch", asy
   const panel = new ModelPanel(app);
   await panel.load();
   panel.sel = panel.routes.length;
+  panel.onKey({ type: "key", name: "enter" });
+  panel.addCursor = panel.addItems.length - 1;
   panel.onKey({ type: "key", name: "enter" });
   const keyRow = panel.formItems.find((item) => item.kind === "key");
   panel.formIdx = panel.formItems.indexOf(keyRow);
@@ -935,6 +1555,8 @@ test("ModelPanel: draft route rename validates identifiers and migrates derived 
   const panel = new ModelPanel(app);
   await panel.load();
   panel.sel = 0;
+  panel.onKey({ type: "key", name: "enter" });
+  panel.addCursor = panel.addItems.length - 1;
   panel.onKey({ type: "key", name: "enter" });
   const routeIdx = () => panel.formItems.findIndex((item) => item.key === "route");
   const keyIdx = () => panel.formItems.findIndex((item) => item.kind === "key");
@@ -1295,6 +1917,26 @@ test("ModelPanel navigation: ↑/↓ move within the focused region, →/← swi
   assert.equal(panel.mode, "list", "← returned to the provider list");
   panel.onKey({ type: "key", name: "right" });
   assert.equal(panel.mode, "form", "→ re-entered the form");
+});
+
+test("ModelPanel keeps long provider, form, sub-model, and scan cursors visible", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 12 };
+  const providers = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`p${i}`, { displayName: `Provider ${i}`, api: "openai-completions", models: Array.from({ length: 30 }, (_, j) => ({ id: `m${j}` })) }]));
+  app.api.call = async (method) => method === "settings.describe" ? { namespaces: [{ ns: "llm-pi-ai", revision: 1, value: { providers } }], writable: true } : {};
+  const panel = new ModelPanel(app); panel.relayout(0, 0, 100, 11); await panel.load();
+  for (let i = 0; i < 25; i++) panel.onKey({ type: "key", name: "down" });
+  assert.ok(panel.sel >= panel.listView.scrollY && panel.sel < panel.listView.scrollY + panel.listView.h, "provider cursor visible");
+  panel.onKey({ type: "key", name: "enter" });
+  for (let i = 0; i < 12; i++) panel.onKey({ type: "key", name: "down" });
+  let formLine = panel.formClickMap.findIndex((target) => target?.type === "item" && !target.sub && target.index === panel.formIdx);
+  assert.ok(formLine >= panel.formView.scrollY && formLine < panel.formView.scrollY + panel.formView.h, "form cursor visible");
+  panel.formIdx = panel.formItems.findIndex((item) => item.label === "模型管理"); panel.onKey({ type: "key", name: "enter" });
+  for (let i = 0; i < 25; i++) panel.onKey({ type: "key", name: "down" });
+  const subLine = panel.formClickMap.findIndex((target) => target?.type === "item" && target.sub && target.index === panel.sub.cursor);
+  assert.ok(subLine >= panel.formView.scrollY && subLine < panel.formView.scrollY + panel.formView.h, "model sub-buffer cursor visible");
+  panel.sub = null; panel.scanMode = true; panel.scanning = false; panel.scanItems = Array.from({ length: 30 }, (_, i) => ({ id: `scan-${i}` })); panel.scanCursor = 25; panel.formView.scrollY = 0; panel.relayout(0, 0, 100, 11); panel.onKey({ type: "key", name: "down" });
+  const scanLine = panel.formClickMap.findIndex((target) => target?.type === "scan" && target.index === panel.scanCursor);
+  assert.ok(scanLine >= panel.formView.scrollY && scanLine < panel.formView.scrollY + panel.formView.h, "scan cursor visible");
 });
 
 test("ModelPanel: the api protocol popup autocompletes and tab-selects every candidate", async () => {
@@ -1923,6 +2565,14 @@ test("ModelPanel: Esc leaves level by level and unsaved form edits ask 保存/�
   assert.equal(panel.mode, "form", "← cancelled stayed on the form");
 });
 
+test("node event seq ranges do not bleed into the next sibling", () => {
+  const nodes = nodeForEvents([
+    { event: { type: "user/message", seq: 5, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "user" }] } } },
+    { event: { type: "assistant/message", seq: 6, data: { message: { id: "a", content: [{ type: "text", text: "assistant" }] } } } },
+  ], () => {});
+  assert.deepEqual(nodes.map((node) => [node.id, node.firstSeq, node.lastSeq]), [["u", 5, 5], ["a", 6, 6]]);
+});
+
 test("a new turn closes a stale deep-diving timer instead of running two", () => {
   const nodes = nodeForEvents([
     { event: { type: "turn/start", time: 1000, data: { turn: 1 } } },
@@ -2214,6 +2864,58 @@ async function traj() {
 
 const stepLine = (panel, n) => panel.view.lines.findIndex((l) => l.some((g) => g.t.includes(`step ${String(n).padStart(3)}`)));
 
+test("trajectory turn/start metadata does not create phantom steps", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 30 }; app.currentSession = "s";
+  app.api.call = async () => ({ events: [
+    { event: { type: "turn/start", seq: 1, data: { turn: 1 } } },
+    { event: { type: "step/start", seq: 2, data: { step: 1, turn: 1 } } },
+    { event: { type: "step/end", seq: 3, data: {} } },
+    { event: { type: "turn/start", seq: 4, data: { turn: 2 } } },
+    { event: { type: "step/start", seq: 5, data: { step: 2, turn: 2 } } },
+    { event: { type: "step/end", seq: 6, data: {} } },
+  ], hasMore: false, projections: { values: {} } });
+  const panel = new TrajectoryPanel(app); await panel.load("s");
+  assert.equal(panel.steps.length, 2); assert.deepEqual(panel.steps.map((step) => step.step), [1, 2]);
+  assert.deepEqual(panel.steps[0].events.map((event) => event.seq), [1, 2, 3]);
+  assert.deepEqual(panel.steps[1].events.map((event) => event.seq), [4, 5, 6], "turn metadata prefixes its real step without a phantom row");
+});
+
+test("trajectory session switch resets per-session expansion, selection, window and query", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 30 }; app.currentSession = "a";
+  app.api.call = async () => ({ events: [{ event: { type: "step/start", seq: 1, data: { step: 1 } } }, { event: { type: "step/end", seq: 2, data: {} } }], hasMore: false, projections: { values: {} } });
+  const panel = new TrajectoryPanel(app); await panel.load("a");
+  panel.expandedSteps.add(1); panel.selectedStepKey = 1; panel.winSeqLo = panel.winSeqHi = 1; panel.query = "old"; panel.flashKey = 1;
+  app.currentSession = "b"; await panel.load("b");
+  assert.equal(panel.expandedSteps.size, 0); assert.equal(panel.query, ""); assert.equal(panel.flashKey, null);
+  assert.equal(panel.winSeqLo, null); assert.equal(panel.winSeqHi, null);
+});
+
+test("trajectory keeps a leading partial step, dedupes overlap, and merges at page boundary", async () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 30 }; app.currentSession = "s";
+  const recent = [
+    { event: { type: "tool/result", seq: 5, data: { message: { content: [{ type: "text", text: "tail" }] } } } },
+    { event: { type: "step/end", seq: 6, data: {} } },
+    { event: { type: "step/start", seq: 7, data: { step: 2 } } },
+    { event: { type: "step/end", seq: 8, data: {} } },
+  ];
+  const older = [
+    { event: { type: "step/start", seq: 1, data: { step: 1 } } },
+    { event: { type: "tool/call", seq: 4, data: { name: "bash" } } },
+    recent[0],
+  ];
+  let calls = 0; app.api.call = async () => calls++ === 0 ? { events: recent, hasMore: true, projections: { values: {} } } : { events: older, hasMore: false };
+  const panel = new TrajectoryPanel(app); panel.relayout(0, 1, 100, 28);
+  await panel.load("s");
+  assert.equal(panel.steps.length, 2); assert.equal(panel.steps[0].partial, true); assert.deepEqual(panel.steps[0].events.map((e) => e.seq), [5, 6]);
+  panel.selectedStepKey = 5; panel.expandedSteps.add(5);
+  await panel.loadOlder();
+  assert.equal(panel.steps.length, 2); assert.deepEqual(panel.steps[0].events.map((e) => e.seq), [1, 4, 5, 6]);
+  assert.equal(panel.selectedStepKey, 1, "selection follows the partial step after its real start arrives");
+  assert.ok(panel.expandedSteps.has(1), "expanded state follows the merged step identity");
+  assert.equal(panel.allEvents.filter((e) => e.event.seq === 5).length, 1, "overlap event is deduplicated");
+  assert.equal(panel.stepKey(panel.steps[0]), 1);
+});
+
 test("trajectory: left click toggles a step's 详细/简略 expansion", async () => {
   const { app, panel } = await traj();
   const li = stepLine(panel, 1);
@@ -2231,7 +2933,7 @@ test("trajectory: left click toggles a step's 详细/简略 expansion", async ()
   assert.equal(panel.expandedSteps.size, 0, "step collapsed by second left click");
 });
 
-test("trajectory: right click opens 展开/转跳/详情 menu; toggle expands 详细", async () => {
+test("trajectory: right click opens 展开/转跳 menu; toggle expands 详细", async () => {
   const { app, panel } = await traj();
   const li = stepLine(panel, 1);
   panel.onMouse({ type: "mouse", kind: "press", button: 2, x: panel.view.x + 2, y: panel.view.y + li });
@@ -2239,7 +2941,7 @@ test("trajectory: right click opens 展开/转跳/详情 menu; toggle expands �
   const labels = app.lastMenu.items.map((i) => i.label);
   assert.ok(labels.includes("展开（详细）"), `menu offers 展开（详细） (got ${labels})`);
   assert.ok(labels.includes("转跳对话"));
-  assert.ok(labels.includes("查看详情"));
+  assert.ok(!labels.includes("查看详情"), "legacy unimplemented detail action removed");
   const toggle = app.lastMenu.items.find((i) => i.label === "展开（详细）");
   assert.equal(panel.expandedSteps.size, 0);
   toggle.action();
@@ -2257,6 +2959,40 @@ test("trajectory: right click opens 展开/转跳/详情 menu; toggle expands �
   assert.ok(fold, "menu now offers 折叠（简略）");
   fold.action();
   assert.equal(panel.expandedSteps.size, 0);
+});
+
+test("trajectory keyboard selection defaults latest, wraps, scrolls, toggles, jumps, and opens menu", async () => {
+  const { app, panel } = await traj();
+  const newest = panel.steps.at(-1);
+  assert.equal(panel.selectedStepKey, panel.stepKey(newest), "latest step selected on first open");
+  assert.ok(panel.view.lines.some((line) => line.map((seg) => seg.t).join("").startsWith("=>") && line.some((seg) => seg.t.includes("step   2"))), "selected marker rendered");
+  panel.onKey({ type: "key", name: "up", ctrl: false });
+  assert.equal(panel.selectedStepKey, panel.stepKey(panel.steps[0]));
+  panel.onKey({ type: "key", name: "up", ctrl: false });
+  assert.equal(panel.selectedStepKey, panel.stepKey(newest), "selection wraps at boundary");
+  const beforeScroll = panel.view.scrollY;
+  panel.onKey({ type: "key", name: "down", ctrl: true });
+  assert.equal(panel.selectedStepKey, panel.stepKey(newest), "Ctrl+Down does not move selection");
+  assert.ok(panel.view.scrollY >= beforeScroll);
+  panel.onKey({ type: "text", text: " " });
+  assert.ok(panel.expandedSteps.has(panel.stepKey(newest)), "legacy text Space expands selected step");
+  assert.equal(panel.query, "", "Space is never swallowed by the hidden trajectory filter");
+  panel.onKey({ type: "key", name: "char", key: "r", ctrl: true });
+  assert.ok(app.lastMenu.items.some((item) => item.label === "转跳对话"));
+  let jumped = null; app.jumpToChatStep = (index) => { jumped = index; };
+  panel.onKey({ type: "key", name: "enter" });
+  assert.equal(jumped, panel.steps.length - 1, "Enter jumps selected trajectory step to chat");
+});
+
+test("trajectory expanded detail keeps every event reachable inline", async () => {
+  const { panel } = await traj();
+  const step = panel.steps[0];
+  while (step.events.length < 15) step.events.push({ type: "custom/event", seq: 100 + step.events.length, time: 1000 + step.events.length, data: {} });
+  panel.onKey({ type: "key", name: "down", ctrl: false });
+  panel.onKey({ type: "key", name: "char", key: " ", ctrl: false });
+  const rows = panel.view.lines.map((line) => line.map((seg) => seg.t).join(""));
+  assert.ok(rows.some((row) => row.includes("# 114")), "event 15 remains reachable in expanded inline detail");
+  assert.ok(!rows.some((row) => row.includes("未在内联详情中显示")));
 });
 
 test("trajectory: indexOfMessage / focusMessage locate the right step", async () => {
@@ -2322,7 +3058,7 @@ function winNums(panel) {
   const out = [];
   for (const l of panel.view.lines) {
     for (const g of l) {
-      const m = /^[▾▸] step\s+(\d+)/.exec(g.t ?? "");
+      const m = /^(?:=>|  ) [▾▸] step\s+(\d+)/.exec(g.t ?? "");
       if (m) out.push(Number(m[1]));
     }
   }
@@ -2391,6 +3127,193 @@ function headlessApp() {
   return app;
 }
 
+test("Ctrl+F opens deferred full-screen search and Enter builds workspace/session/block results", async () => {
+  const app = headlessApp();
+  app.sessions = [{ sessionId: "s1", projections: { values: { title: "Session One" } } }];
+  app.workspaceItems = [{ workspaceId: "w1", title: "Workspace One", sessionIds: ["s1"] }];
+  app.sidebar.setData(app.workspaceItems, app.sessions, [], null);
+  const calls = [];
+  app.api.call = async (method, payload) => {
+    calls.push([method, payload]);
+    if (method === "session.search") return { items: [{ sessionId: "s1", snippet: "needle excerpt" }], hasMore: false };
+    if (method === "session.history" && payload.beforeSeq == null) return { events: [
+      { event: { type: "user/message", seq: 20, data: { id: "recent", source: { kind: "user" }, content: [{ type: "text", text: "recent page without the term" }] } } },
+    ], hasMore: true };
+    if (method === "session.history") return { events: [
+      { event: { type: "user/message", seq: 10, data: { id: "u1", source: { kind: "user" }, content: [{ type: "text", text: "before needle after" }] } } },
+      { event: { type: "assistant/message", seq: 11, data: { message: { id: "a1", content: [{ type: "reasoning", text: "needle thought" }, { type: "text", text: "answer needle" }] } } } },
+    ], hasMore: false };
+    return { items: [] };
+  };
+  app.onEvent({ type: "key", name: "char", key: "f", ctrl: true, shift: false });
+  assert.equal(app.searchActive, true); assert.equal(app.searchState.phase, "input");
+  assert.equal(calls.length, 0, "opening search does not scan live");
+  app.searchInput.setValue("needle");
+  app.onEvent({ type: "key", name: "enter", ctrl: false });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls.map(([method]) => method), ["session.search", "session.history", "session.history"], "older pages load until the FTS hit is resolved to a block");
+  assert.equal(calls[2][1].beforeSeq, 20);
+  assert.equal(app.searchState.phase, "results");
+  assert.deepEqual(app.searchState.rows.map((row) => row.kind), ["workspace", "session", "match", "match", "match"]);
+  const matches = app.searchState.rows.filter((row) => row.kind === "match");
+  assert.deepEqual(matches.map((row) => row.match.kind), ["user", "reasoning", "text"]);
+  assert.equal(matches[0].match.seq, 10, "derived block carries durable event seq");
+  app.searchState.selected = app.searchState.rows.findIndex((row) => row.kind === "session");
+  app.onEvent({ type: "text", text: " " });
+  assert.equal(app.searchState.rows.filter((row) => row.kind === "match").length, 0, "legacy text Space folds a session branch");
+  app.onEvent({ type: "text", text: " " });
+  app.onEvent({ type: "text", text: "t" });
+  assert.ok(!app.searchState.rows.some((row) => row.kind === "match" && row.match.kind === "reasoning"), "t folds reasoning matches");
+  const selected = app.searchState.selected, scroll = app.searchState.previewScroll;
+  app.onEvent({ type: "key", name: "down", ctrl: true });
+  assert.equal(app.searchState.selected, selected); assert.ok(app.searchState.previewScroll >= scroll, "Ctrl+Down only scrolls preview");
+  app.onEvent({ type: "text", text: "/" });
+  assert.equal(app.searchState.phase, "input"); assert.equal(app.focused, app.searchInput);
+  const screen = app.screen; app.log = (...args) => { app.lastRenderLog = args; }; app.dirty = true; app.renderFrame();
+  assert.equal(app.lastRenderLog, undefined, app.lastRenderLog?.[1]?.stack ?? String(app.lastRenderLog));
+  const plain = screen.toPlain();
+  assert.ok(plain.includes("Workspace One") && plain.includes("Session One"), plain);
+});
+
+test("closing and reopening search rejects stale async results and errors", async () => {
+  const app = headlessApp(); app.sessions = [{ sessionId: "old", projections: { values: { title: "Old" } } }, { sessionId: "new", projections: { values: { title: "New" } } }];
+  const resolvers = [];
+  app.api.call = (method) => method === "session.search" ? new Promise((resolve, reject) => resolvers.push({ resolve, reject })) : Promise.resolve({ events: [], hasMore: false });
+  app.startSearch(); app.searchInput.setValue("old"); app.onEvent({ type: "key", name: "enter" });
+  app.onEvent({ type: "key", name: "escape" });
+  app.startSearch(); app.searchInput.setValue("new"); app.onEvent({ type: "key", name: "enter" });
+  resolvers[0].resolve({ items: [{ sessionId: "old", snippet: "old" }], hasMore: false });
+  resolvers[1].resolve({ items: [{ sessionId: "new", snippet: "new" }], hasMore: false });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(app.searchState.query, "new");
+  assert.ok(app.searchState.rows.some((row) => row.session?.sessionId === "new"));
+  assert.ok(!app.searchState.rows.some((row) => row.session?.sessionId === "old"));
+});
+
+test("search combines tool args and results and stops non-progressing duplicate pages", async () => {
+  const app = headlessApp(); app.sessions = [{ sessionId: "s", projections: { values: { title: "S" } } }];
+  const history = [
+    { event: { type: "step/start", seq: 1, data: { step: 1 } } },
+    { event: { type: "tool/call", seq: 2, data: { callId: "c", name: "bash", arguments: { command: "needle-arg" } } } },
+    { event: { type: "tool/result", seq: 3, data: { message: { source: { callId: "c" }, content: [{ type: "text", text: "needle-result" }] } } } },
+  ];
+  let pages = 0; app.api.call = async (method) => {
+    if (method === "session.search") return { items: [{ sessionId: "s", snippet: "needle" }], hasMore: true };
+    pages++; return { events: history, hasMore: true };
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" }); await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(pages, 1, "matching first page needs no pagination loop");
+  const texts = app.searchState.rows.filter((row) => row.kind === "match").map((row) => row.match.text).join("\n");
+  assert.match(texts, /needle-arg/); assert.match(texts, /needle-result/);
+  app.renderFrame(); assert.match(app.screen.toPlain(), /Host 候 选 已 截 断/);
+});
+
+test("search Enter selects the exact block and preserves the query highlight", async () => {
+  const app = headlessApp(); app.sessions = [{ sessionId: "s", projections: { values: { title: "S" } } }];
+  const events = [{ event: { type: "assistant/message", seq: 10, data: { message: { id: "a-match", content: [{ type: "text", text: "answer needle here" }] } } } }];
+  app.api.call = async (method) => {
+    if (method === "session.search") return { items: [{ sessionId: "s", snippet: "needle" }], hasMore: false };
+    if (method === "session.history") return { events, hasMore: false, projections: { values: {} } };
+    if (method === "session.models") return { current: null };
+    if (method === "subagent.list") return { items: [] };
+    return {};
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  app.searchState.selected = app.searchState.rows.findIndex((row) => row.kind === "match");
+  app.onEvent({ type: "key", name: "enter" }); await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(app.currentSession, "s"); assert.equal(app.searchQuery, "needle");
+  assert.equal(app.chat.blockItems[app.chat.blockSel]?.nodeKey, "a-match");
+  assert.equal(app.chat.cursorMode, "block");
+});
+
+test("search approximate rows expose the 40-page cap and explain tail-only open", async () => {
+  const app = headlessApp(); app.sessions = [{ sessionId: "s", projections: { values: { title: "S" } } }];
+  let historyCalls = 0;
+  app.api.call = async (method) => {
+    if (method === "session.search") return { items: [{ sessionId: "s", snippet: "host-only needle" }], hasMore: false };
+    if (method === "session.history") {
+      if (!app.searchActive) return { events: [], hasMore: false, projections: { values: {} } };
+      historyCalls++;
+      const seq = 1000 - historyCalls;
+      return { events: [{ event: { type: "user/message", seq, data: { id: `u${seq}`, source: { kind: "user" }, content: [{ type: "text", text: "no local match" }] } } }], hasMore: true };
+    }
+    if (method === "session.models") return { current: null };
+    if (method === "subagent.list") return { items: [] };
+    return {};
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(historyCalls, 41, "one tail page plus forty bounded older pages");
+  const matchIndex = app.searchState.rows.findIndex((row) => row.kind === "match");
+  assert.equal(app.searchState.rows[matchIndex].match.kind, "snippet");
+  assert.equal(app.searchState.rows[matchIndex].match.approximate, true);
+  app.searchState.selected = matchIndex; app.onEvent({ type: "key", name: "enter" }); await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(String(app.toastMsg), /未定位到精确正文/);
+});
+
+test("search jump reports when a resolved seq cannot be reopened", async () => {
+  const app = headlessApp(); app.sessions = [{ sessionId: "s", projections: { values: { title: "S" } } }];
+  let historyCalls = 0;
+  app.api.call = async (method) => {
+    if (method === "session.search") return { items: [{ sessionId: "s", snippet: "needle" }], hasMore: false };
+    if (method === "session.history") {
+      historyCalls++;
+      if (app.searchActive) return { events: [{ event: { type: "user/message", seq: 10, data: { id: "target", source: { kind: "user" }, content: [{ type: "text", text: "needle" }] } } }], hasMore: false };
+      return { events: [{ event: { type: "user/message", seq: 20, data: { id: "tail", source: { kind: "user" }, content: [{ type: "text", text: "tail" }] } } }], hasMore: false, projections: { values: {} } };
+    }
+    if (method === "session.models") return { current: null };
+    if (method === "subagent.list") return { items: [] };
+    return {};
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" }); await new Promise((resolve) => setTimeout(resolve, 0));
+  app.searchState.selected = app.searchState.rows.findIndex((row) => row.kind === "match");
+  app.onEvent({ type: "key", name: "enter" }); await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(historyCalls, 2); assert.match(String(app.toastMsg), /未能定位该匹配/);
+});
+
+test("loading older history shifts node-index fold overrides and clears cached renders", async () => {
+  const app = fakeApp(); app.sessions = []; app.sessionEpoch = 1; app.setStatus = () => {};
+  const chat = new ChatView({ app, x: 0, y: 1, w: 80, h: 24 }); app.chat = chat;
+  chat.sessionId = "s"; chat.hasMore = true; chat.minSeq = 20;
+  chat.nodes = [{ kind: "assistant", id: "new", firstSeq: 20, lastSeq: 20, blocks: [{ kind: "tool", name: "bash", args: "{}", result: "ok" }] }];
+  chat.expanded.add(0); chat.expanded.add("0:0"); chat.expanded.add("disp:call-stable"); chat.collapsedBlocks.add("0:0"); chat.cache.set("stale", {});
+  chat.resize(0, 1, 80, 24);
+  app.api.call = async () => ({ events: [{ event: { type: "user/message", seq: 10, data: { id: "old", source: { kind: "user" }, content: [{ type: "text", text: "old" }] } } }], hasMore: false });
+  await chat.loadOlder();
+  assert.ok(chat.expanded.has(1) && chat.expanded.has("1:0"));
+  assert.ok(chat.expanded.has("disp:call-stable"));
+  assert.ok(chat.collapsedBlocks.has("1:0"));
+  assert.equal(chat.cache.size > 0, true, "rebuild repopulates cache only for current shifted nodes");
+  assert.equal(chat.cache.has("stale"), false);
+});
+
+test("loading older history preserves the selected transcript block identity", async () => {
+  const app = fakeApp(); app.sessions = []; app.sessionEpoch = 1; app.setStatus = () => {};
+  const chat = new ChatView({ app, x: 0, y: 1, w: 80, h: 24 }); app.chat = chat;
+  chat.sessionId = "s"; chat.hasMore = true; chat.minSeq = 20;
+  chat.nodes = nodeForEvents([{ event: { type: "assistant/message", seq: 20, data: { message: { id: "new", content: [{ type: "text", text: "new selected" }] } } } }], () => {});
+  chat.resize(0, 1, 80, 24);
+  const selected = chat.blockItems[chat.blockSel]; assert.equal(selected.nodeKey, "new");
+  app.api.call = async () => ({ events: [{ event: { type: "user/message", seq: 10, data: { id: "old", source: { kind: "user" }, content: [{ type: "text", text: "old" }] } } }], hasMore: false });
+  await chat.loadOlder();
+  assert.equal(chat.blockItems[chat.blockSel].nodeKey, "new", "prepend does not reset selection to another block");
+});
+
+test("opening a new session while trajectory is visible reloads that trajectory", async () => {
+  const app = headlessApp(); app.currentSession = "A"; app.mode = "trajectory";
+  const loads = [];
+  app.trajectoryPanel = { relayout() {}, render() {}, onKey() { return false; }, onMouse() { return false; }, async load(id) { loads.push(id); this.sessionId = id; } };
+  app.api.call = async (method, payload) => {
+    if (method === "session.history") return { events: [], hasMore: false, projections: { values: {} } };
+    if (method === "session.models") return { current: null };
+    if (method === "subagent.list") return { items: [] };
+    return {};
+  };
+  await app.openSession("B");
+  assert.deepEqual(loads, ["B"]); assert.equal(app.trajectoryPanel.sessionId, "B");
+});
+
 test("rapid session switch ignores a late older history response", async () => {
   const app = headlessApp();
   const pending = new Map();
@@ -2453,7 +3376,7 @@ test("footer jobs row is a single 后台任务 summary", () => {
   const row2 = app.status.rows[2];
   const text = [...(row2?.left ?? []), ...(row2?.right ?? [])].map((s) => s.t).join(" ");
   assert.ok(text.includes("2 个后台任务运行中"), text);
-  assert.ok(text.includes("1已完成 1失败"), text);
+  assert.ok(text.includes("1已完成 · 1失败"), text);
   assert.ok(text.includes("Ctrl+J 任务/子代理"), text);
   // no per-job noise rows
   assert.equal(app.status.rows.length, 3, "footer has exactly one jobs row");
@@ -2464,13 +3387,14 @@ test("blank welcome highlights the current preset and shows both versions", () =
   app.currentSession = "blank";
   app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "cordis" }];
   app.dshVersion = "0.1.0-rc.6";
-  app.versionChecks = { dsh: { state: "current", latest: "0.1.0-rc.6" }, tui: { state: "update", latest: "0.2.3" } };
+  const latestTui = `${TUI_VERSION.split(".").slice(0, 2).join(".")}.${Number(TUI_VERSION.split(".")[2]) + 1}`;
+  app.versionChecks = { dsh: { state: "current", latest: "0.1.0-rc.6" }, tui: { state: "update", latest: latestTui } };
   app.chat.sessionId = "blank";
   app.chat.nodes = [];
   app.layout(); app.chat.render(app.screen);
   const rows = app.screen.cells.map((row) => row.map((cell) => cell.ch).join(""));
   assert.ok(rows.some((row) => row.includes("DeepSeek Harness v0.1.0-rc.6") && row.includes("已是最新")), "DSH version and update state shown");
-  assert.ok(rows.some((row) => row.includes(`dsh-neotui v${TUI_VERSION}`) && row.includes("可更新 0.2.3")), "TUI version and update state shown");
+  assert.ok(rows.some((row) => row.includes(`dsh-neotui v${TUI_VERSION}`) && row.includes(`可更新 ${latestTui}`)), "TUI version and update state shown");
   assert.ok(rows.some((row) => row.includes("● 创造模式 [当前]")), "active blank-session preset highlighted");
   assert.ok(rows.some((row) => row.includes("○ 标准模式")), "inactive presets remain unselected");
 });
@@ -2561,15 +3485,43 @@ test("footer shows one compact goal summary and no subagent duplicate", () => {
   assert.ok(row0.includes("ship it") && row0.includes("Ctrl+G") && !row0.includes("worker"), row0);
   assert.equal((row0.match(/ship it/g) ?? []).length, 1, "one compact goal summary");
   assert.ok(row2.includes("worker") && row2.includes("任务/子代理"), row2);
+  assert.ok(row2.includes("◇") && !row2.includes("🛰"), "subagent uses a one-cell-safe symbol");
 });
 
-test("footer reports task and subagent counts independently", () => {
-  const app = headlessApp(); app.currentSession = "s"; app.jobs = [];
-  app.subagentStatsBySession.set("s", { running: 0, completed: 11, total: 11 });
+test("goal and queued-command footer badges use black text on yellow", () => {
+  const app = headlessApp();
+  app.projections.goal = { goal: { id: "g", revision: 1, objective: "ship it", phase: "active" } };
+  app.queueItems = [{ id: "q", placement: "queued", message: { content: [{ type: "text", text: "later" }] } }];
   app.renderFrame();
-  const text = [...(app.status.rows[2]?.left ?? []), ...(app.status.rows[2]?.right ?? [])].map((s) => s.t).join(" ");
-  assert.ok(text.includes("没有后台任务运行"), text);
-  assert.ok(text.includes("没有子代理运行 11已完成"), text);
+  const goal = app.status.rows[0].left.find((seg) => seg.t.includes("ship it"));
+  const queue = app.status.rows[2].left.find((seg) => seg.t.includes("命令正在排队"));
+  assert.equal(goal?.bg, T.WARN); assert.equal(goal?.fg, 0x000000);
+  assert.equal(queue?.bg, T.WARN); assert.equal(queue?.fg, 0x000000);
+});
+
+test("footer task/subagent colors are symmetric and Ctrl+J stays beside both summaries", () => {
+  const app = headlessApp(); app.currentSession = "s";
+  app.jobs = [{ status: "running" }, { status: "completed" }];
+  app.subagentStatsBySession.set("s", { running: 2, completed: 11, total: 13 });
+  app.renderFrame();
+  const row = app.status.rows[2];
+  const taskRun = row.left.find((seg) => seg.t.includes("后台任务运行中"));
+  const taskDone = row.left.find((seg) => seg.t.includes("1已完成"));
+  const subRun = row.left.find((seg) => seg.t.includes("子代理运行中"));
+  const subDone = row.left.find((seg) => seg.t.includes("11已完成"));
+  const shortcut = row.left.find((seg) => seg.t.includes("Ctrl+J"));
+  assert.equal(taskRun?.fg, T.WARN); assert.equal(subRun?.fg, T.WARN, "running colors match");
+  assert.equal(taskDone?.fg, T.OK); assert.equal(subDone?.fg, T.OK, "completed colors match");
+  assert.ok(shortcut, "Ctrl+J moved beside activity summaries");
+  assert.ok(row.left.indexOf(shortcut) > row.left.indexOf(subDone), "shortcut follows both task/subagent groups");
+  assert.ok(!row.right.some((seg) => seg.t.includes("Ctrl+J")), "Ctrl+J no longer floats at the far right");
+
+  app.jobs = [];
+  app.subagentStatsBySession.set("s", { running: 0, completed: 0, total: 0 });
+  app.renderFrame();
+  const idle = app.status.rows[2].left;
+  assert.equal(idle.find((seg) => seg.t.includes("没有后台任务运行"))?.fg, T.FAINT);
+  assert.equal(idle.find((seg) => seg.t.includes("没有子代理运行"))?.fg, T.FAINT, "idle colors match");
 });
 
 test("footer jobs row says 没有任务正在后台运行 when none run", () => {
@@ -2641,26 +3593,157 @@ test("JobsPanel shares one buffer with subagents and updates expand triangle", a
   panel.onKey({ type: "key", name: "tab" });
   assert.equal(panel.page, "subagents");
   let line = panel.lines.flat().map((part) => part.t ?? "").join("");
-  assert.ok(line.includes("▸ 🛰 researcher"), line);
+  assert.ok(line.includes("▸ ◇ researcher"), line);
+  assert.equal(strWidth("◇"), 1, "subagent marker occupies exactly one terminal cell");
+  assert.ok(!line.includes("🛰"), "no ambiguous-width satellite emoji");
   panel.onKey({ type: "key", name: "enter" });
   line = panel.lines.flat().map((part) => part.t ?? "").join("");
-  assert.ok(line.includes("▾ 🛰 researcher"), line);
+  assert.ok(line.includes("▾ ◇ researcher"), line);
   panel.onKey({ type: "key", name: "enter" });
   line = panel.lines.flat().map((part) => part.t ?? "").join("");
-  assert.ok(line.includes("▸ 🛰 researcher"), line);
+  assert.ok(line.includes("▸ ◇ researcher"), line);
   panel.onKey({ type: "key", name: "left" });
   assert.equal(panel.page, "jobs");
 });
 
-test("NORMAL Tab toggles chat/trajectory and Shift+Tab rotates permissions", () => {
+test("Ctrl+Left/Right cycles pane focus and global Tab is unbound", () => {
   const app = headlessApp(); app.currentSession = "s";
-  let rotations = 0; app.rotatePermission = () => { rotations++; };
   app.onEvent({ type: "key", name: "tab", ctrl: false, shift: false });
-  assert.equal(app.mode, "trajectory");
-  app.onEvent({ type: "key", name: "tab", ctrl: false, shift: false });
-  assert.equal(app.mode, "chat");
-  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
-  assert.equal(rotations, 1);
+  assert.equal(app.mode, "chat", "Tab no longer switches global panes");
+  assert.equal(app.focused, app.chat);
+  app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
+  assert.equal(app.focused, app.sidebar, "Ctrl+Left focuses workspace sidebar");
+  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
+  assert.equal(app.focused, app.chat, "Ctrl+Right returns to chat");
+  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
+  assert.equal(app.mode, "trajectory", "next pane is trajectory");
+  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
+  assert.equal(app.focused, app.sidebar, "pane sequence wraps");
+  // A full-screen buffer is modal: pane cycling is swallowed until Esc, then
+  // focus mode works again — buffers never fight the focus mode.
+  app.setMode("chat"); app.focus(app.chat);
+  app.showSettingsBuffer();
+  assert.equal(app.fullBuffer, app.settingsPanel);
+  app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
+  assert.equal(app.focused, app.settingsPanel, "Ctrl+Left is owned by the open buffer");
+  assert.equal(app.mode, "chat", "the buffer leaves the chat/trajectory mode untouched");
+  app.onEvent({ type: "key", name: "escape", ctrl: false, shift: false });
+  assert.equal(app.fullBuffer, null);
+  app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
+  assert.equal(app.focused, app.sidebar, "Ctrl+Left cycles panes again after Esc closes the buffer");
+  app.focus(app.chat.input); const beforeCursor = app.chat.input.cursor;
+  app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
+  assert.equal(app.focused, app.chat.input, "Ctrl+Left remains an editor motion in INSERT");
+  assert.ok(app.chat.input.cursor <= beforeCursor);
+});
+
+test("pane cycling skips unavailable trajectory and hidden sidebar", () => {
+  const app = headlessApp(); app.currentSession = null; app.focus(app.chat);
+  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
+  assert.equal(app.focused, app.sidebar);
+  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
+  assert.equal(app.focused, app.chat, "trajectory is skipped without a session");
+  app.sidebarWanted = false; app.layout(); app.focus(app.chat);
+  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
+  assert.equal(app.focused, app.chat, "hidden sidebar and unavailable trajectory are both skipped");
+});
+
+test("keybinding registry parses, matches, describes and validates two-slot specs", () => {
+  const ctrlF = { type: "key", name: "char", key: "f", ctrl: true, shift: false, alt: false };
+  assert.equal(matchKeyPart(ctrlF, "Ctrl+F"), true);
+  assert.equal(matchKeyPart(ctrlF, "F"), false, "uppercase F means Shift, not Ctrl");
+  assert.equal(matchKeyPart({ type: "key", name: "char", key: "g", ctrl: false, shift: true }, "G"), true);
+  assert.equal(matchKeyPart({ type: "key", name: "left", ctrl: true, shift: false }, "Ctrl+Left"), true);
+  assert.equal(matchKeyPart({ type: "key", name: "char", key: " ", ctrl: true }, "Ctrl+Space"), true);
+  const chord = matchKeyBinding({ type: "key", name: "char", key: "g", ctrl: false }, keyBindings().top);
+  assert.equal(chord.kind, "pending");
+  assert.equal(matchKeyBinding({ type: "key", name: "char", key: "g", ctrl: false }, keyBindings().top, chord).kind, "full");
+  assert.equal(describeSpec("g g"), "g, g"); assert.equal(describeSpec(""), "—");
+  assert.equal(validateKeySpec("Ctrl+Shift+C").ok, true);
+  assert.equal(validateKeySpec("Bogus+F12").ok, false);
+  assert.equal(validateKeySpec("g g g").ok, false, "chords cap at two presses");
+  const hit = bindingMatchFor({ type: "key", name: "char", key: "/", ctrl: false }, keyBindings(), false, KEYBINDING_ORDER);
+  assert.equal(hit.id, "sessionFilter"); assert.equal(hit.slot, "key2");
+});
+
+test("edited keybindings drive the real dispatchers in App, ChatView and Sidebar", () => {
+  const app = headlessApp(); app.currentSession = "s"; app.focus(app.chat);
+  assert.ok(setKeyBinding("homeSwitch", { mode: "normal", key: "Ctrl+Up", key2: "Ctrl+Down" }));
+  app.onEvent({ type: "key", name: "up", ctrl: true, shift: false });
+  assert.equal(app.focused, app.sidebar, "remapped primary slot focuses sidebar (slot key = -1)");
+  app.onEvent({ type: "key", name: "down", ctrl: true, shift: false });
+  assert.equal(app.focused, app.chat, "remapped alternate slot returns to chat (slot key2 = +1)");
+  assert.ok(setKeyBinding("think", { mode: "normal", key: "q", key2: "" }));
+  const { chat } = render([]); chat.app = app; app.chat = chat; app.focus(chat);
+  chat.nodes = [{ kind: "assistant", id: "a", blocks: [{ kind: "reasoning", text: "x" }] }];
+  chat.resize(0, 1, 80, 24);
+  const before = chat.thinkMode;
+  chat.onKey({ type: "key", name: "char", key: "q", ctrl: false, alt: false, shift: false });
+  assert.notEqual(chat.thinkMode, before, "remapped transcript binding toggles think mode");
+  assert.ok(setKeyBinding("newSession", { mode: "normal", key: "n", key2: "" }));
+  assert.ok(resetKeyBinding("homeSwitch")); assert.ok(resetKeyBinding("think")); assert.ok(resetKeyBinding("newSession"));
+});
+
+test("ControlPanel shortcut page shows two slots and edits both via JSON", () => {
+  const app = fakeApp(); app.screen = { w: 110, h: 24 };
+  const panel = new ControlPanel(app, { startPage: 0 });
+  const home = panel.shortcutItems().find((row) => row[3] === "homeSwitch");
+  assert.equal(home[0].split("\t").length, 3);
+  assert.equal(home[0].split("\t")[1], "Ctrl+Left"); assert.equal(home[0].split("\t")[2], "Ctrl+Right");
+  assert.ok(panel.shortcutItems().some((row) => row[3] === "editConfig"));
+  panel.editShortcut("sessionFilter");
+  app.focused.setValue('{"mode":"normal","key":"Ctrl+L","key2":"Ctrl+F"}');
+  app.overlay.onKey({ type: "key", name: "enter" });
+  assert.deepEqual(keyBindings().sessionFilter, { mode: "normal", key: "Ctrl+L", key2: "Ctrl+F" });
+  assert.ok(resetKeyBinding("sessionFilter"));
+});
+
+test("Ctrl+K opens the config in the default editor and Ctrl+H opens skills", async () => {
+  const app = headlessApp(); app.currentSession = "s";
+  const calls = [];
+  app.spawnEditor = (file, editor) => calls.push({ file, editor });
+  let stopped = 0, started = 0;
+  app.term.stop = () => { stopped++; }; app.term.start = () => { started++; };
+  app.onEvent({ type: "key", name: "char", key: "k", ctrl: true, shift: false });
+  await new Promise((resolve) => setTimeout(resolve, 220));
+  assert.equal(calls.length, 1); assert.equal(calls[0].file, tuiConfigFile());
+  assert.match(calls[0].editor, /vi|nano|\S+/);
+  assert.equal(stopped, 1); assert.equal(started, 1);
+  app.onEvent({ type: "key", name: "char", key: "h", ctrl: true, shift: false });
+  assert.equal(app.fullBuffer, app.skillsPanel, "skills moved to Ctrl+H because Ctrl+K edits config");
+});
+
+test("search falls back to a bounded local scan when the Host index is unavailable", async () => {
+  const app = headlessApp();
+  app.sessions = [{ sessionId: "s1", projections: { values: { title: "Local One" } } }, { sessionId: "s2", blank: true, projections: { values: { title: "Blank" } } }];
+  app.api.call = async (method, payload) => {
+    if (method === "session.search") throw new Error("session search is unavailable");
+    if (method === "session.history" && payload.sessionId === "s1") return { events: [{ event: { type: "user/message", seq: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "local needle" }] } } }], hasMore: true };
+    return { events: [], hasMore: false };
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(app.searchState.fallback, true);
+  assert.equal(app.searchState.error, null);
+  assert.ok(app.searchState.rows.some((row) => row.kind === "match" && String(row.match.text).includes("local needle")));
+  assert.ok(!app.searchState.rows.some((row) => row.session?.sessionId === "s2"), "blank drafts are skipped");
+  app.renderFrame();
+  assert.match(app.screen.toPlain(), /Host 搜 索 索 引 不 可 用/);
+});
+
+test("blank welcome mode selection wraps and Enter applies without mouse", () => {
+  const app = headlessApp(); app.currentSession = "blank";
+  app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "standard" }];
+  app.chat.sessionId = "blank"; app.chat.nodes = [];
+  let selected = null; app.selectPreset = (id) => { selected = id; };
+  app.focus(app.chat);
+  app.chat.welcomeModeSel = 0;
+  app.chat.onKey({ type: "key", name: "up" });
+  assert.equal(app.chat.welcomeModeSel, 3);
+  app.chat.onKey({ type: "key", name: "down" });
+  assert.equal(app.chat.welcomeModeSel, 0);
+  app.chat.onKey({ type: "key", name: "enter" });
+  assert.equal(selected, "standard");
 });
 
 test("installed version helpers expose usable package versions", () => {
@@ -2682,6 +3765,82 @@ test("welcome update checks compare both npm packages without blocking", async (
   app.versionFetcher = async () => "0.1.0";
   await app.checkUpdates("tui");
   assert.equal(app.versionChecks.tui.state, "current", "an older registry tag never offers a downgrade");
+});
+
+test("QueuePanel expands full details by keyboard and mouse, preserving state across reorder", () => {
+  const app = headlessApp(); app.currentSession = "s";
+  const long = "first line\n" + "full queued detail ".repeat(20);
+  app.queueItems = [
+    { id: "a", placement: "queued", createdAt: 123, message: { source: { kind: "user" }, content: [{ type: "text", text: long }, { type: "image", name: "shot.png" }] } },
+    { id: "b", placement: "steering", message: { content: [{ type: "text", text: "second" }] } },
+  ];
+  const panel = new QueuePanel(app);
+  assert.equal(panel.expanded.size, 0);
+  assert.ok(panel.lines[0][0].t.includes("▸"), "collapsed glyph rendered");
+  panel.onKey({ type: "key", name: "enter" });
+  assert.ok(panel.expanded.has("a"), "Enter expands by stable item id");
+  const renderedRows = panel.lines.map((line) => line.map((seg) => seg.t ?? "").join(""));
+  const text = renderedRows.join("\n");
+  assert.ok(text.includes("位置: 排队（下一回合）"), text);
+  assert.ok(text.includes("full queued detail"), "full multiline content visible");
+  assert.ok(text.includes("[image] shot.png"), "non-text content summarized");
+  panel.syncItems([app.queueItems[1], app.queueItems[0]]);
+  assert.equal(panel.items[panel.sel].id, "a", "selection follows item through reorder");
+  assert.ok(panel.expanded.has("a"), "expanded state survives reorder");
+  // click any detail row for a to collapse the same item
+  const detailRow = panel.rowOf.findIndex((idx, row) => idx === panel.sel && row > 0);
+  panel.onMouse({ type: "mouse", kind: "press", button: 0, x: panel.x + 2, y: panel.y + 1 + detailRow - panel.scrollY });
+  assert.ok(!panel.expanded.has("a"), "clicking detail collapses the command");
+  panel.onKey({ type: "key", name: "right" });
+  assert.ok(panel.expanded.has("a"), "right expands");
+  panel.onKey({ type: "key", name: "left" });
+  assert.ok(!panel.expanded.has("a"), "left collapses");
+});
+
+test("QueuePanel detail scrolling is keyboard-first and independent from selection", () => {
+  const app = headlessApp(); app.currentSession = "s";
+  const lines = Array.from({ length: 90 }, (_, i) => `detail-line-${String(i).padStart(2, "0")}`).join("\n");
+  app.queueItems = [
+    { id: "long", placement: "queued", message: { content: [{ type: "text", text: lines }] } },
+    { id: "other", placement: "queued", message: { content: [{ type: "text", text: "other" }] } },
+  ];
+  const panel = new QueuePanel(app);
+  panel.onKey({ type: "key", name: "enter" });
+  assert.ok(panel.maxScroll() > panel.contentRows(), "long detail exceeds one page");
+  assert.equal(panel.sel, 0);
+
+  panel.onKey({ type: "key", name: "pgdn" });
+  const page = panel.scrollY;
+  assert.equal(page, panel.contentRows(), "PgDn scrolls one full page");
+  assert.equal(panel.sel, 0, "paging never changes selected command");
+
+  panel.onKey({ type: "key", name: "char", key: "d", ctrl: true, alt: false, shift: false });
+  assert.equal(panel.scrollY, page + Math.floor(panel.contentRows() / 2), "Ctrl+D scrolls half page");
+  assert.equal(panel.dArmed, false, "Ctrl+D never arms dd deletion");
+  panel.onKey({ type: "key", name: "char", key: "u", ctrl: true, alt: false, shift: false });
+  assert.equal(panel.scrollY, page, "Ctrl+U scrolls half page up");
+
+  panel.onKey({ type: "key", name: "char", key: "e", ctrl: true, alt: false, shift: false });
+  assert.equal(panel.scrollY, page + 1, "Ctrl+E scrolls one line down");
+  panel.onKey({ type: "key", name: "char", key: "y", ctrl: true, alt: false, shift: false });
+  assert.equal(panel.scrollY, page, "Ctrl+Y scrolls one line up");
+  panel.onKey({ type: "key", name: "down", shift: true, ctrl: false, alt: false });
+  assert.equal(panel.scrollY, page + 1, "Shift+Down is an alternative line scroll");
+  assert.equal(panel.sel, 0);
+
+  panel.onKey({ type: "key", name: "end" });
+  assert.equal(panel.scrollY, panel.maxScroll(), "End jumps to detail bottom");
+  panel.onKey({ type: "key", name: "home" });
+  assert.equal(panel.scrollY, 0, "Home jumps to detail top");
+
+  panel.onKey({ type: "text", text: "?", ctrl: false, alt: false, shift: true });
+  assert.equal(panel.helpVisible, true);
+  assert.ok(panel.lines.some((line) => line.some((seg) => seg.t.includes("Ctrl+U/D"))), "? exposes keyboard help inside the TUI");
+  panel.onKey({ type: "text", text: "?", ctrl: false, alt: false, shift: true });
+  assert.equal(panel.helpVisible, false);
+
+  panel.onKey({ type: "key", name: "down", shift: false, ctrl: false, alt: false });
+  assert.equal(panel.sel, 1, "plain Down still selects the next command");
 });
 
 test("QueuePanel keeps one command per row, preserves selection, and dd removes", async () => {

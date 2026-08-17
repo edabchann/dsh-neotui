@@ -1,8 +1,11 @@
 {
   "name": "dsh-neotui",
-  "version": "0.2.3",
-  "description": "Neo-TUI: mouse-driven terminal UI client for DeepSeek Harness (B-tier per dsh-tui-design.md)",
+  "version": "0.3.0",
+  "description": "Keyboard-first Vim/tmux-style terminal client for DeepSeek Harness",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "bin": {
     "dsh-neotui": "bin/dsh-tui.js"
   },

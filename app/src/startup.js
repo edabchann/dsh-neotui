@@ -14,7 +14,7 @@ export const TUI_STARTUP_SERVICE = "tuiStartup";
 function tuiCommand() {
   return new Command()
     .name("dsh --profile dsh-neotui")
-    .description("Interactive mouse-driven terminal UI for DeepSeek Harness.")
+    .description("Interactive keyboard-first terminal UI for DeepSeek Harness.")
     .helpOption("-h, --help", "show this help")
     .option("--host <host>", "API bind host (default 127.0.0.1)")
     .option("--port <port>", "API listen port; 0 lets the OS pick a free port (default 0)")
