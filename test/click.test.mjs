@@ -1853,6 +1853,116 @@ test("search wrap/highlight stays bounded and crash-free under random Unicode", 
   }
 });
 
+test("input undo/redo walks user edits, collapses redo on edit and clears on submit", () => {
+  const input = new Input({ x: 0, y: 0, w: 40, h: 3, multi: true, app: { toast: () => {} } });
+  input.app.inputBindingFor = (ev) => ev.ctrl && ev.key === "z" ? { id: "undoInput" } : ev.ctrl && ev.key === "y" ? { id: "redoInput" } : null;
+  const type = (k) => input.onKey({ type: "key", name: "char", key: k, ctrl: false, text: k });
+  type("a"); type("b"); type("c");
+  assert.equal(input.value, "abc");
+  input.onKey({ type: "key", name: "char", key: "z", ctrl: true, text: "z" });
+  assert.equal(input.value, "ab", "undo steps back one edit");
+  input.onKey({ type: "key", name: "char", key: "z", ctrl: true, text: "z" });
+  assert.equal(input.value, "a");
+  input.onKey({ type: "key", name: "char", key: "y", ctrl: true, text: "y" });
+  assert.equal(input.value, "ab", "redo restores");
+  type("x");
+  assert.equal(input.value, "abx");
+  input.onKey({ type: "key", name: "char", key: "y", ctrl: true, text: "y" });
+  assert.equal(input.value, "abx", "a new edit invalidates redo");
+  input.onKey({ type: "key", name: "char", key: "c", ctrl: true, text: "c" });
+  assert.equal(input.value, "", "Ctrl+C clears");
+  input.onKey({ type: "key", name: "char", key: "z", ctrl: true, text: "z" });
+  assert.equal(input.value, "abx", "clear is undoable");
+  input.setValue("hello");
+  input.onKey({ type: "key", name: "enter" });
+  input.onKey({ type: "key", name: "char", key: "z", ctrl: true, text: "z" });
+  assert.equal(input.value, "", "undo history cleared after submit");
+});
+
+test("undo/redo bindings dispatch through the registry in INSERT", () => {
+  const app = headlessApp(); app.currentSession = "s";
+  assert.ok(setKeyBinding("undoInput", { mode: "insert", key: "Ctrl+9", key2: "" }));
+  assert.ok(setKeyBinding("redoInput", { mode: "insert", key: "Ctrl+8", key2: "" }));
+  app.focus(app.chat.input);
+  app.chat.input.onKey({ type: "key", name: "char", key: "a", ctrl: false, text: "a" });
+  app.onEvent({ type: "key", name: "char", key: "9", ctrl: true, shift: false });
+  assert.equal(app.chat.input.value, "", "remapped undoInput undoes the insert");
+  app.onEvent({ type: "key", name: "char", key: "8", ctrl: true, shift: false });
+  assert.equal(app.chat.input.value, "a", "remapped redoInput redoes it");
+  assert.ok(resetKeyBinding("undoInput")); assert.ok(resetKeyBinding("redoInput"));
+});
+
+test("host frames keep workspaces/archives in sync and surface errors", () => {
+  const app = headlessApp();
+  let refreshes = 0; const orig = app.refreshSessions; app.refreshSessions = () => { refreshes++; };
+  app.hostFrame({ type: "host/workspace-changed", workspace: { workspaceId: "w1", title: "New" } });
+  app.hostFrame({ type: "host/workspace-removed", workspaceId: "w2" });
+  app.hostFrame({ type: "host/workspace-order-changed", workspaceIds: ["w1", "w2"] });
+  app.hostFrame({ type: "host/archived-sessions-changed", archivedSessionIds: ["s1"] });
+  assert.equal(refreshes, 4, "every workspace/archive mutation refreshes the sidebar");
+  app.refreshSessions = orig;
+  app.sessions = [{ sessionId: "s1", projections: { values: { title: "Mine" } } }];
+  app.hostFrame({ type: "host/agent-error", sessionId: "s1", message: "boom" });
+  assert.ok(app.toastMsg.includes("会话出错") && app.toastMsg.includes("boom"), app.toastMsg);
+  app.hostFrame({ type: "stream/error", error: { code: "transport", message: "disconnected" } });
+  assert.ok(app.toastMsg.includes("disconnected"), app.toastMsg);
+});
+
+test("input drafts mirror per session across switches", async () => {
+  const app = headlessApp(); app.currentSession = null;
+  app.api.call = async (method) => method === "session.history"
+    ? { events: [{ event: { type: "user/message", seq: 1, time: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] } } }], hasMore: false }
+    : {};
+  await app.openSession("s1");
+  app.chat.input.setValue("draft for s1");
+  await app.openSession("s2");
+  assert.equal(app.chat.input.value, "", "switching to a session with no draft clears the input");
+  await app.openSession("s1");
+  assert.equal(app.chat.input.value, "draft for s1", "draft restored on return");
+});
+
+test("a max-tokens cut-off turn suggests sending 继续", () => {
+  const { app, chat } = render([]);
+  app.chat = chat; // the prefill action reaches the input through app.chat
+  chat.nodes = nodeForEvents([{ event: { type: "turn/end", seq: 5, time: 10, data: { turn: 1, reason: { kind: "max-tokens" } } } }]);
+  chat.bashMode = "expanded"; chat.resize(0, 1, 80, 24); chat.queueRebuild(); chat.flushRebuild();
+  const joined = chat.lines.map((l) => l.map((g) => g.t ?? "").join(""));
+  assert.ok(joined.some((l) => l.includes("发送『继续』")), "the notice explains how to resume");
+  const idx = chat.blockItems.findIndex((item) => item.kind === "turn-max-tokens");
+  assert.ok(idx >= 0, "the notice is a selectable block");
+  chat.blockSel = idx;
+  chat.onKey({ type: "key", name: "char", key: "r", ctrl: true, shift: false });
+  assert.ok(app.lastMenu.items.some((entry) => entry.label === "草稿填入『继续』"));
+  app.lastMenu.items.find((entry) => entry.label === "草稿填入『继续』").action();
+  assert.equal(app.chat.input.value, "继续");
+});
+
+test("file mentions in tool args open in the workspace preview", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tui-mention-"));
+  const path = join(dir, "notes.txt");
+  writeFileSync(path, "hello");
+  const { app, chat } = render([toolNode({ blocks: [
+    { kind: "tool", name: "read", args: { path }, result: "ok", done: true, view: null },
+  ] })]);
+  const tool = chat.blockItems.findIndex((item) => item.kind === "tool");
+  assert.ok(tool >= 0, "tool block is selectable");
+  chat.blockSel = tool;
+  chat.onKey({ type: "key", name: "char", key: "r", ctrl: true, shift: false });
+  const entry = app.lastMenu.items.find((e) => e.label === "文件预览: notes.txt");
+  assert.ok(entry, "existing local path in args offers a preview action: " + JSON.stringify(app.lastMenu.items.map((e) => e.label)));
+  app.openWorkspaceFile = (p) => { app.workspaceOpened = p; };
+  entry.action();
+  assert.equal(app.workspaceOpened, path);
+});
+
+test("unknown streaming block kinds render as bounded unknown cards", () => {
+  const chat = render([]).chat;
+  chat.nodes = nodeForEvents([{ event: { type: "assistant/chunk", seq: 1, data: { chunk: { type: "block-start", blockType: "binary", index: 0 } } } }]);
+  chat.bashMode = "expanded"; chat.resize(0, 1, 80, 24); chat.flushRebuild();
+  const lines = chat.lines.map((l) => l.map((g) => g.t).join(""));
+  assert.ok(lines.some((l) => l.includes("未知内容块: binary")), "unknown blocks never render as markdown text");
+});
+
 test("legacy one-slot keybinding values migrate to the new two-slot defaults", async () => {
   const app = headlessApp(); app.currentSession = "s"; app.focus(app.chat);
   saveTuiConfig({ keyBindings: {

@@ -3,7 +3,7 @@ import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
 import { truncate, strWidth, pad, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth, takeGraphemes, bytesLabel } from "./text.js";
 import { readFileSync, appendFileSync, mkdirSync, existsSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { Widget, ScrollView, Input, Popup, Menu, StatusBar, wrapIndex } from "./widgets.js";
@@ -418,8 +418,12 @@ function applyEvent(nodes, event, view, log, state = null) {
         }
         node.streaming = true;
         if (ch.type === "block-start") {
-          const kind = ch.blockType === "tool-call" ? "tool" : ch.blockType ?? "text";
-          node.blocks[ch.index ?? 0] = { kind, text: "", args: kind === "tool" ? "" : undefined, streaming: true, startedAt: event.time ?? Date.now() };
+          // Unknown block kinds must never masquerade as markdown text; they
+          // render as a bounded "unknown block" card like the Web UI's JSON view.
+          const kind = ch.blockType === "tool-call" ? "tool"
+            : ch.blockType === "text" || ch.blockType === "reasoning" ? ch.blockType : "other";
+          const text = kind === "other" ? `[未知内容块: ${ch.blockType ?? "?"}]` : "";
+          node.blocks[ch.index ?? 0] = { kind, text, args: kind === "tool" ? "" : undefined, streaming: true, startedAt: event.time ?? Date.now() };
         } else if (ch.type === "text-delta") {
           const b = node.blocks[ch.index ?? 0];
           if (b) b.text = (b.text ?? "") + (ch.delta ?? "");
@@ -524,7 +528,7 @@ function applyEvent(nodes, event, view, log, state = null) {
         if (node && st.turnStart !== undefined) node.turnMs = Math.max(0, end - st.turnStart);
         const reason = d.reason?.kind;
         if (reason === "error") nodes.push({ kind: "turn-error", text: d.reason?.error?.message ?? "模型请求失败", code: d.reason?.error?.code });
-        else if (reason === "max-tokens") nodes.push({ kind: "turn-max-tokens", text: "已达到本轮最大输出 token 限制" });
+        else if (reason === "max-tokens") nodes.push({ kind: "turn-max-tokens", text: "已达到本轮最大输出 token 限制；内容已保留，发送『继续』可让模型接着输出" });
         else if (["cancelled", "interrupted", "aborted"].includes(reason)) {
           for (const assistant of nodes) for (const block of assistant.kind === "assistant" ? assistant.blocks ?? [] : []) if (block.kind === "tool" && block.result == null) block.stopped = true;
           nodes.push({ kind: "system", text: "■ 本轮已停止" });
@@ -2428,6 +2432,26 @@ export class ChatView extends Widget {
     return this.#toggleAt({ nodeIdx: item.nodeIdx, blockIdx: item.blockIdx });
   }
 
+  /** Existing absolute file paths mentioned in tool args/results (deduped,
+   *  max 3) — the local ones can be opened in the workspace preview. */
+  #existingPathsIn(...texts) {
+    const out = [];
+    const seen = new Set();
+    for (const s of texts) {
+      if (s == null) continue;
+      const flat = typeof s === "object" ? JSON.stringify(s) : String(s ?? "");
+      for (const m of flat.matchAll(/(?:^|[\s"'`:=(])(\/[^\s"'`,;)\]]+)/g)) {
+        const p = m[1]?.replace(/[),.;]+$/, "");
+        if (p && !seen.has(p) && existsSync(p)) {
+          seen.add(p);
+          out.push(p);
+          if (out.length >= 3) return out;
+        }
+      }
+    }
+    return out;
+  }
+
   /** Open a Host spill file: the gateway's host.openPath works from anywhere
    *  (the path is host-local); when the TUI runs on the same machine a local
    *  OS opener is the fallback. */
@@ -2486,6 +2510,20 @@ export class ChatView extends Widget {
     if (item.foldable) entries.push({ label: "展开 / 折叠", action: () => this.#toggleAt(info) });
     if (node?.id) entries.push({ label: "转跳轨迹", action: () => this.app.jumpToTrajectoryNode(item.nodeIdx) });
     entries.push({ label: "加载更早记录", action: () => this.loadOlder() });
+    if (node?.kind === "turn-max-tokens") {
+      // Web parity: a cut-off turn suggests sending “继续” to resume.
+      entries.push({ label: "草稿填入『继续』", action: () => {
+        if (this.app.chat.input.value) { this.app.toast("输入框已有草稿，可自行追加『继续』"); return; }
+        this.app.chat.input.setValue("继续");
+        this.app.focus(this.app.chat.input);
+        this.app.redraw();
+      } });
+    }
+    // File mentions in tool args/results open directly in the workspace preview.
+    const fileBlock = item.blockIdx != null ? node?.blocks?.[item.blockIdx] : null;
+    for (const p of this.#existingPathsIn(fileBlock?.args, fileBlock?.result)) {
+      entries.push({ label: `文件预览: ${basename(p)}`, action: () => this.app.openWorkspaceFile(p) });
+    }
     // Host spill recovery: the truncated tool output names its full file.
     const spillBlock = item.blockIdx != null ? node?.blocks?.[item.blockIdx] : null;
     const spill = spillPathFromText(spillBlock?.result ?? spillBlock?.text ?? node?.text ?? "");
@@ -3265,6 +3303,7 @@ export class App {
     this.draggingDivider = false;
     this.inputDrag = false;     // mouse drag-selection inside the input is active
     this.feedbackMap = new Map(); // messageId → {rating, version}
+    this.draftsBySession = new Map(); // sessionId → unsubmitted input draft (web draft-mirror parity)
     this.searchQuery = null;        // active find-in-conversation term (highlight)
     this.searchQueryTarget = null;  // optional { nodeKey, blockIdx } result scope
     this.queueItems = [];
@@ -3627,6 +3666,9 @@ export class App {
     this.redraw();
   }
 
+  /** Public entry for host-frame injection (scripted tests). */
+  hostFrame(frame) { this.#onHostFrame(frame); }
+
   #onHostFrame(frame) {
     if (frame.type === "host/session-added" || frame.type === "host/session-removed") {
       this.refreshSessions();
@@ -3635,6 +3677,15 @@ export class App {
       if (session) session.running = frame.running;
       if (frame.sessionId === this.currentSession) this.chat.running = frame.running || this.chat.nodes.some((n) => n.kind === "turn-progress" && n.streaming);
       this.sidebar.setData(this.workspaceItems ?? [], this.sessions, [], this.currentSession);
+    } else if (["host/workspace-changed", "host/workspace-removed", "host/workspace-order-changed", "host/archived-sessions-changed"].includes(frame.type)) {
+      // Other clients (or the daemon itself) mutate workspaces / archives;
+      // refresh immediately instead of waiting for the next poll tick.
+      this.refreshSessions();
+    } else if (frame.type === "host/agent-error") {
+      const title = this.sessions.find((s) => s.sessionId === frame.sessionId)?.projections?.values?.title ?? frame.sessionId.slice(0, 8);
+      this.toast(`会话出错（${title}）: ${frame.message}`);
+    } else if (frame.type === "stream/error") {
+      this.toast(`实时流错误: ${frame.error?.message ?? frame.message ?? "未知错误"}`);
     }
     this.redraw();
   }
@@ -3939,6 +3990,10 @@ export class App {
   async openSession(sessionId) {
     if (typeof sessionId !== "string" || !sessionId) { this.toast("无法打开会话：缺少会话 ID"); return; }
     const epoch = ++this.sessionEpoch;
+    // Draft mirror: park the current session's unsubmitted text under its id
+    // so switching back restores exactly what was being typed (web parity).
+    const prevId = this.currentSession;
+    if (prevId && prevId !== sessionId) this.draftsBySession.set(prevId, this.chat.input?.value ?? "");
     if (sessionId !== this.currentSession && !this.searchActive) {
       // A scoped result highlight belongs to the session it was opened from;
       // ordinary sidebar/session switches must not leak it into another chat.
@@ -3963,6 +4018,7 @@ export class App {
     }
     await this.chat.open(sessionId, epoch);
     if (epoch !== this.sessionEpoch || sessionId !== this.currentSession) return;
+    this.chat.input?.setValue(this.draftsBySession.get(sessionId) ?? "");
     // A sidebar Enter intentionally preserves sidebar focus, but every
     // session-scoped panel must immediately follow the newly opened session.
     if (this.mode === "trajectory" && this.trajectoryPanel) await this.trajectoryPanel.load(sessionId);
@@ -4040,6 +4096,14 @@ export class App {
     return true;
   }
   showWorkspaceBuffer() { if (!this.workspacePanel) this.workspacePanel = new WorkspacePanel(this); this.openFullBuffer(this.workspacePanel); this.workspacePanel.load(); }
+  /** Open a local file path in the workspace panel's preview pane. */
+  openWorkspaceFile(path) {
+    if (!this.workspacePanel) this.workspacePanel = new WorkspacePanel(this);
+    if (this.fullBuffer !== this.workspacePanel) { this.openFullBuffer(this.workspacePanel); this.workspacePanel.load(); }
+    this.workspacePanel.previewFile(path);
+    this.focus(this.workspacePanel);
+    this.redraw();
+  }
   showSettingsBuffer() { if (!this.settingsPanel) this.settingsPanel = new SettingsPanel(this); this.openFullBuffer(this.settingsPanel); this.settingsPanel.load(); }
   showModelsBuffer() { if (!this.modelPanel) this.modelPanel = new ModelPanel(this); this.openFullBuffer(this.modelPanel); this.modelPanel.load(); }
   showSubagentBuffer() {

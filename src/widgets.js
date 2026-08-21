@@ -281,6 +281,8 @@ export class Input extends Widget {
     this.history = [];
     this.histIdx = -1;
     this.masked = opts.masked ?? false;  // secret fields render •••• instead of the value
+    this.undoStack = [];                 // {value,cursor,selStart,selEnd} snapshots (user edits)
+    this.redoStack = [];
   }
   #cps() { return graphemes(this.value); }             // user-perceived characters
   /** Visual rows for multi-line input: logical lines wrapped at the width. */
@@ -384,6 +386,7 @@ export class Input extends Widget {
    *  replaces it, edits elsewhere just shift it. Always notifies onChange —
    *  the second-paste swap must reflow the layout just like typing. */
   #edit(from, to, text = "") {
+    this.#pushUndo();
     this.selStart = this.selEnd = null; // edits consume the selection
     const cps = this.#cps();
     const t = graphemes(text);
@@ -615,12 +618,43 @@ export class Input extends Widget {
     this.app?.toast?.(this.expanded ? "输入栏已展开（Ctrl+L 折叠）" : "输入栏已折叠（Ctrl+L 展开）");
     return true;
   }
+  #record() { return { value: this.value, cursor: this.cursor, selStart: this.selStart, selEnd: this.selEnd }; }
+  #pushUndo() {
+    this.undoStack.push(this.#record());
+    if (this.undoStack.length > 200) this.undoStack.shift();
+    this.redoStack = [];
+  }
+  #applySnapshot(snap) {
+    this.value = snap.value;
+    this.cursor = Math.max(0, Math.min(snap.cursor, this.#cps().length));
+    this.selStart = snap.selStart;
+    this.selEnd = snap.selEnd;
+    this.selectAll = false;
+    this.#touch();
+    this.#snapCursor();
+    this.#updateCmds();
+    this.onChange?.();
+  }
+  #undo() {
+    if (!this.undoStack.length) { this.app?.toast?.("没有可撤销的操作"); return true; }
+    this.redoStack.push(this.#record());
+    this.#applySnapshot(this.undoStack.pop());
+    return true;
+  }
+  #redo() {
+    if (!this.redoStack.length) { this.app?.toast?.("没有可重做的操作"); return true; }
+    this.undoStack.push(this.#record());
+    this.#applySnapshot(this.redoStack.pop());
+    return true;
+  }
   onKey(ev) {
     if (ev.type === "text" || ev.type === "paste") { return this.#paste(ev.text ?? ""); }
     if (ev.type !== "key") return false;
     const inputHit = this.app?.inputBindingFor?.(ev) ?? null;
     if (inputHit?.id === "copyInput") return this.#copySelection();
     if (inputHit?.id === "expandInput") return this.#toggleExpanded();
+    if (inputHit?.id === "undoInput") return this.#undo();
+    if (inputHit?.id === "redoInput") return this.#redo();
     switch (ev.name) {
       case "backspace":
         if (this.cursor > 0) this.#edit(this.cursor - 1, this.cursor);
@@ -699,6 +733,7 @@ export class Input extends Widget {
             case "c": {
               if (ev.shift) return this.#copySelection();
               // plain Ctrl+C keeps ONE meaning here: clear the input
+              this.#pushUndo();
               this.#touch();
               this.value = "";
               this.cursor = 0;
@@ -733,6 +768,9 @@ export class Input extends Widget {
         if (this.value.trim() === "" && !this.allowEmptyEnter) return false;
         const v = this.value;
         this.#touch();
+        // A submitted draft is finished: undo history starts fresh (web parity).
+        this.undoStack = [];
+        this.redoStack = [];
         this.history.push(v);
         this.histIdx = -1;
         this.value = "";

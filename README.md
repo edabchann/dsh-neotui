@@ -105,10 +105,13 @@ node bin/dsh-tui.js --base http://127.0.0.1:3080
 | INSERT | `Ctrl+L` | 展开/折叠输入栏 |
 | INSERT | `↑` / `↓` | 在首尾行浏览输入历史 |
 | INSERT | `Ctrl+Shift+C` | 复制输入框选区 |
+| INSERT | `Ctrl+Z` / `Ctrl+Y` | 撤销 / 重做（发送后清空历史） |
 | INSERT | `Ctrl+O` | 打开文件选择器 |
 | INSERT | `Ctrl+Shift+V` | 粘贴剪贴板图片 |
 | INSERT | `Esc` | 退出输入（可重映射；`Esc` 始终保留兜底） |
 | NORMAL | `Ctrl+O` | 打开附件管理器 |
+
+输入框草稿按会话镜像：切换到另一会话时保存当前未发送文本，切回时原样恢复（发送后清空）。
 
 文件选择器支持：
 

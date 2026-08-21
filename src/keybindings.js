@@ -20,6 +20,8 @@ export const DEFAULT_KEYBINDINGS = {
   pasteImage: { mode: "insert", key: "Ctrl+Shift+V", key2: "" },
   copyInput: { mode: "insert", key: "Ctrl+Shift+C", key2: "" },
   expandInput: { mode: "insert", key: "Ctrl+L", key2: "" },
+  undoInput: { mode: "insert", key: "Ctrl+Z", key2: "" },
+  redoInput: { mode: "insert", key: "Ctrl+Y", key2: "" },
   sessionFilter: { mode: "normal", key: "Ctrl+F", key2: "/" },
   copySelection: { mode: "normal", key: "Ctrl+Shift+C", key2: "" },
   newSession: { mode: "normal", key: "n", key2: "" },
@@ -61,7 +63,7 @@ export const KEYBINDING_ORDER = [
 /** Input-shell bindings evaluated by App before ordinary editor semantics. */
 export const INPUT_BINDING_ORDER = ["leaveInsert", "insertFilePicker", "pasteImage"];
 /** Input-editor bindings evaluated inside Input before fixed editing keys. */
-export const INPUT_EDIT_BINDING_ORDER = ["copyInput", "expandInput"];
+export const INPUT_EDIT_BINDING_ORDER = ["copyInput", "expandInput", "undoInput", "redoInput"];
 
 /** Transcript-level bindings evaluated inside ChatView.onKey. */
 export const CHAT_BINDING_ORDER = ["think", "tools", "insert", "top", "bottom", "prevQuestion", "nextQuestion", "sessionFilter"];
