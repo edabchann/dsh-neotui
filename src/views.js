@@ -4380,7 +4380,8 @@ export class App {
 
   async doSwitchPermission(preset) {
     try {
-      const res = await this.api.rpcCall("commands/execute", { agentId: this.currentSession, line: `/permission ${preset}` });
+      // dsh ≥0.1.1 requires an explicit images array on command execution.
+      const res = await this.api.rpcCall("commands/execute", { agentId: this.currentSession, line: `/permission ${preset}`, images: [] });
       const text = res?.result?.text ?? "";
       this.toast(`权限已切换: ${text || permName(preset)}`);
     } catch (e) { this.toast(`权限切换失败: ${e.message}`); }

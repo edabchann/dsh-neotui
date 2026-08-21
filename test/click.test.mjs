@@ -2024,6 +2024,14 @@ test("the slash candidate bar merges the Host command directory with hints", asy
   assert.ok(screen.toPlain().includes("<objective>"), "the hint is shown in the candidate bar");
 });
 
+test("commands/execute carries the dsh 0.1.1 images field", async () => {
+  const app = headlessApp(); app.currentSession = "s";
+  const calls = [];
+  app.api.rpcCall = async (method, payload) => { calls.push([method, payload]); return { result: { text: "ok" } }; };
+  await app.doSwitchPermission("workspace-write");
+  assert.deepEqual(calls.at(-1), ["commands/execute", { agentId: "s", line: "/permission workspace-write", images: [] }], "images array rides the execute request");
+});
+
 test("legacy one-slot keybinding values migrate to the new two-slot defaults", async () => {
   const app = headlessApp(); app.currentSession = "s"; app.focus(app.chat);
   saveTuiConfig({ keyBindings: {
