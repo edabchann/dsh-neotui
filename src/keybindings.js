@@ -16,14 +16,17 @@ export const DEFAULT_KEYBINDINGS = {
   tools: { mode: "normal", key: "b", key2: "" },
   insert: { mode: "normal", key: "i", key2: "" },
   leaveInsert: { mode: "insert", key: "Esc", key2: "" },
+  insertFilePicker: { mode: "insert", key: "Ctrl+O", key2: "" },
+  pasteImage: { mode: "insert", key: "Ctrl+Shift+V", key2: "" },
+  copyInput: { mode: "insert", key: "Ctrl+Shift+C", key2: "" },
+  expandInput: { mode: "insert", key: "Ctrl+L", key2: "" },
   sessionFilter: { mode: "normal", key: "Ctrl+F", key2: "/" },
+  copySelection: { mode: "normal", key: "Ctrl+Shift+C", key2: "" },
   newSession: { mode: "normal", key: "n", key2: "" },
   top: { mode: "normal", key: "g g", key2: "" },
   bottom: { mode: "normal", key: "G", key2: "" },
   prevQuestion: { mode: "normal", key: "[", key2: "" },
   nextQuestion: { mode: "normal", key: "]", key2: "" },
-  expandInput: { mode: "insert", key: "Ctrl+L", key2: "" },
-  copyInput: { mode: "insert", key: "Ctrl+Shift+C", key2: "" },
   panel: { mode: "all", key: "Ctrl+Space", key2: "F7" },
   model: { mode: "normal", key: "Ctrl+M", key2: "" },
   trajectory: { mode: "normal", key: "Ctrl+T", key2: "" },
@@ -41,15 +44,24 @@ export const DEFAULT_KEYBINDINGS = {
   stepJump: { mode: "normal", key: "Ctrl+E", key2: "" },
   sidebar: { mode: "normal", key: "Ctrl+B", key2: "" },
   editConfig: { mode: "normal", key: "Ctrl+K", key2: "" },
+  addWorkspace: { mode: "normal", key: "Ctrl+Shift+W", key2: "" },
+  commandPalette: { mode: "normal", key: "Ctrl+P", key2: "" },
+  modePicker: { mode: "normal", key: "F9", key2: "" },
+  quitDouble: { mode: "normal", key: "Ctrl+C", key2: "" },
   quit: { mode: "all", key: "Ctrl+Q", key2: "" },
 };
 
 /** App-level dispatch precedence: the first matching binding wins. */
 export const KEYBINDING_ORDER = [
-  "sessionFilter", "panel", "homeSwitch", "permissionRotate", "editConfig", "quit",
+  "sessionFilter", "panel", "homeSwitch", "permissionRotate", "editConfig", "addWorkspace", "commandPalette", "modePicker", "copySelection", "quitDouble", "quit",
   "model", "trajectory", "workspace", "settings", "subagent", "skills", "goal",
   "jobs", "queue", "busyEnter", "attachments", "stepJump", "sidebar",
 ];
+
+/** Input-shell bindings evaluated by App before ordinary editor semantics. */
+export const INPUT_BINDING_ORDER = ["leaveInsert", "insertFilePicker", "pasteImage"];
+/** Input-editor bindings evaluated inside Input before fixed editing keys. */
+export const INPUT_EDIT_BINDING_ORDER = ["copyInput", "expandInput"];
 
 /** Transcript-level bindings evaluated inside ChatView.onKey. */
 export const CHAT_BINDING_ORDER = ["think", "tools", "insert", "top", "bottom", "prevQuestion", "nextQuestion", "sessionFilter"];

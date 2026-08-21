@@ -598,9 +598,29 @@ export class Input extends Widget {
     this.insert(text);
     return true;
   }
+  #copySelection() {
+    if (this.selStart !== null && this.selEnd !== null && this.selEnd > this.selStart) {
+      const text = this.#cps().slice(this.selStart, this.selEnd).join("");
+      this.selStart = this.selEnd = null;
+      this.app?.copyText?.(text);
+    } else {
+      this.app?.toast?.("先用鼠标拖动选中要复制的内容");
+    }
+    return true;
+  }
+  #toggleExpanded() {
+    this.expanded = !this.expanded;
+    this.maxLines = this.expanded ? 1000 : this.baseMaxLines;
+    this.onChange?.();
+    this.app?.toast?.(this.expanded ? "输入栏已展开（Ctrl+L 折叠）" : "输入栏已折叠（Ctrl+L 展开）");
+    return true;
+  }
   onKey(ev) {
     if (ev.type === "text" || ev.type === "paste") { return this.#paste(ev.text ?? ""); }
     if (ev.type !== "key") return false;
+    const inputHit = this.app?.inputBindingFor?.(ev) ?? null;
+    if (inputHit?.id === "copyInput") return this.#copySelection();
+    if (inputHit?.id === "expandInput") return this.#toggleExpanded();
     switch (ev.name) {
       case "backspace":
         if (this.cursor > 0) this.#edit(this.cursor - 1, this.cursor);
@@ -677,17 +697,7 @@ export class Input extends Widget {
           switch (ev.key) {
             case "j": if (this.multi) { this.insert("\n"); return true; } return false;
             case "c": {
-              if (ev.shift) {
-                // Ctrl+Shift+C: copy the drag-selection (if any)
-                if (this.selStart !== null && this.selEnd !== null && this.selEnd > this.selStart) {
-                  const text = this.#cps().slice(this.selStart, this.selEnd).join("");
-                  this.selStart = this.selEnd = null;
-                  this.app?.copyText?.(text);
-                } else {
-                  this.app?.toast?.("先用鼠标拖动选中要复制的内容");
-                }
-                return true;
-              }
+              if (ev.shift) return this.#copySelection();
               // plain Ctrl+C keeps ONE meaning here: clear the input
               this.#touch();
               this.value = "";
@@ -699,15 +709,7 @@ export class Input extends Widget {
             }
             case "u": this.#edit(0, this.cursor); return true;
             case "k": this.#edit(this.cursor, this.#cps().length); return true;
-            case "l": {
-              // expand/collapse the input: expanded drops the 6-line cap and
-              // lets the editor fill the window above the input
-              this.expanded = !this.expanded;
-              this.maxLines = this.expanded ? 1000 : this.baseMaxLines;
-              this.onChange?.();
-              this.app?.toast?.(this.expanded ? "输入栏已展开（Ctrl+L 折叠）" : "输入栏已折叠（Ctrl+L 展开）");
-              return true;
-            }
+            case "l": return this.#toggleExpanded();
             case "a": this.cursor = 0; return true;
             case "e": this.cursor = this.#cps().length; return true;
             case "w": {

@@ -47,6 +47,25 @@ export function graphemeWidth(g) {
   return clustered ? Math.max(0, ...widths) : widths.reduce((a, b) => a + b, 0);
 }
 
+/** First `count` graphemes, without materializing the whole string (O(count)
+ *  even when the source is huge). */
+export function takeGraphemes(s, count) {
+  if (count <= 0) return "";
+  let out = "", n = 0;
+  if (GRAPHEME_SEGMENTER) {
+    for (const part of GRAPHEME_SEGMENTER.segment(String(s ?? ""))) {
+      out += part.segment;
+      if (++n >= count) break;
+    }
+  } else {
+    for (const part of String(s ?? "")) {
+      out += part;
+      if (++n >= count) break;
+    }
+  }
+  return out;
+}
+
 export function strWidth(s) {
   let w = 0;
   for (const g of graphemes(s)) w += graphemeWidth(g);

@@ -1,15 +1,15 @@
 // views.js — App composition: session list + chat timeline + approvals + status.
 import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
-import { truncate, strWidth, pad, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth } from "./text.js";
-import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { truncate, strWidth, pad, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth, takeGraphemes } from "./text.js";
+import { readFileSync, appendFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { Widget, ScrollView, Input, Popup, Menu, StatusBar, wrapIndex } from "./widgets.js";
 import { UploadPicker } from "./file-picker.js";
 import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, keyBindings, tuiConfigFile, reloadTuiConfig, searchHistory, rememberSearchQuery } from "./config.js";
-import { bindingMatchFor, matchKeyBinding, CHAT_BINDING_ORDER, SIDEBAR_BINDING_ORDER, KEYBINDING_ORDER } from "./keybindings.js";
+import { bindingMatchFor, matchKeyBinding, CHAT_BINDING_ORDER, SIDEBAR_BINDING_ORDER, KEYBINDING_ORDER, INPUT_BINDING_ORDER, INPUT_EDIT_BINDING_ORDER } from "./keybindings.js";
 export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
@@ -51,6 +51,70 @@ function caseInsensitiveParts(text, query) {
   }
   if (cursor < source.length) parts.push({ t: source.slice(cursor).join(""), hit: false });
   return parts.length ? parts : [{ t: source.join(""), hit: false }];
+}
+
+/** Non-overlapping query matches as source-grapheme index ranges [{start,end}],
+ *  sorted ascending. `cap` bounds the scanned prefix so a megabyte tool result
+ *  cannot stall a frame; matches beyond the cap simply stay unhighlighted. */
+function caseInsensitiveRanges(text, query, cap = Infinity) {
+  const source = graphemes(String(text ?? ""));
+  const needle = graphemes(String(query ?? "")).map((g) => g.toLowerCase()).join("");
+  if (!needle) return [];
+  const n = Math.min(source.length, Math.max(0, cap));
+  let folded = "", owner = [];
+  for (let i = 0; i < n; i++) {
+    const lower = source[i].toLowerCase();
+    folded += lower;
+    for (let j = 0; j < lower.length; j++) owner.push(i);
+  }
+  const ranges = [];
+  let from = 0, cursor = 0;
+  while (from <= folded.length - needle.length) {
+    const at = folded.indexOf(needle, from);
+    if (at < 0) break;
+    from = at + Math.max(1, needle.length);
+    const start = owner[at], end = owner[at + needle.length - 1] + 1;
+    if (start == null || end == null || start < cursor) continue;
+    ranges.push({ start, end });
+    cursor = end;
+  }
+  return ranges;
+}
+
+/** Like wrapDisplayText but each line carries the source-grapheme index range
+ *  it came from, so a match spanning a wrap boundary can be split across lines. */
+function wrapDisplayTextWithOffsets(value, width) {
+  const out = [];
+  let index = 0;
+  for (const raw of String(value ?? "").split("\n")) {
+    if (!raw) { out.push({ text: "", start: index, end: index }); index += 1; continue; }
+    let line = "", used = 0, start = index;
+    for (const g of graphemes(raw)) {
+      const gw = graphemeWidth(g);
+      if (line && used + gw > width) { out.push({ text: line, start, end: index }); line = ""; used = 0; start = index; }
+      line += g; used += gw; index += 1;
+    }
+    out.push({ text: line, start, end: index });
+    index += 1; // the newline grapheme between raw lines
+  }
+  return out;
+}
+
+/** Extract the Host spill-file path from a truncated tool-output notice. */
+function spillPathFromText(text) {
+  const s = String(text ?? "");
+  const patterns = [
+    /full output[^\n]*?([^\s\]]+)\s*\]/i,   // [output truncated; full output: /path]
+    /stored at:\s*(\S+)/i,                  // Full grep result stored at: /path
+    /spill[^\n]*?\bat:\s*(\S+)/i,           // … spilled to: /path
+  ];
+  for (const re of patterns) {
+    const m = s.match(re);
+    if (!m) continue;
+    const path = m[1].replace(/[\]),;]+$/, "");
+    if (path.length > 1) return path;
+  }
+  return null;
 }
 
 const require = createRequire(import.meta.url);
@@ -1975,6 +2039,12 @@ export class ChatView extends Widget {
                   const rl = truncateText(b.result, 4000).split("\n");
                   for (const r of rl.slice(0, 30)) { lines.push([{ t: "  " + truncate(r, w - 4), fg: K.DIM }]); mark(realIdx, bi); }
                   if (rl.length > 30) { lines.push([{ t: `  …共 ${rl.length} 行`, fg: K.FAINT }]); mark(realIdx, bi); }
+                  const spill = spillPathFromText(b.result);
+                  if (spill) {
+                    lines.push([{ t: "  ⚠ 完整输出已保存到文件（r 菜单可打开/复制）", fg: K.WARN }]);
+                    lines.push([{ t: "  " + truncate(spill, w - 6), fg: K.ACCENT }]);
+                    mark(realIdx, bi);
+                  }
                 } else if (orphan) {
                   // explain the ambiguous state instead of a bare 无结果
                   lines.push([{ t: "  结果未保留：该工具调用的结果不在当前会话历史中（上下文压缩会修剪早期工具结果），并非执行失败或输出为空。", fg: K.FAINT }]);
@@ -2335,6 +2405,28 @@ export class ChatView extends Widget {
     return this.#toggleAt({ nodeIdx: item.nodeIdx, blockIdx: item.blockIdx });
   }
 
+  /** Open a Host spill file: the gateway's host.openPath works from anywhere
+   *  (the path is host-local); when the TUI runs on the same machine a local
+   *  OS opener is the fallback. */
+  async #openSpillPath(path) {
+    const toast = (msg) => this.app.toast(msg);
+    try {
+      await this.app.api.call("host.openPath", { path });
+      toast(`已请求打开完整输出文件: ${path}`);
+      return;
+    } catch (error) {
+      this.app.log("host.openPath failed:", error?.message ?? error);
+    }
+    if (existsSync(path)) {
+      const cmd = process.platform === "win32" ? ["cmd", ["/c", "start", "", path]] : process.platform === "darwin" ? ["open", [path]] : ["xdg-open", [path]];
+      const run = spawnSync(cmd[0], cmd[1], { detached: true, stdio: "ignore" });
+      if (run.status === 0 || run.error == null) { toast(`已打开完整输出文件: ${path}`); return; }
+      toast(`打开失败（${run.error?.message ?? run.status}）；可用 Ctrl+R 复制路径`);
+      return;
+    }
+    toast(`完整输出路径: ${path}`);
+  }
+
   #openSelectedContextMenu() {
     const item = this.blockItems[this.blockSel];
     if (!item) return false;
@@ -2344,6 +2436,13 @@ export class ChatView extends Widget {
     if (item.foldable) entries.push({ label: "展开 / 折叠", action: () => this.#toggleAt(info) });
     if (node?.id) entries.push({ label: "转跳轨迹", action: () => this.app.jumpToTrajectoryNode(item.nodeIdx) });
     entries.push({ label: "加载更早记录", action: () => this.loadOlder() });
+    // Host spill recovery: the truncated tool output names its full file.
+    const spillBlock = item.blockIdx != null ? node?.blocks?.[item.blockIdx] : null;
+    const spill = spillPathFromText(spillBlock?.result ?? spillBlock?.text ?? node?.text ?? "");
+    if (spill) {
+      entries.push({ label: "打开完整输出文件", action: () => void this.#openSpillPath(spill) });
+      entries.push({ label: "复制完整输出路径", action: () => this.app.copyText(spill) });
+    }
     this.app.openMenu(entries, { x: this.view.x + 2, y: this.view.y + Math.max(0, item.headerLine - this.view.scrollY) });
     return true;
   }
@@ -3165,6 +3264,15 @@ export class App {
   resize(w, h) {
     this.screen.resize(w, h);
     this.layout();
+    // Re-anchor the search preview to the active block: the old previewScroll
+    // was measured against the old width/height and may now point past the
+    // wrapped content or into a blank region.
+    const state = this.searchState;
+    if (state && !state.loading && state.phase === "results" && !state.helpVisible) this.#updateSearchPreview();
+    if (state?.helpVisible) {
+      const maxScroll = Math.max(0, this.#searchHelpLines().length - Math.max(1, this.screen.h - 5));
+      state.helpScroll = Math.max(0, Math.min(maxScroll, state.helpScroll ?? 0));
+    }
     this.redraw();
   }
 
@@ -4101,6 +4209,14 @@ export class App {
     this.switchPermission(next);
   }
 
+  inputBindingFor(ev) {
+    return bindingMatchFor(ev, keyBindings(), true, INPUT_EDIT_BINDING_ORDER);
+  }
+
+  inputShellBindingFor(ev) {
+    return bindingMatchFor(ev, keyBindings(), true, INPUT_BINDING_ORDER);
+  }
+
   /** Execute an editable global binding (two slots per id). */
   #runBinding(id, slot) {
     switch (id) {
@@ -4128,6 +4244,9 @@ export class App {
       case "attachments": this.overlay = new AttachmentPanel(this); this.focus(this.overlay); this.redraw(); return true;
       case "stepJump": this.quickJumpStep(); return true;
       case "sidebar": this.toggleSidebar(); return true;
+      case "addWorkspace": this.addWorkspace(); return true;
+      case "commandPalette": this.overlay = new ControlPanel(this, { startPage: 1 }); this.redraw(); return true;
+      case "modePicker": this.showModePicker(); return true;
       default: return false;
     }
   }
@@ -4290,6 +4409,13 @@ export class App {
       this.redraw();
       return;
     }
+    // The search buffer is a modal full-screen surface: mouse events are
+    // handled by it exclusively and must never leak into the panes beneath.
+    if (this.searchActive && ev.type === "mouse") {
+      this.#onSearchMouse(ev);
+      this.redraw();
+      return;
+    }
     // Full-screen panel buffers (workspace/settings/models/subagent/skills)
     // are modal surfaces over the main area. Pane cycling (Ctrl+Left/Right)
     // works again the moment Esc closes the buffer.
@@ -4401,7 +4527,8 @@ export class App {
       // Global shortcuts (Ctrl+P, Ctrl+B, F7, …) are disabled here so plain
       // typing and Ctrl+J / Shift+Enter newlines behave like a normal editor.
       if (this.focused === this.chat.input) {
-        if (ev.name === "escape") {
+        const inputShell = this.inputShellBindingFor(ev);
+        if (ev.name === "escape" || inputShell?.id === "leaveInsert") {
           // Esc closes the open / command candidate bar first, then exits
           // insert — Esc is the ONLY way out of insert mode.
           if (this.chat.input.cmdOpen) { this.chat.input.cmdOpen = false; this.redraw(); return; }
@@ -4409,9 +4536,9 @@ export class App {
           // so ordinary Vim muscle memory cannot accidentally stop a long turn.
           this.focus(this.chat);
           this.toast(this.chat.running ? "已退出输入；Ctrl+C 可中断当前回合" : "已退出输入（i 重新进入）");
-        } else if (ev.ctrl && ev.key === "o") {
+        } else if (inputShell?.id === "insertFilePicker") {
           this.showFilePicker();
-        } else if (ev.ctrl && ev.shift && ev.key === "v") {
+        } else if (inputShell?.id === "pasteImage") {
           if (!this.chat.pasteClipboardImage()) this.chat.input.onKey(ev);
         } else {
           this.chat.input.onKey(ev);
@@ -4428,12 +4555,12 @@ export class App {
       // keybindings registry (tui-config.json keyBindings.<id>).
       const hit = bindingMatchFor(ev, keyBindings(), false, KEYBINDING_ORDER);
       if (hit && this.#runBinding(hit.id, hit.slot)) return;
-      if (ev.ctrl && ev.shift && ev.key === "c") {
+      if (bindingMatchFor(ev, keyBindings(), false, ["copySelection"])?.id === "copySelection") {
         if (this.focused === this.chat) this.chat.onKey(ev);
         else this.toast("请先在正文中选择要复制的内容");
         this.redraw(); return;
       }
-      if (ev.ctrl && ev.key === "c" && !ev.shift) {
+      if (bindingMatchFor(ev, keyBindings(), false, ["quitDouble"])?.id === "quitDouble") {
         // NORMAL-mode Ctrl+C: two presses within the toast window exit the
         // process; the first press just warns (insert mode owns Ctrl+C for
         // clearing the input).
@@ -4444,9 +4571,6 @@ export class App {
         this.toast("再按一次 Ctrl+C 退出 TUI");
         return;
       }
-      if (ev.ctrl && ev.shift && ev.key === "w") { this.addWorkspace(); return; }
-      if (ev.ctrl && ev.key === "p") { this.overlay = new ControlPanel(this, { startPage: 1 }); this.redraw(); return; }
-      if (ev.name === "f9") { this.showModePicker(); return; }
       if (ev.name === "escape") {
         // Esc in NORMAL mode interrupts a running turn (one press, regardless
         // of focus); otherwise it steps back toward the chat view.
@@ -4576,7 +4700,12 @@ export class App {
     }
     if (!matches.length && deep) matches.push({ nodeIdx: -1, blockIdx: null, kind: "snippet", text: snippet ?? "", seq: null, approximate: true });
     const session = this.sessions.find((item) => item.sessionId === sessionId);
-    return { sessionId, title: session?.projections?.values?.title ?? sessionId.slice(0, 8), updatedAt: session?.updatedAt ?? 0, snippet: snippet ?? "", nodes, matches, hasMore: history.hasMore, beforeSeq: allEvents[0]?.event?.seq ?? null };
+    const projections = history.projections?.values ?? {};
+    // Sessions absent from the sidebar list still sort correctly: the tail
+    // page's newest event time is a faithful proxy for "最近更新".
+    const lastEvent = allEvents.length ? Math.max(...allEvents.map((entry) => Number(entry?.event?.time) || 0)) : 0;
+    const updatedAt = session?.updatedAt ?? lastEvent ?? projections.updatedAt ?? projections.lastUpdatedAt ?? projections.updated ?? 0;
+    return { sessionId, title: session?.projections?.values?.title ?? projections.title ?? sessionId.slice(0, 8), updatedAt, snippet: snippet ?? "", nodes, matches, hasMore: history.hasMore, beforeSeq: allEvents[0]?.event?.seq ?? null };
   }
 
   /** Bounded local scan over loaded sessions when the Host FTS index is absent. */
@@ -4609,7 +4738,7 @@ export class App {
     if (!state || !query || state.loading) { if (!query) this.toast("请输入搜索内容"); return; }
     rememberSearchQuery(query); // best-effort history; search itself must never depend on config writes
     this.searchInput.history = searchHistory(); this.searchInput.histIdx = -1;
-    state.loading = true; state.error = null; state.fallback = false; state.fallbackError = null; state.progress = { done: 0, total: 0, label: "" }; state.phase = "results"; state.query = query; state.rows = []; state.preview = []; state.selected = 0; this.focus(this); this.redraw();
+    state.loading = true; state.error = null; state.fallback = false; state.fallbackError = null; state.progress = { done: 0, total: 0, label: "" }; state.phase = "results"; state.query = query; state.rows = []; state.preview = []; state.selected = 0; this.searchClick = null; this.focus(this); this.redraw();
     const seq = ++this.searchSeq;
     const lower = query.toLowerCase();
     try {
@@ -4701,16 +4830,59 @@ export class App {
     return Math.max(8, Math.min(Math.max(24, Math.floor(w * 0.36)), 48, w - 16));
   }
 
-  /** Draw text truncated to a width, with every query occurrence highlighted. */
-  #drawSearchHighlight(s, x, y, text, width, style, query) {
-    const parts = caseInsensitiveParts(text, query);
-    let px = x;
-    for (const part of parts) {
-      const avail = x + width - px;
-      if (avail <= 0) break;
-      const t = strWidth(part.t) > avail ? truncate(part.t, avail) : part.t;
-      s.text(px, y, t, part.hit ? { ...style, bg: T.WARN, fg: T.SELFG } : style);
-      px += strWidth(t);
+  /** Flattened single-line label for a match row (cached per match). */
+  #searchRowLabel(row) {
+    row.match._flat ??= row.match.text.replace(/\s+/g, " ");
+    return row.match._flat;
+  }
+
+  /** Wrapped preview lines with source offsets, cached per item per width so a
+   *  megabyte block is wrapped once per selection/resize, not once per frame. */
+  #searchItemWrap(item, width) {
+    const cached = item._wrap;
+    if (cached && cached.width === width) return cached.lines;
+    const lines = wrapDisplayTextWithOffsets(item.text || "（空）", width);
+    item._wrap = { width, lines };
+    return lines;
+  }
+
+  /** Query ranges for one preview item, cached; cap bounds the scan so huge
+   *  tool results never stall a frame (matches past the cap stay plain). */
+  #searchItemRanges(item, query) {
+    if (item._ranges && item._ranges.query === query) return item._ranges.ranges;
+    const ranges = caseInsensitiveRanges(item.text || "（空）", query, 200000);
+    item._ranges = { query, ranges };
+    return ranges;
+  }
+
+  #putSearchSeg(s, px, y, t, limitX, style) {
+    const avail = limitX - px;
+    if (avail <= 0 || !t) return px;
+    const tt = strWidth(t) > avail ? truncate(t, avail) : t;
+    s.text(px, y, tt, style);
+    return px + strWidth(tt);
+  }
+
+  /** Paint wrapped lines with cross-wrap highlighting: `lines` are
+   *  {text,start,end} and `ranges` are source-grapheme [start,end) matches,
+   *  so a query spanning a wrap boundary lights up on both lines. */
+  #paintSearchLines(s, x, y, lines, ranges, width, style) {
+    let pi = 0, py = y;
+    for (const line of lines) {
+      const lg = graphemes(line.text);
+      let px = x, local = 0;
+      while (pi < ranges.length && ranges[pi].end <= line.start) pi++;
+      for (let k = pi; k < ranges.length && ranges[k].start < line.end; k++) {
+        const r = ranges[k];
+        // Convert source-grapheme range to line-local indices.
+        const a = Math.max(r.start, line.start) - line.start;
+        const b = Math.min(r.end, line.end) - line.start;
+        if (a > local) px = this.#putSearchSeg(s, px, py, lg.slice(local, a).join(""), x + width, style);
+        px = this.#putSearchSeg(s, px, py, lg.slice(a, b).join(""), x + width, { ...style, bg: T.WARN, fg: T.SELFG });
+        local = b;
+      }
+      px = this.#putSearchSeg(s, px, py, lg.slice(local).join(""), x + width, style);
+      py++;
     }
   }
 
@@ -4741,7 +4913,7 @@ export class App {
     let lines = 0;
     for (const item of state?.preview ?? []) {
       if (state.typeFold.has(item.kind)) continue;
-      lines += wrapDisplayText(item.text || "（空）", width).length;
+      lines += this.#searchItemWrap(item, width).length;
     }
     const viewHeight = Math.max(1, this.screen.h - 5);
     return { width, viewHeight, maxScroll: Math.max(0, lines - viewHeight) };
@@ -4771,7 +4943,7 @@ export class App {
       for (let i = 0; i < state.preview.length; i++) {
         const item = state.preview[i];
         if (state.typeFold.has(item.kind)) continue;
-        const h = wrapDisplayText(item.text || "（空）", width).length;
+        const h = this.#searchItemWrap(item, width).length;
         if (i === activeIdx) { state.previewScroll = Math.min(maxScroll, Math.max(0, Math.min(logical, logical + h - viewHeight))); break; }
         logical += h;
       }
@@ -4836,8 +5008,63 @@ export class App {
       ["查询长度", "查询会去除首尾空白；空查询不会执行或写入历史"],
       ["帮助导航", "Shift+/（?）切换帮助；↑/↓、PgUp/PgDn、Home/End 滚动"],
       ["关闭帮助", "再次按 Shift+/ 或 Esc 返回搜索"],
+      ["鼠标", "点击结果行选中、双击跳转或折叠；滚轮按位置滚动列表/预览/帮助页；点击查询行回到输入"],
       ["提示", "帮助打开时不会触发搜索、排序、折叠或跳转"],
     ];
+  }
+
+  /** List geometry shared by the renderer and the mouse hit-test so a click
+   *  always lands on the row the user saw. */
+  #searchListLayout(state) {
+    let y0 = 3;
+    if (state.error) y0++;
+    if (state.fallback) y0++;
+    if (state.hasMore && state.rows.length) y0++;
+    const available = Math.max(1, this.screen.h - y0 - 2);
+    const scroll = Math.max(0, Math.min(Math.max(0, state.rows.length - available), state.selected - Math.floor(available / 2)));
+    return { y0, available, scroll };
+  }
+
+  #onSearchMouse(ev) {
+    const state = this.searchState; if (!state) return;
+    if (ev.kind === "press" && ev.button === 0 && ev.y === 1 && !state.helpVisible) {
+      // Clicking the query row re-enters the input phase (results → / → query).
+      if (state.phase !== "input") { state.phase = "input"; this.searchInput.setValue(state.query); }
+      this.focus(this.searchInput);
+      return;
+    }
+    if (ev.kind === "wheel-up" || ev.kind === "wheel-down") {
+      const delta = ev.kind === "wheel-up" ? -1 : 1;
+      if (state.helpVisible) {
+        const maxScroll = Math.max(0, this.#searchHelpLines().length - Math.max(1, this.screen.h - 5));
+        state.helpScroll = Math.max(0, Math.min(maxScroll, state.helpScroll + delta * 3));
+        return;
+      }
+      if (state.phase !== "results" || state.loading) return;
+      if (ev.x > this.#searchSplit()) { this.#scrollSearchPreview(delta * 3); return; }
+      if (state.rows.length) { state.selected = wrapIndex(state.selected + delta, state.rows.length); this.#updateSearchPreview(); }
+      return;
+    }
+    if (ev.kind !== "press" || ev.button !== 0 || state.helpVisible || state.loading || state.phase !== "results") return;
+    const split = this.#searchSplit();
+    if (ev.x > split || ev.y <= 2) return; // preview pane: wheel-only; title rows: no action
+    const { y0, available, scroll } = this.#searchListLayout(state);
+    const index = scroll + (ev.y - y0);
+    if (index < 0 || index >= state.rows.length) return;
+    const row = state.rows[index];
+    const now = Date.now();
+    const click = this.searchClick;
+    if (click && click.index === index && now - click.at < 400) {
+      // Double-click: jump to the match, or toggle a workspace/session fold.
+      this.searchClick = null;
+      if (row.kind === "match") void this.#jumpSearchResult(row);
+      else { if (state.collapsed.has(row.key)) state.collapsed.delete(row.key); else state.collapsed.add(row.key); this.#flattenSearchRows(); }
+      return;
+    }
+    this.searchClick = { index, at: now };
+    if (index === state.selected) return;
+    state.selected = index;
+    this.#updateSearchPreview();
   }
 
   #onSearchKey(ev) {
@@ -4939,7 +5166,7 @@ export class App {
     if (state.error) s.text(2, y++, `搜索失败: ${truncate(state.error, split - 8)}`, { fg: K.ERR });
     if (state.fallback) s.text(2, y++, `Host 搜索索引不可用：已本地扫描最近 20 个会话的近期历史（${truncate(String(state.fallbackError ?? ""), Math.max(8, split - 30))}）`, { fg: K.WARN });
     if (state.hasMore && state.rows.length) s.text(2, y++, "Host 候选已截断，请缩小查询", { fg: K.WARN });
-    const available = Math.max(1, s.h - y - 2), scroll = Math.max(0, Math.min(Math.max(0, state.rows.length - available), state.selected - Math.floor(available / 2)));
+    const { available, scroll } = this.#searchListLayout(state);
     for (let i = 0; i < available; i++) {
       const index = scroll + i, row = state.rows[index]; if (!row) break;
       const selected = index === state.selected, folded = state.collapsed.has(row.key);
@@ -4949,10 +5176,15 @@ export class App {
       else {
         const rowWidth = Math.max(0, split - 2);
         const prefix = this.#searchRowPrefix(row, selected, rowWidth);
-        const label = row.match.approximate ? `（仅摘要）${row.match.text.replace(/\s+/g, " ")}` : row.match.text.replace(/\s+/g, " ");
         const prefixW = strWidth(prefix);
         s.text(1, y + i, prefix, style);
-        this.#drawSearchHighlight(s, 1 + prefixW, y + i, label, rowWidth - prefixW, style, state.query);
+        const flat = row.match.approximate ? `（仅摘要）${this.#searchRowLabel(row)}` : this.#searchRowLabel(row);
+        const lineWidth = Math.max(1, rowWidth - prefixW);
+        // Only the visible window is scanned/highlighted: a multi-megabyte
+        // block label stays O(width) instead of O(text) per frame.
+        const source = takeGraphemes(flat, lineWidth + 1);
+        const ranges = caseInsensitiveRanges(source, state.query);
+        this.#paintSearchLines(s, 1 + prefixW, y + i, [{ text: source, start: 0, end: graphemes(source).length }], ranges, lineWidth, style);
       }
     }
     let py = 3, logical = 0;
@@ -4960,12 +5192,17 @@ export class App {
       if (state.typeFold.has(item.kind)) continue;
       const prefix = this.#searchPreviewPrefix(item);
       const prefixW = strWidth(prefix);
-      const wrapped = wrapDisplayText(item.text || "（空）", Math.max(1, s.w - split - 4 - prefixW));
-      for (const line of wrapped) {
-        if (logical++ < state.previewScroll) continue; if (py >= s.h - 2) break;
+      const width = Math.max(1, s.w - split - 4 - prefixW);
+      const wrapped = this.#searchItemWrap(item, width);
+      const ranges = this.#searchItemRanges(item, state.query);
+      const itemStart = logical;
+      logical += wrapped.length;
+      const from = Math.max(0, state.previewScroll - itemStart);
+      const to = Math.min(wrapped.length, from + Math.max(0, s.h - 2 - py));
+      for (let i = from; i < to; i++) {
         const style = { fg: item.active ? T.ACCENT : K.TXT, attrs: item.active ? 1 : 0 };
         s.text(split + 2, py, prefix, style);
-        this.#drawSearchHighlight(s, split + 2 + prefixW, py, line, s.w - split - 4 - prefixW, style, state.query);
+        this.#paintSearchLines(s, split + 2 + prefixW, py, [wrapped[i]], ranges, width, style);
         py++;
       }
       if (py >= s.h - 2) break;

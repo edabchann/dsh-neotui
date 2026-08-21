@@ -1562,6 +1562,200 @@ test("search result list keeps the selected row visible while scrolling", async 
   assert.ok(!plain.includes("match s0"), "the list scrolled away from the top");
 });
 
+test("input-shell, input-editor and new global bindings dispatch through the registry", () => {
+  const app = headlessApp(); app.currentSession = "s"; app.focus(app.chat);
+  assert.ok(setKeyBinding("insertFilePicker", { mode: "insert", key: "Ctrl+9", key2: "" }));
+  assert.ok(setKeyBinding("expandInput", { mode: "insert", key: "Ctrl+8", key2: "" }));
+  assert.ok(setKeyBinding("copyInput", { mode: "insert", key: "Ctrl+7", key2: "" }));
+  assert.ok(setKeyBinding("leaveInsert", { mode: "insert", key: "Ctrl+0", key2: "" }));
+  let picked = 0; const origPicker = app.showFilePicker; app.showFilePicker = () => { picked++; };
+  app.focus(app.chat.input);
+  app.chat.input.setValue("select me"); app.chat.input.selStart = 0; app.chat.input.selEnd = 4;
+  app.onEvent({ type: "key", name: "char", key: "9", ctrl: true, shift: false });
+  assert.equal(picked, 1, "remapped insertFilePicker fires in INSERT");
+  app.showFilePicker = origPicker;
+  app.onEvent({ type: "key", name: "char", key: "8", ctrl: true, shift: false });
+  assert.equal(app.chat.input.expanded, true, "remapped expandInput toggles the editor height");
+  const copied = []; const origCopy = app.copyText; app.copyText = (t) => copied.push(t);
+  app.onEvent({ type: "key", name: "char", key: "7", ctrl: true, shift: false });
+  assert.deepEqual(copied, ["sele"], "remapped copyInput copies the selection");
+  app.copyText = origCopy;
+  app.onEvent({ type: "key", name: "char", key: "0", ctrl: true, shift: false });
+  assert.equal(app.focused, app.chat, "remapped leaveInsert exits insert mode");
+  app.onEvent({ type: "key", name: "escape", ctrl: false });
+  app.focus(app.chat.input);
+  app.onEvent({ type: "key", name: "escape", ctrl: false });
+  assert.equal(app.focused, app.chat, "Esc keeps working even when leaveInsert is remapped away");
+  assert.ok(resetKeyBinding("insertFilePicker")); assert.ok(resetKeyBinding("expandInput"));
+  assert.ok(resetKeyBinding("copyInput")); assert.ok(resetKeyBinding("leaveInsert"));
+});
+
+test("new global bindings (palette/mode/workspace/quitDouble/copySelection) are registry-driven", () => {
+  const app = headlessApp(); app.currentSession = "s"; app.focus(app.chat);
+  assert.ok(setKeyBinding("commandPalette", { mode: "normal", key: "F10", key2: "" }));
+  assert.ok(setKeyBinding("modePicker", { mode: "normal", key: "F11", key2: "" }));
+  assert.ok(setKeyBinding("addWorkspace", { mode: "normal", key: "Ctrl+Shift+8", key2: "" }));
+  assert.ok(setKeyBinding("quitDouble", { mode: "normal", key: "Ctrl+X", key2: "" }));
+  assert.ok(setKeyBinding("copySelection", { mode: "normal", key: "Ctrl+Shift+9", key2: "" }));
+  app.onEvent({ type: "key", name: "f10", shift: false });
+  assert.ok(app.overlay instanceof ControlPanel, "F10 opens the command palette");
+  app.overlay = null;
+  app.onEvent({ type: "key", name: "f11", shift: false });
+  assert.ok(app.overlay, "F11 opens the mode picker");
+  app.overlay = null;
+  let workspaces = 0; const orig = app.addWorkspace; app.addWorkspace = () => { workspaces++; };
+  app.onEvent({ type: "key", name: "char", key: "8", ctrl: true, shift: true });
+  assert.equal(workspaces, 1, "remapped addWorkspace fires");
+  app.addWorkspace = orig;
+  let yanked = 0; const origChat = app.chat.onKey; app.chat.onKey = () => { yanked++; return true; };
+  app.onEvent({ type: "key", name: "char", key: "9", ctrl: true, shift: true });
+  assert.equal(yanked, 1, "remapped copySelection routes to the transcript copier");
+  app.chat.onKey = origChat;
+  let stopped = 0; const origStop = app.stop; app.stop = () => { stopped++; };
+  app.onEvent({ type: "key", name: "char", key: "x", ctrl: true, shift: false });
+  assert.equal(stopped, 0, "first remapped quit press only warns");
+  app.onEvent({ type: "key", name: "char", key: "x", ctrl: true, shift: false });
+  assert.equal(stopped, 1, "second press quits");
+  app.stop = origStop;
+  assert.ok(resetKeyBinding("commandPalette")); assert.ok(resetKeyBinding("modePicker"));
+  assert.ok(resetKeyBinding("addWorkspace")); assert.ok(resetKeyBinding("quitDouble"));
+  assert.ok(resetKeyBinding("copySelection"));
+});
+
+test("search mouse: row click selects, double-click jumps, wheel scrolls list and preview", async () => {
+  const app = headlessApp(); app.screen.resize(100, 24); app.layout();
+  app.api.call = async (method, payload) => {
+    if (method === "session.search") return { items: [
+      { sessionId: "a", snippet: "needle alpha" },
+      { sessionId: "b", snippet: "needle beta" },
+    ], hasMore: false };
+    if (method === "session.history") {
+      const time = payload.sessionId === "a" ? 2 : 1;
+      return { events: [{ event: { type: "user/message", seq: 1, time, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: `${payload.sessionId} needle` }] } } }], hasMore: false };
+    }
+    return {};
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  app.renderFrame();
+  const rows = app.searchState.rows;
+  const matchIdx = rows.findIndex((row) => row.kind === "match");
+  assert.ok(matchIdx > 0, "match rows exist");
+  const y = 3 + matchIdx; // selected starts at 0 → scroll 0 on a 24-row terminal
+  app.onEvent({ type: "mouse", kind: "press", button: 0, x: 4, y });
+  assert.equal(app.searchState.selected, matchIdx, "clicking a row selects it");
+  let opened = null; app.openSession = async (id) => { opened = id; };
+  app.onEvent({ type: "mouse", kind: "press", button: 0, x: 4, y });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(opened, rows[matchIdx].session.sessionId, "double-click jumps into the session");
+});
+
+test("search mouse: wheel moves the list, scrolls the preview and the query row re-enters input", async () => {
+  const app = headlessApp(); app.screen.resize(100, 24); app.layout();
+  const longText = Array.from({ length: 40 }, (_, i) => `needle line ${i}`).join("\n");
+  app.api.call = async (method) => method === "session.search"
+    ? { items: [{ sessionId: "s", snippet: "needle" }], hasMore: false }
+    : { events: [{ event: { type: "user/message", seq: 1, time: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: longText }] } } }], hasMore: false };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  app.searchState.selected = app.searchState.rows.findIndex((row) => row.kind === "match");
+  app.onEvent({ type: "key", name: "down" }); app.onEvent({ type: "key", name: "up" });
+  const split = 36; // 100-wide terminal
+  const before = app.searchState.selected;
+  const rowCount = app.searchState.rows.length;
+  app.onEvent({ type: "mouse", kind: "wheel-down", x: 4, y: 5 });
+  assert.equal(app.searchState.selected, (before + 1) % rowCount, "wheel over the list moves the selection");
+  // return to the match row so the preview has content, then wheel over the preview pane
+  app.onEvent({ type: "key", name: "down" }); app.onEvent({ type: "key", name: "down" });
+  assert.ok(app.searchState.rows[app.searchState.selected].kind === "match", "selection is back on a match row");
+  app.onEvent({ type: "mouse", kind: "wheel-down", x: split + 4, y: 5 });
+  assert.equal(app.searchState.previewScroll, 3, "wheel over the preview scrolls it");
+  app.onEvent({ type: "mouse", kind: "press", button: 0, x: 10, y: 1 });
+  assert.equal(app.searchState.phase, "input", "clicking the query row re-enters input");
+  assert.equal(app.focused, app.searchInput);
+});
+
+test("search preview re-anchors to the active block after a terminal resize", async () => {
+  const app = headlessApp(); app.screen.resize(100, 30); app.layout();
+  const longText = Array.from({ length: 80 }, (_, i) => `line ${i}`).join("\n") + "\nneedle";
+  app.api.call = async (method) => method === "session.search"
+    ? { items: [{ sessionId: "s", snippet: "needle" }], hasMore: false }
+    : { events: [{ event: { type: "user/message", seq: 1, time: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: longText }] } } }], hasMore: false };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  app.searchState.selected = app.searchState.rows.findIndex((row) => row.kind === "match");
+  app.onEvent({ type: "key", name: "down" }); app.onEvent({ type: "key", name: "up" });
+  for (let i = 0; i < 6; i++) app.onEvent({ type: "key", name: "pgdn", ctrl: true });
+  assert.ok(app.searchState.previewScroll > 0, "manual preview scroll is deep");
+  app.onEvent({ type: "resize", w: 60, h: 16 });
+  assert.equal(app.searchState.previewScroll, 0, "resize re-anchors the preview to the active block");
+  app.renderFrame();
+  assert.match(app.screen.toPlain(), /line 0/, "the active block's first wrapped line is visible again");
+});
+
+test("search highlight spans preview wrap boundaries", async () => {
+  const app = headlessApp(); app.screen.resize(40, 10); app.layout();
+  app.api.call = async (method) => method === "session.search"
+    ? { items: [{ sessionId: "s", snippet: "abc needle-xyz" }], hasMore: false }
+    : { events: [{ event: { type: "user/message", seq: 1, time: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "abc needle-xyz" }] } } }], hasMore: false };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  app.searchState.selected = app.searchState.rows.findIndex((row) => row.kind === "match");
+  app.onEvent({ type: "key", name: "down" }); app.onEvent({ type: "key", name: "up" });
+  app.renderFrame();
+  const prev = app.screen.prev;
+  // 40-wide: the preview wraps "abc needle-xyz" into "abc needl" / "e-xyz";
+  // "needle" straddles the boundary and must light up on BOTH lines.
+  const warnAt = (y) => { for (let x = 25; x < 40; x++) if (prev[y][x].bg === T.WARN) return x; return -1; };
+  const x1 = warnAt(3), x2 = warnAt(4);
+  assert.ok(x1 >= 0 && prev[3][x1].ch === "n", "the first half of the straddling match is highlighted");
+  assert.ok(x2 >= 0 && prev[4][x2].ch === "e", "the wrapped continuation of the match is highlighted");
+  assert.notEqual(prev[3][x1 - 1].bg, T.WARN, "the cell before the match stays plain");
+  assert.notEqual(prev[4][x2 + 1].bg, T.WARN, "text after the continuation stays plain");
+});
+
+test("Host hits from unknown sessions sort by their newest event time under 最近更新", async () => {
+  const app = headlessApp();
+  app.sessions = [{ sessionId: "known", updatedAt: 50, projections: { values: { title: "Known" } } }];
+  app.api.call = async (method, payload) => {
+    if (method === "session.search") return { items: [
+      { sessionId: "unknown", snippet: "u needle" },
+      { sessionId: "known", snippet: "k needle" },
+    ], hasMore: false };
+    if (method === "session.history") {
+      const time = payload.sessionId === "unknown" ? 999 : 50;
+      return { events: [{ event: { type: "user/message", seq: 1, time, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "needle here" }] } } }], hasMore: false };
+    }
+    return {};
+  };
+  app.startSearch(); app.searchInput.setValue("needle"); app.onEvent({ type: "key", name: "enter" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  app.onEvent({ type: "key", name: "char", key: "s", ctrl: false, shift: false }); // relevance → recent
+  const sessions = app.searchState.rows.filter((row) => row.kind === "session");
+  assert.equal(sessions[0].session.sessionId, "unknown", "the tail page's newest event time orders the unknown session first");
+});
+
+test("truncated tool output with a spill notice exposes open/copy recovery actions", async () => {
+  const notice = "…[output truncated; full output: /tmp/spill-123.txt]";
+  const { app, chat, lines } = render([toolNode({ blocks: [
+    { kind: "tool", name: "bash", args: { command: "huge" }, result: notice, done: true, view: null },
+  ] })]);
+  assert.ok(lines.some((l) => l.includes("完整输出已保存到文件")), "the card advertises the spill file");
+  assert.ok(lines.some((l) => l.includes("/tmp/spill-123.txt")), "the spill path is rendered");
+  const tool = chat.blockItems.findIndex((item) => item.kind === "tool");
+  assert.ok(tool >= 0, "tool block is selectable");
+  chat.blockSel = tool;
+  chat.onKey({ type: "key", name: "char", key: "r", ctrl: true, shift: false });
+  assert.ok(app.lastMenu.items.some((entry) => entry.label === "打开完整输出文件"));
+  assert.ok(app.lastMenu.items.some((entry) => entry.label === "复制完整输出路径"));
+  app.lastMenu.items.find((entry) => entry.label === "复制完整输出路径").action();
+  assert.equal(app.copied, "/tmp/spill-123.txt");
+  const calls = [];
+  app.api.call = async (method, payload) => { calls.push([method, payload]); return { opened: true }; };
+  await app.lastMenu.items.find((entry) => entry.label === "打开完整输出文件").action();
+  assert.deepEqual(calls[0], ["host.openPath", { path: "/tmp/spill-123.txt" }]);
+});
+
 test("legacy one-slot keybinding values migrate to the new two-slot defaults", async () => {
   const app = headlessApp(); app.currentSession = "s"; app.focus(app.chat);
   saveTuiConfig({ keyBindings: {
