@@ -1817,6 +1817,42 @@ test("spill recovery previews the full output inside the TUI", () => {
   assert.equal(app.overlay, null, "Esc closes the preview viewer");
 });
 
+test("search wrap/highlight stays bounded and crash-free under random Unicode", async () => {
+  // Deterministic PRNG so failures reproduce; the pool mixes wide CJK, emoji
+  // (skin tone / ZWJ), combining marks and the fold-expanding U+0130.
+  const rand = (seed) => () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+  const rng = rand(0xc0ffee);
+  const pool = ["a", "b", "c", " ", "👍🏽", "汉", "字", "e\u0301", "İ", "中", "文", "，", "。", "x", "y", "👨‍👩‍👧‍👦", "-", "_", "9", "Q"];
+  for (let round = 0; round < 120; round++) {
+    const app = headlessApp();
+    const w = 20 + Math.floor(rng() * 80), h = 8 + Math.floor(rng() * 18);
+    app.screen.resize(w, h); app.layout();
+    const text = Array.from({ length: 1 + Math.floor(rng() * 300) }, () => pool[Math.floor(rng() * pool.length)]).join("");
+    const query = pool[Math.floor(rng() * pool.length)] + (rng() > 0.5 ? pool[Math.floor(rng() * pool.length)] : "");
+    app.api.call = async (method) => method === "session.search"
+      ? { items: [{ sessionId: "s", snippet: text }], hasMore: false }
+      : { events: [{ event: { type: "user/message", seq: 1, time: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text }] } } }], hasMore: false };
+    app.startSearch(); app.searchInput.setValue(query); app.onEvent({ type: "key", name: "enter" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    app.searchState.selected = app.searchState.rows.findIndex((row) => row.kind === "match");
+    app.onEvent({ type: "key", name: "down" }); app.onEvent({ type: "key", name: "up" });
+    for (let i = 0; i < 3; i++) app.onEvent({ type: "key", name: "pgdn", ctrl: true });
+    app.renderFrame();
+    // Exact cell-level invariant: no non-blank cell may land beyond the
+    // screen edge (toPlain strings are ambiguous — wide chars leave a space
+    // continuation and emoji span several code units in one cell).
+    const prev = app.screen.prev;
+    for (let y = 0; y < prev.length; y++) {
+      let last = -1;
+      for (let x = 0; x < prev[y].length; x++) {
+        const c = prev[y][x];
+        if (c.ch !== " " && c.ch !== "") last = x;
+      }
+      assert.ok(last < w, `round ${round}: content reached x=${last} on width ${w} (row ${y})`);
+    }
+  }
+});
+
 test("legacy one-slot keybinding values migrate to the new two-slot defaults", async () => {
   const app = headlessApp(); app.currentSession = "s"; app.focus(app.chat);
   saveTuiConfig({ keyBindings: {
