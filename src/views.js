@@ -4498,7 +4498,7 @@ export class App {
     this.searchInput.history = searchHistory();
     this.searchInput.histIdx = -1;
     this.searchInput.setValue("");
-    this.searchState = { phase: "input", query: "", rows: [], selected: 0, collapsed: new Set(), typeFold: new Set(), preview: [], previewScroll: 0, loading: false, hasMore: false, fallback: false, fallbackError: null, sort: "relevance" };
+    this.searchState = { phase: "input", query: "", rows: [], selected: 0, collapsed: new Set(), typeFold: new Set(), preview: [], previewScroll: 0, loading: false, hasMore: false, fallback: false, fallbackError: null, sort: "relevance", helpVisible: false, helpScroll: 0 };
     this.focus(this.searchInput);
     this.redraw();
   }
@@ -4819,9 +4819,49 @@ export class App {
     this.redraw();
   }
 
+  #searchHelpLines() {
+    return [
+      ["查询与退出", "Enter 执行查询/打开匹配；/ 返回编辑；Esc 关闭帮助或退出搜索"],
+      ["查询历史", "编辑阶段 ↑/↓ 回溯最近 20 条持久化查询"],
+      ["结果导航", "↑/↓ 逐项选择；PgUp/PgDn 翻页；Home/End 跳到首尾"],
+      ["树形折叠", "Space 或 Enter 折叠/展开工作区、会话"],
+      ["类型折叠", "t 切换思考匹配；b 切换工具匹配"],
+      ["排序", "s 循环：相关度 → 最近更新 → 命中数，并保留当前项"],
+      ["预览滚动", "Ctrl+↑/↓ 每次 3 行；Ctrl+PgUp/PgDn 整页滚动"],
+      ["命中显示", "结果与预览高亮查询词；会话内匹配按最新优先"],
+      ["跳转高亮", "Enter 打开匹配后只高亮对应正文块；Esc 清除"],
+      ["索引范围", "Host 索引覆盖 user/assistant；工具、参数、结果和思考在候选会话内补充匹配"],
+      ["降级搜索", "Host 索引不可用时，本地扫描最近更新的 20 个非空会话近期历史"],
+      ["结果上限", "Host 候选被截断时会提示缩小查询；仅摘要结果会明确标注"],
+      ["查询长度", "查询会去除首尾空白；空查询不会执行或写入历史"],
+      ["帮助导航", "Shift+/（?）切换帮助；↑/↓、PgUp/PgDn、Home/End 滚动"],
+      ["关闭帮助", "再次按 Shift+/ 或 Esc 返回搜索"],
+      ["提示", "帮助打开时不会触发搜索、排序、折叠或跳转"],
+    ];
+  }
+
   #onSearchKey(ev) {
     const state = this.searchState; if (!state) return;
-    if (ev.type === "key" && ev.name === "escape") { this.searchSeq++; this.searchActive = false; this.searchState = null; this.focus(this.chat); this.layout(); return; }
+    const helpKey = (ev.type === "text" && ev.text === "?") || (ev.type === "key" && ev.name === "char" && (ev.key === "?" || ev.key === "/" && ev.shift) && !ev.ctrl && !ev.alt);
+    if (helpKey) {
+      state.helpVisible = !state.helpVisible; state.helpScroll = 0;
+      this.focus(state.helpVisible ? this : state.phase === "input" ? this.searchInput : this);
+      return;
+    }
+    if (ev.type === "key" && ev.name === "escape") {
+      if (state.helpVisible) { state.helpVisible = false; state.helpScroll = 0; this.focus(state.phase === "input" ? this.searchInput : this); return; }
+      this.searchSeq++; this.searchActive = false; this.searchState = null; this.focus(this.chat); this.layout(); return;
+    }
+    if (state.helpVisible) {
+      if (ev.type !== "key") return;
+      const viewHeight = Math.max(1, this.screen.h - 5), maxScroll = Math.max(0, this.#searchHelpLines().length - viewHeight);
+      const page = Math.max(1, viewHeight - 1);
+      if (ev.name === "up" || ev.name === "down" || ev.name === "pgup" || ev.name === "pgdn" || ev.name === "home" || ev.name === "end") {
+        const next = ev.name === "up" ? state.helpScroll - 1 : ev.name === "down" ? state.helpScroll + 1 : ev.name === "pgup" ? state.helpScroll - page : ev.name === "pgdn" ? state.helpScroll + page : ev.name === "home" ? 0 : maxScroll;
+        state.helpScroll = Math.max(0, Math.min(maxScroll, next));
+      }
+      return;
+    }
     if (state.phase === "input") {
       if (ev.type === "key" && ev.name === "enter") { void this.#executeSearch(); return; }
       this.searchInput.onKey(ev); return;
@@ -4856,21 +4896,35 @@ export class App {
     if (ev.name === "enter" && row) { if (row.kind === "match") void this.#jumpSearchResult(row); else { if (state.collapsed.has(row.key)) state.collapsed.delete(row.key); else state.collapsed.add(row.key); this.#flattenSearchRows(); } }
   }
 
+  #renderSearchHelp(s, state) {
+    const lines = this.#searchHelpLines();
+    s.text(2, 1, "搜索帮助", { fg: K.ACCENT, attrs: 1 });
+    if (s.w >= 44) s.text(s.w - 31, 1, "Shift+/ 或 Esc 返回", { fg: K.FAINT });
+    const available = Math.max(1, s.h - 5), maxScroll = Math.max(0, lines.length - available);
+    state.helpScroll = Math.max(0, Math.min(maxScroll, state.helpScroll ?? 0));
+    let y = 3;
+    for (const [title, detail] of lines.slice(state.helpScroll, state.helpScroll + available)) {
+      const prefix = `${title}  `, prefixW = strWidth(prefix);
+      s.text(2, y, prefix, { fg: K.ACCENT, attrs: 1 });
+      s.text(2 + prefixW, y++, truncate(detail, Math.max(0, s.w - prefixW - 5)), { fg: K.TXT });
+    }
+    if (maxScroll > 0) s.text(Math.max(2, s.w - 22), s.h - 2, `帮助 ${state.helpScroll + 1}-${Math.min(lines.length, state.helpScroll + available)}/${lines.length}`, { fg: K.FAINT });
+  }
+
   #renderSearchBuffer(s) {
     const state = this.searchState; if (!state) return;
     s.fillRect(0, 0, s.w - 1, s.h - 1, " ", { bg: T.BG });
     const split = this.#searchSplit();
-    s.box(0, 0, s.w - 1, s.h - 1, { fg: T.BORDER2, bg: T.BG }, " 跨会话搜索 · Enter 执行 · / 编辑 · s 排序 · PgUp/PgDn 翻页 · t/b 折叠 · Ctrl+↑↓ 预览 ");
+    s.box(0, 0, s.w - 1, s.h - 1, { fg: T.BORDER2, bg: T.BG }, " 跨会话搜索 · Shift+/ 帮助 ");
+    if (state.helpVisible) { this.#renderSearchHelp(s, state); return; }
     s.vline(split, 1, s.h - 2, "│", { fg: T.BORDER2 });
     this.searchInput.x = 2; this.searchInput.y = 1; this.searchInput.w = Math.max(8, s.w - 4); this.searchInput.render(s);
     let y = 3;
     if (state.phase === "input") {
-      s.text(2, y++, "执行搜索前仅显示工作区 / 会话结构；不会实时扫描历史；↑/↓ 回溯最近 20 条查询。", { fg: K.FAINT });
-      s.text(2, y++, "Host 索引覆盖 user/assistant 消息；工具名、参数、结果与思考内容在候选会话内本地补充匹配。", { fg: K.FAINT });
       for (const group of this.sidebar.groups) { if (y >= s.h - 2) break; s.text(2, y++, truncate(`▾ ${group.title} (${group.sessions.length})`, split - 3), { fg: K.DIM }); for (const session of group.sessions) { if (y >= s.h - 2) break; s.text(4, y++, truncate(session.projections?.values?.title ?? session.sessionId.slice(0, 8), split - 5), { fg: K.FAINT }); } }
       return;
     }
-    s.text(2, 2, `排序: ${this.#searchSortLabel(state.sort)}（s 切换） · ↑/↓ 查询历史仅在编辑阶段`, { fg: K.FAINT });
+    s.text(2, 2, `排序: ${this.#searchSortLabel(state.sort)}（s 切换）`, { fg: K.FAINT });
     if (state.loading) {
       const p = state.progress;
       if (p && p.total > 0) {

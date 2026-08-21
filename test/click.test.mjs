@@ -1330,6 +1330,38 @@ test("model picker management row opens the providers full-screen buffer", async
   assert.equal(app.fullBuffer, app.modelPanel, "manage row opens the ModelPanel buffer");
 });
 
+test("search top bar stays compact and Shift+/ opens scrollable help", () => {
+  const app = headlessApp(); app.screen.resize(100, 12); app.layout(); app.startSearch(); app.renderFrame();
+  let rows = app.screen.toPlain().split("\n");
+  assert.match(rows[0], /Shift\+\/.*帮 助/);
+  assert.doesNotMatch(rows[0], /Enter|PgUp|Ctrl/);
+
+  app.onEvent({ type: "text", text: "?", ctrl: false, alt: false, shift: true });
+  assert.equal(app.searchState.helpVisible, true);
+  assert.equal(app.focused, app);
+  app.renderFrame(); rows = app.screen.toPlain().split("\n");
+  assert.match(rows.join("\n"), /查 询 与 退 出/);
+  assert.match(rows.join("\n"), /预 览 滚 动/);
+
+  app.onEvent({ type: "key", name: "end", ctrl: false, alt: false, shift: false });
+  assert.ok(app.searchState.helpScroll > 0, "End scrolls to the bottom of help on a short screen");
+  app.renderFrame(); rows = app.screen.toPlain().split("\n");
+  assert.match(rows.join("\n"), /降 级 搜 索/);
+  app.onEvent({ type: "text", text: "?", ctrl: false, alt: false, shift: true });
+  assert.equal(app.searchState.helpVisible, false);
+  assert.equal(app.focused, app.searchInput);
+});
+
+test("search Escape closes help before closing the search buffer", () => {
+  const app = headlessApp(); app.startSearch();
+  app.onEvent({ type: "key", name: "char", key: "?", text: "?", ctrl: false, alt: false, shift: true });
+  app.onEvent({ type: "key", name: "escape", ctrl: false, alt: false, shift: false });
+  assert.equal(app.searchActive, true); assert.equal(app.searchState.helpVisible, false);
+  assert.equal(app.focused, app.searchInput);
+  app.onEvent({ type: "key", name: "escape", ctrl: false, alt: false, shift: false });
+  assert.equal(app.searchActive, false);
+});
+
 test("search query history persists, dedupes, caps at 20 and recalls with Up/Down", () => {
   saveTuiConfig({ searchHistory: [] });
   for (let i = 0; i < 22; i++) assert.ok(rememberSearchQuery(`query-${i}`));
