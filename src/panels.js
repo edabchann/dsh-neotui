@@ -2,7 +2,7 @@
 // timeline, jobs/goal panels, and the terminal image viewer (kitty graphics
 // protocol with external-viewer / chafa fallbacks).
 import { Widget, ScrollView, Input, Popup, wrapIndex } from "./widgets.js";
-import { strWidth, truncate, pad, graphemes, graphemeWidth, bytesLabel } from "./text.js";
+import { strWidth, truncate, pad, graphemes, graphemeWidth, bytesLabel, prettyJson } from "./text.js";
 import { renderMd, C } from "./md.js";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1848,7 +1848,7 @@ export class JobsPanel extends Popup {
     const budget = Math.max(20, this.w - 10);
     for (const [k, v] of Object.entries(j)) {
       if (["status", "kind"].includes(k)) continue;
-      let s = v !== null && typeof v === "object" ? JSON.stringify(v) : String(v ?? "");
+      let s = v !== null && typeof v === "object" ? (prettyJson(JSON.stringify(v)) ?? JSON.stringify(v)) : String(v ?? "");
       if (k === "startedAt" || k === "finishedAt") s = fmtBeijing(v);
       if (s === "") continue;
       const key = names[k] ?? k;
@@ -1877,7 +1877,7 @@ export class JobsPanel extends Popup {
         const status = child.activity ?? child.status ?? child.mode ?? "idle";
         const open = this.expanded.has(i);
         lines.push([{ t: ` ${open ? "▾" : "▸"} ◇ ${truncate(child.label ?? child.sessionId ?? child.id ?? "子代理", 42)} `, fg: K.TXT, bg, bold: i === this.sel }, { t: status, fg: status === "running" ? K.WARN : K.DIM, bg }]); rowOf.push(i);
-        if (this.expanded.has(i)) for (const [key, value] of Object.entries(child)) { lines.push([{ t: `      ${key}: ${truncate(typeof value === "object" ? JSON.stringify(value) : value, this.w - 16)}`, fg: K.DIM }]); rowOf.push(-1); }
+        if (this.expanded.has(i)) for (const [key, value] of Object.entries(child)) { const shown = typeof value === "object" ? (prettyJson(JSON.stringify(value)) ?? JSON.stringify(value)) : value; lines.push([{ t: `      ${key}: ${truncate(shown, this.w - 16)}`, fg: K.DIM }]); rowOf.push(-1); }
       }
       this.lines = lines; this.rowOf = rowOf; this.#ensureVisible(); return;
     }

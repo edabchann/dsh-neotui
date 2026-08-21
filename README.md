@@ -204,8 +204,7 @@ Host 提供的 `/compact`、`/export`、`/feedback`、`/plan` 等命令会动态
 TUI 支持：
 
 - 工作区和分组会话树：新建、打开、重命名、移动、归档、删除和导出；
-- terminal、read、search、web、diff 和 generic presentation；
-- `run_code` 嵌套子调用树；
+- terminal、read、search、web、diff 和 generic presentation；最小化的 JSON（如 workflow 结果）自动按 2 空格缩进排布为多行可读结构（正文代码块与思考内容不触碰）；
 - 工具审批、AskUser 单选/多选、Plan Review；
 - Goal、TODO、后台任务和 Subagent；
 - 独立插件清单及 `/` 筛选；

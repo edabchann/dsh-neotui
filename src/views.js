@@ -1,7 +1,7 @@
 // views.js — App composition: session list + chat timeline + approvals + status.
 import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
-import { truncate, strWidth, pad, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth, takeGraphemes, bytesLabel } from "./text.js";
+import { truncate, strWidth, pad, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth, takeGraphemes, bytesLabel, prettyJson, looksLikeJson } from "./text.js";
 import { readFileSync, appendFileSync, mkdirSync, existsSync, statSync } from "node:fs";
 import { join, basename } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -205,7 +205,8 @@ function renderToolCard(view, width, expanded) {
   ]);
   const pushText = (label, text, fg) => {
     const segs = [{ t: label, fg: K.DIM }];
-    const content = String(text ?? "");
+    // JSON-looking values (workflow / generic tool payloads) get pretty-printed.
+    const content = looksLikeJson(text) ? (prettyJson(text) ?? String(text ?? "")) : String(text ?? "");
     for (const ln of content.split("\n")) {
       lines.push([...segs, { t: truncate(ln, width - 6 - strWidth(label)), fg: fg ?? K.TXT }]);
       if (lines.length > 40) break;
@@ -310,7 +311,8 @@ function renderToolCard(view, width, expanded) {
       for (const sec of card.sections ?? []) {
         if (sec?.label) lines.push([{ t: `  ${sec.label}`, fg: K.ACCENT, bold: true }]);
         for (const row of sec?.rows ?? sec?.items ?? []) {
-          const r = typeof row === "string" ? row : row?.text ?? row?.label ?? JSON.stringify(row);
+          const raw = typeof row === "string" ? row : row?.text ?? row?.label ?? JSON.stringify(row);
+          const r = looksLikeJson(raw) ? (prettyJson(raw) ?? raw) : raw;
           lines.push([{ t: "   " + truncate(r, width - 7), fg: K.TXT }]);
         }
       }
@@ -325,8 +327,12 @@ function renderToolCard(view, width, expanded) {
 
 function jsonPreview(args, width, expanded) {
   let s;
-  try { s = JSON.stringify(JSON.parse(args ?? "{}"), null, 1); } catch { s = String(args ?? ""); }
-  return s.split("\n").slice(0, expanded ? 30 : 4).map((l) => [{ t: "  " + truncate(l, width - 4), fg: K.DIM, code: true }]);
+  try { s = JSON.stringify(JSON.parse(args ?? "{}"), null, 2); } catch { s = String(args ?? ""); }
+  const lines = s.split("\n");
+  const cap = expanded ? 30 : 4;
+  const out = lines.slice(0, cap).map((l) => [{ t: "  " + truncate(l, width - 4), fg: K.DIM, code: true }]);
+  if (lines.length > cap) out.push([{ t: `  …参数共 ${lines.length} 行（展开更多）`, fg: K.FAINT }]);
+  return out;
 }
 
 function diffText(oldText, newText, width) {
@@ -388,7 +394,7 @@ function applyEvent(nodes, event, view, log, state = null) {
           // immediately follows carries the callId and args, and tool/result
           // attaches to that block. Emitting one here too doubles every bash.
           else if (p.type === "tool-call") { /* handled by tool/call event */ }
-          else blocks.push({ kind: "other", text: JSON.stringify(p).slice(0, 500) });
+          else blocks.push({ kind: "other", text: (prettyJson(JSON.stringify(p)) ?? JSON.stringify(p)).slice(0, 500) });
         }
         // Finalization stamps: endedAt marks when the message completed. The
         // final message REPLACES the chunk-built blocks, so carry their start
@@ -504,7 +510,7 @@ function applyEvent(nodes, event, view, log, state = null) {
           }
         }
         if (block) {
-          block.result = text ?? JSON.stringify(d).slice(0, 400);
+          block.result = text ?? (prettyJson(JSON.stringify(d)) ?? JSON.stringify(d)).slice(0, 400);
           if (view?.view !== undefined) block.resultView = view.view;
           block.isError = d.message?.content?.some?.((p) => p?.isError === true) || !!d.error;
           block.error = d.error;
@@ -2111,8 +2117,11 @@ export class ChatView extends Widget {
                     lines.push([{ t: `  ⚠ 二进制数据（${bytesLabel(bytes) || `${bytes} bytes`}）· 仅显示元数据，不渲染原始字节`, fg: K.WARN }]);
                     mark(realIdx, bi);
                   } else {
-                    const rl = truncateText(b.result, 4000).split("\n");
-                    for (const r of rl.slice(0, 30)) { lines.push([{ t: "  " + truncate(r, w - 4), fg: K.DIM }]); mark(realIdx, bi); }
+                    // Raw JSON dumps (e.g. workflow results) render pretty-printed
+                    // and code-styled instead of one unreadable minified line.
+                    const pretty = looksLikeJson(b.result) ? prettyJson(b.result) : null;
+                    const rl = truncateText(pretty ?? b.result, 4000).split("\n");
+                    for (const r of rl.slice(0, 30)) { lines.push([{ t: "  " + truncate(r, w - 4), fg: K.DIM, ...(pretty ? { code: true } : {}) }]); mark(realIdx, bi); }
                     if (rl.length > 30) { lines.push([{ t: `  …共 ${rl.length} 行`, fg: K.FAINT }]); mark(realIdx, bi); }
                   }
                   const spill = spillPathFromText(b.result);
@@ -4836,7 +4845,9 @@ export class App {
     const fields = [block.name, block.text, block.args, block.result];
     return fields.filter((value) => value != null && value !== "").map((value) => {
       if (typeof value === "string") return value;
-      try { return JSON.stringify(value); } catch { return String(value); }
+      // Structured fields pretty-print so search previews stay readable too;
+      // the match scan runs on the same text, keeping highlighting consistent.
+      try { return prettyJson(JSON.stringify(value)) ?? JSON.stringify(value); } catch { return String(value); }
     }).join("\n");
   }
 

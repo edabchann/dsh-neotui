@@ -1766,6 +1766,36 @@ test("binary tool results render metadata instead of raw bytes", () => {
   assert.ok(!lines.some((l) => l.includes("PNG")), "raw binary payload is never dumped");
 });
 
+test("minified JSON tool results render pretty-printed like the Web UI", () => {
+  const result = JSON.stringify({ status: "ok", data: { count: 3, name: "x" }, list: [1, 2] });
+  const { lines } = render([toolNode({ blocks: [
+    { kind: "tool", name: "workflow", args: { script: "x" }, result, done: true, view: null },
+  ] })]);
+  assert.ok(lines.some((l) => l.includes('"status": "ok"')), "top-level keys pretty-printed");
+  assert.ok(lines.some((l) => l.includes('"count": 3')), "nested objects pretty-printed");
+  assert.ok(lines.some((l) => l.includes('"list": [')), "arrays keep their own indentation");
+  assert.ok(!lines.some((l) => l.includes('"status":"ok"')), "the minified blob is gone");
+});
+
+test("generic tool cards pretty-print JSON fields instead of raw dumps", () => {
+  const result = JSON.stringify({ done: true, summary: { items: 5 } });
+  const { lines } = render([toolNode({ blocks: [
+    { kind: "tool", name: "workflow", args: {}, resultView: { card: { card: "generic", result, title: "workflow" } }, result, done: true, view: null },
+  ] })]);
+  assert.ok(lines.some((l) => l.includes('"done": true')), "generic result field pretty-printed");
+  assert.ok(lines.some((l) => l.includes('"items": 5')), "nested field pretty-printed");
+});
+
+test("prettyJson helpers reformat only parseable object/array dumps", async () => {
+  const { prettyJson, looksLikeJson } = await import("../src/text.js");
+  assert.equal(prettyJson('{"a":1,"b":[2]}'), '{\n  "a": 1,\n  "b": [\n    2\n  ]\n}');
+  assert.equal(prettyJson("plain text"), null);
+  assert.equal(looksLikeJson('{"a":1}'), true);
+  assert.equal(looksLikeJson("[1,2]"), true);
+  assert.equal(looksLikeJson("42"), false);
+  assert.equal(looksLikeJson("```json\n{}\n```"), false, "code fences are never reformatted");
+});
+
 test("non-image files attach as metadata-only entries instead of being skipped", () => {
   const dir = mkdtempSync(join(tmpdir(), "tui-file-"));
   const path = join(dir, "notes.txt");

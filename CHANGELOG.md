@@ -14,6 +14,7 @@
 - 二进制仅显示元数据：非图片文件不再跳过或伪装发送，选择后作为「仅元数据」条目（名称/大小）进入附件列表；工具结果含原始二进制字节（NUL/控制字符）时，工具卡只显示数据大小等元数据，不渲染原始字节。
 - WebUI 功能对齐：输入框撤销/重做（`Ctrl+Z`/`Ctrl+Y`，发送后清空历史，可重映射）；输入草稿按会话镜像（切换会话保存/恢复未发送文本）；Host 帧同步（`workspace-changed`/`workspace-removed`/`workspace-order-changed`/`archived-sessions-changed` 立即刷新侧栏，`host/agent-error` 与 host 流 `stream/error` 以 toast 呈现，不再静默丢弃）；max-tokens 截断回合提示「发送『继续』」且右键菜单可直接草稿填入；工具参数/结果中的本地文件路径提供「文件预览」动作（工作区面板打开）；未知流式内容块渲染为有界「未知内容块」卡片而非伪 markdown 文本。
 - WebUI 功能对齐（二）：按消息分叉会话——消息级右键「从此消息之后分叉」携带 `session.fork` 的 `atSeq` 从指定点分支（整会话分叉保持原样）；回合尾部指标——从 `step/start→首token` 推导 TTFT、解码窗口与输出 token（`usage` chunk），回合结束在最后一块下方显示 `⌁ 用时 · TTFT · 解码 · 输出 tok · tok/s`；斜杠候选栏合并 Host 命令目录（`commands/list`，含 `input.hint` 参数提示，TUI 本地命令作为兜底）。命令的「选项弹窗」为 Web 客户端插件贡献（client-side），wire 契约不包含 options，TUI 无法经 Host 获得，已标注为客户端私有能力。
+- JSON 可读化：所有直接展示压缩 JSON 的位置（workflow/通用工具卡的结果与内容字段、工具参数预览、未知内容块、搜索结果块文本、任务与子代理详情）统一按 2 空格缩进多行排布并标 `code` 样式；正文输出与思考内容中的 JSON 代码块保持原样不重排。
 
 ## 0.3.0 — 2026-08-17
 

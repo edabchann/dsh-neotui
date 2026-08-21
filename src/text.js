@@ -86,6 +86,20 @@ export function truncate(s, w) {
   return out + ell;
 }
 
+/** Pretty-print a JSON string with 2-space indent when it parses; null otherwise. */
+export function prettyJson(text) {
+  const s = String(text ?? "").trim();
+  if (!s) return null;
+  try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return null; }
+}
+
+/** True when the trimmed text parses as a JSON object/array (raw dumps only —
+ *  assistant code fences and reasoning content are never reformatted). */
+export function looksLikeJson(text) {
+  const s = String(text ?? "").trim();
+  return (s.startsWith("{") || s.startsWith("[")) && prettyJson(s) !== null;
+}
+
 /** Human-readable byte size ("1.2 MB", "64 KB", "512 B"); "" for unknown. */
 export function bytesLabel(n) {
   if (!Number.isFinite(n) || n <= 0) return "";
