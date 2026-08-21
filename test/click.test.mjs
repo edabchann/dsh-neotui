@@ -1963,6 +1963,67 @@ test("unknown streaming block kinds render as bounded unknown cards", () => {
   assert.ok(lines.some((l) => l.includes("未知内容块: binary")), "unknown blocks never render as markdown text");
 });
 
+test("session fork accepts a message-bound atSeq and menus offer it", async () => {
+  const app = headlessApp(); app.currentSession = "s";
+  const forks = [];
+  app.api.call = async (method, payload) => { if (method === "session.fork") forks.push(payload); return { sessionId: "child" }; };
+  app.refreshSessions = async () => {};
+  await app.forkSession({ sessionId: "s" }, 42);
+  assert.deepEqual(forks.at(-1), { sessionId: "s", atSeq: 42 }, "atSeq rides the fork request");
+  await app.forkSession({ sessionId: "s" });
+  assert.deepEqual(forks.at(-1), { sessionId: "s" }, "whole-session fork keeps the plain payload");
+  // message context menu offers the branch action
+  const chat = new ChatView({ app, x: 0, y: 1, w: 80, h: 24 });
+  chat.nodes = nodeForEvents([{ event: { type: "user/message", seq: 10, time: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "pick here" }] } } }]);
+  chat.seq = 10; chat.sessionId = "s";
+  chat.bashMode = "expanded"; chat.resize(0, 1, 80, 24); chat.queueRebuild(); chat.flushRebuild();
+  const idx = chat.blockItems.findIndex((item) => item.kind === "user");
+  assert.ok(idx >= 0, "user message is selectable");
+  chat.blockSel = idx;
+  chat.onKey({ type: "key", name: "char", key: "r", ctrl: true, shift: false });
+  assert.ok(app.menu.items.some((e) => e.label === "从此消息之后分叉"), "message menu offers fork-at");
+});
+
+test("per-turn metrics derive from step timing and usage chunks", () => {
+  const chat = render([]).chat;
+  chat.nodes = nodeForEvents([
+    { event: { type: "turn/start", seq: 1, time: 1000, data: { turn: 1 } } },
+    { event: { type: "step/start", seq: 2, time: 1000, data: { step: 1 } } },
+    { event: { type: "assistant/chunk", seq: 3, time: 1100, data: { chunk: { type: "block-start", blockType: "text", index: 0 } } } },
+    { event: { type: "assistant/chunk", seq: 4, time: 1100, data: { chunk: { type: "text-delta", index: 0, delta: "hello" } } } },
+    { event: { type: "assistant/chunk", seq: 5, time: 1150, data: { chunk: { type: "usage", usage: { outputTokens: 12 } } } } },
+    { event: { type: "step/end", seq: 6, time: 5000, data: { step: 1 } } },
+    { event: { type: "turn/end", seq: 7, time: 6000, data: { turn: 1, reason: { kind: "done" } } } },
+  ]);
+  chat.bashMode = "expanded"; chat.resize(0, 1, 80, 24); chat.queueRebuild(); chat.flushRebuild();
+  const joined = chat.lines.map((l) => l.map((g) => g.t ?? "").join(""));
+  assert.ok(joined.some((l) => l.includes("TTFT 0.1s")), "TTFT derived from step start to first token");
+  assert.ok(joined.some((l) => l.includes("输出 12 tok")), "output tokens from the usage chunk");
+  assert.ok(joined.some((l) => l.includes("tok/s")), "decode throughput derived");
+  assert.ok(joined.some((l) => l.includes("用时 5.0s")), "whole-turn wall time attached");
+});
+
+test("the slash candidate bar merges the Host command directory with hints", async () => {
+  const { chat } = render([]);
+  chat.app.sessionEpoch = 1; chat.app.currentSession = "s";
+  chat.app.api = {
+    call: async (method) => method === "session.history"
+      ? { events: [{ event: { type: "user/message", seq: 1, time: 1, data: { id: "u", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] } } }], hasMore: false }
+      : {},
+    rpcCall: async (method) => method === "commands/list"
+      ? [{ name: "goal", description: "Manage the goal", input: { hint: "<objective>" } }]
+      : [],
+  };
+  await chat.open("s", 1);
+  assert.ok(chat.input.commands.some((c) => c.name === "/goal" && c.hint === "<objective>"), "host command appears with its hint");
+  assert.ok(chat.input.commands.some((c) => c.name === "/reload"), "TUI-local commands remain as fallback");
+  chat.input.onKey({ type: "key", name: "char", key: "/", ctrl: false, text: "/" });
+  assert.ok(chat.input.cmdOpen, "the candidate bar opens");
+  const screen = new Screen(100, 30);
+  chat.render(screen);
+  assert.ok(screen.toPlain().includes("<objective>"), "the hint is shown in the candidate bar");
+});
+
 test("legacy one-slot keybinding values migrate to the new two-slot defaults", async () => {
   const app = headlessApp(); app.currentSession = "s"; app.focus(app.chat);
   saveTuiConfig({ keyBindings: {

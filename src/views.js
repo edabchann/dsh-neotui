@@ -356,6 +356,9 @@ function applyEvent(nodes, event, view, log, state = null) {
   switch (event.type) {
       case "step/start": {
         st.step = d.step ?? (st.step ?? 0) + 1;
+        st.stepStartAt = event.time ?? Date.now();
+        st.firstTokenAt = undefined;
+        st.lastUsage = undefined;
         break;
       }
       case "user/message": {
@@ -405,7 +408,7 @@ function applyEvent(nodes, event, view, log, state = null) {
           last.id = id ?? last.id;
           last.streaming = false;
         } else {
-          nodes.push({ kind: "assistant", blocks, images, id, streaming: false, step: st.step });
+          nodes.push({ kind: "assistant", blocks, images, id, streaming: false, step: st.step, turn: st.turn });
         }
         break;
       }
@@ -413,7 +416,7 @@ function applyEvent(nodes, event, view, log, state = null) {
         const ch = d.chunk ?? {};
         let node = cur();
         if (!node || node.kind !== "assistant" || node.finalized) {
-          node = { kind: "assistant", blocks: [], streaming: true, finalized: false, step: st.step, turnStartAt: st.turnStart ?? undefined };
+          node = { kind: "assistant", blocks: [], streaming: true, finalized: false, step: st.step, turn: st.turn, turnStartAt: st.turnStart ?? undefined };
           nodes.push(node);
         }
         node.streaming = true;
@@ -425,8 +428,12 @@ function applyEvent(nodes, event, view, log, state = null) {
           const text = kind === "other" ? `[未知内容块: ${ch.blockType ?? "?"}]` : "";
           node.blocks[ch.index ?? 0] = { kind, text, args: kind === "tool" ? "" : undefined, streaming: true, startedAt: event.time ?? Date.now() };
         } else if (ch.type === "text-delta") {
+          // TTFT anchor: the first streamed token of the step.
+          if (st.firstTokenAt === undefined) st.firstTokenAt = event.time ?? Date.now();
           const b = node.blocks[ch.index ?? 0];
           if (b) b.text = (b.text ?? "") + (ch.delta ?? "");
+        } else if (ch.type === "usage") {
+          st.lastUsage = ch.usage ?? null;
         } else if (ch.type === "reasoning-delta") {
           const b = node.blocks[ch.index ?? 0];
           if (b) b.text = (b.text ?? "") + (ch.text ?? "");
@@ -464,7 +471,7 @@ function applyEvent(nodes, event, view, log, state = null) {
         }
         let node = cur();
         if (!node || node.kind !== "assistant") {
-          node = { kind: "assistant", blocks: [], streaming: true, finalized: false, step: st.step, turnStartAt: st.turnStart ?? undefined };
+          node = { kind: "assistant", blocks: [], streaming: true, finalized: false, step: st.step, turn: st.turn, turnStartAt: st.turnStart ?? undefined };
           nodes.push(node);
         }
         node.blocks.push({ kind: "tool", name: d.name, args: d.arguments, callId, view: view?.view, result: null, subCalls: [], startedAt: event.time ?? Date.now() });
@@ -526,6 +533,24 @@ function applyEvent(nodes, event, view, log, state = null) {
         if (progress) { progress.streaming = false; progress.endedAt = end; progress.reason = d.reason; }
         const node = [...nodes].reverse().find((n) => n.kind === "assistant");
         if (node && st.turnStart !== undefined) node.turnMs = Math.max(0, end - st.turnStart);
+        // Per-turn metrics from per-step readings (web parity): TTFT of the
+        // first step, decode window and output tokens where both ends exist.
+        const readings = nodes.filter((n) => n.kind === "assistant" && n.turn === turn && n.timing);
+        if (readings.length) {
+          const first = readings.reduce((a, b) => ((b.step ?? Infinity) < (a.step ?? Infinity) ? b : a));
+          const ttft = first.timing.firstTokenTime != null ? Math.max(0, first.timing.firstTokenTime - first.timing.stepStartTime) : null;
+          let decodeMs = 0, tokens = 0;
+          for (const r of readings) {
+            if (r.timing.firstTokenTime != null && r.timing.completedTime != null) decodeMs += Math.max(0, r.timing.completedTime - r.timing.firstTokenTime);
+            const out = Number(r.usage?.outputTokens ?? r.usage?.output ?? NaN);
+            if (Number.isFinite(out)) tokens += out;
+          }
+          const metrics = { ttftMs: ttft, decodeMs: decodeMs > 0 ? decodeMs : null, tokens: tokens > 0 ? tokens : null, tokPerSec: tokens > 0 && decodeMs > 0 ? tokens / (decodeMs / 1000) : null, turnMs: node?.turnMs ?? null };
+          if (ttft != null || metrics.tokens != null || metrics.tokPerSec != null) {
+            const target = readings.reduce((a, b) => ((a.step ?? -1) < (b.step ?? -1) ? b : a));
+            if (target) target.turnMetrics = metrics;
+          }
+        }
         const reason = d.reason?.kind;
         if (reason === "error") nodes.push({ kind: "turn-error", text: d.reason?.error?.message ?? "模型请求失败", code: d.reason?.error?.code });
         else if (reason === "max-tokens") nodes.push({ kind: "turn-max-tokens", text: "已达到本轮最大输出 token 限制；内容已保留，发送『继续』可让模型接着输出" });
@@ -556,7 +581,15 @@ function applyEvent(nodes, event, view, log, state = null) {
             b.streaming = false;
             if (b.endedAt === undefined) b.endedAt = event.time ?? Date.now();
           }
+          // Per-step timing/usage (web parity): TTFT + decode window + output tokens.
+          if (st.stepStartAt !== undefined) {
+            node.timing = { stepStartTime: st.stepStartAt, firstTokenTime: st.firstTokenAt ?? null, completedTime: event.time ?? Date.now() };
+            if (st.lastUsage !== undefined) node.usage = st.lastUsage;
+          }
         }
+        st.firstTokenAt = undefined;
+        st.lastUsage = undefined;
+        st.stepStartAt = undefined;
         break;
       }
       case "session/title": {
@@ -1404,6 +1437,22 @@ export class ChatView extends Widget {
     } catch (e) {
       this.nodes = [{ kind: "system", text: `加载失败: ${e.message}` }];
     }
+    // Host command directory feeds the / candidate bar (web parity): the Host
+    // is the source of truth for slash commands; TUI-local commands stay as
+    // fallback for names the Host does not declare.
+    if (typeof this.app.api?.rpcCall === "function") {
+      try {
+        const host = await this.app.api.rpcCall("commands/list", { agentId: sessionId });
+        if (this.sessionId === sessionId && Array.isArray(host)) {
+          const hostNames = new Set(host.map((c) => "/" + c.name));
+          this.input.commands = [
+            ...host.map((c) => ({ name: "/" + c.name, desc: c.description ?? "", hint: c.input?.hint })),
+            ...SLASH_COMMANDS.filter((c) => !hostNames.has(c.name)),
+          ];
+          if (this.input.value.startsWith("/") && !this.input.value.includes(" ")) this.input.onChange?.();
+        }
+      } catch { /* directory is best-effort; local commands remain */ }
+    }
     this.inputChanged();
     this.#rebuild();
     // Jump to the LIVE tail (the newest content) on open — the view would
@@ -2196,6 +2245,19 @@ export class ChatView extends Widget {
               sep();
             }
           }
+          if (node.turnMetrics) {
+            const m = node.turnMetrics;
+            const bits = [];
+            if (m.turnMs != null) bits.push(`用时 ${(m.turnMs / 1000).toFixed(1)}s`);
+            if (m.ttftMs != null) bits.push(`TTFT ${(m.ttftMs / 1000).toFixed(1)}s`);
+            if (m.decodeMs != null) bits.push(`解码 ${(m.decodeMs / 1000).toFixed(1)}s`);
+            if (m.tokens != null) bits.push(`输出 ${m.tokens} tok`);
+            if (m.tokPerSec != null) bits.push(`${Math.round(m.tokPerSec)} tok/s`);
+            if (bits.length) {
+              lines.push([{ t: `  ⌁ ${bits.join(" · ")}`, fg: K.FAINT }]);
+              mark(realIdx, Math.max(0, blocks.length - 1));
+            }
+          }
           if (node.images) {
             for (let ii = 0; ii < node.images.length; ii++) {
               const img = node.images[ii];
@@ -2510,6 +2572,11 @@ export class ChatView extends Widget {
     if (item.foldable) entries.push({ label: "展开 / 折叠", action: () => this.#toggleAt(info) });
     if (node?.id) entries.push({ label: "转跳轨迹", action: () => this.app.jumpToTrajectoryNode(item.nodeIdx) });
     entries.push({ label: "加载更早记录", action: () => this.loadOlder() });
+    if (node?.lastSeq != null || node?.firstSeq != null) {
+      // Web parity: branch the session from this message onward.
+      const atSeq = node.lastSeq ?? node.firstSeq;
+      entries.push({ label: "从此消息之后分叉", action: () => void this.app.forkSession({ sessionId: this.sessionId }, atSeq) });
+    }
     if (node?.kind === "turn-max-tokens") {
       // Web parity: a cut-off turn suggests sending “继续” to resume.
       entries.push({ label: "草稿填入『继续』", action: () => {
@@ -2686,7 +2753,9 @@ export class ChatView extends Widget {
       const c = inp.cmds[i];
       const sel = i === inp.cmdIdx;
       screen.text(this.x + 1, y0 + i, `${sel ? "▸" : " "} ${c.name}`, { fg: sel ? T.SELFG : T.TXT, bg: sel ? T.MENUSEL : T.BG2, attrs: sel ? 1 : 0 });
-      screen.text(this.x + 2 + strWidth(c.name) + 2, y0 + i, truncate(c.desc ?? "", w - strWidth(c.name) - 6), { fg: T.FAINT, bg: sel ? T.MENUSEL : T.BG2 });
+      // Host commands carry an input hint (web ghost-hint parity): shown in the
+      // bar so the argument shape is visible before Tab completes the name.
+      screen.text(this.x + 2 + strWidth(c.name) + 2, y0 + i, truncate(`${c.hint ? c.hint + " · " : ""}${c.desc ?? ""}`, w - strWidth(c.name) - 6), { fg: c.hint ? T.ACCENT : T.FAINT, bg: sel ? T.MENUSEL : T.BG2 });
     }
   }
 
@@ -3845,12 +3914,14 @@ export class App {
       .catch((e) => this.toast(`重命名失败: ${e.message}`));
   }
 
-  async forkSession(s) {
+  /** Fork the whole session, or — with `atSeq` — everything up to that message
+   *  (web forkAt parity: branch from a chosen point of a completed turn). */
+  async forkSession(s, atSeq = null) {
     try {
-      const { sessionId } = await this.api.call("session.fork", { sessionId: s.sessionId });
+      const { sessionId } = await this.api.call("session.fork", { sessionId: s.sessionId, ...(atSeq != null ? { atSeq } : {}) });
       await this.refreshSessions();
       this.openSession(sessionId);
-      this.toast(`已分叉: ${sessionId.slice(0, 8)}`);
+      this.toast(atSeq != null ? `已分叉到该消息之后: ${sessionId.slice(0, 8)}` : `已分叉: ${sessionId.slice(0, 8)}`);
     } catch (e) { this.toast(`分叉失败: ${e.message}`); }
   }
 
