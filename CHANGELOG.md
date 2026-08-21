@@ -10,7 +10,8 @@
 ### Added
 
 - 快捷键 dispatch 收尾：输入阶段 `Ctrl+O` 文件选择、`Ctrl+Shift+V` 图片粘贴、`Ctrl+Shift+C` 复制选区、`Ctrl+L` 展开/折叠、退出输入（Esc）均可重映射；`Ctrl+Shift+W` 添加工作区、`Ctrl+P` 命令面板、`F9` 模式选择器、普通模式 `Ctrl+Shift+C` 复制正文选区、`Ctrl+C` 双击退出也纳入注册表（控制面板快捷键页可见可改）。`Esc` 仍保留为退出输入的兜底键。
-- Host 截断输出恢复：工具卡内检测 `[output truncated; full output: <path>]` / `stored at: <path>` 类溢出提示并显示完整输出文件路径；选中该块的 `Ctrl+R` 菜单提供“打开完整输出文件”（`host.openPath`，失败时回退本地 `xdg-open`/`open`）与“复制完整输出路径”。
+- Host 截断输出恢复：工具卡内检测 `[output truncated; full output: <path>]` / `stored at: <path>` 类溢出提示并显示完整输出文件路径；选中该块的 `Ctrl+R` 菜单提供“打开完整输出文件”（`host.openPath`，失败时回退本地 `xdg-open`/`open`）、“复制完整输出路径”，以及本地部署下的“TUI 内预览完整输出”（可滚动查看，上限 256 KB / 500 行）。
+- 二进制仅显示元数据：非图片文件不再跳过或伪装发送，选择后作为「仅元数据」条目（名称/大小）进入附件列表；工具结果含原始二进制字节（NUL/控制字符）时，工具卡只显示数据大小等元数据，不渲染原始字节。
 
 ## 0.3.0 — 2026-08-17
 

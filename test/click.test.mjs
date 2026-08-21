@@ -2,11 +2,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { userInfo } from "node:os";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion } from "../src/views.js";
-import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker } from "../src/panels.js";
+import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker, AttachmentPanel } from "../src/panels.js";
 import { fmtDuration, strWidth, pad, graphemeWidth } from "../src/text.js";
 import { renderMd, wrapSegs } from "../src/md.js";
 import { Input, List } from "../src/widgets.js";
@@ -1754,6 +1754,67 @@ test("truncated tool output with a spill notice exposes open/copy recovery actio
   app.api.call = async (method, payload) => { calls.push([method, payload]); return { opened: true }; };
   await app.lastMenu.items.find((entry) => entry.label === "打开完整输出文件").action();
   assert.deepEqual(calls[0], ["host.openPath", { path: "/tmp/spill-123.txt" }]);
+});
+
+test("binary tool results render metadata instead of raw bytes", () => {
+  const bin = "PNG\u0000\u0001\u0002" + "x".repeat(500);
+  const { lines } = render([toolNode({ blocks: [
+    { kind: "tool", name: "bash", args: { command: "cat" }, result: bin, done: true, view: null },
+  ] })]);
+  assert.ok(lines.some((l) => l.includes("二进制数据")), "binary marker is shown");
+  assert.ok(lines.some((l) => l.includes("仅显示元数据")), "metadata-only label is shown");
+  assert.ok(!lines.some((l) => l.includes("PNG")), "raw binary payload is never dumped");
+});
+
+test("non-image files attach as metadata-only entries instead of being skipped", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tui-file-"));
+  const path = join(dir, "notes.txt");
+  writeFileSync(path, "hello");
+  const app = headlessApp();
+  app.showFilePicker();
+  app.overlay.onUpload([{ path, name: "notes.txt", kind: "text" }]);
+  const meta = app.chat.attachments.find((a) => a.binary);
+  assert.ok(meta, "non-image file becomes a metadata entry");
+  assert.equal(meta.bytes, 5);
+  assert.equal(meta.data, undefined, "no payload is carried");
+  assert.equal(app.chat.clipboardImages.length, 0, "never queued for upload");
+  assert.ok(app.toastMsg?.includes("仅显示元数据"), app.toastMsg);
+});
+
+test("AttachmentPanel shows binary entries with metadata only", () => {
+  const app = fakeApp(); app.screen = { w: 100, h: 30 };
+  app.chat = { attachments: [{ id: "x", name: "blob.bin", binary: true, bytes: 2048, path: "/tmp/blob.bin" }], clipboardImages: [], inputChanged: () => {} };
+  const panel = new AttachmentPanel(app);
+  const screen = new Screen(100, 30);
+  panel.render(screen);
+  const plain = screen.toPlain();
+  assert.ok(plain.includes("2 KB"), "size is shown");
+  assert.ok(plain.includes("仅 元 数 据"), "metadata-only label is shown");
+  panel.onKey({ type: "key", name: "enter" });
+  assert.ok(app.toastMsg.includes("仅元数据") && app.toastMsg.includes("blob.bin"), app.toastMsg);
+});
+
+test("spill recovery previews the full output inside the TUI", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tui-spill-"));
+  const spillPath = join(dir, "full-output.txt");
+  writeFileSync(spillPath, "line 1\nline 2\nneedle tail");
+  const app = headlessApp();
+  app.chat.nodes = [toolNode({ blocks: [
+    { kind: "tool", name: "bash", args: { command: "huge" }, result: `[output truncated; full output: ${spillPath}]`, done: true, view: null },
+  ] })];
+  app.chat.bashMode = "expanded";
+  app.chat.resize(0, 1, 100, 27);
+  app.chat.queueRebuild(); app.chat.flushRebuild();
+  const tool = app.chat.blockItems.findIndex((item) => item.kind === "tool");
+  assert.ok(tool >= 0, "tool block is selectable");
+  app.chat.blockSel = tool;
+  app.chat.onKey({ type: "key", name: "char", key: "r", ctrl: true, shift: false });
+  assert.ok(app.menu.items.some((entry) => entry.label === "TUI 内预览完整输出"), "local spill file offers in-TUI preview");
+  app.menu.items.find((entry) => entry.label === "TUI 内预览完整输出").action();
+  assert.ok(app.overlay?.title?.includes("完整输出"), "preview viewer opens");
+  assert.ok(app.overlay.lines.some((l) => l.includes("needle tail")), "file content is shown");
+  app.overlay.onKey({ type: "key", name: "escape" });
+  assert.equal(app.overlay, null, "Esc closes the preview viewer");
 });
 
 test("legacy one-slot keybinding values migrate to the new two-slot defaults", async () => {

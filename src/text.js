@@ -86,6 +86,14 @@ export function truncate(s, w) {
   return out + ell;
 }
 
+/** Human-readable byte size ("1.2 MB", "64 KB", "512 B"); "" for unknown. */
+export function bytesLabel(n) {
+  if (!Number.isFinite(n) || n <= 0) return "";
+  if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+
 /** Pad with spaces to exact display width (assumes strWidth(s) <= w). */
 export function pad(s, w, align = "left") {
   const gap = w - strWidth(s);

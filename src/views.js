@@ -1,8 +1,8 @@
 // views.js — App composition: session list + chat timeline + approvals + status.
 import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
-import { truncate, strWidth, pad, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth, takeGraphemes } from "./text.js";
-import { readFileSync, appendFileSync, mkdirSync, existsSync } from "node:fs";
+import { truncate, strWidth, pad, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth, takeGraphemes, bytesLabel } from "./text.js";
+import { readFileSync, appendFileSync, mkdirSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
@@ -98,6 +98,21 @@ function wrapDisplayTextWithOffsets(value, width) {
     index += 1; // the newline grapheme between raw lines
   }
   return out;
+}
+
+/** Heuristic: does the string carry raw binary payload (NUL bytes or a large
+ *  share of control characters)? Such results are metadata-only, never dumped. */
+function isLikelyBinary(text) {
+  const s = String(text ?? "");
+  if (!s) return false;
+  const n = Math.min(s.length, 8192);
+  let control = 0;
+  for (let i = 0; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 0) return true;
+    if (c < 32 && c !== 9 && c !== 10 && c !== 13) control++;
+  }
+  return n > 0 && control / n > 0.1;
 }
 
 /** Extract the Host spill-file path from a truncated tool-output notice. */
@@ -2036,12 +2051,20 @@ export class ChatView extends Widget {
                 if (b.result != null) {
                   lines.push([{ t: "  结果:", fg: K.DIM, underline: true }]);
                   mark(realIdx, bi);
-                  const rl = truncateText(b.result, 4000).split("\n");
-                  for (const r of rl.slice(0, 30)) { lines.push([{ t: "  " + truncate(r, w - 4), fg: K.DIM }]); mark(realIdx, bi); }
-                  if (rl.length > 30) { lines.push([{ t: `  …共 ${rl.length} 行`, fg: K.FAINT }]); mark(realIdx, bi); }
+                  if (isLikelyBinary(b.result)) {
+                    // Raw bytes never belong in the transcript: show metadata
+                    // only (Host has no generic binary content block).
+                    const bytes = Buffer.byteLength(b.result, "utf8");
+                    lines.push([{ t: `  ⚠ 二进制数据（${bytesLabel(bytes) || `${bytes} bytes`}）· 仅显示元数据，不渲染原始字节`, fg: K.WARN }]);
+                    mark(realIdx, bi);
+                  } else {
+                    const rl = truncateText(b.result, 4000).split("\n");
+                    for (const r of rl.slice(0, 30)) { lines.push([{ t: "  " + truncate(r, w - 4), fg: K.DIM }]); mark(realIdx, bi); }
+                    if (rl.length > 30) { lines.push([{ t: `  …共 ${rl.length} 行`, fg: K.FAINT }]); mark(realIdx, bi); }
+                  }
                   const spill = spillPathFromText(b.result);
                   if (spill) {
-                    lines.push([{ t: "  ⚠ 完整输出已保存到文件（r 菜单可打开/复制）", fg: K.WARN }]);
+                    lines.push([{ t: "  ⚠ 完整输出已保存到文件（r 菜单可打开/复制/预览）", fg: K.WARN }]);
                     lines.push([{ t: "  " + truncate(spill, w - 6), fg: K.ACCENT }]);
                     mark(realIdx, bi);
                   }
@@ -2427,6 +2450,33 @@ export class ChatView extends Widget {
     toast(`完整输出路径: ${path}`);
   }
 
+  /** Read the spill file into a scrollable in-TUI viewer (local deployments:
+   *  the path is host-local, so a remote TUI simply lacks the entry). */
+  #openSpillPreview(path) {
+    let text;
+    try { text = readFileSync(path, "utf8"); } catch (error) { this.app.toast(`读取完整输出失败: ${error.message}`); return; }
+    const MAX = 256 * 1024, MAX_LINES = 500;
+    const truncated = text.length > MAX;
+    if (truncated) text = text.slice(0, MAX);
+    const rawLines = text.split("\n");
+    const cut = rawLines.length > MAX_LINES;
+    const width = Math.min(96, Math.max(40, this.app.screen.w - 6));
+    const lines = rawLines.slice(0, MAX_LINES).map((ln) => truncate(ln, width - 6));
+    if (truncated || cut) lines.push("…预览截断（完整内容见文件）");
+    const h = Math.min(20, Math.max(8, Math.min(lines.length + 4, this.app.screen.h - 4)));
+    const popup = new Popup({
+      x: Math.max(0, Math.floor((this.app.screen.w - width) / 2)),
+      y: Math.max(0, Math.floor((this.app.screen.h - h) / 2)),
+      w: width, h,
+      title: `完整输出 · ${path.split(/[\\/]/).pop()} · ↑↓/PgUp/PgDn 滚动 · Esc 关闭`,
+      lines, scrollable: true, buttons: [],
+      onAction: () => { this.app.overlay = null; this.app.focus(this); this.app.redraw(); },
+    });
+    this.app.overlay = popup;
+    this.app.focus(popup);
+    this.app.redraw();
+  }
+
   #openSelectedContextMenu() {
     const item = this.blockItems[this.blockSel];
     if (!item) return false;
@@ -2442,6 +2492,7 @@ export class ChatView extends Widget {
     if (spill) {
       entries.push({ label: "打开完整输出文件", action: () => void this.#openSpillPath(spill) });
       entries.push({ label: "复制完整输出路径", action: () => this.app.copyText(spill) });
+      if (existsSync(spill)) entries.push({ label: "TUI 内预览完整输出", action: () => this.#openSpillPreview(spill) });
     }
     this.app.openMenu(entries, { x: this.view.x + 2, y: this.view.y + Math.max(0, item.headerLine - this.view.scrollY) });
     return true;
@@ -4275,12 +4326,24 @@ export class App {
   showFilePicker() {
     const session = this.sessions.find((s) => s.sessionId === this.currentSession);
     this.overlay = new UploadPicker(this, { startPath: session?.cwd ?? process.cwd(), onUpload: (files) => {
-      let added = 0;
+      let added = 0, meta = 0;
       for (const file of files) {
-        if (!IMAGE_EXT.test(file.path)) { this.toast(`Host 当前仅接受图片附件；已跳过 ${file.name}`); continue; }
+        if (!IMAGE_EXT.test(file.path)) {
+          // Host 协议没有通用二进制通道：非图片文件不发送，仅作为元数据条目
+          // （名称/大小/类型）出现在附件列表，绝不伪装成可发送附件。
+          try {
+            const st = statSync(file.path);
+            this.chat.attachments.push({ id: `file-${Date.now()}-${meta}`, path: file.path, local: true, name: file.name, binary: true, bytes: st.size });
+            meta++;
+          } catch (e) { this.toast(`无法读取文件信息: ${file.name}: ${e.message}`); }
+          continue;
+        }
         try { const ext = IMAGE_EXT.exec(file.path)[1].toLowerCase(); const mediaType = MEDIA_TYPES[ext]; const data = readFileSync(file.path, "base64"); const item = { id: `file-${Date.now()}-${added}`, path:file.path, local:true, name:file.name, mediaType, data, bytes:Buffer.byteLength(data,"base64") }; this.chat.clipboardImages.push(item); this.chat.attachments.push(item); added++; } catch(e){ this.toast(`文件读取失败: ${file.name}: ${e.message}`); }
       }
-      this.chat.inputChanged(); if (added) this.toast(`已添加 ${added} 个图片附件`);
+      this.chat.inputChanged();
+      if (added && meta) this.toast(`已添加 ${added} 个图片附件；${meta} 个文件仅显示元数据（Host 不支持二进制附件）`);
+      else if (added) this.toast(`已添加 ${added} 个图片附件`);
+      else if (meta) this.toast(`${meta} 个文件仅显示元数据（Host 不支持二进制附件）`);
     }, onCancel: () => { this.overlay=null; this.focus(this.chat.input); this.redraw(); } });
     this.focus(this.overlay); this.redraw();
   }
