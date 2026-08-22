@@ -155,7 +155,8 @@ Kitty graphics 可用时，图片在文件选择器和附件预览中等比例�
 | NORMAL | `Ctrl+W` | 工作区 |
 | NORMAL | `Ctrl+Shift+W` | 添加工作区 |
 | NORMAL | `Ctrl+T` | 轨迹视图 |
-| NORMAL | `Ctrl+←` / `Ctrl+→` | 工作区栏 / 对话 / 轨迹 pane 循环聚焦 |
+| NORMAL | `Ctrl+←` | pane 焦点移到上一窗格（工作区栏 / 对话 / 轨迹循环） |
+| NORMAL | `Ctrl+→` | pane 焦点移到下一窗格（两个方向独立可重映射） |
 | NORMAL | `Ctrl+E` | 按 step 快速跳转 |
 | NORMAL | `Ctrl+J` | 后台任务与 Subagent |
 | NORMAL | `Ctrl+N` | 排队命令详情 |

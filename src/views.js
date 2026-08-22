@@ -4419,7 +4419,8 @@ export class App {
     switch (id) {
       case "sessionFilter": this.startSearch(); this.redraw(); return true;
       case "panel": this.overlay = new ControlPanel(this, { startPage: 0 }); this.redraw(); return true;
-      case "homeSwitch": this.focusPane(slot === "key" ? -1 : 1); return true;
+      case "panePrev": this.focusPane(-1); return true;
+      case "paneNext": this.focusPane(1); return true;
       case "permissionRotate": this.rotatePermission(); return true;
       case "editConfig": this.editConfigFile(); return true;
       case "quit": this.stop(); return true;

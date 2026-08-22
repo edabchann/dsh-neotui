@@ -32,7 +32,8 @@ export const DEFAULT_KEYBINDINGS = {
   panel: { mode: "all", key: "Ctrl+Space", key2: "F7" },
   model: { mode: "normal", key: "Ctrl+M", key2: "" },
   trajectory: { mode: "normal", key: "Ctrl+T", key2: "" },
-  homeSwitch: { mode: "normal", key: "Ctrl+Left", key2: "Ctrl+Right" },
+  panePrev: { mode: "normal", key: "Ctrl+Left", key2: "" },
+  paneNext: { mode: "normal", key: "Ctrl+Right", key2: "" },
   permissionRotate: { mode: "normal", key: "F8", key2: "" },
   workspace: { mode: "normal", key: "Ctrl+W", key2: "" },
   settings: { mode: "normal", key: "Ctrl+S", key2: "" },
@@ -56,7 +57,7 @@ export const DEFAULT_KEYBINDINGS = {
 
 /** App-level dispatch precedence: the first matching binding wins. */
 export const KEYBINDING_ORDER = [
-  "sessionFilter", "panel", "homeSwitch", "permissionRotate", "editConfig", "addWorkspace", "commandPalette", "modePicker", "themePicker", "copySelection", "quitDouble", "quit",
+  "sessionFilter", "panel", "panePrev", "paneNext", "permissionRotate", "editConfig", "addWorkspace", "commandPalette", "modePicker", "themePicker", "copySelection", "quitDouble", "quit",
   "model", "trajectory", "workspace", "settings", "subagent", "skills", "goal",
   "jobs", "queue", "busyEnter", "attachments", "stepJump", "sidebar",
 ];

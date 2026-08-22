@@ -90,13 +90,28 @@ export function rememberSearchQuery(query) {
  *  bindings (e.g. an old sessionFilter "/" override removes Ctrl+F). */
 const LEGACY_KEY_VALUES = {
   sessionFilter: { mode: "normal", key: "/" },
-  homeSwitch: { mode: "normal", key: "Ctrl+Left/Right" },
   skills: { mode: "normal", key: "Ctrl+K" },
 };
 
+/** Split one legacy two-slot binding into two directional functions.
+ *  pre-0.4.x pane focus was a single homeSwitch with key/key2; a stored
+ *  custom remap now powers panePrev/paneNext independently. */
+function splitLegacyHomeSwitch(stored) {
+  const n = normalizeKeyBinding(stored);
+  if (!n.key || !n.key2 || !validateKeySpec(n.key).ok || !validateKeySpec(n.key2).ok) return null;
+  return {
+    panePrev: { mode: n.mode, key: n.key, key2: "" },
+    paneNext: { mode: n.mode, key: n.key2, key2: "" },
+  };
+}
+
 /** Effective two-slot keybindings: defaults merged per id with user overrides. */
 export function keyBindings() {
-  const overrides = loadTuiConfig().keyBindings ?? {};
+  const stored = loadTuiConfig().keyBindings ?? {};
+  const overrides = { ...stored };
+  if (stored.homeSwitch && !Object.hasOwn(stored, "panePrev") && !Object.hasOwn(stored, "paneNext")) {
+    Object.assign(overrides, splitLegacyHomeSwitch(stored.homeSwitch) ?? {});
+  }
   const merged = {};
   for (const id of Object.keys(DEFAULT_KEYBINDINGS)) {
     const def = DEFAULT_KEYBINDINGS[id];

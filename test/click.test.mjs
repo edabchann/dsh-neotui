@@ -2131,7 +2131,8 @@ test("legacy one-slot keybinding values migrate to the new two-slot defaults", a
   } });
   const kb = keyBindings();
   assert.deepEqual(kb.sessionFilter, { mode: "normal", key: "Ctrl+F", key2: "/" });
-  assert.deepEqual(kb.homeSwitch, { mode: "normal", key: "Ctrl+Left", key2: "Ctrl+Right" });
+  assert.deepEqual(kb.panePrev, { mode: "normal", key: "Ctrl+Left", key2: "" });
+  assert.deepEqual(kb.paneNext, { mode: "normal", key: "Ctrl+Right", key2: "" });
   assert.equal(kb.skills.key, "Ctrl+H");
   app.onEvent({ type: "key", name: "char", key: "f", ctrl: true, shift: false });
   assert.equal(app.searchActive, true, "Ctrl+F works even with a legacy sessionFilter override in the config");
@@ -4534,11 +4535,12 @@ test("keybinding registry parses, matches, describes and validates two-slot spec
 
 test("edited keybindings drive the real dispatchers in App, ChatView and Sidebar", () => {
   const app = headlessApp(); app.currentSession = "s"; app.focus(app.chat);
-  assert.ok(setKeyBinding("homeSwitch", { mode: "normal", key: "Ctrl+Up", key2: "Ctrl+Down" }));
+  assert.ok(setKeyBinding("panePrev", { mode: "normal", key: "Ctrl+Up", key2: "" }));
+  assert.ok(setKeyBinding("paneNext", { mode: "normal", key: "Ctrl+Down", key2: "" }));
   app.onEvent({ type: "key", name: "up", ctrl: true, shift: false });
-  assert.equal(app.focused, app.sidebar, "remapped primary slot focuses sidebar (slot key = -1)");
+  assert.equal(app.focused, app.sidebar, "remapped panePrev focuses the previous pane");
   app.onEvent({ type: "key", name: "down", ctrl: true, shift: false });
-  assert.equal(app.focused, app.chat, "remapped alternate slot returns to chat (slot key2 = +1)");
+  assert.equal(app.focused, app.chat, "remapped paneNext focuses the next pane");
   assert.ok(setKeyBinding("think", { mode: "normal", key: "q", key2: "" }));
   const { chat } = render([]); chat.app = app; app.chat = chat; app.focus(chat);
   chat.nodes = [{ kind: "assistant", id: "a", blocks: [{ kind: "reasoning", text: "x" }] }];
@@ -4547,15 +4549,18 @@ test("edited keybindings drive the real dispatchers in App, ChatView and Sidebar
   chat.onKey({ type: "key", name: "char", key: "q", ctrl: false, alt: false, shift: false });
   assert.notEqual(chat.thinkMode, before, "remapped transcript binding toggles think mode");
   assert.ok(setKeyBinding("newSession", { mode: "normal", key: "n", key2: "" }));
-  assert.ok(resetKeyBinding("homeSwitch")); assert.ok(resetKeyBinding("think")); assert.ok(resetKeyBinding("newSession"));
+  assert.ok(resetKeyBinding("panePrev")); assert.ok(resetKeyBinding("paneNext")); assert.ok(resetKeyBinding("think")); assert.ok(resetKeyBinding("newSession"));
 });
 
 test("ControlPanel shortcut page shows two slots and edits both via JSON", () => {
   const app = fakeApp(); app.screen = { w: 110, h: 24 };
   const panel = new ControlPanel(app, { startPage: 0 });
-  const home = panel.shortcutItems().find((row) => row[3] === "homeSwitch");
-  assert.equal(home[0].split("\t").length, 3);
-  assert.equal(home[0].split("\t")[1], "Ctrl+Left"); assert.equal(home[0].split("\t")[2], "Ctrl+Right");
+  const prev = panel.shortcutItems().find((row) => row[3] === "panePrev");
+  const next = panel.shortcutItems().find((row) => row[3] === "paneNext");
+  assert.equal(prev[0].split("\t").length, 3);
+  assert.equal(prev[0].split("\t")[1], "Ctrl+Left"); assert.equal(prev[0].split("\t")[2], "—");
+  assert.equal(next[0].split("\t")[1], "Ctrl+Right");
+  assert.ok(!panel.shortcutItems().some((row) => row[3] === "homeSwitch"), "the single homeSwitch binding is gone");
   assert.ok(panel.shortcutItems().some((row) => row[3] === "editConfig"));
   panel.editShortcut("sessionFilter");
   app.focused.setValue('{"mode":"normal","key":"Ctrl+L","key2":"Ctrl+F"}');
