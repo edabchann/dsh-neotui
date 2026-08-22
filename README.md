@@ -167,6 +167,7 @@ Kitty graphics 可用时，图片在文件选择器和附件预览中等比例�
 | NORMAL | `Ctrl+H` | Skills |
 | NORMAL | `Ctrl+K` | 用默认编辑器（`$EDITOR` / `$VISUAL` / `vi`）打开 `tui-config.json`；编辑完成后快捷键立即重载 |
 | NORMAL | `Ctrl+Shift+C` | 复制正文选区/当前块（与 `y` 等价） |
+| NORMAL | `Ctrl+D` | 配色主题选择器（`/theme` 同义） |
 | NORMAL | `Ctrl+C` | 双击退出（第一次按仅提示） |
 | ALL | `Ctrl+Q` | 退出 |
 | 正文块 | `↑` / `↓`、`j` / `k` | 上下选择正文块，两端停留不环绕；`Ctrl+↑/↓` 只滚动视口 |
@@ -208,7 +209,7 @@ TUI 支持：
 - 工具审批、AskUser 单选/多选、Plan Review；
 - Goal、TODO、后台任务和 Subagent；
 - 独立插件清单及 `/` 筛选；
-- 11 套配色主题：dark、light、gruvbox、nord、solarized-dark、solarized-light、dracula、onedark、catppuccin-mocha、tokyonight、monokai（`/theme` 或命令面板循环切换，选择持久化到 `$DSH_HOME/tui-theme.txt`）。
+- 11 套配色主题：dark、light、gruvbox、nord、solarized-dark、solarized-light、dracula、onedark、catppuccin-mocha、tokyonight、monokai；`Ctrl+D`、`/theme` 或命令面板打开**配色选择器**——每行带该方案的实时色板预览（面板/用户/强调/成功/警告/错误六色），`↑/↓/PgUp/PgDn` 浏览、`Enter` 或双击应用、`Esc` 取消；选择持久化到 `$DSH_HOME/tui-theme.txt`。
 
 工作区（`Ctrl+W`）、设置（`Ctrl+S`）、模型供应商（模型选择器里的 `⚙ 管理供应商…`）、子代理（`Ctrl+A`）和技能（`Ctrl+H`）都是**全屏模态 Buffer**：打开后覆盖整个界面，`Esc` 逐级返回并最终关闭。它们不再占用“标签页模式”，因此关闭后 `Ctrl+←/→` 的 pane 聚焦立即恢复，两者互不冲突。轨迹仍是 pane 序列的一部分，由 `Ctrl+T` 或 `Ctrl+←/→` 进入。
 

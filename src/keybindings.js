@@ -49,13 +49,14 @@ export const DEFAULT_KEYBINDINGS = {
   addWorkspace: { mode: "normal", key: "Ctrl+Shift+W", key2: "" },
   commandPalette: { mode: "normal", key: "Ctrl+P", key2: "" },
   modePicker: { mode: "normal", key: "F9", key2: "" },
+  themePicker: { mode: "normal", key: "Ctrl+D", key2: "" },
   quitDouble: { mode: "normal", key: "Ctrl+C", key2: "" },
   quit: { mode: "all", key: "Ctrl+Q", key2: "" },
 };
 
 /** App-level dispatch precedence: the first matching binding wins. */
 export const KEYBINDING_ORDER = [
-  "sessionFilter", "panel", "homeSwitch", "permissionRotate", "editConfig", "addWorkspace", "commandPalette", "modePicker", "copySelection", "quitDouble", "quit",
+  "sessionFilter", "panel", "homeSwitch", "permissionRotate", "editConfig", "addWorkspace", "commandPalette", "modePicker", "themePicker", "copySelection", "quitDouble", "quit",
   "model", "trajectory", "workspace", "settings", "subagent", "skills", "goal",
   "jobs", "queue", "busyEnter", "attachments", "stepJump", "sidebar",
 ];

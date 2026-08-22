@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join, basename, extname, dirname } from "node:path";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 
-import { T, THEMES, cycleTheme, themeName } from "./theme.js";
+import { T, THEMES, setTheme, themeName } from "./theme.js";
 import { loadTuiConfig, saveTuiConfig, userPrefix, userName, foldDefaults, keyBindings, setKeyBinding, resetKeyBinding } from "./config.js";
 import { validateKeySpec, describeSpec } from "./keybindings.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
@@ -361,6 +361,81 @@ export function buildPermissionPicker(app) {
   });
 }
 
+/** Theme selector with a live palette strip per row: pick by color, not by
+ *  name — cycling is no longer viable with a growing catalog. */
+export class ThemePickerBuffer extends Widget {
+  constructor(app) {
+    const names = Object.keys(THEMES);
+    const w = Math.max(1, Math.min(64, app.screen.w - 4)), h = Math.max(1, Math.min(names.length + 4, app.screen.h - 4));
+    super({ x: Math.max(0, Math.floor((app.screen.w - w) / 2)), y: Math.max(0, Math.floor((app.screen.h - h) / 2)), w, h });
+    this.app = app;
+    this.names = names;
+    this.sel = Math.max(0, names.indexOf(themeName()));
+    this.scroll = 0;
+  }
+  #nameOf(idx) { return this.names[idx]; }
+  #apply(idx) {
+    const name = this.#nameOf(idx);
+    if (!name) return;
+    setTheme(name);
+    this.app.overlay = null;
+    this.app.toast(`主题: ${name}`);
+    this.app.redraw();
+  }
+  onMouse(ev) {
+    if (ev.kind === "wheel-up") { this.sel = wrapIndex(this.sel - 1, this.names.length); return true; }
+    if (ev.kind === "wheel-down") { this.sel = wrapIndex(this.sel + 1, this.names.length); return true; }
+    if (ev.kind === "press" && ev.button === 0) {
+      const idx = this.scroll + (ev.y - this.y - 2);
+      if (idx < 0 || idx >= this.names.length) return true;
+      const now = Date.now();
+      this.sel = idx;
+      if (this.lastClick && now - this.lastClick < 400) this.#apply(idx);
+      else this.lastClick = now;
+      return true;
+    }
+    return true;
+  }
+  onKey(ev) {
+    if (ev.type !== "key") return false;
+    if (ev.name === "up") { this.sel = wrapIndex(this.sel - 1, this.names.length); return true; }
+    if (ev.name === "down") { this.sel = wrapIndex(this.sel + 1, this.names.length); return true; }
+    if (ev.name === "pgup") { this.sel = Math.max(0, this.sel - (this.h - 3)); return true; }
+    if (ev.name === "pgdn") { this.sel = Math.min(this.names.length - 1, this.sel + (this.h - 3)); return true; }
+    if (ev.name === "home") { this.sel = 0; return true; }
+    if (ev.name === "end") { this.sel = this.names.length - 1; return true; }
+    if (ev.name === "enter") { this.#apply(this.sel); return true; }
+    if (ev.name === "escape") { this.app.overlay = null; this.app.redraw(); return true; }
+    return false;
+  }
+  render(s) {
+    s.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.BG2 });
+    s.box(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, { fg: K.ACCENT, bg: T.BG2 }, "外观 · 配色方案");
+    s.text(this.x + 2, this.y + this.h - 1, "↑/↓ 选择 · Enter 应用 · 双击应用 · Esc 关闭", { fg: K.FAINT, bg: T.BG2 });
+    const lh = Math.max(1, this.h - 4);
+    if (this.sel < this.scroll) this.scroll = this.sel;
+    if (this.sel >= this.scroll + lh) this.scroll = this.sel - lh + 1;
+    for (let i = 0; i < lh; i++) {
+      const idx = this.scroll + i;
+      const name = this.#nameOf(idx);
+      const y = this.y + 2 + i;
+      if (!name) continue;
+      const palette = THEMES[name];
+      const sel = idx === this.sel, current = name === themeName();
+      s.fillRect(this.x + 1, y, this.x + this.w - 2, y, " ", { bg: sel ? T.MENUSEL : T.BG2 });
+      // live palette strip: panel / user / accent / ok / warn / err
+      let px = this.x + 2;
+      for (const key of ["PANEL", "USERBG", "ACCENT", "OK", "WARN", "ERR"]) {
+        s.text(px, y, "  ", { bg: palette[key] ?? -1, fg: palette[key] ?? -1 });
+        px += 2;
+        if (px > this.x + this.w - 4) break;
+      }
+      s.text(px + 1, y, truncate(name, this.w - (px - this.x) - 8), { fg: sel ? 0xffffff : K.TXT, bg: sel ? T.MENUSEL : T.BG2, attrs: sel ? 1 : 0 });
+      if (current) s.text(this.x + this.w - 2 - strWidth("当前"), y, "当前", { fg: K.OK, bg: sel ? T.MENUSEL : T.BG2 });
+    }
+  }
+}
+
 export class ArchivePanel extends Popup {
   constructor(app) {
     const w = Math.min(90, app.screen.w - 4), h = Math.min(28, app.screen.h - 4);
@@ -453,7 +528,7 @@ export function buildCommandPalette(app) {
     { label: "刷新会话列表", action: () => app.refreshSessions(), keywords: "refresh reload" },
     { label: "查看归档会话", action: () => { app.overlay = new ArchivePanel(app); app.redraw(); }, keywords: "archive archived sessions history" },
     { label: "打开原始配置文件", action: async () => { try { const r = await app.api.call("settings.openDocument"); app.toast(r.opened ? "已在系统编辑器打开配置" : `配置文件: ${r.path}`); } catch (e) { app.toast(`打开配置失败: ${e.message}`); } }, keywords: "settings config raw document" },
-    { label: "切换主题", action: () => { cycleTheme(); app.toast(`主题: ${themeName()}`); }, keywords: "theme color" },
+    { label: "选择配色主题", action: () => { app.overlay = new ThemePickerBuffer(app); app.redraw(); }, keywords: "theme color scheme palette" },
     { label: "复制当前会话 ID", action: () => app.copyText(app.currentSession ?? ""), keywords: "copy id" },
     { label: "退出", hint: "q", action: () => app.stop(), keywords: "quit exit" },
   ];
@@ -1659,7 +1734,7 @@ export class ControlPanel extends Widget {
     const b=keyBindings();
     const row=(id,desc)=>[`${(b[id]?.mode??"all").toUpperCase()}\t${describeSpec(b[id]?.key)}\t${describeSpec(b[id]?.key2)}`,desc,null,id];
     return [
-      row("think","思考块 展开/折叠"),row("tools","工具块 展开/折叠"),row("insert","进入输入"),row("leaveInsert","退出输入"),row("sessionFilter","跨会话搜索"),row("newSession","新建会话"),row("top","跳到首个正文块"),row("bottom","跳到最新正文块"),row("prevQuestion","上一提问的终点"),row("nextQuestion","下一提问的终点"),row("expandInput","输入栏 展开/折叠"),row("copyInput","复制输入栏选区"),row("undoInput","输入撤销"),row("redoInput","输入重做"),row("insertFilePicker","输入中打开文件选择器"),row("pasteImage","输入中粘贴剪贴板图片"),row("copySelection","复制正文选区"),row("addWorkspace","添加工作区"),row("commandPalette","命令面板"),row("modePicker","模式选择器"),row("quitDouble","双击 Ctrl+C 退出"),row("panel","控制面板"),row("model","切换模型"),row("trajectory","轨迹视图"),row("homeSwitch","pane 焦点切换"),row("permissionRotate","权限模式轮换"),row("workspace","工作区"),row("settings","设置"),row("subagent","子代理"),row("skills","技能"),row("goal","目标"),row("jobs","后台任务"),row("queue","后台队列"),row("busyEnter","运行中 Enter 策略"),row("attachments","附件管理"),row("stepJump","步骤转跳"),row("sidebar","侧栏显示/隐藏"),row("editConfig","编辑配置文件（默认编辑器）"),row("quit","退出"),
+      row("think","思考块 展开/折叠"),row("tools","工具块 展开/折叠"),row("insert","进入输入"),row("leaveInsert","退出输入"),row("sessionFilter","跨会话搜索"),row("newSession","新建会话"),row("top","跳到首个正文块"),row("bottom","跳到最新正文块"),row("prevQuestion","上一提问的终点"),row("nextQuestion","下一提问的终点"),row("expandInput","输入栏 展开/折叠"),row("copyInput","复制输入栏选区"),row("undoInput","输入撤销"),row("redoInput","输入重做"),row("insertFilePicker","输入中打开文件选择器"),row("pasteImage","输入中粘贴剪贴板图片"),row("copySelection","复制正文选区"),row("addWorkspace","添加工作区"),row("commandPalette","命令面板"),row("modePicker","模式选择器"),row("themePicker","配色主题选择器"),row("quitDouble","双击 Ctrl+C 退出"),row("panel","控制面板"),row("model","切换模型"),row("trajectory","轨迹视图"),row("homeSwitch","pane 焦点切换"),row("permissionRotate","权限模式轮换"),row("workspace","工作区"),row("settings","设置"),row("subagent","子代理"),row("skills","技能"),row("goal","目标"),row("jobs","后台任务"),row("queue","后台队列"),row("busyEnter","运行中 Enter 策略"),row("attachments","附件管理"),row("stepJump","步骤转跳"),row("sidebar","侧栏显示/隐藏"),row("editConfig","编辑配置文件（默认编辑器）"),row("quit","退出"),
     ];
   }
   items() {
@@ -1682,7 +1757,7 @@ export class ControlPanel extends Widget {
         ["模式（Agent 预设）", "标准 / PTC / 极简 / 创造", () => { this.app.overlay = buildModePicker(this.app); this.app.redraw(); }],
         ["权限（沙箱 + 审批）", "只读 / 工作区写入 / 完全访问", () => { this.app.overlay = buildPermissionPicker(this.app); this.app.redraw(); }],
         ["完整设置（JSON 编辑器）", "所有命名空间的原始值", () => { this.app.closeOverlay(); this.app.showSettingsBuffer ? this.app.showSettingsBuffer() : this.app.setMode?.("settings"); }],
-        ["切换主题", Object.keys(THEMES).join(" / "), () => { cycleTheme(); this.app.toast(`主题: ${themeName()}`); }],
+        ["选择配色主题", Object.keys(THEMES).join(" / "), () => { this.app.overlay = new ThemePickerBuffer(this.app); this.app.redraw(); }],
         ["侧栏显示/隐藏", "nvim 式整体收起", () => this.app.toggleSidebar()],
         ["导出当前会话日志", "下载 ZIP", () => { const sess = this.app.sessions.find((x) => x.sessionId === this.app.currentSession); if (sess) { this.app.closeOverlay(); this.app.exportSession(sess); } }],
         ["复制会话 ID", "", () => this.app.copyText(this.app.currentSession ?? "")],

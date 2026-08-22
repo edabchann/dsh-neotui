@@ -15,7 +15,7 @@ import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
   modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker, FilePicker, AttachmentPanel,
   ImagePopup, kittyCapable, buildGoalPopup, GoalPanel, SettingsPanel, SubagentPanel,
-  SkillsPanel, ControlPanel, JobsPanel, QueuePanel, ModelPanel, fmtMs,
+  SkillsPanel, ControlPanel, JobsPanel, QueuePanel, ModelPanel, fmtMs, ThemePickerBuffer,
 } from "./panels.js";
 
 import { T, themeName, cycleTheme } from "./theme.js";
@@ -1612,7 +1612,7 @@ export class ChatView extends Widget {
     if (trimmed === "/reload") { this.app.softReload(); return; }
     if (trimmed === "/restart") { this.app.restartApp(); return; }
     if (trimmed === "/model") { this.app.overlay = buildModelPicker(this.app); this.app.redraw(); return; }
-    if (trimmed === "/theme") { cycleTheme(); this.queueRebuild(); this.app.toast(`主题已切换: ${themeName()}`); return; }
+    if (trimmed === "/theme") { this.app.showThemePicker(); return; }
     if (trimmed === "/permission") { this.app.showPermissionPicker(); return; }
     if (trimmed === "/goal") { this.app.showGoal(); return; }
     if (!trimmed && this.clipboardImages.length === 0) return;
@@ -4236,6 +4236,7 @@ export class App {
   showQueue() { this.overlay = new QueuePanel(this); this.redraw(); }
   showGoal() { this.overlay = buildGoalPopup(this); this.redraw(); }
   showModePicker() { this.overlay = buildModePicker(this); this.redraw(); }
+  showThemePicker() { this.overlay = new ThemePickerBuffer(this); this.redraw(); }
   showPermissionPicker() { this.overlay = buildPermissionPicker(this); this.redraw(); }
 
   /** /reload: in-place soft reload — fresh session list, fresh chat history,
@@ -4443,6 +4444,7 @@ export class App {
       case "addWorkspace": this.addWorkspace(); return true;
       case "commandPalette": this.overlay = new ControlPanel(this, { startPage: 1 }); this.redraw(); return true;
       case "modePicker": this.showModePicker(); return true;
+      case "themePicker": this.showThemePicker(); return true;
       default: return false;
     }
   }

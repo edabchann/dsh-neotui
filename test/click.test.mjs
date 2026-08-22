@@ -6,7 +6,8 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion } from "../src/views.js";
-import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker, AttachmentPanel } from "../src/panels.js";
+import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker, AttachmentPanel, ThemePickerBuffer } from "../src/panels.js";
+import { setTheme, themeName, THEMES } from "../src/theme.js";
 import { fmtDuration, strWidth, pad, graphemeWidth } from "../src/text.js";
 import { renderMd, wrapSegs } from "../src/md.js";
 import { Input, List } from "../src/widgets.js";
@@ -2060,6 +2061,49 @@ test("commands/execute carries the dsh 0.1.1 images field", async () => {
   app.api.rpcCall = async (method, payload) => { calls.push([method, payload]); return { result: { text: "ok" } }; };
   await app.doSwitchPermission("workspace-write");
   assert.deepEqual(calls.at(-1), ["commands/execute", { agentId: "s", line: "/permission workspace-write", images: [] }], "images array rides the execute request");
+});
+
+test("the theme picker opens from /theme, Ctrl+D and the command palette", () => {
+  const app = headlessApp(); app.currentSession = "s"; app.chat.sessionId = "s"; app.focus(app.chat);
+  app.chat.send("/theme");
+  assert.ok(app.overlay instanceof ThemePickerBuffer, "/theme opens the selector");
+  const names = Object.keys(THEMES);
+  assert.equal(app.overlay.names.length, names.length, "every scheme is listed");
+  app.overlay.onKey({ type: "key", name: "escape" });
+  assert.equal(app.overlay, null, "Esc closes");
+  app.onEvent({ type: "key", name: "char", key: "d", ctrl: true, shift: false });
+  assert.ok(app.overlay instanceof ThemePickerBuffer, "Ctrl+D opens the selector");
+  app.overlay.onKey({ type: "key", name: "escape" });
+  assert.ok(setKeyBinding("themePicker", { mode: "normal", key: "Ctrl+9", key2: "" }));
+  app.onEvent({ type: "key", name: "char", key: "9", ctrl: true, shift: false });
+  assert.ok(app.overlay instanceof ThemePickerBuffer, "remapped themePicker still opens the selector");
+  assert.ok(resetKeyBinding("themePicker"));
+});
+
+test("the theme picker applies a scheme and previews its palette", () => {
+  const app = headlessApp();
+  setTheme("dark");
+  const picker = new ThemePickerBuffer(app);
+  assert.ok(picker.names.includes("dracula"));
+  const screen = new Screen(80, 30);
+  picker.render(screen);
+  screen.render(); // publish the frame so prev holds the drawn cells
+  assert.ok(screen.prev.map((r) => r.map((c) => c.ch).join("")).join("\n").includes("dark"), "the current scheme is listed");
+  const idx = picker.names.indexOf("dark");
+  picker.sel = idx; picker.scroll = 0;
+  picker.render(screen);
+  screen.render();
+  // palette strip: PANEL(2) USERBG(2) ACCENT(2) — the accent swatch follows
+  const rowY = picker.y + 2 + idx;
+  const accent = THEMES.dark.ACCENT;
+  const hits = [];
+  for (let x = picker.x + 1; x < picker.x + picker.w - 1; x++) if (screen.prev[rowY]?.[x]?.bg === accent) hits.push(x);
+  assert.ok(hits.length >= 2, "the accent swatch renders in any row");
+  picker.sel = picker.names.indexOf("dracula");
+  picker.onKey({ type: "key", name: "enter" });
+  assert.equal(themeName(), "dracula", "Enter applies the selected scheme");
+  assert.equal(app.overlay, null, "the picker closes after applying");
+  setTheme("gruvbox");
 });
 
 test("legacy one-slot keybinding values migrate to the new two-slot defaults", async () => {

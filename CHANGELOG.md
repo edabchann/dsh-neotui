@@ -4,7 +4,8 @@
 
 ### Added
 
-- 11 套常用配色主题：dark、light、gruvbox 之外新增 nord、solarized-dark、solarized-light、dracula、onedark、catppuccin-mocha、tokyonight、monokai（全套语义键补齐，`/theme` 或命令面板循环切换，选择持久化到 `$DSH_HOME/tui-theme.txt`；新增回归测试保证每个主题键集完整、循环覆盖全部方案）。
+- 11 套常用配色主题：dark、light、gruvbox 之外新增 nord、solarized-dark、solarized-light、dracula、onedark、catppuccin-mocha、tokyonight、monokai（全套语义键补齐；新增回归测试保证每个主题键集完整、循环覆盖全部方案）。
+- 主题改为**选择器**而非轮换：`Ctrl+D`、`/theme` 或命令面板打开「外观 · 配色方案」面板，每行渲染该方案的实时色板预览（面板/用户/强调/成功/警告/错误六色），`↑/↓/PgUp/PgDn` 浏览、`Enter` 或双击应用、`Esc` 取消；快捷键可重映射（`themePicker`）。
 
 ## 0.4.0 — 2026-08-21
 
