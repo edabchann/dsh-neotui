@@ -179,14 +179,18 @@ function themeFile() {
 let current = "gruvbox";
 const ORDER = ["dark", "light", "gruvbox", "nord", "solarized-dark", "solarized-light", "dracula", "onedark", "catppuccin-mocha", "tokyonight", "monokai"];
 
+// Live preview: the T proxy renders `preview` (when set) without persisting.
+// The theme picker previews on cursor movement and commits on Enter.
+let preview = null;
+
 try {
   const saved = readFileSync(themeFile(), "utf8").trim();
   if (THEMES[saved]) current = saved;
 } catch { /* first run */ }
 
-/** Live theme accessor: T.ACCENT etc. reads the active palette. */
+/** Live theme accessor: T.ACCENT etc. reads the active (or previewed) palette. */
 export const T = new Proxy({}, {
-  get(_t, key) { return THEMES[current][key]; },
+  get(_t, key) { return THEMES[preview ?? current][key]; },
 });
 
 function persist() {
@@ -195,6 +199,21 @@ function persist() {
     writeFileSync(themeFile(), current + "\n");
   } catch {}
 }
+
+/** Temporarily render with `name` (never persisted). Returns false when unknown. */
+export function setThemePreview(name) {
+  if (!THEMES[name]) return false;
+  preview = name;
+  return true;
+}
+
+/** Drop the preview and render the committed theme again. */
+export function clearThemePreview() {
+  preview = null;
+}
+
+/** Theme the T proxy currently renders (preview wins over the committed one). */
+export function renderedThemeName() { return preview ?? current; }
 
 export function setTheme(name) {
   if (THEMES[name]) { current = name; persist(); return true; }

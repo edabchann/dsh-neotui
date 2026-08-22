@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join, basename, extname, dirname } from "node:path";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 
-import { T, THEMES, setTheme, themeName } from "./theme.js";
+import { T, THEMES, setTheme, setThemePreview, clearThemePreview, themeName, renderedThemeName } from "./theme.js";
 import { loadTuiConfig, saveTuiConfig, userPrefix, userName, foldDefaults, keyBindings, setKeyBinding, resetKeyBinding } from "./config.js";
 import { validateKeySpec, describeSpec } from "./keybindings.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
@@ -361,8 +361,9 @@ export function buildPermissionPicker(app) {
   });
 }
 
-/** Theme selector with a live palette strip per row: pick by color, not by
- *  name — cycling is no longer viable with a growing catalog. */
+/** Theme selector with live preview: moving the cursor re-renders the whole
+ *  UI in the hovered scheme (nothing persisted until Enter), and Enter commits
+ *  while keeping the buffer open — a control buffer must not exit on pick. */
 export class ThemePickerBuffer extends Widget {
   constructor(app) {
     const names = Object.keys(THEMES);
@@ -374,23 +375,29 @@ export class ThemePickerBuffer extends Widget {
     this.scroll = 0;
   }
   #nameOf(idx) { return this.names[idx]; }
-  #apply(idx) {
-    const name = this.#nameOf(idx);
+  /** Select + preview: the whole TUI re-renders in the hovered scheme. */
+  #move(idx) {
+    this.sel = wrapIndex(idx, this.names.length);
+    setThemePreview(this.#nameOf(this.sel) ?? themeName());
+    this.app.redraw();
+    return true;
+  }
+  /** Commit the previewed theme and KEEP the buffer open for further tweaks. */
+  #commit() {
+    const name = this.#nameOf(this.sel);
     if (!name) return;
-    setTheme(name);
-    this.app.overlay = null;
-    this.app.toast(`主题: ${name}`);
+    if (setTheme(name)) this.app.toast(`已应用主题: ${name}（Esc 关闭）`);
     this.app.redraw();
   }
   onMouse(ev) {
-    if (ev.kind === "wheel-up") { this.sel = wrapIndex(this.sel - 1, this.names.length); return true; }
-    if (ev.kind === "wheel-down") { this.sel = wrapIndex(this.sel + 1, this.names.length); return true; }
+    if (ev.kind === "wheel-up") return this.#move(this.sel - 1);
+    if (ev.kind === "wheel-down") return this.#move(this.sel + 1);
     if (ev.kind === "press" && ev.button === 0) {
       const idx = this.scroll + (ev.y - this.y - 2);
       if (idx < 0 || idx >= this.names.length) return true;
       const now = Date.now();
-      this.sel = idx;
-      if (this.lastClick && now - this.lastClick < 400) this.#apply(idx);
+      this.#move(idx);
+      if (this.lastClick && now - this.lastClick < 400) this.#commit();
       else this.lastClick = now;
       return true;
     }
@@ -398,20 +405,28 @@ export class ThemePickerBuffer extends Widget {
   }
   onKey(ev) {
     if (ev.type !== "key") return false;
-    if (ev.name === "up") { this.sel = wrapIndex(this.sel - 1, this.names.length); return true; }
-    if (ev.name === "down") { this.sel = wrapIndex(this.sel + 1, this.names.length); return true; }
-    if (ev.name === "pgup") { this.sel = Math.max(0, this.sel - (this.h - 3)); return true; }
-    if (ev.name === "pgdn") { this.sel = Math.min(this.names.length - 1, this.sel + (this.h - 3)); return true; }
-    if (ev.name === "home") { this.sel = 0; return true; }
-    if (ev.name === "end") { this.sel = this.names.length - 1; return true; }
-    if (ev.name === "enter") { this.#apply(this.sel); return true; }
-    if (ev.name === "escape") { this.app.overlay = null; this.app.redraw(); return true; }
+    if (ev.name === "up") return this.#move(this.sel - 1);
+    if (ev.name === "down") return this.#move(this.sel + 1);
+    if (ev.name === "pgup") { this.sel = Math.max(0, this.sel - (this.h - 3)); setThemePreview(this.#nameOf(this.sel)); this.app.redraw(); return true; }
+    if (ev.name === "pgdn") { this.sel = Math.min(this.names.length - 1, this.sel + (this.h - 3)); setThemePreview(this.#nameOf(this.sel)); this.app.redraw(); return true; }
+    if (ev.name === "home") return this.#move(0);
+    if (ev.name === "end") return this.#move(this.names.length - 1);
+    if (ev.name === "enter") { this.#commit(); return true; }
+    if (ev.name === "escape") {
+      // Cancel: drop the preview (revert to the committed theme), then close.
+      clearThemePreview();
+      this.app.overlay = null;
+      this.app.redraw();
+      return true;
+    }
     return false;
   }
   render(s) {
     s.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.BG2 });
-    s.box(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, { fg: K.ACCENT, bg: T.BG2 }, "外观 · 配色方案");
-    s.text(this.x + 2, this.y + this.h - 1, "↑/↓ 选择 · Enter 应用 · 双击应用 · Esc 关闭", { fg: K.FAINT, bg: T.BG2 });
+    const previewing = renderedThemeName() !== themeName();
+    s.box(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, { fg: K.ACCENT, bg: T.BG2 },
+      `外观 · 配色方案${previewing ? ` · 预览: ${renderedThemeName()}` : ""}`);
+    s.text(this.x + 2, this.y + this.h - 1, "↑/↓ 即时预览 · Enter 应用（停留） · 双击应用 · Esc 恢复并关闭", { fg: K.FAINT, bg: T.BG2 });
     const lh = Math.max(1, this.h - 4);
     if (this.sel < this.scroll) this.scroll = this.sel;
     if (this.sel >= this.scroll + lh) this.scroll = this.sel - lh + 1;

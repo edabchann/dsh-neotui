@@ -5,7 +5,7 @@
 ### Added
 
 - 11 套常用配色主题：dark、light、gruvbox 之外新增 nord、solarized-dark、solarized-light、dracula、onedark、catppuccin-mocha、tokyonight、monokai（全套语义键补齐；新增回归测试保证每个主题键集完整、循环覆盖全部方案）。
-- 主题改为**选择器**而非轮换：`Ctrl+D`、`/theme` 或命令面板打开「外观 · 配色方案」面板，每行渲染该方案的实时色板预览（面板/用户/强调/成功/警告/错误六色），`↑/↓/PgUp/PgDn` 浏览、`Enter` 或双击应用、`Esc` 取消；快捷键可重映射（`themePicker`）。
+- 主题改为**选择器**而非轮换：`Ctrl+D`、`/theme` 或命令面板打开「外观 · 配色方案」面板，每行渲染该方案的色板（面板/用户/强调/成功/警告/错误六色），**光标移动即对整套 TUI 即时预览**（`setThemePreview`，不持久化，标题栏提示「预览: <name>」），`Enter` 或双击应用后**停留**继续调整（控制类 buffer 不再因选择而退出），`Esc` 恢复已提交主题并关闭；快捷键可重映射（`themePicker`）。
 
 ## 0.4.0 — 2026-08-21
 

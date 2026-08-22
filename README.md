@@ -209,7 +209,7 @@ TUI 支持：
 - 工具审批、AskUser 单选/多选、Plan Review；
 - Goal、TODO、后台任务和 Subagent；
 - 独立插件清单及 `/` 筛选；
-- 11 套配色主题：dark、light、gruvbox、nord、solarized-dark、solarized-light、dracula、onedark、catppuccin-mocha、tokyonight、monokai；`Ctrl+D`、`/theme` 或命令面板打开**配色选择器**——每行带该方案的实时色板预览（面板/用户/强调/成功/警告/错误六色），`↑/↓/PgUp/PgDn` 浏览、`Enter` 或双击应用、`Esc` 取消；选择持久化到 `$DSH_HOME/tui-theme.txt`。
+- 11 套配色主题：dark、light、gruvbox、nord、solarized-dark、solarized-light、dracula、onedark、catppuccin-mocha、tokyonight、monokai；`Ctrl+D`、`/theme` 或命令面板打开**配色选择器**——每行带该方案的色板（面板/用户/强调/成功/警告/错误六色），**光标移动即对整套 TUI 即时预览**（未持久化，标题栏显示「预览: <name>」），`Enter` 或双击应用并停留继续调整，`Esc` 恢复已提交主题并关闭；选择持久化到 `$DSH_HOME/tui-theme.txt`。
 
 工作区（`Ctrl+W`）、设置（`Ctrl+S`）、模型供应商（模型选择器里的 `⚙ 管理供应商…`）、子代理（`Ctrl+A`）和技能（`Ctrl+H`）都是**全屏模态 Buffer**：打开后覆盖整个界面，`Esc` 逐级返回并最终关闭。它们不再占用“标签页模式”，因此关闭后 `Ctrl+←/→` 的 pane 聚焦立即恢复，两者互不冲突。轨迹仍是 pane 序列的一部分，由 `Ctrl+T` 或 `Ctrl+←/→` 进入。
 

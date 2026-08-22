@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion } from "../src/views.js";
 import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker, AttachmentPanel, ThemePickerBuffer } from "../src/panels.js";
-import { setTheme, themeName, THEMES } from "../src/theme.js";
+import { setTheme, themeName, THEMES, renderedThemeName, clearThemePreview } from "../src/theme.js";
 import { fmtDuration, strWidth, pad, graphemeWidth } from "../src/text.js";
 import { renderMd, wrapSegs } from "../src/md.js";
 import { Input, List } from "../src/widgets.js";
@@ -2080,10 +2080,12 @@ test("the theme picker opens from /theme, Ctrl+D and the command palette", () =>
   assert.ok(resetKeyBinding("themePicker"));
 });
 
-test("the theme picker applies a scheme and previews its palette", () => {
+test("the theme picker previews live, commits on Enter and stays open", () => {
   const app = headlessApp();
   setTheme("dark");
+  clearThemePreview();
   const picker = new ThemePickerBuffer(app);
+  app.overlay = picker; // the buffer owns the overlay while open
   assert.ok(picker.names.includes("dracula"));
   const screen = new Screen(80, 30);
   picker.render(screen);
@@ -2099,11 +2101,25 @@ test("the theme picker applies a scheme and previews its palette", () => {
   const hits = [];
   for (let x = picker.x + 1; x < picker.x + picker.w - 1; x++) if (screen.prev[rowY]?.[x]?.bg === accent) hits.push(x);
   assert.ok(hits.length >= 2, "the accent swatch renders in any row");
-  picker.sel = picker.names.indexOf("dracula");
+  // moving the selection previews that theme WITHOUT committing it
+  const draculaIdx = picker.names.indexOf("dracula");
+  picker.onKey({ type: "key", name: "down" });
+  picker.onKey({ type: "key", name: "down" });
+  picker.onKey({ type: "key", name: "down" });
+  assert.equal(themeName(), "dark", "preview never commits");
+  assert.equal(renderedThemeName(), THEMES[picker.names[picker.sel]] && picker.names[picker.sel], "the proxy renders the hovered scheme");
+  assert.equal(T.ACCENT, THEMES[picker.names[picker.sel]].ACCENT, "live palette follows the cursor");
+  // Enter commits the previewed theme and KEEPS the buffer open
+  picker.sel = draculaIdx;
   picker.onKey({ type: "key", name: "enter" });
   assert.equal(themeName(), "dracula", "Enter applies the selected scheme");
-  assert.equal(app.overlay, null, "the picker closes after applying");
+  assert.equal(app.overlay, picker, "the buffer stays open after applying");
+  // Esc drops any preview and closes
+  picker.onKey({ type: "key", name: "escape" });
+  assert.equal(app.overlay, null, "Esc closes the buffer");
+  assert.equal(renderedThemeName(), "dracula", "Esc keeps the committed theme");
   setTheme("gruvbox");
+  clearThemePreview();
 });
 
 test("legacy one-slot keybinding values migrate to the new two-slot defaults", async () => {
