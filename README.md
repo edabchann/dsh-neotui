@@ -208,7 +208,7 @@ TUI 支持：
 - 工具审批、AskUser 单选/多选、Plan Review；
 - Goal、TODO、后台任务和 Subagent；
 - 独立插件清单及 `/` 筛选；
-- dark、light、gruvbox 主题。
+- 11 套配色主题：dark、light、gruvbox、nord、solarized-dark、solarized-light、dracula、onedark、catppuccin-mocha、tokyonight、monokai（`/theme` 或命令面板循环切换，选择持久化到 `$DSH_HOME/tui-theme.txt`）。
 
 工作区（`Ctrl+W`）、设置（`Ctrl+S`）、模型供应商（模型选择器里的 `⚙ 管理供应商…`）、子代理（`Ctrl+A`）和技能（`Ctrl+H`）都是**全屏模态 Buffer**：打开后覆盖整个界面，`Esc` 逐级返回并最终关闭。它们不再占用“标签页模式”，因此关闭后 `Ctrl+←/→` 的 pane 聚焦立即恢复，两者互不冲突。轨迹仍是 pane 序列的一部分，由 `Ctrl+T` 或 `Ctrl+←/→` 进入。
 

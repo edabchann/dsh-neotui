@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join, basename, extname, dirname } from "node:path";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 
-import { T, cycleTheme, themeName } from "./theme.js";
+import { T, THEMES, cycleTheme, themeName } from "./theme.js";
 import { loadTuiConfig, saveTuiConfig, userPrefix, userName, foldDefaults, keyBindings, setKeyBinding, resetKeyBinding } from "./config.js";
 import { validateKeySpec, describeSpec } from "./keybindings.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
@@ -1682,7 +1682,7 @@ export class ControlPanel extends Widget {
         ["模式（Agent 预设）", "标准 / PTC / 极简 / 创造", () => { this.app.overlay = buildModePicker(this.app); this.app.redraw(); }],
         ["权限（沙箱 + 审批）", "只读 / 工作区写入 / 完全访问", () => { this.app.overlay = buildPermissionPicker(this.app); this.app.redraw(); }],
         ["完整设置（JSON 编辑器）", "所有命名空间的原始值", () => { this.app.closeOverlay(); this.app.showSettingsBuffer ? this.app.showSettingsBuffer() : this.app.setMode?.("settings"); }],
-        ["切换主题", "dark / light / gruvbox", () => { cycleTheme(); this.app.toast(`主题: ${themeName()}`); }],
+        ["切换主题", Object.keys(THEMES).join(" / "), () => { cycleTheme(); this.app.toast(`主题: ${themeName()}`); }],
         ["侧栏显示/隐藏", "nvim 式整体收起", () => this.app.toggleSidebar()],
         ["导出当前会话日志", "下载 ZIP", () => { const sess = this.app.sessions.find((x) => x.sessionId === this.app.currentSession); if (sess) { this.app.closeOverlay(); this.app.exportSession(sess); } }],
         ["复制会话 ID", "", () => this.app.copyText(this.app.currentSession ?? "")],
