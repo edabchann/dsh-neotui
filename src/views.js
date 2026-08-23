@@ -226,26 +226,27 @@ function lerpColor(a, b, t) {
 
 // ---- Welcome brand wordmarks (TUI-drawn half-block letters) ----
 
-/** 4x6 pixel font for the welcome brand lines; renders like the splash's
- *  DEEPSEEK wordmark (█▀▄), not as spaced plain text. */
+/** 5x7 pixel font for the welcome brand lines (7 pixel rows = 4 terminal
+ *  rows with ▀/▄ half-blocks, the last row single-half). */
 const BRAND_GLYPHS = {
-  A: ["0110", "1001", "1111", "1001", "1001", "1001"],
-  D: ["1110", "1001", "1001", "1001", "1001", "1110"],
-  E: ["1111", "1000", "1110", "1000", "1000", "1111"],
-  H: ["1001", "1001", "1111", "1001", "1001", "1001"],
-  I: ["1111", "0110", "0110", "0110", "0110", "1111"], // 工-style serif I
-  K: ["1001", "1010", "1100", "1010", "1001", "1001"],
-  N: ["1001", "1101", "1011", "1001", "1001", "1001"],
-  O: ["0110", "1001", "1001", "1001", "1001", "0110"],
-  P: ["1110", "1001", "1001", "1110", "1000", "1000"],
-  R: ["1110", "1001", "1001", "1110", "1010", "1001"],
-  S: ["0111", "1000", "0110", "0001", "0001", "1110"],
-  T: ["1111", "0100", "0100", "0100", "0100", "0100"],
-  U: ["1001", "1001", "1001", "1001", "1001", "0110"],
+  A: ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+  D: ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+  E: ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+  H: ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+  I: ["01110", "00100", "00100", "00100", "00100", "00100", "01110"], // 工-style serif I
+  K: ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
+  N: ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+  O: ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+  P: ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
+  R: ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+  S: ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+  T: ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+  U: ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
 };
 
-/** Draw a half-block wordmark. `bandX` (nullable) places a diagonal shimmer
- *  sweep: pixels near the band mix toward white, tilted ~0.7 cols/row. */
+/** Draw a half-block wordmark (5-wide glyphs, 6-col advance). `bandX`
+ *  (nullable) places a diagonal shimmer sweep: pixels near the band mix
+ *  toward white, tilted ~0.7 cols/row. */
 function drawHalfBlockWordmark(screen, x0, y0, word, color, bandX, bg) {
   const mix = (col, px, py) => {
     if (bandX == null) return col;
@@ -255,12 +256,12 @@ function drawHalfBlockWordmark(screen, x0, y0, word, color, bandX, bg) {
   };
   let cx = x0;
   for (const ch of word) {
-    if (ch === " ") { cx += 4; continue; }
-    const rows = BRAND_GLYPHS[ch] ?? ["0000", "0000", "0000", "0000", "0000", "0000"];
-    for (let pr = 0; pr < 6; pr += 2) {
-      const topBits = rows[pr], botBits = rows[pr + 1];
+    if (ch === " ") { cx += 5; continue; }
+    const rows = BRAND_GLYPHS[ch] ?? ["00000", "00000", "00000", "00000", "00000", "00000", "00000"];
+    for (let pr = 0; pr < 7; pr += 2) {
+      const topBits = rows[pr], botBits = rows[pr + 1] ?? "00000";
       const y = y0 + pr / 2;
-      for (let px = 0; px < 4; px++) {
+      for (let px = 0; px < 5; px++) {
         const t = topBits[px] === "1", b = botBits[px] === "1";
         if (!t && !b) continue;
         const fc = mix(color, cx + px, y);
@@ -269,7 +270,7 @@ function drawHalfBlockWordmark(screen, x0, y0, word, color, bandX, bg) {
         else screen.put(cx + px, y, "▄", { fg: fc, bg });
       }
     }
-    cx += 5;
+    cx += 6;
   }
   return cx - x0 - 1;
 }
@@ -2762,18 +2763,18 @@ export class ChatView extends Widget {
     // its clickable version/update row on the right; the diagonal shimmer
     // sweeps across every ~4s. Falls back to spaced text on short/narrow views.
     const brandY = top + (logoDrawn ? LOGO_ROWS + 1 : 0);
-    const useWordmarks = h >= 29 && this.view.w >= 60;
+    const useWordmarks = h >= 32 && this.view.w >= 62;
     if (useWordmarks) {
       const bandX = this.app.brandShimmer >= 0
-        ? (x + Math.floor((this.view.w - 44) / 2) - 5 + this.app.brandShimmer * 58)
+        ? (x + Math.floor((this.view.w - 58) / 2) - 5 + this.app.brandShimmer * 72)
         : null;
       const glow = lerpColor(T.HEADING, 0xffffff, 0.18);
       const w1Y = brandY;
-      drawHalfBlockWordmark(screen, x + Math.max(0, Math.floor((this.view.w - 39) / 2)), w1Y, "DEEPSEEK", glow, bandX, T.BG);
+      drawHalfBlockWordmark(screen, x + Math.max(0, Math.floor((this.view.w - 47) / 2)), w1Y, "DEEPSEEK", glow, bandX, T.BG);
       this.#putVersionRight(screen, w1Y + 1, "dsh", this.app.dshVersion ?? "unknown", T.HEADING, true);
-      const w2Y = w1Y + 3;
+      const w2Y = w1Y + 4;
       const glide = lerpColor(T.DIM, 0xffffff, 0.10);
-      drawHalfBlockWordmark(screen, x + Math.max(0, Math.floor((this.view.w - 44) / 2)), w2Y, "DSH NEOTUI", glide, bandX, T.BG);
+      drawHalfBlockWordmark(screen, x + Math.max(0, Math.floor((this.view.w - 58) / 2)), w2Y, "DSH NEOTUI", glide, bandX, T.BG);
       this.#putVersionRight(screen, w2Y + 1, "tui", TUI_VERSION, T.FAINT, false);
       // Update/check notices live at the bottom (only when not latest).
       this.#putUpdateHints(screen, top, h);
@@ -5831,7 +5832,7 @@ export class App {
   tickWelcomeShimmer(now) {
     const welcomeUp = this.chat.nodes.length === 0
       && (this.sessions.find((s) => s.sessionId === this.currentSession)?.blank ?? false)
-      && this.chat.view.h >= 29 && this.chat.view.w >= 60;
+      && this.chat.view.h >= 32 && this.chat.view.w >= 62;
     if (!welcomeUp) {
       if (this.brandSweep0 >= 0 || this.brandShimmer >= 0) { this.brandSweep0 = -1; this.brandShimmer = -1; }
       return;

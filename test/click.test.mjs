@@ -4320,7 +4320,7 @@ test("footer jobs row is a single 后台任务 summary", () => {
 
 test("blank welcome shows logo, TUI-drawn brand wordmarks and a bottom mode hint", () => {
   // tall view → half-block wordmarks with shimmer sweep support
-  const app = new App({ screen: new Screen(112, 36), term: { output: { chunks: [], write: (s) => { app.term.output.chunks.push(s); } } }, api: { call: async () => ({ items: [] }) }, log: () => {} });
+  const app = new App({ screen: new Screen(120, 40), term: { output: { chunks: [], write: (s) => { app.term.output.chunks.push(s); } } }, api: { call: async () => ({ items: [] }) }, log: () => {} });
   app.currentSession = "blank";
   app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "cordis" }];
   app.dshVersion = "0.1.0-rc.6";
@@ -4331,7 +4331,7 @@ test("blank welcome shows logo, TUI-drawn brand wordmarks and a bottom mode hint
   app.layout(); app.chat.render(app.screen);
   const rows = app.screen.cells.map((row) => row.map((cell) => cell.ch).join(""));
   assert.ok(rows.slice(1, 21).some((row) => row.includes("▀") && row.includes("▄")), "the 40x19 half-block logo is drawn");
-  assert.ok(rows.slice(21, 27).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 20), "DEEPSEEK / DSH NEOTUI wordmarks are TUI-drawn blocks");
+  assert.ok(rows.slice(21, 29).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 20), "DEEPSEEK / DSH NEOTUI wordmarks are TUI-drawn blocks");
   assert.ok(!rows.some((row) => row.includes("D E E P S E E K")), "the brand rows are not plain spaced text");
   assert.ok(rows.some((row) => row.includes("v0.1.0-rc.6")), "version shown beside the DSH wordmark");
   assert.ok(rows.some((row) => row.includes(`v${TUI_VERSION}`)), "version shown beside the TUI wordmark");
@@ -4356,7 +4356,7 @@ test("welcome shimmer sweeps periodically only on a tall blank welcome", () => {
   app.layout();
   app.tickWelcomeShimmer(1000);
   assert.equal(app.brandShimmer, -1, "short view: never sweeps");
-  app.chat.resize(30, 1, 82, 34); // tall view → shimmer active
+  app.chat.resize(30, 1, 82, 34); // tall view (h=34>=31, w=82>=62) → shimmer active
   app.tickWelcomeShimmer(1000);
   assert.equal(app.brandSweep0 ?? -1, -1, "idle before the first sweep");
   app.tickWelcomeShimmer(2601); // first sweep is 1.5s after the gate opens
