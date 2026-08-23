@@ -4318,7 +4318,7 @@ test("footer jobs row is a single 后台任务 summary", () => {
   assert.equal(app.status.rows.length, 3, "footer has exactly one jobs row");
 });
 
-test("blank welcome highlights the current preset and shows both versions", () => {
+test("blank welcome shows logo, spaced brand rows and a bottom mode hint", () => {
   const app = headlessApp();
   app.currentSession = "blank";
   app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "cordis" }];
@@ -4329,10 +4329,11 @@ test("blank welcome highlights the current preset and shows both versions", () =
   app.chat.nodes = [];
   app.layout(); app.chat.render(app.screen);
   const rows = app.screen.cells.map((row) => row.map((cell) => cell.ch).join(""));
-  assert.ok(rows.some((row) => row.includes("DeepSeek Harness v0.1.0-rc.6") && row.includes("已是最新")), "DSH version and update state shown");
-  assert.ok(rows.some((row) => row.includes(`dsh-neotui v${TUI_VERSION}`) && row.includes(`可更新 ${latestTui}`)), "TUI version and update state shown");
-  assert.ok(rows.some((row) => row.includes("● 创造模式 [当前]")), "active blank-session preset highlighted");
-  assert.ok(rows.some((row) => row.includes("○ 标准模式")), "inactive presets remain unselected");
+  assert.ok(rows.slice(1, 21).some((row) => row.includes("▀") && row.includes("▄")), "the 40x19 half-block logo is drawn");
+  assert.ok(rows.some((row) => row.includes("D E E P S E E K") && row.includes("H A R N E S S") && row.includes("v0.1.0-rc.6") && row.includes("已是最新")), "spaced DSH brand row with update state");
+  assert.ok(rows.some((row) => row.includes("D S H") && row.includes("N E O T U I") && row.includes(`可更新 ${latestTui}`)), "spaced TUI brand row with update state");
+  assert.ok(rows.some((row) => row.includes("模式: 创造模式") && row.includes("F9")), "bottom hint shows the current preset and F9 entry");
+  assert.ok(!rows.some((row) => row.includes("标准模式") && row.includes("○")), "the inline 4-mode list is gone");
 });
 
 test("blank preset selection updates highlight immediately", async () => {
@@ -4671,19 +4672,15 @@ test("search falls back to a bounded local scan when the Host index is unavailab
   assert.match(app.screen.toPlain(), /Host 搜 索 索 引 不 可 用/);
 });
 
-test("blank welcome mode selection wraps and Enter applies without mouse", () => {
+test("blank welcome mode selection lives in the F9 picker buffer", () => {
   const app = headlessApp(); app.currentSession = "blank";
   app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "standard" }];
   app.chat.sessionId = "blank"; app.chat.nodes = [];
-  let selected = null; app.selectPreset = (id) => { selected = id; };
-  app.focus(app.chat);
-  app.chat.welcomeModeSel = 0;
-  app.chat.onKey({ type: "key", name: "up" });
-  assert.equal(app.chat.welcomeModeSel, 3);
-  app.chat.onKey({ type: "key", name: "down" });
-  assert.equal(app.chat.welcomeModeSel, 0);
-  app.chat.onKey({ type: "key", name: "enter" });
-  assert.equal(selected, "standard");
+  app.layout(); app.chat.render(app.screen);
+  const rows = app.screen.cells.map((row) => row.map((c) => c.ch).join(""));
+  assert.ok(rows.some((r) => r.includes("模式: 标准模式") && r.includes("F9")), "the bottom hint shows the preset and F9 entry");
+  app.onEvent({ type: "key", name: "f9", shift: false });
+  assert.ok(app.overlay !== null, "F9 opens the mode picker buffer (custom presets included)");
 });
 
 test("installed version helpers expose usable package versions", () => {

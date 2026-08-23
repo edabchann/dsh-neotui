@@ -210,6 +210,7 @@ TUI 支持：
 - 工具审批、AskUser 单选/多选、Plan Review；
 - Goal、TODO、后台任务和 Subagent；
 - 独立插件清单及 `/` 筛选；
+- 空白会话欢迎页：40×19 半块渲染的 DeepSeek 吉祥物 logo（真实色、无背景）、间距品牌行 `DEEPSEEK HARNESS` / `DSH NEOTUI`（带版本与点击检查更新），模式选择收敛为底部提示（`模式: <当前> · F9 打开模式选择（支持自定义）`，F9 或点击进入模式选择 buffer——与 WebUI 自定义预设的方向一致）；
 - 11 套配色主题：dark、light、gruvbox、nord、solarized-dark、solarized-light、dracula、onedark、catppuccin-mocha、tokyonight、monokai；`Ctrl+D`、`/theme` 或命令面板打开**配色选择器**——每行带该方案的色板（面板/用户/强调/成功/警告/错误六色），**光标移动即对整套 TUI 即时预览**（未持久化，标题栏显示「预览: <name>」），`Enter` 或双击应用并停留继续调整，`Esc` 恢复已提交主题并关闭；选择持久化到 `$DSH_HOME/tui-theme.txt`。
 - 启动动画（经典游戏启动器风格，**默认关闭的 meme**）：纯黑 → 白色从屏幕中心圆扩散到全屏（约 1s）→ 四行健康游戏忠告（"抵制不良游戏，拒绝盗版游戏。"等，逐句淡入，约 2s）→ 忠告淡出同时 `DEEPSEEK` 半块大字交叉淡入（约 2s）→ 底部闪烁「按任意键进入游戏」，**按任意键进入**。全程纯 ANSI（`█▀▄`）；`dsh-tui --launcher-anime`（或 `DSH_TUI_LAUNCHER_ANIME=1`）显式启用，`DSH_TUI_NO_SPLASH=1` 强制关闭，`--script` 模式不播放。
 

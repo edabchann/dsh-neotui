@@ -19,6 +19,7 @@ import {
 } from "./panels.js";
 
 import { T, themeName, cycleTheme } from "./theme.js";
+import { LOGO_COLS, LOGO_ROWS, LOGO_PALETTE, LOGO_GRID } from "./logo.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
 const K = new Proxy({}, { get(_k, key) { return T[key]; } });
 
@@ -1287,9 +1288,6 @@ export class ChatView extends Widget {
     this.rebuildQueued = false;
     this.cache = new Map();   // node render cache: key → { lines, marks }
     this.cardRanges = [];     // absolute line ranges of card-backed message blocks
-    this.welcomeModes = [];   // absolute row y → agent preset id (welcome screen)
-    this.welcomeModeIds = ["standard", "code", "minimal", "cordis"];
-    this.welcomeModeSel = 0;
     this.pressY = null;
     this.pressInfo = null;  // hit identity locked at press time
     this.pressCtx = null;
@@ -1503,7 +1501,6 @@ export class ChatView extends Widget {
   async open(sessionId, epoch = this.app.sessionEpoch, maxMessages = 80) {
     this.sessionId = sessionId;
     this.nodes = [];
-    this.welcomeModeSel = 0;
     this.blockSel = -1;
     this.cursorMode = "block";
     this.visualAnchor = null;
@@ -2699,55 +2696,59 @@ export class ChatView extends Widget {
     return true;
   }
 
-  /** Blank session: whale logo + mode selection prompt (no conversation yet). */
+  /** Blank session: logo + brand/version rows + a bottom mode hint. The 4-mode
+   *  inline list is gone: mode selection lives in the F9 picker buffer, which
+   *  also supports custom presets (web parity: self-made modes encouraged). */
   #renderWelcome(screen) {
     const x = this.view.x;
     const cx = x + Math.max(0, Math.floor((this.view.w - 40) / 2));
-    let y = this.view.y + 1;
-    const put = (t, fg, bold) => { if (y < this.view.y + this.view.h) { screen.text(cx, y, t, { fg, attrs: bold ? 1 : 0 }); } y++; };
-    put("", 0, false);
+    const h = this.view.h, top = this.view.y + 1;
+    const put = (t, fg, bold, yy) => { if (yy < top + h) screen.text(cx, yy, t, { fg, attrs: bold ? 1 : 0 }); };
+    // 40x19 half-block logo (real colors), centered on the 40-col block.
     this.welcomeVersionRows = [];
-    const versionLine = (name, version, key, fg, bold) => {
+    if (this.view.w >= 48) {
+      const ly = top;
+      for (let r = 0; r < LOGO_ROWS && ly + r < top + h; r++) {
+        for (let c = 0; c < LOGO_COLS; c++) {
+          // each cell = 2 palette indices × 2 hex chars each
+          const i = (r * LOGO_COLS + c) * 4;
+          const topIdx = parseInt(LOGO_GRID.slice(i, i + 2), 16);
+          const botIdx = parseInt(LOGO_GRID.slice(i + 2, i + 4), 16);
+          if (topIdx === 0 && botIdx === 0) continue;
+          const tcol = topIdx ? parseInt(LOGO_PALETTE[topIdx - 1], 16) : null;
+          const bcol = botIdx ? parseInt(LOGO_PALETTE[botIdx - 1], 16) : null;
+          // Half-block glyph: upper half renders fg, lower half renders bg.
+          // top-only → "▀" fg=top; bottom-only → "▄" fg=bottom; both → "▀" fg=top bg=bottom.
+          const fgc = tcol ?? bcol ?? T.BG;
+          const bgc = bcol ?? T.BG;
+          screen.put(cx + c, ly + r, tcol ? "▀" : "▄", { fg: fgc, bg: bgc });
+        }
+      }
+    }
+    // Brand + version rows (re-drawn to match): spaced caps + clickable update check.
+    const versionLine = (name, version, key, fg, bold, yy) => {
       const check = this.app.versionChecks?.[key];
       const status = check?.state === "checking" ? "← 检查更新…"
         : check?.state === "current" ? "← 已是最新"
         : check?.state === "update" ? `← 可更新 ${check.latest}`
         : check?.state === "error" ? "← 检查失败（点击重试）"
         : "← 检查更新";
-      const text = `  ${name} ${version === "unknown" ? "版本未知" : `v${version}`}  ${status}`;
-      put(text, fg, bold);
-      this.welcomeVersionRows[y - 1] = { key, x1: cx, x2: cx + strWidth(text) - 1 };
+      const spaced = [...name].join(" ");
+      const text = `${spaced}  ${version === "unknown" ? "版本未知" : `v${version}`}  ${status}`;
+      const tx = x + Math.max(0, Math.floor((this.view.w - strWidth(text)) / 2));
+      if (yy < top + h) screen.text(tx, yy, text, { fg, attrs: bold ? 1 : 0 });
+      this.welcomeVersionRows[yy] = { key, x1: tx, x2: tx + strWidth(text) - 1 };
     };
-    versionLine("DeepSeek Harness", this.app.dshVersion ?? "unknown", "dsh", T.HEADING, true);
-    versionLine("dsh-neotui", TUI_VERSION, "tui", T.FAINT, false);
-    put("", 0, false);
-    if (this.app.currentSession == null) {
-      put("  打开一个会话开始，或 Ctrl+N 新建", T.DIM, false);
-      return;
-    }
-    put("  请选择模式（F9 或点击下方，选择后立即生效）：", T.WARN, true);
-    put("", 0, false);
-    this.welcomeModes = [];
-    const currentPreset = this.app.sessions.find((s) => s.sessionId === this.app.currentSession)?.agentPreset;
-    const presets = [
-      ["standard", "标准模式", "完整编码 Agent（文件/Shell/检索/Skills/目标/子代理）"],
-      ["code", "PTC 模式", "标准模式能力 + Code Mode SDK 单程序多步操作"],
-      ["minimal", "极简模式", "仅持久 bash 与 str_replace_editor 双工具"],
-      ["cordis", "创造模式", "标准模式 + 运行时检查/插件实验/预设创作"],
-    ];
-    const currentIdx = presets.findIndex(([id]) => id === currentPreset);
-    if (this.welcomeModeSel == null || this.welcomeModeSel >= presets.length) this.welcomeModeSel = currentIdx >= 0 ? currentIdx : 0;
-    for (let i = 0; i < presets.length; i++) {
-      const [id, name, desc] = presets[i];
-      if (y < this.view.y + this.view.h) {
-        const active = id === currentPreset;
-        const cursor = this.app.focused === this && i === this.welcomeModeSel;
-        const label = `${cursor ? "=>" : "  "} ${active ? "●" : "○"} ${name}${active ? " [当前]" : ""}`;
-        screen.text(cx, y, `  ${label}`, { fg: active ? T.OK : cursor ? T.ACCENT : T.DIM, bg: cursor ? T.MENUSEL : -1, attrs: active || cursor ? 1 : 0 });
-        screen.text(cx + 2 + strWidth(label) + 1, y, truncate(desc, Math.max(1, this.view.w - strWidth(label) - 8)), { fg: cursor ? T.TXT : T.DIM, bg: cursor ? T.MENUSEL : -1 });
-        this.welcomeModes[y] = id;
-      }
-      y++;
+    const brandY = top + (this.view.w >= 48 ? LOGO_ROWS + 1 : 0);
+    versionLine("DEEPSEEK HARNESS", this.app.dshVersion ?? "unknown", "dsh", T.HEADING, true, brandY);
+    versionLine("DSH NEOTUI", TUI_VERSION, "tui", T.FAINT, false, brandY + 1);
+    // Bottom hint: current preset + F9 opens the (custom-mode friendly) picker.
+    if (this.app.currentSession != null) {
+      const currentPreset = this.app.sessions.find((s) => s.sessionId === this.app.currentSession)?.agentPreset;
+      const hint = `模式: ${modeName(currentPreset ?? "standard")} · F9 打开模式选择（支持自定义）`;
+      this.welcomeModeRow = top + h - 2;
+      const hx = x + Math.max(0, Math.floor((this.view.w - strWidth(hint)) / 2));
+      screen.text(hx, this.welcomeModeRow, hint, { fg: T.WARN, attrs: 1 });
     }
   }
 
@@ -2924,12 +2925,12 @@ export class ChatView extends Widget {
     if (this.view.inside(ev.x, ev.y)) {
       // clicks act, but never exit INSERT mode — Esc is the only way out
       if (this.app.focused !== this.app.chat?.input) this.app.focus(this);
-      // Welcome-screen mode click: select the preset under the cursor.
+      // Welcome-screen clicks: version rows check updates; the mode hint opens
+      // the custom-mode-friendly picker buffer.
       if (this.nodes.length === 0 && ev.kind === "press" && ev.button === 0) {
         const versionHit = this.welcomeVersionRows?.[ev.y];
         if (versionHit && ev.x >= versionHit.x1 && ev.x <= versionHit.x2) { this.app.checkUpdates(versionHit.key, true); return true; }
-        const id = this.welcomeModes[ev.y];
-        if (id) { this.app.selectPreset(id); return true; }
+        if (ev.y === this.welcomeModeRow && ev.x >= cx && ev.x <= cx + 40) { this.app.showModePicker(); return true; }
       }
       if (ev.kind === "wheel-up" && this.view.scrollY <= 3 && this.hasMore) { void this.loadOlder(); return true; }
       if (ev.kind === "press" && ev.button === 0) {
@@ -3040,15 +3041,6 @@ export class ChatView extends Widget {
   }
 
   onKey(ev) {
-    const blankWelcome = this.nodes.length === 0 && (this.app.sessions.find((s) => s.sessionId === this.sessionId)?.blank ?? false);
-    if (blankWelcome && ev.type === "key" && (ev.name === "up" || ev.name === "down")) {
-      this.welcomeModeSel = wrapIndex(this.welcomeModeSel + (ev.name === "up" ? -1 : 1), this.welcomeModeIds.length);
-      return true;
-    }
-    if (blankWelcome && ev.type === "key" && ev.name === "enter") {
-      this.app.selectPreset(this.welcomeModeIds[this.welcomeModeSel]);
-      return true;
-    }
     if (ev.type === "text" || ev.type === "paste") {
       // In cursor/Visual modes text is never inserted into the transcript or
       // silently redirected to INSERT. Only explicit i enters the input editor.
