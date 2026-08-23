@@ -23,7 +23,7 @@ export function launchTui(opts = {}) {
   }
   const screen = new Screen(process.stdout.columns || 80, process.stdout.rows || 24);
   const api = new Api({ base: opts.base ?? "http://127.0.0.1:1", log, onFrame: () => {}, onHostFrame: () => {} });
-  const app = new App({ screen, term: null, api, log });
+  const app = new App({ screen, term: null, api, log, launcherAnime: opts.launcherAnime ?? process.env.DSH_TUI_LAUNCHER_ANIME === "1" });
   const term = new Term({
     output: process.stdout,
     kitty: detectKitty(),

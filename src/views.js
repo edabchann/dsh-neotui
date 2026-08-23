@@ -3392,12 +3392,13 @@ export class ApprovalPopup extends Popup {
 // ---- App ----
 
 export class App {
-  constructor({ screen, term, api, base, log, versionFetcher = latestNpmVersion }) {
+  constructor({ screen, term, api, base, log, versionFetcher = latestNpmVersion, launcherAnime = false }) {
     this.screen = screen;
     this.term = term;
     this.api = api;
     this.log = log ?? (() => {});
     this.versionFetcher = versionFetcher;
+    this.launcherAnime = launcherAnime; // opt-in boot animation (--launcher-anime)
     this.popup = null;
     this.activePrompt = null;
     this.promptQueue = [];
@@ -5487,8 +5488,11 @@ export class App {
   // ---- main loop ----
 
   /** DeepSeek-style boot splash: white background, DEEPSEEK wordmark fading
-   *  in, pulsing 启动中 dot, then dissolve into the theme background. */
+   *  in, pulsing 启动中 dot, then dissolve into the theme background.
+   *  Opt-in meme: enable with --launcher-anime / DSH_TUI_LAUNCHER_ANIME=1;
+   *  DSH_TUI_NO_SPLASH=1 always wins. */
   playSplash() {
+    if (!this.launcherAnime) return;
     if (process.env.DSH_TUI_NO_SPLASH === "1") return;
     if (!this.term?.output?.write) return;
     const w = this.screen.w, h = this.screen.h;

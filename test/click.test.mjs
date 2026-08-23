@@ -2149,21 +2149,27 @@ test("boot splash fades the DEEPSEEK wordmark into a white frame and dissolves o
   assert.equal(screen.prev[0][0].bg, T.BG, "fade-out lands on the app background");
 });
 
-test("playSplash respects the disable flag and never runs in tests without output", () => {
+test("the boot splash is opt-in via launcherAnime and DSH_TUI_NO_SPLASH always wins", () => {
   const app = headlessApp();
   app.splashDelay = 0; // run the animation instantly
   const write = app.term.output.write;
   let writes = 0;
   app.term.output.write = () => { writes++; return true; };
-  const saved = process.env.DSH_TUI_NO_SPLASH;
+  app.playSplash();
+  assert.equal(writes, 0, "opt-in: nothing plays without launcherAnime");
+  app.launcherAnime = true;
+  const savedDisable = process.env.DSH_TUI_NO_SPLASH;
   process.env.DSH_TUI_NO_SPLASH = "1";
   app.playSplash();
-  assert.equal(writes, 0, "DSH_TUI_NO_SPLASH disables the animation");
+  assert.equal(writes, 0, "DSH_TUI_NO_SPLASH overrides the opt-in flag");
   process.env.DSH_TUI_NO_SPLASH = "0";
   app.playSplash();
-  assert.equal(writes, 29, "14 fade + 8 hold + 7 dissolve frames");
+  assert.equal(writes, 29, "14 fade + 8 hold + 7 dissolve frames when enabled");
+  app.launcherAnime = false;
+  app.playSplash();
+  assert.equal(writes, 29, "disabling the flag stops it again");
   app.term.output.write = write;
-  if (saved === undefined) delete process.env.DSH_TUI_NO_SPLASH; else process.env.DSH_TUI_NO_SPLASH = saved;
+  if (savedDisable === undefined) delete process.env.DSH_TUI_NO_SPLASH; else process.env.DSH_TUI_NO_SPLASH = savedDisable;
 });
 
 test("legacy one-slot keybinding values migrate to the new two-slot defaults", async () => {

@@ -3,6 +3,7 @@
 // Usage:
 //   dsh-tui                        interactive mode (needs a real terminal)
 //   dsh-tui --base http://host:port
+//   dsh-tui --launcher-anime       opt-in white fade-in boot animation
 //   dsh-tui --script <file>        scripted mode: feed events from a file, dump frames
 //   dsh-tui --plain                with --script: dump plain text frames (no ANSI)
 import { Term, detectKitty } from "../src/term.js";
@@ -29,9 +30,12 @@ async function main() {
     return;
   }
   // ---- interactive ----
+  // The boot animation is opt-in meme fuel: --launcher-anime enables it
+  // (DSH_TUI_LAUNCHER_ANIME=1 works too); it stays OFF by default.
+  const launcherAnime = has("--launcher-anime") || process.env.DSH_TUI_LAUNCHER_ANIME === "1";
   const screen = new Screen(process.stdout.columns || 80, process.stdout.rows || 24);
   const api = new Api({ base, log, onFrame: () => {}, onHostFrame: () => {} });
-  const app = new App({ screen, term: null, api, log });
+  const app = new App({ screen, term: null, api, log, launcherAnime });
   const term = new Term({
     output: process.stdout,
     kitty: detectKitty(),
