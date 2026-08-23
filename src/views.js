@@ -2765,8 +2765,10 @@ export class ChatView extends Widget {
     const brandY = top + (logoDrawn ? LOGO_ROWS + 1 : 0);
     const useWordmarks = h >= 32 && this.view.w >= 62;
     if (useWordmarks) {
+      // The band must run PAST the right edge: the final I of DSH NEOTUI sits
+      // at x0+57 (plus the ~0.6/row diagonal offset), so phase 1 lands ~x0+72.
       const bandX = this.app.brandShimmer >= 0
-        ? (x + Math.floor((this.view.w - 58) / 2) - 5 + this.app.brandShimmer * 72)
+        ? (x + Math.floor((this.view.w - 58) / 2) - 8 + this.app.brandShimmer * 80)
         : null;
       const glow = lerpColor(T.HEADING, 0xffffff, 0.18);
       const w1Y = brandY;
@@ -5838,9 +5840,10 @@ export class App {
       return;
     }
     if (this.brandSweep0 >= 0) {
-      if (now - this.brandSweep0 > 850) { this.brandSweep0 = -1; this.brandShimmer = -1; this.dirty = true; }
+      // 900ms so the very last tick reaches phase ~1.0 (the band's far end).
+      if (now - this.brandSweep0 > 900) { this.brandSweep0 = -1; this.brandShimmer = -1; this.dirty = true; }
       else {
-        const p = (now - this.brandSweep0) / 850;
+        const p = (now - this.brandSweep0) / 900;
         if (p !== this.brandShimmer) { this.brandShimmer = p; this.dirty = true; }
       }
     } else {

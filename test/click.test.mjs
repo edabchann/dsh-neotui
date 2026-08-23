@@ -4365,10 +4365,21 @@ test("welcome shimmer sweeps periodically only on a tall blank welcome", () => {
   app.tickWelcomeShimmer(2901);
   assert.ok(app.brandShimmer > 0 && app.brandShimmer < 1, "mid-sweep phase");
   assert.equal(app.dirty, true, "repaint requested during the sweep");
-  app.tickWelcomeShimmer(3461);
-  assert.equal(app.brandShimmer, -1, "sweep ended (850ms)");
+  app.tickWelcomeShimmer(3511);
+  assert.equal(app.brandShimmer, -1, "sweep ended (900ms)");
   app.tickWelcomeShimmer(2601 + 3500 + 1);
   assert.equal(app.brandSweep0, 2601 + 3500 + 1, "next sweep scheduled 3.5s later");
+  // the band's far end must light the trailing I of DSH NEOTUI (wordmark2
+  // x0 = 30 + floor((82-58)/2) = 42 → I at x 95..101, rows 25..28)
+  app.brandShimmer = 0.97;
+  app.chat.render(app.screen);
+  const litRows = app.screen.cells.map((row) => row.map((c) => c.fg));
+  app.brandShimmer = -1;
+  app.chat.render(app.screen);
+  const idleRows = app.screen.cells.map((row) => row.map((c) => c.fg));
+  let litI = false;
+  for (let y = 25; y <= 28 && !litI; y++) for (let x = 95; x <= 101; x++) if (litRows[y][x] !== idleRows[y][x]) { litI = true; break; }
+  assert.ok(litI, "the glint reaches the trailing I columns");
 });
 
 test("logo picker: Ctrl+R buffer switches preset / custom file / none and persists", () => {
