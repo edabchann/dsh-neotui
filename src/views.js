@@ -2844,20 +2844,31 @@ export class ChatView extends Widget {
     const GL = [" ", "▘", "▝", "▀", "▖", "▌", "▞", "▛", "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█"];
     for (let r = 0; r < LOGO_ROWS && top + r < hr; r++) {
       for (let c = 0; c < LOGO_COLS; c++) {
-        let mask, fi, bi;
+        let kind, mask, fi, bi;
         if (quadrant) {
           const cell = custom ? grid[r][c] : null;
-          if (cell) { mask = cell[0]; fi = cell[1]; bi = cell[2]; }
+          if (cell) { kind = cell.length === 4 ? cell[0] : 0; mask = cell.length === 4 ? cell[1] : cell[0]; fi = cell.length === 4 ? cell[2] : cell[1]; bi = cell.length === 4 ? cell[3] : cell[2]; }
           else {
-            // each cell = 3 bytes (mask,fg,bg) = 6 hex chars; low nibble =
-            // character quads, high nibble = second-color quads (full cells)
-            const i = (r * LOGO_COLS + c) * 6;
-            mask = parseInt(grid.slice(i, i + 2), 16); fi = parseInt(grid.slice(i + 2, i + 4), 16); bi = parseInt(grid.slice(i + 4, i + 6), 16);
+            // each cell = 4 bytes (type,mask,fg,bg) = 8 hex chars; type 0 =
+            // quadrant (low nibble character quads, high nibble 2nd-color
+            // quads), type 1 = braille (mouth region, 2x4 dots)
+            const i = (r * LOGO_COLS + c) * 8;
+            kind = parseInt(grid.slice(i, i + 2), 16);
+            mask = parseInt(grid.slice(i + 2, i + 4), 16);
+            fi = parseInt(grid.slice(i + 4, i + 6), 16);
+            bi = parseInt(grid.slice(i + 6, i + 8), 16);
+          }
+          if (kind === 0 && mask === 0 && fi === 0 && bi === 0) continue;
+          const fgc = fi ? (custom ? pal[fi] : parseInt(pal[fi - 1], 16)) : null;
+          const bgc = bi ? (custom ? pal[bi] : parseInt(pal[bi - 1], 16)) : null;
+          if (kind === 1) {
+            // braille mouth cell: 8 dots (2 cols x 4 rows), fg/bg pair
+            screen.put(cx + c, top + r, String.fromCharCode(0x2800 | (mask & 0xff)),
+              { fg: fgc ?? T.BG, bg: bgc ?? T.BG });
+            continue;
           }
           const fm = mask & 0x0f, cm = (mask >> 4) & 0x0f;
           if (fm === 0) continue;
-          const fgc = fi ? (custom ? pal[fi] : parseInt(pal[fi - 1], 16)) : null;
-          const bgc = bi ? (custom ? pal[bi] : parseInt(pal[bi - 1], 16)) : null;
           if (fm === 0x0f && bgc != null) {
             // full cell: second-color quads render as glyph bg → true 2×2.
             const glyph = GL[(~cm) & 0x0f];
