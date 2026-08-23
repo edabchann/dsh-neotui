@@ -4332,7 +4332,7 @@ test("blank welcome shows logo, TUI-drawn brand wordmarks and a bottom mode hint
   const rows = app.screen.cells.map((row) => row.map((cell) => cell.ch).join(""));
   const LOGO_GLYPHS = /[▀▄▘▝▖▗▚▞▙▛▜▟▌▐█]/;
   assert.ok(rows.slice(1, 29).some((row) => LOGO_GLYPHS.test(row)), "the 58x27 half-block logo is drawn");
-  assert.ok(rows.slice(29, 37).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 20), "DEEPSEEK / DSH NEOTUI wordmarks are TUI-drawn blocks");
+  assert.ok(rows.slice(22, 30).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 20), "DEEPSEEK / DSH NEOTUI wordmarks are TUI-drawn blocks");
   assert.ok(!rows.some((row) => row.includes("D E E P S E E K")), "the brand rows are not plain spaced text");
   assert.ok(rows.some((row) => row.includes("v0.1.0-rc.6")), "version shown beside the DSH wordmark");
   assert.ok(rows.some((row) => row.includes(`v${TUI_VERSION}`)), "version shown beside the TUI wordmark");
@@ -4341,7 +4341,7 @@ test("blank welcome shows logo, TUI-drawn brand wordmarks and a bottom mode hint
   assert.ok(rows.some((row) => row.includes("模式: 创造模式") && row.includes("F9")), "bottom hint shows the current preset and F9 entry");
   assert.ok(!rows.some((row) => row.includes("标准模式") && row.includes("○")), "the inline 4-mode list is gone");
   // shimmer: a mid-sweep lightens wordmark pixels toward white
-  const wrow = 32; // wordmark1 middle row: view y1 + logo 27 + blank + 1
+  const wrow = 23; // wordmark1 middle row (brandY 22 + 1)
   const before = app.screen.cells[wrow].map((c) => c.fg);
   app.brandShimmer = 0.5;
   app.chat.render(app.screen);
@@ -4377,17 +4377,21 @@ test("welcome shimmer sweeps periodically only on a tall blank welcome", () => {
   app.tickWelcomeShimmer(2601 + 3500 + 1);
   assert.equal(app.brandSweep0, 2601 + 3500 + 1, "next sweep scheduled 3.5s later");
   // the band's far end must light the trailing I of DSH NEOTUI: wordmark2
-  // rows start at 2+27+1+4 = 34 (view y 1, logo 27, blank 1, wordmark1 4)
-  const wm2 = 2 + 27 + 1 + 4;
-  app.brandShimmer = 0.97;
-  app.chat.render(app.screen);
-  const litRows = app.screen.cells.map((row) => row.map((c) => c.fg));
-  app.brandShimmer = -1;
+  // rows start at 2+19+1+4 = 26 (view y 1, logo 19, blank 1, wordmark1 4)
+  const wm2 = 2 + 19 + 1 + 4;
+  app.screen.prev = null;
   app.chat.render(app.screen);
   const idleRows = app.screen.cells.map((row) => row.map((c) => c.fg));
   let litI = false;
-  for (let y = wm2; y <= wm2 + 3 && !litI; y++) for (let x = 90; x <= 105; x++) if (litRows[y][x] !== idleRows[y][x]) { litI = true; break; }
-  assert.ok(litI, "the glint reaches the trailing I columns");
+  for (const phase of [0.8, 0.88, 0.95]) {
+    app.brandShimmer = phase;
+    app.chat.render(app.screen);
+    const litRows = app.screen.cells.map((row) => row.map((c) => c.fg));
+    for (let y = wm2; y <= wm2 + 3 && !litI; y++) for (let x = 88; x <= 100; x++) if (litRows[y][x] !== idleRows[y][x]) { litI = true; break; }
+    if (litI) break;
+  }
+  app.brandShimmer = -1;
+  assert.ok(litI, "the glint sweeps across the trailing I columns");
 });
 
 test("logo picker: Ctrl+R buffer switches preset / custom file / none and persists", () => {
