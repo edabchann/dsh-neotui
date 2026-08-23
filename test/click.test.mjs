@@ -4318,8 +4318,9 @@ test("footer jobs row is a single 后台任务 summary", () => {
   assert.equal(app.status.rows.length, 3, "footer has exactly one jobs row");
 });
 
-test("blank welcome shows logo, spaced brand rows and a bottom mode hint", () => {
-  const app = headlessApp();
+test("blank welcome shows logo, TUI-drawn brand wordmarks and a bottom mode hint", () => {
+  // tall view → half-block wordmarks with shimmer sweep support
+  const app = new App({ screen: new Screen(112, 36), term: { output: { chunks: [], write: (s) => { app.term.output.chunks.push(s); } } }, api: { call: async () => ({ items: [] }) }, log: () => {} });
   app.currentSession = "blank";
   app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "cordis" }];
   app.dshVersion = "0.1.0-rc.6";
@@ -4330,10 +4331,31 @@ test("blank welcome shows logo, spaced brand rows and a bottom mode hint", () =>
   app.layout(); app.chat.render(app.screen);
   const rows = app.screen.cells.map((row) => row.map((cell) => cell.ch).join(""));
   assert.ok(rows.slice(1, 21).some((row) => row.includes("▀") && row.includes("▄")), "the 40x19 half-block logo is drawn");
-  assert.ok(rows.some((row) => row.includes("D E E P S E E K") && row.includes("H A R N E S S") && row.includes("v0.1.0-rc.6") && row.includes("已是最新")), "spaced DSH brand row with update state");
-  assert.ok(rows.some((row) => row.includes("D S H") && row.includes("N E O T U I") && row.includes(`可更新 ${latestTui}`)), "spaced TUI brand row with update state");
+  assert.ok(rows.slice(21, 27).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 20), "DEEPSEEK / DSH NEOTUI wordmarks are TUI-drawn blocks");
+  assert.ok(!rows.some((row) => row.includes("D E E P S E E K")), "the brand rows are not plain spaced text");
+  assert.ok(rows.some((row) => row.includes("v0.1.0-rc.6") && row.includes("已是最新")), "DSH version/update row shown beside the wordmark");
+  assert.ok(rows.some((row) => row.includes(`v${TUI_VERSION}`) && row.includes(`可更新 ${latestTui}`)), "TUI version/update row shown beside the wordmark");
   assert.ok(rows.some((row) => row.includes("模式: 创造模式") && row.includes("F9")), "bottom hint shows the current preset and F9 entry");
   assert.ok(!rows.some((row) => row.includes("标准模式") && row.includes("○")), "the inline 4-mode list is gone");
+  // shimmer: a mid-sweep lightens wordmark pixels toward white
+  const before = app.screen.cells[22].map((c) => c.fg);
+  app.brandShimmer = 0.5;
+  app.chat.render(app.screen);
+  const after = app.screen.cells[22].map((c) => c.fg);
+  assert.ok(after.some((fg, i) => before[i] !== fg), "the diagonal shimmer lightens wordmark pixels");
+  app.brandShimmer = -1;
+});
+
+test("blank welcome falls back to spaced text on short views", () => {
+  const app = headlessApp(); // 100x30 → chat view 28 rows
+  app.currentSession = "blank";
+  app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "standard" }];
+  app.dshVersion = "0.1.0-rc.6";
+  app.chat.sessionId = "blank";
+  app.chat.nodes = [];
+  app.layout(); app.chat.render(app.screen);
+  const rows = app.screen.cells.map((row) => row.map((cell) => cell.ch).join(""));
+  assert.ok(rows.some((row) => row.includes("D E E P S E E K") && row.includes("H A R N E S S") && row.includes("v0.1.0-rc.6")), "short views keep the plain version-line fallback");
 });
 
 test("blank preset selection updates highlight immediately", async () => {

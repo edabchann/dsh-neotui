@@ -224,6 +224,55 @@ function lerpColor(a, b, t) {
   return ((Math.round(ar + (br - ar) * t) << 16) | (Math.round(ag + (bg2 - ag) * t) << 8) | Math.round(ab + (bb - ab) * t)) >>> 0;
 }
 
+// ---- Welcome brand wordmarks (TUI-drawn half-block letters) ----
+
+/** 4x6 pixel font for the welcome brand lines; renders like the splash's
+ *  DEEPSEEK wordmark (█▀▄), not as spaced plain text. */
+const BRAND_GLYPHS = {
+  A: ["0110", "1001", "1111", "1001", "1001", "1001"],
+  D: ["1110", "1001", "1001", "1001", "1001", "1110"],
+  E: ["1111", "1000", "1110", "1000", "1000", "1111"],
+  H: ["1001", "1001", "1111", "1001", "1001", "1001"],
+  K: ["1001", "1010", "1100", "1010", "1001", "1001"],
+  N: ["1001", "1101", "1011", "1001", "1001", "1001"],
+  O: ["0110", "1001", "1001", "1001", "1001", "0110"],
+  P: ["1110", "1001", "1001", "1110", "1000", "1000"],
+  R: ["1110", "1001", "1001", "1110", "1010", "1001"],
+  S: ["0111", "1000", "0110", "0001", "0001", "1110"],
+  T: ["1111", "0100", "0100", "0100", "0100", "0100"],
+  U: ["1001", "1001", "1001", "1001", "1001", "0110"],
+};
+
+/** Draw a half-block wordmark. `bandX` (nullable) places a diagonal shimmer
+ *  sweep: pixels near the band mix toward white, tilted ~0.7 cols/row. */
+function drawHalfBlockWordmark(screen, x0, y0, word, color, bandX, bg) {
+  const mix = (col, px, py) => {
+    if (bandX == null) return col;
+    const d = Math.abs((px + py * 0.7) - bandX);
+    if (d > 2.5) return col;
+    return lerpColor(col, 0xffffff, ((2.5 - d) / 2.5) * 0.6);
+  };
+  let cx = x0;
+  for (const ch of word) {
+    if (ch === " ") { cx += 4; continue; }
+    const rows = BRAND_GLYPHS[ch] ?? ["0000", "0000", "0000", "0000", "0000", "0000"];
+    for (let pr = 0; pr < 6; pr += 2) {
+      const topBits = rows[pr], botBits = rows[pr + 1];
+      const y = y0 + pr / 2;
+      for (let px = 0; px < 4; px++) {
+        const t = topBits[px] === "1", b = botBits[px] === "1";
+        if (!t && !b) continue;
+        const fc = mix(color, cx + px, y);
+        if (t && b) screen.put(cx + px, y, "▀", { fg: fc, bg: fc });
+        else if (t) screen.put(cx + px, y, "▀", { fg: fc, bg });
+        else screen.put(cx + px, y, "▄", { fg: fc, bg });
+      }
+    }
+    cx += 5;
+  }
+  return cx - x0 - 1;
+}
+
 /** One frame of the opt-in boot animation. Phases are driven by opaque
  *  numbers so the renderer stays pure and testable:
  *   diffuse 0..1  white circle expanding from the screen center over black;
@@ -2725,23 +2774,43 @@ export class ChatView extends Widget {
         }
       }
     }
-    // Brand + version rows (re-drawn to match): spaced caps + clickable update check.
-    const versionLine = (name, version, key, fg, bold, yy) => {
+    // Brand lines: TUI-drawn half-block wordmarks (like the splash), each with
+    // its clickable version/update row on the right; the diagonal shimmer
+    // sweeps across every ~4s. Falls back to spaced text on short/narrow views.
+    const versionText = (key, version) => {
       const check = this.app.versionChecks?.[key];
       const status = check?.state === "checking" ? "← 检查更新…"
         : check?.state === "current" ? "← 已是最新"
         : check?.state === "update" ? `← 可更新 ${check.latest}`
         : check?.state === "error" ? "← 检查失败（点击重试）"
         : "← 检查更新";
-      const spaced = [...name].join(" ");
-      const text = `${spaced}  ${version === "unknown" ? "版本未知" : `v${version}`}  ${status}`;
-      const tx = x + Math.max(0, Math.floor((this.view.w - strWidth(text)) / 2));
-      if (yy < top + h) screen.text(tx, yy, text, { fg, attrs: bold ? 1 : 0 });
-      this.welcomeVersionRows[yy] = { key, x1: tx, x2: tx + strWidth(text) - 1 };
+      return `${version === "unknown" ? "版本未知" : `v${version}`}  ${status}`;
     };
     const brandY = top + (this.view.w >= 48 ? LOGO_ROWS + 1 : 0);
-    versionLine("DEEPSEEK HARNESS", this.app.dshVersion ?? "unknown", "dsh", T.HEADING, true, brandY);
-    versionLine("DSH NEOTUI", TUI_VERSION, "tui", T.FAINT, false, brandY + 1);
+    const useWordmarks = h >= 29 && this.view.w >= 60;
+    if (useWordmarks) {
+      const bandX = this.app.brandShimmer >= 0
+        ? (x + Math.floor((this.view.w - 44) / 2) - 5 + this.app.brandShimmer * 58)
+        : null;
+      const glow = lerpColor(T.HEADING, 0xffffff, 0.18);
+      const w1Y = brandY;
+      drawHalfBlockWordmark(screen, x + Math.max(0, Math.floor((this.view.w - 39) / 2)), w1Y, "DEEPSEEK", glow, bandX, T.BG);
+      this.#putVersionRight(screen, w1Y + 1, "dsh", this.app.dshVersion ?? "unknown", T.HEADING, true);
+      const w2Y = w1Y + 3;
+      const glide = lerpColor(T.DIM, 0xffffff, 0.10);
+      drawHalfBlockWordmark(screen, x + Math.max(0, Math.floor((this.view.w - 44) / 2)), w2Y, "DSH NEOTUI", glide, bandX, T.BG);
+      this.#putVersionRight(screen, w2Y + 1, "tui", TUI_VERSION, T.FAINT, false);
+    } else {
+      const versionLine = (name, version, key, fg, bold, yy) => {
+        const spaced = [...name].join(" ");
+        const text = `${spaced}  ${versionText(key, version)}`;
+        const tx = x + Math.max(0, Math.floor((this.view.w - strWidth(text)) / 2));
+        if (yy < top + h) screen.text(tx, yy, text, { fg, attrs: bold ? 1 : 0 });
+        this.welcomeVersionRows[yy] = { key, x1: tx, x2: tx + strWidth(text) - 1 };
+      };
+      versionLine("DEEPSEEK HARNESS", this.app.dshVersion ?? "unknown", "dsh", T.HEADING, true, brandY);
+      versionLine("DSH NEOTUI", TUI_VERSION, "tui", T.FAINT, false, brandY + 1);
+    }
     // Bottom hint: current preset + F9 opens the (custom-mode friendly) picker.
     if (this.app.currentSession != null) {
       const currentPreset = this.app.sessions.find((s) => s.sessionId === this.app.currentSession)?.agentPreset;
@@ -2750,6 +2819,20 @@ export class ChatView extends Widget {
       const hx = x + Math.max(0, Math.floor((this.view.w - strWidth(hint)) / 2));
       screen.text(hx, this.welcomeModeRow, hint, { fg: T.WARN, attrs: 1 });
     }
+  }
+
+  /** Right-aligned version/update row for the wordmark brand lines. */
+  #putVersionRight(screen, y, key, version, fg, bold) {
+    const check = this.app.versionChecks?.[key];
+    const status = check?.state === "checking" ? "← 检查更新…"
+      : check?.state === "current" ? "← 已是最新"
+      : check?.state === "update" ? `← 可更新 ${check.latest}`
+      : check?.state === "error" ? "← 检查失败（点击重试）"
+      : "← 检查更新";
+    const text = `${version === "unknown" ? "版本未知" : `v${version}`}  ${status}`;
+    const tx = this.view.x + Math.max(0, this.view.w - strWidth(text) - 2);
+    if (y < this.view.y + this.view.h) screen.text(tx, y, text, { fg, attrs: bold ? 1 : 0 });
+    this.welcomeVersionRows[y] = { key, x1: tx, x2: tx + strWidth(text) - 1 };
   }
 
   render(screen) {
@@ -5563,6 +5646,25 @@ export class App {
     this.playSplash();
     const tick = () => {
       try {
+        // Welcome brand shimmer: a diagonal sweep across the wordmarks every
+        // ~4s (only when the blank welcome is actually on screen).
+        const welcomeUp = this.chat.nodes.length === 0
+          && (this.sessions.find((s) => s.sessionId === this.currentSession)?.blank ?? false)
+          && this.chat.view.h >= 29 && this.chat.view.w >= 60;
+        if (!welcomeUp) {
+          if (this.brandSweep0 >= 0 || this.brandShimmer >= 0) { this.brandSweep0 = -1; this.brandShimmer = -1; }
+        } else {
+          const now = Date.now();
+          if (this.brandSweep0 >= 0) {
+            if (now - this.brandSweep0 > 700) { this.brandSweep0 = -1; this.brandShimmer = -1; this.dirty = true; }
+            else {
+              const p = (now - this.brandSweep0) / 700;
+              if (p !== this.brandShimmer) { this.brandShimmer = p; this.dirty = true; }
+            }
+          } else if (now >= (this.brandShimmerNext ?? now + 3000)) {
+            this.brandSweep0 = now; this.brandShimmer = 0; this.brandShimmerNext = now + 4200; this.dirty = true;
+          }
+        }
         // While the splash waits for a key, only the blinking prompt is
         // repainted — the real UI must not render underneath it.
         if (this.splashWaiting) {
