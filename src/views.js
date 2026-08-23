@@ -3623,7 +3623,7 @@ export class App {
     // Welcome logo mode: "preset" (bundled mascot), "custom" (JSON file) or
     // "none" (title only). Persisted in the tui config file.
     const logoCfg = loadTuiConfig().logo ?? {};
-    this.logoMode = ["preset", "custom", "none"].includes(logoCfg.mode) ? logoCfg.mode : "preset";
+    this.logoMode = ["preset", "custom", "none"].includes(logoCfg.mode) ? logoCfg.mode : "none"; // mascot off by default; Ctrl+R re-enables
     this.logoStyle = logoCfg.style === "ascii" ? "ascii" : "pixel"; // pixel = quadrant blocks
     this.logoPath = logoCfg.path ?? null;
     this.logoData = null;       // decoded custom logo: { palette, grid }

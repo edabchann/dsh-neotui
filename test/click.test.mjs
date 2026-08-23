@@ -4328,10 +4328,11 @@ test("blank welcome shows logo, TUI-drawn brand wordmarks and a bottom mode hint
   app.versionChecks = { dsh: { state: "current", latest: "0.1.0-rc.6" }, tui: { state: "update", latest: latestTui } };
   app.chat.sessionId = "blank";
   app.chat.nodes = [];
+  app.logoMode = "preset"; // tests exercise the mascot; the default is none
   app.layout(); app.chat.render(app.screen);
   const rows = app.screen.cells.map((row) => row.map((cell) => cell.ch).join(""));
   const LOGO_GLYPHS = /[▀▄▘▝▖▗▚▞▙▛▜▟▌▐█]/;
-  assert.ok(rows.slice(1, 29).some((row) => LOGO_GLYPHS.test(row)), "the 58x27 half-block logo is drawn");
+  assert.ok(rows.slice(1, 21).some((row) => LOGO_GLYPHS.test(row)), "the 40x19 quadrant logo is drawn");
   assert.ok(rows.slice(22, 30).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 20), "DEEPSEEK / DSH NEOTUI wordmarks are TUI-drawn blocks");
   assert.ok(!rows.some((row) => row.includes("D E E P S E E K")), "the brand rows are not plain spaced text");
   assert.ok(rows.some((row) => row.includes("v0.1.0-rc.6")), "version shown beside the DSH wordmark");
@@ -4362,7 +4363,8 @@ test("welcome shimmer sweeps periodically only on a tall blank welcome", () => {
   tall.currentSession = "blank";
   tall.sessions = [{ sessionId: "blank", blank: true, agentPreset: "standard" }];
   tall.chat.sessionId = "blank"; tall.chat.nodes = [];
-  tall.layout(); // view 44x70 → 27-row logo + wordmarks fit
+  tall.logoMode = "preset";
+  tall.layout(); // view 44x70 → 19-row logo + wordmarks fit
   app = tall;
   app.tickWelcomeShimmer(1000);
   assert.equal(app.brandSweep0 ?? -1, -1, "idle before the first sweep");
