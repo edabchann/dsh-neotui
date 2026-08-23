@@ -13,7 +13,7 @@ import { bindingMatchFor, matchKeyBinding, CHAT_BINDING_ORDER, SIDEBAR_BINDING_O
 export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
-  modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker, FilePicker, AttachmentPanel,
+  modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker, AttachmentPanel,
   ImagePopup, kittyCapable, buildGoalPopup, GoalPanel, SettingsPanel, SubagentPanel,
   SkillsPanel, ControlPanel, JobsPanel, QueuePanel, ModelPanel, fmtMs, ThemePickerBuffer,
 } from "./panels.js";
@@ -4475,13 +4475,16 @@ export class App {
         this.closeOverlay();
         this.redraw();
       } else if (action === "custom") {
+        // Reuse the shared Ctrl+O / 新建工作区 picker (UploadPicker) in its
+        // single-select mode — same UI, same navigation, one file only.
         const dir = this.logoPath ? dirname(this.logoPath) : (this.sessions.find((s) => s.sessionId === this.currentSession)?.cwd ?? process.cwd());
-        this.overlay = new FilePicker(this, {
+        const picker = new UploadPicker(this, {
           startPath: dir,
-          onPick: (path) => this.#applyCustomLogo(path),
-          onCancel: () => { this.closeOverlay(); this.redraw(); },
+          single: true,
+          onPickFile: (path) => this.#applyCustomLogo(path),
+          onCancel: () => { this.overlay = null; this.focus(this.chat); this.redraw(); },
         });
-        this.redraw();
+        this.overlay = picker; this.focus(picker); this.redraw();
       }
     };
     const w = Math.max(1, Math.min(66, this.screen.w - 4)), ph = Math.max(1, Math.min(12, this.screen.h - 4));

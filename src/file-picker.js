@@ -49,10 +49,10 @@ class YnPopup extends Popup {
 }
 
 export class UploadPicker extends Widget {
-  constructor(app, { startPath, onUpload, onCancel, selectDirectories = false, onPickDirectory = null }) {
+  constructor(app, { startPath, onUpload, onCancel, selectDirectories = false, onPickDirectory = null, single = false, onPickFile = null }) {
     const w = Math.min(app.screen.w - 4, 120), h = Math.min(app.screen.h - 4, 34);
     super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h });
-    this.app = app; this.path = startPath; this.onUpload = onUpload; this.onCancel = onCancel; this.selectDirectories = selectDirectories; this.onPickDirectory = onPickDirectory;
+    this.app = app; this.path = startPath; this.onUpload = onUpload; this.onCancel = onCancel; this.selectDirectories = selectDirectories; this.onPickDirectory = onPickDirectory; this.single = single; this.onPickFile = onPickFile;
     this.all = []; this.sel = 0; this.selected = new Map(); this.filter = ''; this.filterInput = null; this.showHidden = false; this.pathPopup = null; this.imagePreview = null;
     this.load();
   }
@@ -81,6 +81,7 @@ export class UploadPicker extends Widget {
       this.confirmDirectory(it.path); return;
     }
     if (it.dir) { this.app.toast('不可选择文件夹'); return; }
+    if (this.single) { this.clearKitty(); this.onPickFile?.(it.path); return; }
     if (this.selected.has(it.path)) this.selected.delete(it.path); else this.selected.set(it.path, it);
     this.app.redraw();
   }
@@ -187,7 +188,14 @@ export class UploadPicker extends Widget {
     if (ev.name === 'down') { this.clearKitty(); this.sel = wrapIndex(this.sel + 1, this.items().length); return true; }
     if (ev.name === 'left') { this.goParent(); return true; }
     if (ev.name === 'right') { this.enterDir(); return true; }
-    if (ev.name === 'enter') { this.confirmUpload(); return true; }
+    if (ev.name === 'enter') {
+      if (this.single) {
+        const it = this.current();
+        if (it?.dir) { this.enterDir(); return true; }
+        if (it) { this.clearKitty(); this.onPickFile?.(it.path); return true; }
+      }
+      this.confirmUpload(); return true;
+    }
     if (ev.name === 'char' && ev.key === ' ') { this.toggle(); return true; }
     if (ev.name === 'char' && ev.key === '/') { this.startFilter(); return true; }
     return false;
