@@ -4320,7 +4320,7 @@ test("footer jobs row is a single 后台任务 summary", () => {
 
 test("blank welcome shows logo, TUI-drawn brand wordmarks and a bottom mode hint", () => {
   // tall view → half-block wordmarks with shimmer sweep support
-  const app = new App({ screen: new Screen(120, 40), term: { output: { chunks: [], write: (s) => { app.term.output.chunks.push(s); } } }, api: { call: async () => ({ items: [] }) }, log: () => {} });
+  const app = new App({ screen: new Screen(120, 46), term: { output: { chunks: [], write: (s) => { app.term.output.chunks.push(s); } } }, api: { call: async () => ({ items: [] }) }, log: () => {} });
   app.currentSession = "blank";
   app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "cordis" }];
   app.dshVersion = "0.1.0-rc.6";
@@ -4331,8 +4331,8 @@ test("blank welcome shows logo, TUI-drawn brand wordmarks and a bottom mode hint
   app.layout(); app.chat.render(app.screen);
   const rows = app.screen.cells.map((row) => row.map((cell) => cell.ch).join(""));
   const LOGO_GLYPHS = /[▀▄▘▝▖▗▚▞▙▛▜▟▌▐█]/;
-  assert.ok(rows.slice(1, 21).some((row) => LOGO_GLYPHS.test(row)), "the 40x19 quadrant logo is drawn");
-  assert.ok(rows.slice(21, 29).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 20), "DEEPSEEK / DSH NEOTUI wordmarks are TUI-drawn blocks");
+  assert.ok(rows.slice(1, 29).some((row) => LOGO_GLYPHS.test(row)), "the 58x27 half-block logo is drawn");
+  assert.ok(rows.slice(29, 37).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 20), "DEEPSEEK / DSH NEOTUI wordmarks are TUI-drawn blocks");
   assert.ok(!rows.some((row) => row.includes("D E E P S E E K")), "the brand rows are not plain spaced text");
   assert.ok(rows.some((row) => row.includes("v0.1.0-rc.6")), "version shown beside the DSH wordmark");
   assert.ok(rows.some((row) => row.includes(`v${TUI_VERSION}`)), "version shown beside the TUI wordmark");
@@ -4341,23 +4341,29 @@ test("blank welcome shows logo, TUI-drawn brand wordmarks and a bottom mode hint
   assert.ok(rows.some((row) => row.includes("模式: 创造模式") && row.includes("F9")), "bottom hint shows the current preset and F9 entry");
   assert.ok(!rows.some((row) => row.includes("标准模式") && row.includes("○")), "the inline 4-mode list is gone");
   // shimmer: a mid-sweep lightens wordmark pixels toward white
-  const before = app.screen.cells[22].map((c) => c.fg);
+  const wrow = 32; // wordmark1 middle row: view y1 + logo 27 + blank + 1
+  const before = app.screen.cells[wrow].map((c) => c.fg);
   app.brandShimmer = 0.5;
   app.chat.render(app.screen);
-  const after = app.screen.cells[22].map((c) => c.fg);
+  const after = app.screen.cells[wrow].map((c) => c.fg);
   assert.ok(after.some((fg, i) => before[i] !== fg), "the diagonal shimmer lightens wordmark pixels");
   app.brandShimmer = -1;
 });
 
 test("welcome shimmer sweeps periodically only on a tall blank welcome", () => {
-  const app = headlessApp(); // 100x30 → chat view 28 rows → gate closed
+  let app = headlessApp(); // 100x30 → chat view 28 rows → gate closed
   app.currentSession = "blank";
   app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "standard" }];
   app.chat.sessionId = "blank"; app.chat.nodes = [];
   app.layout();
   app.tickWelcomeShimmer(1000);
   assert.equal(app.brandShimmer, -1, "short view: never sweeps");
-  app.chat.resize(30, 1, 82, 34); // tall view (h=34>=31, w=82>=62) → shimmer active
+  const tall = new App({ screen: new Screen(100, 46), api: { call: async () => ({ items: [] }) }, term: { output: { chunks: [], write: () => {} } }, log: () => {} });
+  tall.currentSession = "blank";
+  tall.sessions = [{ sessionId: "blank", blank: true, agentPreset: "standard" }];
+  tall.chat.sessionId = "blank"; tall.chat.nodes = [];
+  tall.layout(); // view 44x70 → 27-row logo + wordmarks fit
+  app = tall;
   app.tickWelcomeShimmer(1000);
   assert.equal(app.brandSweep0 ?? -1, -1, "idle before the first sweep");
   app.tickWelcomeShimmer(2601); // first sweep is 1.5s after the gate opens
@@ -4370,8 +4376,9 @@ test("welcome shimmer sweeps periodically only on a tall blank welcome", () => {
   assert.equal(app.brandShimmer, -1, "sweep ended (900ms)");
   app.tickWelcomeShimmer(2601 + 3500 + 1);
   assert.equal(app.brandSweep0, 2601 + 3500 + 1, "next sweep scheduled 3.5s later");
-  // the band's far end must light the trailing I of DSH NEOTUI (wordmark2
-  // x0 = 30 + floor((82-58)/2) = 42 → I at x 95..101, rows 25..28)
+  // the band's far end must light the trailing I of DSH NEOTUI: wordmark2
+  // rows start at 2+27+1+4 = 34 (view y 1, logo 27, blank 1, wordmark1 4)
+  const wm2 = 2 + 27 + 1 + 4;
   app.brandShimmer = 0.97;
   app.chat.render(app.screen);
   const litRows = app.screen.cells.map((row) => row.map((c) => c.fg));
@@ -4379,12 +4386,12 @@ test("welcome shimmer sweeps periodically only on a tall blank welcome", () => {
   app.chat.render(app.screen);
   const idleRows = app.screen.cells.map((row) => row.map((c) => c.fg));
   let litI = false;
-  for (let y = 25; y <= 28 && !litI; y++) for (let x = 95; x <= 101; x++) if (litRows[y][x] !== idleRows[y][x]) { litI = true; break; }
+  for (let y = wm2; y <= wm2 + 3 && !litI; y++) for (let x = 90; x <= 105; x++) if (litRows[y][x] !== idleRows[y][x]) { litI = true; break; }
   assert.ok(litI, "the glint reaches the trailing I columns");
 });
 
 test("logo picker: Ctrl+R buffer switches preset / custom file / none and persists", () => {
-  const app = headlessApp();
+  let app = new App({ screen: new Screen(100, 40), api: { call: async () => ({ items: [] }) }, term: { output: { chunks: [], write: () => {} } }, log: () => {} });
   // Ctrl+R opens the picker buffer
   app.onEvent({ type: "key", name: "char", key: "r", ctrl: true, shift: false });
   assert.ok(app.overlay?.constructor?.name === "Picker", "Ctrl+R opens the logo picker buffer");

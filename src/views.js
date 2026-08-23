@@ -2759,18 +2759,24 @@ export class ChatView extends Widget {
     // 40x19 half-block logo, per mode: preset (bundled), custom (JSON file)
     // or none (title only). Centered on the 40-col block.
     this.welcomeVersionRows = [];
-    const logoH = this.view.w >= 48 ? this.#renderWelcomeLogo(screen, cx, top) : 0;
+    // the logo only fits when the view is tall enough for its own grid;
+    // otherwise the welcome falls back to the plain text brand lines.
+    const needRows = this.app.logoMode === "none" ? 0
+      : this.app.logoStyle === "ascii" && this.app.logoMode !== "custom" ? ASCII_LOGO_ROWS
+      : this.app.logoMode === "custom" ? (this.app.logoData?.grid?.length ?? LOGO_ROWS)
+      : (this.app.logoStyle === "ascii" ? ASCII_LOGO_ROWS : LOGO_ROWS);
+    const logoH = this.view.w >= 62 && h >= needRows + 6 ? this.#renderWelcomeLogo(screen, cx, top) : 0;
     const logoDrawn = logoH > 0;
     // Brand lines: TUI-drawn half-block wordmarks (like the splash), each with
     // its clickable version/update row on the right; the diagonal shimmer
     // sweeps across every ~4s. Falls back to spaced text on short/narrow views.
     const brandY = top + (logoDrawn ? logoH + 1 : 0);
-    const useWordmarks = h >= logoH + 13 && this.view.w >= 62;
+    const useWordmarks = h >= (logoH > 0 ? logoH + 13 : 32) && this.view.w >= 62;
     if (useWordmarks) {
       // The band must run PAST the right edge: the final I of DSH NEOTUI sits
       // at x0+57 (plus the ~0.6/row diagonal offset), so phase 1 lands ~x0+72.
       const bandX = this.app.brandShimmer >= 0
-        ? (x + Math.floor((this.view.w - 58) / 2) - 8 + this.app.brandShimmer * 80)
+        ? (x + Math.floor((this.view.w - 58) / 2) - 8 + this.app.brandShimmer * 88)
         : null;
       const glow = lerpColor(T.HEADING, 0xffffff, 0.18);
       const w1Y = brandY;
@@ -2842,11 +2848,13 @@ export class ChatView extends Widget {
     }
     // mask → glyph: bits tl/tr/bl/br (quadrant blocks render width 1).
     const GL = [" ", "▘", "▝", "▀", "▖", "▌", "▞", "▛", "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█"];
-    for (let r = 0; r < LOGO_ROWS && top + r < hr; r++) {
-      for (let c = 0; c < LOGO_COLS; c++) {
+    const rows = custom ? grid.length : LOGO_ROWS;
+    const cols = custom ? (grid[0]?.length ?? LOGO_COLS) : LOGO_COLS;
+    for (let r = 0; r < rows && top + r < hr; r++) {
+      for (let c = 0; c < cols; c++) {
         let kind, mask, fi, bi;
         if (quadrant) {
-          const cell = custom ? grid[r][c] : null;
+          const cell = custom ? grid[r]?.[c] : null;
           if (cell) { kind = cell.length === 4 ? cell[0] : 0; mask = cell.length === 4 ? cell[1] : cell[0]; fi = cell.length === 4 ? cell[2] : cell[1]; bi = cell.length === 4 ? cell[3] : cell[2]; }
           else {
             // each cell = 4 bytes (type,mask,fg,bg) = 8 hex chars; type 0 =
@@ -2865,6 +2873,11 @@ export class ChatView extends Widget {
             // braille mouth cell: 8 dots (2 cols x 4 rows), fg/bg pair
             screen.put(cx + c, top + r, String.fromCharCode(0x2800 | (mask & 0xff)),
               { fg: fgc ?? T.BG, bg: bgc ?? T.BG });
+            continue;
+          }
+          if (kind === 2) {
+            // half-block: one cell = one full-width pixel pair (top/bottom)
+            screen.put(cx + c, top + r, "▀", { fg: fgc ?? T.BG, bg: bgc ?? T.BG });
             continue;
           }
           const fm = mask & 0x0f, cm = (mask >> 4) & 0x0f;
@@ -4568,10 +4581,12 @@ export class App {
   loadCustomLogo(path) {
     const data = JSON.parse(readFileSync(path, "utf8"));
     const pal = data?.palette, grid = data?.grid;
-    if (!Array.isArray(pal) || !Array.isArray(grid) || grid.length !== LOGO_ROWS
-      || grid.some((row) => !Array.isArray(row) || row.length !== LOGO_COLS)
+    const rows = grid?.length, cols = grid?.[0]?.length;
+    if (!Array.isArray(pal) || !Array.isArray(grid) || (rows !== LOGO_ROWS && rows !== 19)
+      || grid.some((row) => !Array.isArray(row) || row.length !== cols)
+      || (cols !== LOGO_COLS && cols !== 40)
       || pal.length < 1 || pal.length > 65535) {
-      throw new Error("需要 { palette:[…], grid:[...] } 且为 40×19");
+      throw new Error(`需要 { palette:[…], grid:[...] } 且为 58×27 或 40×19（得到 ${rows ?? "?"}×${cols ?? "?"}）`);
     }
     const norm = pal.map((c) => {
       if (Array.isArray(c) && c.length >= 3) return ((c[0] << 16) | (c[1] << 8) | c[2]) >>> 0;
