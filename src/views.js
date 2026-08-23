@@ -250,9 +250,9 @@ const BRAND_GLYPHS = {
 function drawHalfBlockWordmark(screen, x0, y0, word, color, bandX, bg) {
   const mix = (col, px, py) => {
     if (bandX == null) return col;
-    const d = Math.abs((px + py * 0.7) - bandX);
+    const d = Math.abs((px + py * 0.6) - bandX);
     if (d > 2.5) return col;
-    return lerpColor(col, 0xffffff, ((2.5 - d) / 2.5) * 0.6);
+    return lerpColor(col, 0xffffff, ((2.5 - d) / 2.5) * 0.7);
   };
   let cx = x0;
   for (const ch of word) {
@@ -2773,7 +2773,7 @@ export class ChatView extends Widget {
       drawHalfBlockWordmark(screen, x + Math.max(0, Math.floor((this.view.w - 47) / 2)), w1Y, "DEEPSEEK", glow, bandX, T.BG);
       this.#putVersionRight(screen, w1Y + 1, "dsh", this.app.dshVersion ?? "unknown", T.HEADING, true);
       const w2Y = w1Y + 4;
-      const glide = lerpColor(T.DIM, 0xffffff, 0.10);
+      const glide = T.FAINT; // dark enough for the white glint to pop
       drawHalfBlockWordmark(screen, x + Math.max(0, Math.floor((this.view.w - 58) / 2)), w2Y, "DSH NEOTUI", glide, bandX, T.BG);
       this.#putVersionRight(screen, w2Y + 1, "tui", TUI_VERSION, T.FAINT, false);
       // Update/check notices live at the bottom (only when not latest).
