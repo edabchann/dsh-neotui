@@ -2832,15 +2832,23 @@ export class ChatView extends Widget {
           const cell = custom ? grid[r][c] : null;
           if (cell) { mask = cell[0]; fi = cell[1]; bi = cell[2]; }
           else {
-            // each cell = 3 bytes (mask,fg,bg) = 6 hex chars
+            // each cell = 3 bytes (mask,fg,bg) = 6 hex chars; low nibble =
+            // character quads, high nibble = second-color quads (full cells)
             const i = (r * LOGO_COLS + c) * 6;
             mask = parseInt(grid.slice(i, i + 2), 16); fi = parseInt(grid.slice(i + 2, i + 4), 16); bi = parseInt(grid.slice(i + 4, i + 6), 16);
           }
-          const full = mask === 0x0f;
-          if (mask === 0) continue;
+          const fm = mask & 0x0f, cm = (mask >> 4) & 0x0f;
+          if (fm === 0) continue;
           const fgc = fi ? (custom ? pal[fi] : parseInt(pal[fi - 1], 16)) : null;
           const bgc = bi ? (custom ? pal[bi] : parseInt(pal[bi - 1], 16)) : null;
-          screen.put(cx + c, top + r, GL[mask], { fg: fgc ?? T.BG, bg: full && bgc ? bgc : T.BG });
+          if (fm === 0x0f && bgc != null) {
+            // full cell: second-color quads render as glyph bg → true 2×2.
+            const glyph = GL[(~cm) & 0x0f];
+            screen.put(cx + c, top + r, glyph, { fg: fgc ?? T.BG, bg: bgc });
+          } else {
+            // partial: character quads in fg over the transparent background.
+            screen.put(cx + c, top + r, GL[fm], { fg: fgc ?? T.BG, bg: T.BG });
+          }
         } else {
           const cell = custom ? grid[r][c] : null;
           let topIdx, botIdx;
@@ -4542,9 +4550,9 @@ export class App {
       for (const cell of row) {
         if (!Array.isArray(cell) || !Number.isInteger(cell[0])) throw new Error("grid 单元必须是数组");
         if (fmt === "quadrant") {
-          if (cell.length !== 3 || cell[0] < 0 || cell[0] > 0x0f || cell[1] < -1 || cell[2] < -1
+          if (cell.length !== 3 || cell[0] < 0 || cell[0] > 0xff || cell[1] < -1 || cell[2] < -1
             || cell[1] >= norm.length || cell[2] >= norm.length) {
-            throw new Error("quadrant 单元必须是 [mask(0-15), fg, bg] 且索引在调色板范围内");
+            throw new Error("quadrant 单元必须是 [maskByte, fg, bg] 且索引在调色板范围内（mask 低四位=角色象限，高四位=第二色象限）");
           }
         } else {
           if (cell.length !== 2 || cell[0] < -1 || cell[1] < -1
