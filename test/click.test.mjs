@@ -4330,7 +4330,8 @@ test("blank welcome shows logo, TUI-drawn brand wordmarks and a bottom mode hint
   app.chat.nodes = [];
   app.layout(); app.chat.render(app.screen);
   const rows = app.screen.cells.map((row) => row.map((cell) => cell.ch).join(""));
-  assert.ok(rows.slice(1, 21).some((row) => row.includes("▀") && row.includes("▄")), "the 40x19 half-block logo is drawn");
+  const LOGO_GLYPHS = /[▀▄▘▝▖▗▚▞▙▛▜▟▌▐█]/;
+  assert.ok(rows.slice(1, 21).some((row) => LOGO_GLYPHS.test(row)), "the 40x19 quadrant logo is drawn");
   assert.ok(rows.slice(21, 29).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 20), "DEEPSEEK / DSH NEOTUI wordmarks are TUI-drawn blocks");
   assert.ok(!rows.some((row) => row.includes("D E E P S E E K")), "the brand rows are not plain spaced text");
   assert.ok(rows.some((row) => row.includes("v0.1.0-rc.6")), "version shown beside the DSH wordmark");
@@ -4404,19 +4405,19 @@ test("logo picker: Ctrl+R buffer switches preset / custom file / none and persis
   app.chat.sessionId = "blank"; app.chat.nodes = [];
   app.layout(); app.chat.render(app.screen);
   const rows = app.screen.cells.map((row) => row.map((cell) => cell.ch).join(""));
-  assert.ok(rows.slice(1, 21).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 30), "custom logo drawn from the JSON");
+  assert.ok(rows.slice(1, 21).some((row) => (row.match(/[▀▄▘▝▖▗▚▞▙▛▜▟▌▐█]/g) ?? []).length >= 30), "custom logo drawn from the JSON");
   // none → title-only (no mascot blocks)
   app.showLogoPicker(); app.overlay.onPick({ action: "none" });
   assert.equal(app.logoMode, "none");
   app.layout(); app.renderFrame();
   const rows2 = app.screen.prev.map((row) => row.map((cell) => cell.ch).join(""));
-  assert.ok(!rows2.slice(1, 21).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 30), "mascot logo hidden in none mode (title wordmarks may remain)");
+  assert.ok(!rows2.slice(1, 21).some((row) => (row.match(/[▀▄▘▝▖▗▚▞▙▛▜▟▌▐█]/g) ?? []).length >= 30), "mascot logo hidden in none mode (title wordmarks may remain)");
   // back to preset
   app.showLogoPicker(); app.overlay.onPick({ action: "preset" });
   assert.equal(app.logoMode, "preset");
   app.layout(); app.renderFrame();
   const rows3 = app.screen.prev.map((row) => row.map((cell) => cell.ch).join(""));
-  assert.ok(rows3.slice(1, 21).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 30), "preset logo restored");
+  assert.ok(rows3.slice(1, 21).some((row) => (row.match(/[▀▄▘▝▖▗▚▞▙▛▜▟▌▐█]/g) ?? []).length >= 15), "preset logo restored (quadrant)");
   unlinkSync(file);
   saveTuiConfig({ logo: { mode: "preset", path: null } });
 });

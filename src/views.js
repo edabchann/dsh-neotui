@@ -2802,12 +2802,15 @@ export class ChatView extends Widget {
     }
   }
 
-  /** The 40x19 half-block mascot for the current logo mode. */
+  /** The 40x19 mascot for the current logo mode, rendered as 2x2 quadrant
+   *  blocks (80x38 effective pixels). Grid cells are either half-block pairs
+   *  [top, bottom] (legacy) or quadrant triples [mask, fg, bg]. */
   #renderWelcomeLogo(screen, cx, top) {
     if (this.app.logoMode === "none") return false;
     const hr = this.view.y + this.view.h;
-    let pal, grid;
-    if (this.app.logoMode === "custom") {
+    const custom = this.app.logoMode === "custom";
+    let pal, grid, quadrant = !custom;
+    if (custom) {
       if (!this.app.logoData) {
         if (this.app.logoPath) {
           try { this.app.logoData = this.app.loadCustomLogo(this.app.logoPath); }
@@ -2816,30 +2819,47 @@ export class ChatView extends Widget {
         if (!this.app.logoData) return false;
       }
       pal = this.app.logoData.palette; grid = this.app.logoData.grid;
+      quadrant = this.app.logoData.quadrant !== false;
     } else {
       pal = LOGO_PALETTE; grid = LOGO_GRID;
     }
+    // mask → glyph: bits tl/tr/bl/br (quadrant blocks render width 1).
+    const GL = [" ", "▘", "▝", "▀", "▖", "▌", "▞", "▛", "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█"];
     for (let r = 0; r < LOGO_ROWS && top + r < hr; r++) {
       for (let c = 0; c < LOGO_COLS; c++) {
-        let topIdx, botIdx;
-        if (this.app.logoMode === "custom") {
-          const cell = grid[r][c];
-          topIdx = cell[0]; botIdx = cell[1];
+        let mask, fi, bi;
+        if (quadrant) {
+          const cell = custom ? grid[r][c] : null;
+          if (cell) { mask = cell[0]; fi = cell[1]; bi = cell[2]; }
+          else {
+            // each cell = 3 bytes (mask,fg,bg) = 6 hex chars
+            const i = (r * LOGO_COLS + c) * 6;
+            mask = parseInt(grid.slice(i, i + 2), 16); fi = parseInt(grid.slice(i + 2, i + 4), 16); bi = parseInt(grid.slice(i + 4, i + 6), 16);
+          }
+          const full = mask === 0x0f;
+          if (mask === 0) continue;
+          const fgc = fi ? (custom ? pal[fi] : parseInt(pal[fi - 1], 16)) : null;
+          const bgc = bi ? (custom ? pal[bi] : parseInt(pal[bi - 1], 16)) : null;
+          screen.put(cx + c, top + r, GL[mask], { fg: fgc ?? T.BG, bg: full && bgc ? bgc : T.BG });
         } else {
-          const i = (r * LOGO_COLS + c) * 4;
-          topIdx = parseInt(grid.slice(i, i + 2), 16);
-          botIdx = parseInt(grid.slice(i + 2, i + 4), 16);
+          const cell = custom ? grid[r][c] : null;
+          let topIdx, botIdx;
+          if (cell) { topIdx = cell[0]; botIdx = cell[1]; }
+          else {
+            const i = (r * LOGO_COLS + c) * 4;
+            topIdx = parseInt(grid.slice(i, i + 2), 16);
+            botIdx = parseInt(grid.slice(i + 2, i + 4), 16);
+          }
+          const emptyT = custom ? topIdx < 0 : topIdx === 0;
+          const emptyB = custom ? botIdx < 0 : botIdx === 0;
+          if (emptyT && emptyB) continue;
+          const pal32 = (pi) => (custom ? pal[pi] : parseInt(pal[pi], 16));
+          const tcol = emptyT ? null : pal32(custom ? topIdx : topIdx - 1);
+          const bcol = emptyB ? null : pal32(custom ? botIdx : botIdx - 1);
+          const fgc = tcol ?? bcol ?? T.BG;
+          const bgc = bcol ?? T.BG;
+          screen.put(cx + c, top + r, tcol != null ? "▀" : "▄", { fg: fgc, bg: bgc });
         }
-        const custom = this.app.logoMode === "custom";
-        const emptyT = custom ? topIdx < 0 : topIdx === 0;
-        const emptyB = custom ? botIdx < 0 : botIdx === 0;
-        if (emptyT && emptyB) continue;
-        const pal32 = (pi) => (custom ? pal[pi] : parseInt(pal[pi], 16));
-        const tcol = emptyT ? null : pal32(custom ? topIdx : topIdx - 1);
-        const bcol = emptyB ? null : pal32(custom ? botIdx : botIdx - 1);
-        const fgc = tcol ?? bcol ?? T.BG;
-        const bgc = bcol ?? T.BG;
-        screen.put(cx + c, top + r, tcol != null ? "▀" : "▄", { fg: fgc, bg: bgc });
       }
     }
     return true;
@@ -4508,7 +4528,7 @@ export class App {
     if (!Array.isArray(pal) || !Array.isArray(grid) || grid.length !== LOGO_ROWS
       || grid.some((row) => !Array.isArray(row) || row.length !== LOGO_COLS)
       || pal.length < 1 || pal.length > 65535) {
-      throw new Error("需要 { palette:[…], grid:[[top,bottom]...] } 且为 40×19");
+      throw new Error("需要 { palette:[…], grid:[...] } 且为 40×19");
     }
     const norm = pal.map((c) => {
       if (Array.isArray(c) && c.length >= 3) return ((c[0] << 16) | (c[1] << 8) | c[2]) >>> 0;
@@ -4516,15 +4536,25 @@ export class App {
       return NaN;
     });
     if (norm.some((c) => Number.isNaN(c) || c < 0 || c > 0xffffff)) throw new Error("调色板条目必须是 [r,g,b] 或 #rrggbb");
+    // Cells: [top, bottom] = half-block (legacy) or [mask, fg, bg] = quadrant.
+    const fmt = grid[0][0]?.length === 3 ? "quadrant" : "half";
     for (const row of grid) {
       for (const cell of row) {
-        if (!Array.isArray(cell) || cell.length !== 2 || cell[0] < -1 || cell[1] < -1
-          || cell[0] >= norm.length || cell[1] >= norm.length || !Number.isInteger(cell[0]) || !Number.isInteger(cell[1])) {
-          throw new Error("grid 必须是 [[top,bottom]...] 且索引在调色板范围内");
+        if (!Array.isArray(cell) || !Number.isInteger(cell[0])) throw new Error("grid 单元必须是数组");
+        if (fmt === "quadrant") {
+          if (cell.length !== 3 || cell[0] < 0 || cell[0] > 0x0f || cell[1] < -1 || cell[2] < -1
+            || cell[1] >= norm.length || cell[2] >= norm.length) {
+            throw new Error("quadrant 单元必须是 [mask(0-15), fg, bg] 且索引在调色板范围内");
+          }
+        } else {
+          if (cell.length !== 2 || cell[0] < -1 || cell[1] < -1
+            || cell[0] >= norm.length || cell[1] >= norm.length || !Number.isInteger(cell[1])) {
+            throw new Error("half 单元必须是 [top, bottom] 且索引在调色板范围内");
+          }
         }
       }
     }
-    return { palette: norm, grid };
+    return { palette: norm, grid, quadrant: fmt === "quadrant" };
   }
 
   #applyCustomLogo(path) {
