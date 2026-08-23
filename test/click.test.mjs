@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { userInfo } from "node:os";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion, drawBootSplash } from "../src/views.js";
@@ -4333,8 +4333,10 @@ test("blank welcome shows logo, TUI-drawn brand wordmarks and a bottom mode hint
   assert.ok(rows.slice(1, 21).some((row) => row.includes("▀") && row.includes("▄")), "the 40x19 half-block logo is drawn");
   assert.ok(rows.slice(21, 27).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 20), "DEEPSEEK / DSH NEOTUI wordmarks are TUI-drawn blocks");
   assert.ok(!rows.some((row) => row.includes("D E E P S E E K")), "the brand rows are not plain spaced text");
-  assert.ok(rows.some((row) => row.includes("v0.1.0-rc.6") && row.includes("已是最新")), "DSH version/update row shown beside the wordmark");
-  assert.ok(rows.some((row) => row.includes(`v${TUI_VERSION}`) && row.includes(`可更新 ${latestTui}`)), "TUI version/update row shown beside the wordmark");
+  assert.ok(rows.some((row) => row.includes("v0.1.0-rc.6")), "version shown beside the DSH wordmark");
+  assert.ok(rows.some((row) => row.includes(`v${TUI_VERSION}`)), "version shown beside the TUI wordmark");
+  assert.ok(!rows.some((row) => row.includes("已是最新")), "no update text when a product is current");
+  assert.ok(rows.some((row) => row.includes("dsh-neotui 可更新") && row.includes(latestTui)), "pending update hinted at the bottom");
   assert.ok(rows.some((row) => row.includes("模式: 创造模式") && row.includes("F9")), "bottom hint shows the current preset and F9 entry");
   assert.ok(!rows.some((row) => row.includes("标准模式") && row.includes("○")), "the inline 4-mode list is gone");
   // shimmer: a mid-sweep lightens wordmark pixels toward white
@@ -4344,6 +4346,66 @@ test("blank welcome shows logo, TUI-drawn brand wordmarks and a bottom mode hint
   const after = app.screen.cells[22].map((c) => c.fg);
   assert.ok(after.some((fg, i) => before[i] !== fg), "the diagonal shimmer lightens wordmark pixels");
   app.brandShimmer = -1;
+});
+
+test("welcome shimmer sweeps periodically only on a tall blank welcome", () => {
+  const app = headlessApp(); // 100x30 → chat view 28 rows → gate closed
+  app.currentSession = "blank";
+  app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "standard" }];
+  app.chat.sessionId = "blank"; app.chat.nodes = [];
+  app.layout();
+  app.tickWelcomeShimmer(1000);
+  assert.equal(app.brandShimmer, -1, "short view: never sweeps");
+  app.chat.resize(30, 1, 82, 34); // tall view → shimmer active
+  app.tickWelcomeShimmer(1000);
+  assert.equal(app.brandSweep0 ?? -1, -1, "idle before the first sweep");
+  app.tickWelcomeShimmer(2601); // first sweep is 1.5s after the gate opens
+  assert.equal(app.brandSweep0, 2601, "first sweep starts");
+  assert.equal(app.brandShimmer, 0, "sweep at phase 0");
+  app.tickWelcomeShimmer(2901);
+  assert.ok(app.brandShimmer > 0 && app.brandShimmer < 1, "mid-sweep phase");
+  assert.equal(app.dirty, true, "repaint requested during the sweep");
+  app.tickWelcomeShimmer(3461);
+  assert.equal(app.brandShimmer, -1, "sweep ended (850ms)");
+  app.tickWelcomeShimmer(2601 + 3500 + 1);
+  assert.equal(app.brandSweep0, 2601 + 3500 + 1, "next sweep scheduled 3.5s later");
+});
+
+test("logo picker: Ctrl+R buffer switches preset / custom file / none and persists", () => {
+  const app = headlessApp();
+  // Ctrl+R opens the picker buffer
+  app.onEvent({ type: "key", name: "char", key: "r", ctrl: true, shift: false });
+  assert.ok(app.overlay?.constructor?.name === "Picker", "Ctrl+R opens the logo picker buffer");
+  // custom → Yazi-style single-select file picker
+  const logoJson = { palette: [[255, 80, 80], [80, 255, 80]], grid: Array.from({ length: 19 }, () => Array.from({ length: 40 }, () => [-1, 0])) };
+  const file = join(tmpdir(), "dsh-tui-logo-test.json");
+  writeFileSync(file, JSON.stringify(logoJson));
+  app.overlay.onPick({ action: "custom" });
+  assert.ok(app.overlay?.constructor?.name === "FilePicker", "custom opens the file picker");
+  app.overlay.onPick(file);
+  assert.equal(app.logoMode, "custom");
+  assert.equal(app.logoPath, file);
+  assert.equal(app.logoData.palette.length, 2, "custom palette decoded");
+  app.currentSession = "blank";
+  app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "standard" }];
+  app.chat.sessionId = "blank"; app.chat.nodes = [];
+  app.layout(); app.chat.render(app.screen);
+  const rows = app.screen.cells.map((row) => row.map((cell) => cell.ch).join(""));
+  assert.ok(rows.slice(1, 21).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 30), "custom logo drawn from the JSON");
+  // none → title-only (no mascot blocks)
+  app.showLogoPicker(); app.overlay.onPick({ action: "none" });
+  assert.equal(app.logoMode, "none");
+  app.layout(); app.renderFrame();
+  const rows2 = app.screen.prev.map((row) => row.map((cell) => cell.ch).join(""));
+  assert.ok(!rows2.slice(1, 21).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 30), "mascot logo hidden in none mode (title wordmarks may remain)");
+  // back to preset
+  app.showLogoPicker(); app.overlay.onPick({ action: "preset" });
+  assert.equal(app.logoMode, "preset");
+  app.layout(); app.renderFrame();
+  const rows3 = app.screen.prev.map((row) => row.map((cell) => cell.ch).join(""));
+  assert.ok(rows3.slice(1, 21).some((row) => (row.match(/[▀▄]/g) ?? []).length >= 30), "preset logo restored");
+  unlinkSync(file);
+  saveTuiConfig({ logo: { mode: "preset", path: null } });
 });
 
 test("blank welcome falls back to spaced text on short views", () => {

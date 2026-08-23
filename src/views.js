@@ -233,6 +233,7 @@ const BRAND_GLYPHS = {
   D: ["1110", "1001", "1001", "1001", "1001", "1110"],
   E: ["1111", "1000", "1110", "1000", "1000", "1111"],
   H: ["1001", "1001", "1111", "1001", "1001", "1001"],
+  I: ["0110", "0110", "0110", "0110", "0110", "0110"],
   K: ["1001", "1010", "1100", "1010", "1001", "1001"],
   N: ["1001", "1101", "1011", "1001", "1001", "1001"],
   O: ["0110", "1001", "1001", "1001", "1001", "0110"],
@@ -2753,40 +2754,14 @@ export class ChatView extends Widget {
     const cx = x + Math.max(0, Math.floor((this.view.w - 40) / 2));
     const h = this.view.h, top = this.view.y + 1;
     const put = (t, fg, bold, yy) => { if (yy < top + h) screen.text(cx, yy, t, { fg, attrs: bold ? 1 : 0 }); };
-    // 40x19 half-block logo (real colors), centered on the 40-col block.
+    // 40x19 half-block logo, per mode: preset (bundled), custom (JSON file)
+    // or none (title only). Centered on the 40-col block.
     this.welcomeVersionRows = [];
-    if (this.view.w >= 48) {
-      const ly = top;
-      for (let r = 0; r < LOGO_ROWS && ly + r < top + h; r++) {
-        for (let c = 0; c < LOGO_COLS; c++) {
-          // each cell = 2 palette indices × 2 hex chars each
-          const i = (r * LOGO_COLS + c) * 4;
-          const topIdx = parseInt(LOGO_GRID.slice(i, i + 2), 16);
-          const botIdx = parseInt(LOGO_GRID.slice(i + 2, i + 4), 16);
-          if (topIdx === 0 && botIdx === 0) continue;
-          const tcol = topIdx ? parseInt(LOGO_PALETTE[topIdx - 1], 16) : null;
-          const bcol = botIdx ? parseInt(LOGO_PALETTE[botIdx - 1], 16) : null;
-          // Half-block glyph: upper half renders fg, lower half renders bg.
-          // top-only → "▀" fg=top; bottom-only → "▄" fg=bottom; both → "▀" fg=top bg=bottom.
-          const fgc = tcol ?? bcol ?? T.BG;
-          const bgc = bcol ?? T.BG;
-          screen.put(cx + c, ly + r, tcol ? "▀" : "▄", { fg: fgc, bg: bgc });
-        }
-      }
-    }
+    const logoDrawn = this.view.w >= 48 && this.#renderWelcomeLogo(screen, cx, top);
     // Brand lines: TUI-drawn half-block wordmarks (like the splash), each with
     // its clickable version/update row on the right; the diagonal shimmer
     // sweeps across every ~4s. Falls back to spaced text on short/narrow views.
-    const versionText = (key, version) => {
-      const check = this.app.versionChecks?.[key];
-      const status = check?.state === "checking" ? "← 检查更新…"
-        : check?.state === "current" ? "← 已是最新"
-        : check?.state === "update" ? `← 可更新 ${check.latest}`
-        : check?.state === "error" ? "← 检查失败（点击重试）"
-        : "← 检查更新";
-      return `${version === "unknown" ? "版本未知" : `v${version}`}  ${status}`;
-    };
-    const brandY = top + (this.view.w >= 48 ? LOGO_ROWS + 1 : 0);
+    const brandY = top + (logoDrawn ? LOGO_ROWS + 1 : 0);
     const useWordmarks = h >= 29 && this.view.w >= 60;
     if (useWordmarks) {
       const bandX = this.app.brandShimmer >= 0
@@ -2800,36 +2775,103 @@ export class ChatView extends Widget {
       const glide = lerpColor(T.DIM, 0xffffff, 0.10);
       drawHalfBlockWordmark(screen, x + Math.max(0, Math.floor((this.view.w - 44) / 2)), w2Y, "DSH NEOTUI", glide, bandX, T.BG);
       this.#putVersionRight(screen, w2Y + 1, "tui", TUI_VERSION, T.FAINT, false);
+      // Update/check notices live at the bottom (only when not latest).
+      this.#putUpdateHints(screen, top, h);
     } else {
       const versionLine = (name, version, key, fg, bold, yy) => {
         const spaced = [...name].join(" ");
-        const text = `${spaced}  ${versionText(key, version)}`;
+        const text = `${spaced}  ${version === "unknown" ? "版本未知" : `v${version}`}`;
         const tx = x + Math.max(0, Math.floor((this.view.w - strWidth(text)) / 2));
         if (yy < top + h) screen.text(tx, yy, text, { fg, attrs: bold ? 1 : 0 });
         this.welcomeVersionRows[yy] = { key, x1: tx, x2: tx + strWidth(text) - 1 };
       };
       versionLine("DEEPSEEK HARNESS", this.app.dshVersion ?? "unknown", "dsh", T.HEADING, true, brandY);
       versionLine("DSH NEOTUI", TUI_VERSION, "tui", T.FAINT, false, brandY + 1);
+      this.#putUpdateHints(screen, top, h);
     }
     // Bottom hint: current preset + F9 opens the (custom-mode friendly) picker.
     if (this.app.currentSession != null) {
       const currentPreset = this.app.sessions.find((s) => s.sessionId === this.app.currentSession)?.agentPreset;
-      const hint = `模式: ${modeName(currentPreset ?? "standard")} · F9 打开模式选择（支持自定义）`;
+      const hint = `模式: ${modeName(currentPreset ?? "standard")} · F9 打开模式选择（支持自定义） · Ctrl+R 欢迎页 logo`;
       this.welcomeModeRow = top + h - 2;
       const hx = x + Math.max(0, Math.floor((this.view.w - strWidth(hint)) / 2));
       screen.text(hx, this.welcomeModeRow, hint, { fg: T.WARN, attrs: 1 });
     }
   }
 
-  /** Right-aligned version/update row for the wordmark brand lines. */
+  /** The 40x19 half-block mascot for the current logo mode. */
+  #renderWelcomeLogo(screen, cx, top) {
+    if (this.app.logoMode === "none") return false;
+    const hr = this.view.y + this.view.h;
+    let pal, grid;
+    if (this.app.logoMode === "custom") {
+      if (!this.app.logoData) {
+        if (this.app.logoPath) {
+          try { this.app.logoData = this.app.loadCustomLogo(this.app.logoPath); }
+          catch { this.app.logoData = null; } // invalid file → title-only
+        }
+        if (!this.app.logoData) return false;
+      }
+      pal = this.app.logoData.palette; grid = this.app.logoData.grid;
+    } else {
+      pal = LOGO_PALETTE; grid = LOGO_GRID;
+    }
+    for (let r = 0; r < LOGO_ROWS && top + r < hr; r++) {
+      for (let c = 0; c < LOGO_COLS; c++) {
+        let topIdx, botIdx;
+        if (this.app.logoMode === "custom") {
+          const cell = grid[r][c];
+          topIdx = cell[0]; botIdx = cell[1];
+        } else {
+          const i = (r * LOGO_COLS + c) * 4;
+          topIdx = parseInt(grid.slice(i, i + 2), 16);
+          botIdx = parseInt(grid.slice(i + 2, i + 4), 16);
+        }
+        const custom = this.app.logoMode === "custom";
+        const emptyT = custom ? topIdx < 0 : topIdx === 0;
+        const emptyB = custom ? botIdx < 0 : botIdx === 0;
+        if (emptyT && emptyB) continue;
+        const pal32 = (pi) => (custom ? pal[pi] : parseInt(pal[pi], 16));
+        const tcol = emptyT ? null : pal32(custom ? topIdx : topIdx - 1);
+        const bcol = emptyB ? null : pal32(custom ? botIdx : botIdx - 1);
+        const fgc = tcol ?? bcol ?? T.BG;
+        const bgc = bcol ?? T.BG;
+        screen.put(cx + c, top + r, tcol != null ? "▀" : "▄", { fg: fgc, bg: bgc });
+      }
+    }
+    return true;
+  }
+
+  /** Bottom update notices: only shown when a product has a pending update
+   *  (or a failed/ongoing check) — "已是最新" stays quiet. Clickable. */
+  #putUpdateHints(screen, top, h) {
+    this.welcomeUpdateRows = [];
+    const names = { dsh: "DeepSeek Harness", tui: "dsh-neotui" };
+    const parts = [];
+    for (const key of ["dsh", "tui"]) {
+      const check = this.app.versionChecks?.[key];
+      if (!check) continue;
+      if (check.state === "update") parts.push({ key, text: `${names[key]} 可更新 ${check.latest}` });
+      else if (check.state === "error") parts.push({ key, text: `${names[key]} 检查失败（点击重试）` });
+      else if (check.state === "checking") parts.push({ key, text: `${names[key]} 检查中…` });
+    }
+    if (!parts.length) return;
+    const row = top + h - 3;
+    this.welcomeUpdateRow = row;
+    const full = parts.map((p) => p.text).join(" · ");
+    const tx = this.view.x + Math.max(0, Math.floor((this.view.w - strWidth(full)) / 2));
+    let at = tx;
+    for (const p of parts) {
+      if (row < top + h) screen.text(at, row, p.text, { fg: T.WARN, attrs: 1 });
+      this.welcomeUpdateRows.push({ key: p.key, x1: at, x2: at + strWidth(p.text) - 1 });
+      at += strWidth(p.text) + 3;
+    }
+  }
+
+  /** Right-aligned version row for the wordmark brand lines (clickable check;
+   *  update notices themselves live at the bottom of the welcome). */
   #putVersionRight(screen, y, key, version, fg, bold) {
-    const check = this.app.versionChecks?.[key];
-    const status = check?.state === "checking" ? "← 检查更新…"
-      : check?.state === "current" ? "← 已是最新"
-      : check?.state === "update" ? `← 可更新 ${check.latest}`
-      : check?.state === "error" ? "← 检查失败（点击重试）"
-      : "← 检查更新";
-    const text = `${version === "unknown" ? "版本未知" : `v${version}`}  ${status}`;
+    const text = version === "unknown" ? "版本未知" : `v${version}`;
     const tx = this.view.x + Math.max(0, this.view.w - strWidth(text) - 2);
     if (y < this.view.y + this.view.h) screen.text(tx, y, text, { fg, attrs: bold ? 1 : 0 });
     this.welcomeVersionRows[y] = { key, x1: tx, x2: tx + strWidth(text) - 1 };
@@ -3013,6 +3055,8 @@ export class ChatView extends Widget {
       if (this.nodes.length === 0 && ev.kind === "press" && ev.button === 0) {
         const versionHit = this.welcomeVersionRows?.[ev.y];
         if (versionHit && ev.x >= versionHit.x1 && ev.x <= versionHit.x2) { this.app.checkUpdates(versionHit.key, true); return true; }
+        const updateHit = this.welcomeUpdateRows?.find((r) => ev.y === this.welcomeUpdateRow && ev.x >= r.x1 && ev.x <= r.x2);
+        if (updateHit) { this.app.checkUpdates(updateHit.key, true); return true; }
         if (ev.y === this.welcomeModeRow && ev.x >= cx && ev.x <= cx + 40) { this.app.showModePicker(); return true; }
       }
       if (ev.kind === "wheel-up" && this.view.scrollY <= 3 && this.hasMore) { void this.loadOlder(); return true; }
@@ -3504,6 +3548,16 @@ export class App {
     this.log = log ?? (() => {});
     this.versionFetcher = versionFetcher;
     this.launcherAnime = launcherAnime; // opt-in boot animation (--launcher-anime)
+    // Welcome logo mode: "preset" (bundled mascot), "custom" (JSON file) or
+    // "none" (title only). Persisted in the tui config file.
+    const logoCfg = loadTuiConfig().logo ?? {};
+    this.logoMode = ["preset", "custom", "none"].includes(logoCfg.mode) ? logoCfg.mode : "preset";
+    this.logoPath = logoCfg.path ?? null;
+    this.logoData = null;       // decoded custom logo: { palette, grid }
+    this.logoLoadError = null;
+    this.brandShimmer = -1;     // welcome wordmark diagonal sweep phase (-1 = idle)
+    this.brandSweep0 = -1;
+    this.brandShimmerNext = null;
     this.popup = null;
     this.activePrompt = null;
     this.promptQueue = [];
@@ -4400,7 +4454,87 @@ export class App {
   showGoal() { this.overlay = buildGoalPopup(this); this.redraw(); }
   showModePicker() { this.overlay = buildModePicker(this); this.redraw(); }
   showThemePicker() { this.overlay = new ThemePickerBuffer(this); this.redraw(); }
-  showPermissionPicker() { this.overlay = buildPermissionPicker(this); this.redraw(); }
+
+  /** Welcome-logo picker (Ctrl+R / 控制面板): preset, custom file, or none. */
+  showLogoPicker() {
+    const mark = (m) => (this.logoMode === m ? "● " : "○ ");
+    const items = [
+      { label: `${mark("preset")}预设`, hint: "DeepSeek 吉祥物（内置）", action: "preset" },
+      { label: `${mark("custom")}自定义…`, hint: `选择 JSON 文件（当前: ${this.logoPath ?? "—"}）`, action: "custom" },
+      { label: `${mark("none")}关闭`, hint: "不显示 logo，仅保留品牌字标", action: "none" },
+    ];
+    const pick = async (action) => {
+      if (action === "preset" || action === "none") {
+        this.logoMode = action;
+        this.logoData = null;
+        this.logoLoadError = null;
+        saveTuiConfig({ logo: { mode: action, path: action === "preset" ? null : this.logoPath } });
+        this.closeOverlay();
+        this.redraw();
+      } else if (action === "custom") {
+        const dir = this.logoPath ? dirname(this.logoPath) : (this.sessions.find((s) => s.sessionId === this.currentSession)?.cwd ?? process.cwd());
+        this.overlay = new FilePicker(this, {
+          startPath: dir,
+          onPick: (path) => this.#applyCustomLogo(path),
+          onCancel: () => { this.closeOverlay(); this.redraw(); },
+        });
+        this.redraw();
+      }
+    };
+    const w = Math.max(1, Math.min(66, this.screen.w - 4)), ph = Math.max(1, Math.min(12, this.screen.h - 4));
+    this.overlay = new Picker({
+      x: Math.floor((this.screen.w - w) / 2), y: Math.floor((this.screen.h - ph) / 2),
+      w, h: ph, title: "欢迎页 logo（Ctrl+R）",
+      items,
+      onPick: (it) => void pick(it.action),
+      onCancel: () => this.closeOverlay(),
+    });
+    this.redraw();
+  }
+
+  /** Load + validate a custom logo JSON ({ palette, grid }, 40x19) and switch
+   *  to it. Accepted schema mirrors the generator's logo-data.json; palette
+   *  entries may be [r,g,b] arrays or "#rrggbb"/"rrggbb" strings. Returns the
+   *  normalized data or throws with a user-facing message. */
+  loadCustomLogo(path) {
+    const data = JSON.parse(readFileSync(path, "utf8"));
+    const pal = data?.palette, grid = data?.grid;
+    if (!Array.isArray(pal) || !Array.isArray(grid) || grid.length !== LOGO_ROWS
+      || grid.some((row) => !Array.isArray(row) || row.length !== LOGO_COLS)
+      || pal.length < 1 || pal.length > 65535) {
+      throw new Error("需要 { palette:[…], grid:[[top,bottom]...] } 且为 40×19");
+    }
+    const norm = pal.map((c) => {
+      if (Array.isArray(c) && c.length >= 3) return ((c[0] << 16) | (c[1] << 8) | c[2]) >>> 0;
+      if (typeof c === "string") return parseInt(c.replace("#", ""), 16);
+      return NaN;
+    });
+    if (norm.some((c) => Number.isNaN(c) || c < 0 || c > 0xffffff)) throw new Error("调色板条目必须是 [r,g,b] 或 #rrggbb");
+    for (const row of grid) {
+      for (const cell of row) {
+        if (!Array.isArray(cell) || cell.length !== 2 || cell[0] < -1 || cell[1] < -1
+          || cell[0] >= norm.length || cell[1] >= norm.length || !Number.isInteger(cell[0]) || !Number.isInteger(cell[1])) {
+          throw new Error("grid 必须是 [[top,bottom]...] 且索引在调色板范围内");
+        }
+      }
+    }
+    return { palette: norm, grid };
+  }
+
+  #applyCustomLogo(path) {
+    try {
+      this.logoData = this.loadCustomLogo(path);
+      this.logoMode = "custom";
+      this.logoPath = path;
+      this.logoLoadError = null;
+      saveTuiConfig({ logo: { mode: "custom", path } });
+      this.closeOverlay();
+      this.redraw();
+      this.toast("自定义 logo 已应用");
+    } catch (e) {
+      this.toast(`logo 文件无效: ${e.message}`);
+    }
+  }
 
   /** /reload: in-place soft reload — fresh session list, fresh chat history,
    *  panels rebuilt, screen re-rendered. No process churn, no terminal
@@ -4609,6 +4743,7 @@ export class App {
       case "commandPalette": this.overlay = new ControlPanel(this, { startPage: 1 }); this.redraw(); return true;
       case "modePicker": this.showModePicker(); return true;
       case "themePicker": this.showThemePicker(); return true;
+      case "logoPicker": this.showLogoPicker(); return true;
       default: return false;
     }
   }
@@ -5646,25 +5781,7 @@ export class App {
     this.playSplash();
     const tick = () => {
       try {
-        // Welcome brand shimmer: a diagonal sweep across the wordmarks every
-        // ~4s (only when the blank welcome is actually on screen).
-        const welcomeUp = this.chat.nodes.length === 0
-          && (this.sessions.find((s) => s.sessionId === this.currentSession)?.blank ?? false)
-          && this.chat.view.h >= 29 && this.chat.view.w >= 60;
-        if (!welcomeUp) {
-          if (this.brandSweep0 >= 0 || this.brandShimmer >= 0) { this.brandSweep0 = -1; this.brandShimmer = -1; }
-        } else {
-          const now = Date.now();
-          if (this.brandSweep0 >= 0) {
-            if (now - this.brandSweep0 > 700) { this.brandSweep0 = -1; this.brandShimmer = -1; this.dirty = true; }
-            else {
-              const p = (now - this.brandSweep0) / 700;
-              if (p !== this.brandShimmer) { this.brandShimmer = p; this.dirty = true; }
-            }
-          } else if (now >= (this.brandShimmerNext ?? now + 3000)) {
-            this.brandSweep0 = now; this.brandShimmer = 0; this.brandShimmerNext = now + 4200; this.dirty = true;
-          }
-        }
+        this.tickWelcomeShimmer(Date.now());
         // While the splash waits for a key, only the blinking prompt is
         // repainted — the real UI must not render underneath it.
         if (this.splashWaiting) {
@@ -5706,6 +5823,31 @@ export class App {
       this.timer = setTimeout(tick, 33);
     };
     tick();
+  }
+
+  /** Welcome brand shimmer: a diagonal sweep across the wordmarks (~0.85s every
+   *  ~3.5s) while a tall blank welcome is on screen. Separated from the tick
+   *  loop so tests can drive it with fake timestamps. */
+  tickWelcomeShimmer(now) {
+    const welcomeUp = this.chat.nodes.length === 0
+      && (this.sessions.find((s) => s.sessionId === this.currentSession)?.blank ?? false)
+      && this.chat.view.h >= 29 && this.chat.view.w >= 60;
+    if (!welcomeUp) {
+      if (this.brandSweep0 >= 0 || this.brandShimmer >= 0) { this.brandSweep0 = -1; this.brandShimmer = -1; }
+      return;
+    }
+    if (this.brandSweep0 >= 0) {
+      if (now - this.brandSweep0 > 850) { this.brandSweep0 = -1; this.brandShimmer = -1; this.dirty = true; }
+      else {
+        const p = (now - this.brandSweep0) / 850;
+        if (p !== this.brandShimmer) { this.brandShimmer = p; this.dirty = true; }
+      }
+    } else {
+      if (this.brandShimmerNext == null) this.brandShimmerNext = now + 1500;
+      if (now >= this.brandShimmerNext) {
+        this.brandSweep0 = now; this.brandShimmer = 0; this.brandShimmerNext = now + 3500; this.dirty = true;
+      }
+    }
   }
 
   /** Force one render (also used by the scripted test harness). */
