@@ -210,7 +210,7 @@ const SPLASH_LINES = [
 // 5x6 pixel glyphs rendered with half-blocks (3 terminal rows per letter);
 // "█" full, "▀" upper half, "▄" lower half — pure-TUI, no image protocol.
 const SPLASH_GLYPHS = {
-  D: ["01110", "10001", "10001", "10001", "10001", "01110"],
+  D: ["11110", "10001", "10001", "10001", "10001", "11110"],
   E: ["11111", "10000", "11110", "10000", "10000", "11111"],
   P: ["11110", "10001", "10001", "11110", "10000", "10000"],
   S: ["01111", "10000", "01110", "00001", "00001", "11110"],
