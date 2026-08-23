@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- 启动动画（DeepSeek 风格）：纯白背景上 5×6 半块字体的 `DEEPSEEK` 字标淡入（白→深蓝），下方「正在启动 ●○○」三拍脉冲，随后淡出融入当前主题背景——全程纯 ANSI（`█▀▄`），无图片协议；`DSH_TUI_NO_SPLASH=1` 关闭，`--script` 模式不播放，窄小终端自动跳过。
+
 ## 0.4.1 — 2026-08-22
 
 ### Added

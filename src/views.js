@@ -193,6 +193,63 @@ function compareSemver(left, right) {
   return 0;
 }
 
+// ---- Boot splash (DeepSeek-style white fade-in) ----
+
+const SPLASH_WHITE = 0xffffff;
+const SPLASH_BLUE = 0x2b5bd7;   // wordmark final color on white
+const SPLASH_SUB = 0x3a4553;    // subtitle gray
+// 5x6 pixel glyphs rendered with half-blocks (3 terminal rows per letter);
+// "█" full, "▀" upper half, "▄" lower half — pure-TUI, no image protocol.
+const SPLASH_GLYPHS = {
+  D: ["01110", "10001", "10001", "10001", "10001", "01110"],
+  E: ["11111", "10000", "11110", "10000", "10000", "11111"],
+  P: ["11110", "10001", "10001", "11110", "10000", "10000"],
+  S: ["01111", "10000", "01110", "00001", "00001", "11110"],
+  K: ["10001", "10010", "10100", "11000", "10100", "10001"],
+};
+
+function lerpColor(a, b, t) {
+  const ar = (a >> 16) & 255, ag = (a >> 8) & 255, ab = a & 255;
+  const br = (b >> 16) & 255, bg2 = (b >> 8) & 255, bb = b & 255;
+  return ((Math.round(ar + (br - ar) * t) << 16) | (Math.round(ag + (bg2 - ag) * t) << 8) | Math.round(ab + (bb - ab) * t)) >>> 0;
+}
+
+/** One frame of the boot splash. `fade` (0..1) raises the wordmark out of the
+ *  white background; `dots` (0..2) animates the subtitle pulse; `out` (0..1)
+ *  dissolves the white into the theme background. Pure & testable. */
+export function drawBootSplash(screen, { fade = 0, dots = 0, out = 0 } = {}) {
+  const w = screen.w, h = screen.h;
+  const bg = lerpColor(SPLASH_WHITE, T.BG ?? SPLASH_WHITE, Math.min(1, Math.max(0, out)));
+  screen.fillRect(0, 0, Math.max(0, w - 1), Math.max(0, h - 1), " ", { bg });
+  const word = "DEEPSEEK";
+  const ink = lerpColor(bg, SPLASH_BLUE, fade); // rises from white to blue
+  const sub = lerpColor(bg, SPLASH_SUB, fade);
+  if (w >= 52) {
+    const glyphW = 6, totalW = word.length * glyphW - 1;
+    const x0 = Math.max(0, Math.floor((w - totalW) / 2));
+    const y0 = Math.max(0, Math.floor(h / 2) - 2);
+    for (let li = 0; li < word.length; li++) {
+      const rows = SPLASH_GLYPHS[word[li]] ?? ["0000", "0000", "0000", "0000", "0000", "0000"];
+      for (let pr = 0; pr < 6; pr += 2) {
+        const top = rows[pr], bottom = rows[pr + 1];
+        const y = y0 + pr / 2;
+        for (let px2 = 0; px2 < 5; px2++) {
+          const t = top[px2] === "1", b = bottom[px2] === "1";
+          const x = x0 + li * glyphW + px2;
+          if (t && b) screen.text(x, y, "█", { fg: ink });
+          else if (t) screen.text(x, y, "▀", { fg: ink, bg });
+          else if (b) screen.text(x, y, "▄", { fg: ink, bg });
+        }
+      }
+    }
+    screen.text(x0, y0 + 4, `正在启动${"●".repeat(dots)}${"○".repeat(3 - dots)}`, { fg: sub, attrs: 1 });
+  } else {
+    const cy = Math.max(1, Math.floor(h / 2) - 1);
+    screen.text(Math.max(0, Math.floor((w - word.length) / 2)), cy, word, { fg: ink, attrs: 1 });
+    screen.text(Math.max(0, Math.floor((w - 9) / 2)), cy + 2, `正在启动${"●".repeat(dots)}${"○".repeat(3 - dots)}`, { fg: sub, attrs: 1 });
+  }
+}
+
 // ---- Tool card renderers (host-computed view models) ----
 
 function renderToolCard(view, width, expanded) {
@@ -5429,7 +5486,29 @@ export class App {
 
   // ---- main loop ----
 
+  /** DeepSeek-style boot splash: white background, DEEPSEEK wordmark fading
+   *  in, pulsing 启动中 dot, then dissolve into the theme background. */
+  playSplash() {
+    if (process.env.DSH_TUI_NO_SPLASH === "1") return;
+    if (!this.term?.output?.write) return;
+    const w = this.screen.w, h = this.screen.h;
+    if (w < 30 || h < 12) return;
+    const wait = (ms) => { if (this.splashDelay ?? 30) { const sab = new Int32Array(new SharedArrayBuffer(4)); Atomics.wait(sab, 0, 0, ms); } };
+    const frames = (steps, dur, draw) => {
+      for (let i = 0; i < steps; i++) {
+        draw(i / Math.max(1, steps - 1), i);
+        this.term.output.write(this.screen.render() + "\x1b[?25l");
+        wait(dur);
+      }
+    };
+    const ease = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+    frames(14, this.splashDelay ?? 32, (t, i) => drawBootSplash(this.screen, { fade: ease(t), dots: i % 3 }));
+    frames(8, this.splashDelay ?? 45, (t, i) => drawBootSplash(this.screen, { fade: 1, dots: i % 3 }));
+    frames(7, this.splashDelay ?? 26, (t) => drawBootSplash(this.screen, { fade: 1, dots: 1, out: t }));
+  }
+
   run() {
+    this.playSplash();
     const tick = () => {
       try {
         if (this.dirty) {

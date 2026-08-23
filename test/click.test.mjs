@@ -5,7 +5,7 @@ import { userInfo } from "node:os";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion } from "../src/views.js";
+import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion, drawBootSplash } from "../src/views.js";
 import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker, AttachmentPanel, ThemePickerBuffer } from "../src/panels.js";
 import { setTheme, themeName, THEMES, renderedThemeName, clearThemePreview } from "../src/theme.js";
 import { fmtDuration, strWidth, pad, graphemeWidth } from "../src/text.js";
@@ -2120,6 +2120,50 @@ test("the theme picker previews live, commits on Enter and stays open", () => {
   assert.equal(renderedThemeName(), "dracula", "Esc keeps the committed theme");
   setTheme("gruvbox");
   clearThemePreview();
+});
+
+test("boot splash fades the DEEPSEEK wordmark into a white frame and dissolves out", () => {
+  const screen = new Screen(80, 24);
+  drawBootSplash(screen, { fade: 0, dots: 0, out: 0 });
+  screen.render();
+  const frame = screen.prev;
+  const cy = 10; // half-block letters span rows y0..y0+3 with y0 = h/2-2
+  let any = 0;
+  for (let y = cy; y < cy + 3; y++) for (let x = 20; x < 60; x++) {
+    const c = frame[y][x];
+    if (c.ch === "█" || c.ch === "▀" || c.ch === "▄") { any++; assert.equal(c.fg, c.bg, "fade 0: wordmark invisible (fg==bg)"); }
+  }
+  assert.ok(any >= 20, "half-block wordmark is drawn");
+  drawBootSplash(screen, { fade: 1, dots: 2, out: 0 });
+  screen.render();
+  const done = screen.prev;
+  let ink = null;
+  for (let y = cy; y < cy + 3 && !ink; y++) for (let x = 20; x < 60; x++) {
+    const c = done[y][x];
+    if (c.ch === "█" || c.ch === "▀" || c.ch === "▄") { ink = c.fg; break; }
+  }
+  assert.equal(ink, 0x2b5bd7, "fade 1: wordmark at full DeepSeek blue");
+  assert.ok(done[cy + 4][20].ch !== " ", "subtitle present");
+  drawBootSplash(screen, { fade: 1, dots: 1, out: 1 });
+  screen.render();
+  assert.equal(screen.prev[0][0].bg, T.BG, "fade-out lands on the app background");
+});
+
+test("playSplash respects the disable flag and never runs in tests without output", () => {
+  const app = headlessApp();
+  app.splashDelay = 0; // run the animation instantly
+  const write = app.term.output.write;
+  let writes = 0;
+  app.term.output.write = () => { writes++; return true; };
+  const saved = process.env.DSH_TUI_NO_SPLASH;
+  process.env.DSH_TUI_NO_SPLASH = "1";
+  app.playSplash();
+  assert.equal(writes, 0, "DSH_TUI_NO_SPLASH disables the animation");
+  process.env.DSH_TUI_NO_SPLASH = "0";
+  app.playSplash();
+  assert.equal(writes, 29, "14 fade + 8 hold + 7 dissolve frames");
+  app.term.output.write = write;
+  if (saved === undefined) delete process.env.DSH_TUI_NO_SPLASH; else process.env.DSH_TUI_NO_SPLASH = saved;
 });
 
 test("legacy one-slot keybinding values migrate to the new two-slot defaults", async () => {
