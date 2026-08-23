@@ -4,7 +4,7 @@
 
 ### Added
 
-- 启动动画（DeepSeek 风格，**opt-in meme**）：纯白背景上 5×6 半块字体的 `DEEPSEEK` 字标淡入（白→深蓝），下方「正在启动 ●○○」三拍脉冲，随后淡出融入当前主题背景——全程纯 ANSI（`█▀▄`），无图片协议；默认关闭，`--launcher-anime`（或 `DSH_TUI_LAUNCHER_ANIME=1`）显式启用，`DSH_TUI_NO_SPLASH=1` 强制关闭；`--script` 模式不播放，窄小终端自动跳过。
+- 启动动画（经典游戏启动器风格，**opt-in meme**）：纯黑 → 白色从屏幕中心圆形扩散至全屏（1s）→ 四行健康游戏忠告逐句淡入（2s）→ 忠告淡出的同时 `DEEPSEEK` 半块大字交叉淡入（2s）→ 底部闪烁「按任意键进入游戏」，任意键进入主界面——全程纯 ANSI（`█▀▄`），无图片协议；默认关闭，`--launcher-anime`（或 `DSH_TUI_LAUNCHER_ANIME=1`）显式启用，`DSH_TUI_NO_SPLASH=1` 强制关闭；`--script` 模式不播放，窄小终端自动跳过。
 
 ## 0.4.1 — 2026-08-22
 

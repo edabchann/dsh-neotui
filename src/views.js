@@ -193,11 +193,20 @@ function compareSemver(left, right) {
   return 0;
 }
 
-// ---- Boot splash (DeepSeek-style white fade-in) ----
+// ---- Boot splash (retro game-launcher animation) ----
 
 const SPLASH_WHITE = 0xffffff;
-const SPLASH_BLUE = 0x2b5bd7;   // wordmark final color on white
-const SPLASH_SUB = 0x3a4553;    // subtitle gray
+const SPLASH_BLACK = 0x000000;
+const SPLASH_BLUE = 0x2b5bd7;   // DEEPSEEK wordmark color on white
+const SPLASH_INK = 0x14181d;    // caution-lines ink
+const SPLASH_HINT = 0x2f3540;   // bottom hint ink
+/** Classic four-line healthy-gaming warning, one sentence per line. */
+const SPLASH_LINES = [
+  "抵制不良游戏，拒绝盗版游戏。",
+  "注意自我保护，谨防受骗上当。",
+  "适度游戏益脑，沉迷游戏伤身。",
+  "合理安排时间，享受健康生活。",
+];
 // 5x6 pixel glyphs rendered with half-blocks (3 terminal rows per letter);
 // "█" full, "▀" upper half, "▄" lower half — pure-TUI, no image protocol.
 const SPLASH_GLYPHS = {
@@ -214,39 +223,60 @@ function lerpColor(a, b, t) {
   return ((Math.round(ar + (br - ar) * t) << 16) | (Math.round(ag + (bg2 - ag) * t) << 8) | Math.round(ab + (bb - ab) * t)) >>> 0;
 }
 
-/** One frame of the boot splash. `fade` (0..1) raises the wordmark out of the
- *  white background; `dots` (0..2) animates the subtitle pulse; `out` (0..1)
- *  dissolves the white into the theme background. Pure & testable. */
-export function drawBootSplash(screen, { fade = 0, dots = 0, out = 0 } = {}) {
+/** One frame of the opt-in boot animation. Phases are driven by opaque
+ *  numbers so the renderer stays pure and testable:
+ *   diffuse 0..1  white circle expanding from the screen center over black;
+ *   lineAlpha[4]  per-line opacity of the healthy-gaming warning;
+ *   wordAlpha 0..1  DEEPSEEK wordmark crossfading in;
+ *   blink  show/hide the 按任意键进入游戏 prompt (toggling = blinking). */
+export function drawBootSplash(screen, { diffuse = 0, lineAlpha = [0, 0, 0, 0], wordAlpha = 0, blink = false } = {}) {
   const w = screen.w, h = screen.h;
-  const bg = lerpColor(SPLASH_WHITE, T.BG ?? SPLASH_WHITE, Math.min(1, Math.max(0, out)));
-  screen.fillRect(0, 0, Math.max(0, w - 1), Math.max(0, h - 1), " ", { bg });
-  const word = "DEEPSEEK";
-  const ink = lerpColor(bg, SPLASH_BLUE, fade); // rises from white to blue
-  const sub = lerpColor(bg, SPLASH_SUB, fade);
-  if (w >= 52) {
-    const glyphW = 6, totalW = word.length * glyphW - 1;
-    const x0 = Math.max(0, Math.floor((w - totalW) / 2));
-    const y0 = Math.max(0, Math.floor(h / 2) - 2);
-    for (let li = 0; li < word.length; li++) {
-      const rows = SPLASH_GLYPHS[word[li]] ?? ["0000", "0000", "0000", "0000", "0000", "0000"];
-      for (let pr = 0; pr < 6; pr += 2) {
-        const top = rows[pr], bottom = rows[pr + 1];
-        const y = y0 + pr / 2;
-        for (let px2 = 0; px2 < 5; px2++) {
-          const t = top[px2] === "1", b = bottom[px2] === "1";
-          const x = x0 + li * glyphW + px2;
-          if (t && b) screen.text(x, y, "█", { fg: ink });
-          else if (t) screen.text(x, y, "▀", { fg: ink, bg });
-          else if (b) screen.text(x, y, "▄", { fg: ink, bg });
+  const p = Math.max(0, Math.min(1, diffuse));
+  const cx = (w - 1) / 2, cy = (h - 1) / 2;
+  const maxR = Math.hypot(cx, cy * 2);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const r = Math.hypot(x - cx, (y - cy) * 2);
+      screen.put(x, y, " ", { bg: p >= 1 || r <= maxR * p ? SPLASH_WHITE : SPLASH_BLACK });
+    }
+  }
+  const inkFor = (a) => lerpColor(SPLASH_WHITE, SPLASH_INK, Math.max(0, Math.min(1, a)));
+  for (let i = 0; i < SPLASH_LINES.length; i++) {
+    const a = Math.max(0, Math.min(1, lineAlpha[i] ?? 0));
+    if (a <= 0) continue;
+    const spaced = [...SPLASH_LINES[i]].join(" ");
+    const x = Math.max(0, Math.floor((w - strWidth(spaced)) / 2));
+    const y = Math.max(1, Math.floor(h / 2) - 4 + i);
+    screen.text(x, y, spaced, { fg: inkFor(a), attrs: 1 });
+  }
+  if (wordAlpha > 0 && w >= 20) {
+    const word = "DEEPSEEK";
+    const ink = lerpColor(SPLASH_WHITE, SPLASH_BLUE, Math.max(0, Math.min(1, wordAlpha)));
+    if (w >= 52) {
+      const glyphW = 6, totalW = word.length * glyphW - 1;
+      const x0 = Math.max(0, Math.floor((w - totalW) / 2));
+      const y0 = Math.max(0, Math.floor(h / 2));
+      for (let li = 0; li < word.length; li++) {
+        const rows = SPLASH_GLYPHS[word[li]] ?? ["00000", "00000", "00000", "00000", "00000", "00000"];
+        for (let pr = 0; pr < 6; pr += 2) {
+          const top = rows[pr], bottom = rows[pr + 1];
+          const y = y0 + pr / 2;
+          for (let px2 = 0; px2 < 5; px2++) {
+            const t = top[px2] === "1", b = bottom[px2] === "1";
+            const x = x0 + li * glyphW + px2;
+            if (t && b) screen.text(x, y, "█", { fg: ink });
+            else if (t) screen.text(x, y, "▀", { fg: ink, bg: SPLASH_WHITE });
+            else if (b) screen.text(x, y, "▄", { fg: ink, bg: SPLASH_WHITE });
+          }
         }
       }
+    } else {
+      screen.text(Math.max(0, Math.floor((w - word.length) / 2)), Math.max(1, Math.floor(h / 2)), word, { fg: ink, attrs: 1 });
     }
-    screen.text(x0, y0 + 4, `正在启动${"●".repeat(dots)}${"○".repeat(3 - dots)}`, { fg: sub, attrs: 1 });
-  } else {
-    const cy = Math.max(1, Math.floor(h / 2) - 1);
-    screen.text(Math.max(0, Math.floor((w - word.length) / 2)), cy, word, { fg: ink, attrs: 1 });
-    screen.text(Math.max(0, Math.floor((w - 9) / 2)), cy + 2, `正在启动${"●".repeat(dots)}${"○".repeat(3 - dots)}`, { fg: sub, attrs: 1 });
+  }
+  if (blink && (p >= 1 || wordAlpha > 0)) {
+    const hint = "按任意键进入游戏";
+    screen.text(Math.max(0, Math.floor((w - strWidth(hint)) / 2)), Math.max(1, h - 2), hint, { fg: lerpColor(SPLASH_WHITE, SPLASH_HINT, 1), attrs: 1 });
   }
 }
 
@@ -4609,6 +4639,16 @@ export class App {
 
   onEvent(ev) {
     if (ev.type === "resize") { this.resize(ev.w, ev.h); return; }
+    // Retro launcher splash: every key/mouse press enters the game. Events
+    // are swallowed while the blinking 按任意键提示 is on screen.
+    if (this.splashWaiting) {
+      if (ev.type === "key" || ev.type === "text" || ev.type === "paste" || ev.type === "mouse") {
+        this.splashWaiting = false;
+        this.screen.prev = null; // force a full repaint of the real UI
+        this.redraw();
+      }
+      return;
+    }
     if (this.swallowRelease && ev.type === "mouse" && ev.kind === "release") {
       this.swallowRelease = false;
       return; // a press just closed an overlay; eat its matching release
@@ -5506,15 +5546,43 @@ export class App {
       }
     };
     const ease = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
-    frames(14, this.splashDelay ?? 32, (t, i) => drawBootSplash(this.screen, { fade: ease(t), dots: i % 3 }));
-    frames(8, this.splashDelay ?? 45, (t, i) => drawBootSplash(this.screen, { fade: 1, dots: i % 3 }));
-    frames(7, this.splashDelay ?? 26, (t) => drawBootSplash(this.screen, { fade: 1, dots: 1, out: t }));
+    const clamp01 = (t) => Math.max(0, Math.min(1, t));
+    // 1s: white circle diffuses from the screen center over pure black.
+    frames(25, this.splashDelay ?? 40, (t) => drawBootSplash(this.screen, { diffuse: ease(t) }));
+    // 2s: the four healthy-gaming lines fade in one sentence at a time.
+    frames(40, this.splashDelay ?? 50, (t) => {
+      const lineAlpha = [];
+      for (let i = 0; i < SPLASH_LINES.length; i++) lineAlpha.push(ease(clamp01((t - i * 0.25) / 0.25)));
+      drawBootSplash(this.screen, { diffuse: 1, lineAlpha });
+    });
+    // 2s: lines dissolve out while DEEPSEEK fades in (crossfade).
+    frames(40, this.splashDelay ?? 50, (t) => drawBootSplash(this.screen, {
+      diffuse: 1, lineAlpha: SPLASH_LINES.map(() => 1 - t), wordAlpha: ease(t),
+    }));
+    // Wait for any key: blinking prompt at the bottom; the tick loop toggles it.
+    this.splashWaiting = true;
+    this.splashBlink = true;
+    this.splashBlinkAt = Date.now();
+    drawBootSplash(this.screen, { diffuse: 1, wordAlpha: 1, blink: this.splashBlink });
+    this.term.output.write(this.screen.render() + "\x1b[?25l");
   }
 
   run() {
     this.playSplash();
     const tick = () => {
       try {
+        // While the splash waits for a key, only the blinking prompt is
+        // repainted — the real UI must not render underneath it.
+        if (this.splashWaiting) {
+          const now = Date.now();
+          if (now - (this.splashBlinkAt ?? 0) >= 400) {
+            this.splashBlinkAt = now;
+            this.splashBlink = !this.splashBlink;
+            drawBootSplash(this.screen, { diffuse: 1, wordAlpha: 1, blink: this.splashBlink });
+            this.term?.output?.write?.(this.screen.render() + "\x1b[?25l");
+          }
+          return;
+        }
         if (this.dirty) {
           this.dirty = false;
           this.renderFrame();

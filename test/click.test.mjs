@@ -2122,34 +2122,49 @@ test("the theme picker previews live, commits on Enter and stays open", () => {
   clearThemePreview();
 });
 
-test("boot splash fades the DEEPSEEK wordmark into a white frame and dissolves out", () => {
+test("boot splash diffuses white from center, staggers the warning lines and crossfades DEEPSEEK", () => {
   const screen = new Screen(80, 24);
-  drawBootSplash(screen, { fade: 0, dots: 0, out: 0 });
+  // pure black before the diffusion starts
+  drawBootSplash(screen, { diffuse: 0 });
   screen.render();
-  const frame = screen.prev;
-  const cy = 10; // half-block letters span rows y0..y0+3 with y0 = h/2-2
-  let any = 0;
-  for (let y = cy; y < cy + 3; y++) for (let x = 20; x < 60; x++) {
-    const c = frame[y][x];
-    if (c.ch === "█" || c.ch === "▀" || c.ch === "▄") { any++; assert.equal(c.fg, c.bg, "fade 0: wordmark invisible (fg==bg)"); }
-  }
-  assert.ok(any >= 20, "half-block wordmark is drawn");
-  drawBootSplash(screen, { fade: 1, dots: 2, out: 0 });
+  assert.equal(screen.prev[12][40].bg, 0x000000, "phase 1: pure black");
+  // partial diffusion: center white, far corner still black
+  drawBootSplash(screen, { diffuse: 0.4 });
+  screen.render();
+  assert.equal(screen.prev[12][40].bg, 0xffffff, "center is white");
+  assert.equal(screen.prev[0][0].bg, 0x000000, "corners stay black mid-diffusion");
+  assert.equal(screen.prev[23][79].bg, 0x000000, "bottom-right corner stays black");
+  // full white + first warning line only
+  drawBootSplash(screen, { diffuse: 1, lineAlpha: [1, 0, 0, 0] });
+  screen.render();
+  const f = screen.prev;
+  const row1 = 8; // h/2-4
+  assert.equal(f[row1][40].fg, 0x14181d, "first warning line at full ink");
+  assert.equal(f[row1 + 1][40].fg, -1, "later lines skip drawing at 0 alpha");
+  // line 2 fully in, line 1 mid-fade; wordmark crossfading
+  drawBootSplash(screen, { diffuse: 1, lineAlpha: [0.5, 1, 0.5, 0], wordAlpha: 0.5 });
+  screen.render();
+  const mid = screen.prev;
+  assert.equal(mid[row1 + 1][40].fg, 0x14181d, "line 2 at full ink");
+  assert.equal(mid[row1][40].fg, 0x8a8c8e, "line 1 mid-fade is the exact white→ink blend");
+  let word = null;
+  for (let y = 12; y < 15 && !word; y++) for (let x = 20; x < 60; x++) if (mid[y][x].ch === "█" || mid[y][x].ch === "▀" || mid[y][x].ch === "▄") { word = mid[y][x].fg; break; }
+  assert.ok(word !== null, "DEEPSEEK wordmark present during crossfade");
+  assert.notEqual(word, 0xffffff, "wordmark is partially faded in");
+  // full crossfade + blinking prompt
+  drawBootSplash(screen, { diffuse: 1, wordAlpha: 1, blink: true });
   screen.render();
   const done = screen.prev;
   let ink = null;
-  for (let y = cy; y < cy + 3 && !ink; y++) for (let x = 20; x < 60; x++) {
-    const c = done[y][x];
-    if (c.ch === "█" || c.ch === "▀" || c.ch === "▄") { ink = c.fg; break; }
-  }
-  assert.equal(ink, 0x2b5bd7, "fade 1: wordmark at full DeepSeek blue");
-  assert.ok(done[cy + 4][20].ch !== " ", "subtitle present");
-  drawBootSplash(screen, { fade: 1, dots: 1, out: 1 });
+  for (let y = 12; y < 15 && !ink; y++) for (let x = 20; x < 60; x++) if (done[y][x].ch === "█" || done[y][x].ch === "▀" || done[y][x].ch === "▄") { ink = done[y][x].fg; break; }
+  assert.equal(ink, 0x2b5bd7, "full wordmark at DeepSeek blue");
+  assert.notEqual(done[22][40].ch, " ", "blinking 按任意键 prompt at the bottom");
+  drawBootSplash(screen, { diffuse: 1, wordAlpha: 1, blink: false });
   screen.render();
-  assert.equal(screen.prev[0][0].bg, T.BG, "fade-out lands on the app background");
+  assert.equal(screen.prev[22][40].ch, " ", "prompt hidden on the blink-off beat");
 });
 
-test("the boot splash is opt-in via launcherAnime and DSH_TUI_NO_SPLASH always wins", () => {
+test("the boot splash is opt-in, waits for a key and any key enters", () => {
   const app = headlessApp();
   app.splashDelay = 0; // run the animation instantly
   const write = app.term.output.write;
@@ -2164,10 +2179,14 @@ test("the boot splash is opt-in via launcherAnime and DSH_TUI_NO_SPLASH always w
   assert.equal(writes, 0, "DSH_TUI_NO_SPLASH overrides the opt-in flag");
   process.env.DSH_TUI_NO_SPLASH = "0";
   app.playSplash();
-  assert.equal(writes, 29, "14 fade + 8 hold + 7 dissolve frames when enabled");
+  assert.equal(writes, 106, "25 diffuse + 40 lines + 40 crossfade + 1 wait frames when enabled");
+  assert.equal(app.splashWaiting, true, "the animation now waits for a key");
+  app.onEvent({ type: "key", name: "enter" });
+  assert.equal(app.splashWaiting, false, "any key dismisses the splash");
+  assert.equal(app.dirty, true, "the real UI is queued for a full repaint");
   app.launcherAnime = false;
   app.playSplash();
-  assert.equal(writes, 29, "disabling the flag stops it again");
+  assert.equal(writes, 106, "disabling the flag stops it again");
   app.term.output.write = write;
   if (savedDisable === undefined) delete process.env.DSH_TUI_NO_SPLASH; else process.env.DSH_TUI_NO_SPLASH = savedDisable;
 });
