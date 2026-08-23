@@ -20,6 +20,7 @@ import {
 
 import { T, themeName, cycleTheme } from "./theme.js";
 import { LOGO_COLS, LOGO_ROWS, LOGO_PALETTE, LOGO_GRID } from "./logo.js";
+import { ASCII_LOGO_COLS, ASCII_LOGO_ROWS, ASCII_LOGO_RAMP, ASCII_LOGO_PALETTE, ASCII_LOGO_GRID } from "./ascii-logo.js";
 // Live theme accessor: K.K.DIM etc. resolve against the active palette at render time.
 const K = new Proxy({}, { get(_k, key) { return T[key]; } });
 
@@ -2758,12 +2759,13 @@ export class ChatView extends Widget {
     // 40x19 half-block logo, per mode: preset (bundled), custom (JSON file)
     // or none (title only). Centered on the 40-col block.
     this.welcomeVersionRows = [];
-    const logoDrawn = this.view.w >= 48 && this.#renderWelcomeLogo(screen, cx, top);
+    const logoH = this.view.w >= 48 ? this.#renderWelcomeLogo(screen, cx, top) : 0;
+    const logoDrawn = logoH > 0;
     // Brand lines: TUI-drawn half-block wordmarks (like the splash), each with
     // its clickable version/update row on the right; the diagonal shimmer
     // sweeps across every ~4s. Falls back to spaced text on short/narrow views.
-    const brandY = top + (logoDrawn ? LOGO_ROWS + 1 : 0);
-    const useWordmarks = h >= 32 && this.view.w >= 62;
+    const brandY = top + (logoDrawn ? logoH + 1 : 0);
+    const useWordmarks = h >= logoH + 13 && this.view.w >= 62;
     if (useWordmarks) {
       // The band must run PAST the right edge: the final I of DSH NEOTUI sits
       // at x0+57 (plus the ~0.6/row diagonal offset), so phase 1 lands ~x0+72.
@@ -2802,12 +2804,27 @@ export class ChatView extends Widget {
     }
   }
 
-  /** The 40x19 mascot for the current logo mode, rendered as 2x2 quadrant
-   *  blocks (80x38 effective pixels). Grid cells are either half-block pairs
-   *  [top, bottom] (legacy) or quadrant triples [mask, fg, bg]. */
+  /** The welcome mascot for the current logo mode/style. Pixel style renders
+   *  40x19 2x2 quadrant blocks (80x38 effective); ascii style renders the
+   *  52x24 character grid (aspect-true for 1:2 terminal cells). Returns the
+   *  drawn height in rows (0 = not drawn). */
   #renderWelcomeLogo(screen, cx, top) {
-    if (this.app.logoMode === "none") return false;
+    if (this.app.logoMode === "none") return 0;
     const hr = this.view.y + this.view.h;
+    if (this.app.logoStyle === "ascii" && this.app.logoMode !== "custom") {
+      for (let r = 0; r < ASCII_LOGO_ROWS && top + r < hr; r++) {
+        for (let c = 0; c < ASCII_LOGO_COLS; c++) {
+          const i = (r * ASCII_LOGO_COLS + c) * 4;
+          // empty cell = ramp 0 AND color 0; ramp 0 with a color = the '.' glyph
+          const ci = parseInt(ASCII_LOGO_GRID.slice(i, i + 2), 16);
+          const pi = parseInt(ASCII_LOGO_GRID.slice(i + 2, i + 4), 16);
+          if (ci === 0 && pi === 0) continue;
+          screen.put(cx - Math.floor((ASCII_LOGO_COLS - LOGO_COLS) / 2) + c, top + r,
+            ASCII_LOGO_RAMP[ci], { fg: pi ? parseInt(ASCII_LOGO_PALETTE[pi - 1], 16) : T.FAINT, attrs: 1 });
+        }
+      }
+      return ASCII_LOGO_ROWS;
+    }
     const custom = this.app.logoMode === "custom";
     let pal, grid, quadrant = !custom;
     if (custom) {
@@ -2870,7 +2887,7 @@ export class ChatView extends Widget {
         }
       }
     }
-    return true;
+    return LOGO_ROWS;
   }
 
   /** Bottom update notices: only shown when a product has a pending update
@@ -3583,6 +3600,7 @@ export class App {
     // "none" (title only). Persisted in the tui config file.
     const logoCfg = loadTuiConfig().logo ?? {};
     this.logoMode = ["preset", "custom", "none"].includes(logoCfg.mode) ? logoCfg.mode : "preset";
+    this.logoStyle = logoCfg.style === "ascii" ? "ascii" : "pixel"; // pixel = quadrant blocks
     this.logoPath = logoCfg.path ?? null;
     this.logoData = null;       // decoded custom logo: { palette, grid }
     this.logoLoadError = null;
@@ -4493,13 +4511,19 @@ export class App {
       { label: `${mark("preset")}预设`, hint: "DeepSeek 吉祥物（内置）", action: "preset" },
       { label: `${mark("custom")}自定义…`, hint: `选择 JSON 文件（当前: ${this.logoPath ?? "—"}）`, action: "custom" },
       { label: `${mark("none")}关闭`, hint: "不显示 logo，仅保留品牌字标", action: "none" },
+      { label: `${this.logoStyle === "ascii" ? "◉" : "○"} 字符样式`, hint: this.logoStyle === "ascii" ? "当前: ASCII 52×24（回车切回像素）" : "当前: 像素 80×38（回车切换为字符画）", action: "style" },
     ];
     const pick = async (action) => {
       if (action === "preset" || action === "none") {
         this.logoMode = action;
         this.logoData = null;
         this.logoLoadError = null;
-        saveTuiConfig({ logo: { mode: action, path: action === "preset" ? null : this.logoPath } });
+        saveTuiConfig({ logo: { mode: action, path: action === "preset" ? null : this.logoPath, style: this.logoStyle } });
+        this.closeOverlay();
+        this.redraw();
+      } else if (action === "style") {
+        this.logoStyle = this.logoStyle === "ascii" ? "pixel" : "ascii";
+        saveTuiConfig({ logo: { mode: this.logoMode, path: this.logoPath, style: this.logoStyle } });
         this.closeOverlay();
         this.redraw();
       } else if (action === "custom") {
@@ -4571,7 +4595,7 @@ export class App {
       this.logoMode = "custom";
       this.logoPath = path;
       this.logoLoadError = null;
-      saveTuiConfig({ logo: { mode: "custom", path } });
+      saveTuiConfig({ logo: { mode: "custom", path, style: this.logoStyle } });
       this.closeOverlay();
       this.redraw();
       this.toast("自定义 logo 已应用");
@@ -5873,9 +5897,10 @@ export class App {
    *  ~3.5s) while a tall blank welcome is on screen. Separated from the tick
    *  loop so tests can drive it with fake timestamps. */
   tickWelcomeShimmer(now) {
+    const logoH = this.logoStyle === "ascii" ? ASCII_LOGO_ROWS : this.logoMode === "none" ? 0 : LOGO_ROWS;
     const welcomeUp = this.chat.nodes.length === 0
       && (this.sessions.find((s) => s.sessionId === this.currentSession)?.blank ?? false)
-      && this.chat.view.h >= 32 && this.chat.view.w >= 62;
+      && this.chat.view.h >= logoH + 13 && this.chat.view.w >= 62;
     if (!welcomeUp) {
       if (this.brandSweep0 >= 0 || this.brandShimmer >= 0) { this.brandSweep0 = -1; this.brandShimmer = -1; }
       return;

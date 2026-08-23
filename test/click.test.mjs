@@ -4411,7 +4411,7 @@ test("logo picker: Ctrl+R buffer switches preset / custom file / none and persis
   assert.equal(app.logoMode, "none");
   app.layout(); app.renderFrame();
   const rows2 = app.screen.prev.map((row) => row.map((cell) => cell.ch).join(""));
-  assert.ok(!rows2.slice(1, 21).some((row) => (row.match(/[▀▄▘▝▖▗▚▞▙▛▜▟▌▐█]/g) ?? []).length >= 30), "mascot logo hidden in none mode (title wordmarks may remain)");
+  assert.ok(!rows2.slice(9, 21).some((row) => (row.match(/[▀▄▘▝▖▗▚▞▙▛▜▟▌▐█]/g) ?? []).length >= 30), "mascot logo hidden in none mode (title wordmarks occupy the top rows only)");
   // back to preset
   app.showLogoPicker(); app.overlay.onPick({ action: "preset" });
   assert.equal(app.logoMode, "preset");
