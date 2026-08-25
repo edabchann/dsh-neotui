@@ -4457,6 +4457,32 @@ test("prompt history persists, dedupes and the prefix h searches it", () => {
   saveTuiConfig({ promptHistory: [] });
 });
 
+test("? (Shift+/) opens a per-scenario help buffer and returns to the pane", () => {
+  const app = headlessApp();
+  app.currentSession = "s";
+  app.sessions = [{ sessionId: "s", agentPreset: "standard" }];
+  app.focus(app.chat);
+  app.onEvent({ type: "key", name: "char", key: "/", shift: true, ctrl: false, alt: false });
+  assert.ok(app.overlay?.constructor?.name === "Popup", "Shift+/ opens a help buffer");
+  assert.ok(app.overlay.title.includes("对话帮助"), "chat scenario from chat focus");
+  const lines = app.overlay.lines.map((set) => set.map((x) => x.t).join("")).join("\n");
+  assert.ok(lines.includes("/rewind") && lines.includes("/btw"), "chat help lists slash commands");
+  app.overlay.onAction?.({});
+  assert.equal(app.focused, app.chat, "Esc returns to the chat pane");
+  // sidebar scenario
+  app.focus(app.sidebar);
+  app.onEvent({ type: "key", name: "char", key: "?", shift: true, ctrl: false, alt: false });
+  assert.ok(app.overlay?.title?.includes("侧栏帮助"), "sidebar scenario from sidebar focus");
+  assert.ok(app.overlay.lines.some((s) => Array.isArray(s) && s.some((x) => x.t.includes("Tab"))), "sidebar help mentions Tab");
+  app.overlay.onAction?.({});
+  // prefix page ? routes to the focus recorded when the panel opened
+  app.focus(app.chat);
+  app.onEvent({ type: "key", name: "char", key: " ", ctrl: true, shift: false });
+  app.onEvent({ type: "key", name: "char", key: "?", ctrl: false, alt: false, shift: true });
+  assert.ok(app.overlay?.title?.includes("对话帮助"), "prefix ? uses the focus-before-panel scenario");
+  app.overlay = null;
+});
+
 test("sidebar Tab toggles an ATTACHED preview card (never a modal)", async () => {
   const app = headlessApp();
   app.currentSession = "s1";

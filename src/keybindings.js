@@ -52,13 +52,14 @@ export const DEFAULT_KEYBINDINGS = {
   modePicker: { mode: "normal", key: "F9", key2: "" },
   themePicker: { mode: "normal", key: "", key2: "" }, // freed: theme picker moved to the Ctrl+Space prefix page (d)
   logoPicker: { mode: "normal", key: "Ctrl+R", key2: "" },
+  help: { mode: "normal", key: "Shift+/", key2: "Shift+?" }, // 场景帮助（Shift+/ 或 Shift+?）——按焦点路由
   quitDouble: { mode: "normal", key: "Ctrl+C", key2: "" },
   quit: { mode: "all", key: "Ctrl+Q", key2: "" },
 };
 
 /** App-level dispatch precedence: the first matching binding wins. */
 export const KEYBINDING_ORDER = [
-  "sessionFilter", "panel", "panePrev", "paneNext", "permissionRotate", "editConfig", "addWorkspace", "commandPalette", "modePicker", "themePicker", "logoPicker", "copySelection", "quitDouble", "quit",
+  "sessionFilter", "help", "panel", "panePrev", "paneNext", "permissionRotate", "editConfig", "addWorkspace", "commandPalette", "modePicker", "themePicker", "logoPicker", "copySelection", "quitDouble", "quit",
   "model", "trajectory", "workspace", "settings", "subagent", "skills", "goal",
   "jobs", "queue", "busyEnter", "attachments", "stepJump", "sidebar",
 ];

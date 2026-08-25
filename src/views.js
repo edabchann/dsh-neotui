@@ -4362,6 +4362,60 @@ export class App {
     this.redraw();
   }
 
+  /** Scenario help: `?` (Shift+/) routes by the focused pane; the prefix
+   *  page's `?` reuses the focus recorded when the panel opened. Scrollable
+   *  buffer, Esc returns to the source pane. */
+  showHelp(forceFocus = null) {
+    const focusTarget = forceFocus ?? this.focused;
+    const scenario = focusTarget === this.sidebar ? "sidebar" : (focusTarget === this.chat || focusTarget === this.chat.input) ? "chat" : "global";
+    const lines = [];
+    const pushTitle = (t) => lines.push([{ t: " " + t, fg: T.PURPLE, bg: T.PANEL, bold: true }]);
+    const pushRow = (a, d) => lines.push([{ t: `  ${a}`, fg: T.ACCENT, bg: T.PANEL, bold: true }, { t: ` ${d}`, fg: T.TXT, bg: T.PANEL }]);
+    const kb = keyBindings();
+    if (scenario === "sidebar") {
+      pushTitle("会话树（侧栏）帮助");
+      pushRow("↑/↓", "选择会话 / 分组       Enter 打开（组=折叠/展开）");
+      pushRow("Space", "组: 折叠/展开并回到组顶点");
+      pushRow("Tab", "会话预览卡片（纯开关，焦点不离开；↑↓ 跟随）");
+      pushRow("Ctrl+R", "会话菜单（重命名/移动/归档/删除/分叉/导出）");
+      pushRow("[ / ]", "把会话移入上一/下一分组");
+      pushRow("Ctrl+N", "新建会话（优先复用空白草稿）");
+      pushRow("Ctrl+O", "附件管理器 / 文件选择器");
+    } else if (scenario === "chat") {
+      pushTitle("对话场景帮助");
+      pushRow("g / G", "跳到首个 / 最新正文块       ↑/↓ 滚动历史");
+      pushRow("[ / ]", "上一 / 下一提问的终点       Ctrl+E 步跳");
+      pushRow("t / b", "全部思考块 / 工具块 展开折叠");
+      pushRow("v / Shift+V", "正文块选择（复制走 OSC 52）");
+      pushRow("Ctrl+R", "块菜单（复制/展开/分叉/文件预览）");
+      pushRow("Ctrl+B", "侧栏显示/隐藏");
+      pushRow(`?`, `本帮助（${scenario}场景）      双击 Ctrl+C 退出`);
+      pushTitle("对话中的常用命令");
+      pushRow("", SLASH_COMMANDS.map((c) => `${c.name}${c.hint ? " " + c.hint : ""}`).join(" · "));
+      pushRow("", "Tab：输入中补全路径 / /命令（候选栏 ↑↓ 循环）");
+    } else {
+      pushTitle("全局约定");
+      pushRow("Esc 层级", "输入 → 关命令栏 → 面板；NORMAL Esc 中断回合，INSERT 不打断");
+      pushRow("Ctrl+Space", "控制面板 → 前缀页（首屏）");
+      pushTitle("前缀键（Ctrl+Space 后按）");
+      for (const [k, d, hint] of ControlPanel.prototype.prefixRows()) pushRow(k, `${d}${hint ? " · " + hint : ""}`);
+      pushRow("Ctrl+P / F9", "命令面板 / 模式选择       Ctrl+G 目标 · Ctrl+T 轨迹页");
+      pushRow("Ctrl+K / Ctrl+H", "编辑配置 / 技能");
+      pushRow("双击 Ctrl+C / Ctrl+Q", "退出 TUI");
+      pushRow("? / 前缀页 ?", "本帮助（按场景）");
+    }
+    const h = Math.min(Math.max(8, lines.length + 2), Math.max(10, this.screen.h - 4));
+    const popup = new Popup({
+      x: Math.max(0, Math.floor((this.screen.w - Math.min(78, this.screen.w - 4)) / 2)),
+      y: Math.max(0, Math.floor(this.screen.h / 2) - Math.floor(h / 2)),
+      w: Math.min(78, this.screen.w - 4), h,
+      title: `${scenario === "sidebar" ? "侧栏" : scenario === "chat" ? "对话" : "全局"}帮助 · ↑↓ 滚动 · Esc 返回`,
+      lines, scrollable: true, buttons: [],
+      onAction: () => { this.overlay = null; this.focus(focusTarget ?? this.chat); this.redraw(); },
+    });
+    this.overlay = popup; this.focus(popup); this.redraw();
+  }
+
   /** Input-history search: filterable picker over the last ~50 typed prompts
    *  (persisted), Enter refills the input. Reached from the prefix page (h). */
   showHistorySearch() {
@@ -5052,7 +5106,12 @@ export class App {
   #runBinding(id, slot) {
     switch (id) {
       case "sessionFilter": this.startSearch(); this.redraw(); return true;
-      case "panel": this.overlay = new ControlPanel(this, { startPage: 0 }); this.redraw(); return true;
+      case "panel":
+        this.focusBeforePanel = this.focused; // prefix ? 帮助回到此场景
+        this.overlay = new ControlPanel(this, { startPage: 0 });
+        this.redraw();
+        return true;
+      case "help": this.showHelp(); return true;
       case "panePrev": this.focusPane(-1); return true;
       case "paneNext": this.focusPane(1); return true;
       case "permissionRotate": this.rotatePermission(); return true;
