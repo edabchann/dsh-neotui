@@ -6,7 +6,7 @@ import { mkdtempSync, writeFileSync, unlinkSync, mkdirSync, rmSync, readFileSync
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion, drawBootSplash, promptHistory, rememberPrompt } from "../src/views.js";
-import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker, AttachmentPanel, ThemePickerBuffer, PanelContainer, SubagentPage, TasksPage, sourceBadge, sourceGroup } from "../src/panels.js";
+import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker, AttachmentPanel, ThemePickerBuffer, SubagentPage, TasksPage, sourceBadge, sourceGroup } from "../src/panels.js";
 import { setTheme, themeName, THEMES, renderedThemeName, clearThemePreview } from "../src/theme.js";
 import { fmtDuration, strWidth, pad, graphemeWidth, graphemes } from "../src/text.js";
 import { renderMd, wrapSegs } from "../src/md.js";
@@ -4242,7 +4242,7 @@ test("loading older history preserves the selected transcript block identity", a
 });
 
 test("opening a new session while trajectory is visible reloads that trajectory", async () => {
-  const app = headlessApp(); app.currentSession = "A"; app.mode = "trajectory";
+  const app = headlessApp(); app.currentSession = "A"; app.mainPane = "trajectory";
   const loads = [];
   app.trajectoryPanel = { relayout() {}, render() {}, onKey() { return false; }, onMouse() { return false; }, async load(id) { loads.push(id); this.sessionId = id; } };
   app.api.call = async (method, payload) => {
@@ -4581,21 +4581,25 @@ test("source badges: shared helpers, trajectory step prefix and goal rounds", ()
   app.chat.sessionId = "s"; app.chat.nodes = [];
   app.chat.loadOlder = async () => {};
   app.chat.minSeq = 1;
-  // trajectory steps with a plugin-sourced initiating message
-  const page0 = app.overlay ?? null;
-  app.showPanelPage(0);
-  const tp = app.overlay.pages[0];
-  tp.steps = [{ step: 1, startSeq: 1, events: [{ type: "user/message", seq: 1, data: { source: { kind: "plugin", plugin: "cron" }, content: [{ type: "text", text: "cron tick" }] } }], firstSeq: 1 }];
-  tp.visibleStepIndices = [0];
-  tp.selectedStepKey = null;
-  app.overlay.goTo(0);
+  // trajectory steps with plugin-/goal-sourced initiating messages render badges
+  app.setPane("trajectory");
+  const tp = app.trajectoryPanel;
+  tp.steps = [
+    { step: 1, startSeq: 1, events: [{ type: "user/message", seq: 1, data: { source: { kind: "plugin", plugin: "cron" }, content: [{ type: "text", text: "cron tick" }] } }], firstSeq: 1 },
+    { step: 2, startSeq: 5, events: [{ type: "user/message", seq: 5, data: { source: { kind: "goal", round: 3 }, content: [{ type: "text", text: "next" }] } }], firstSeq: 5 },
+  ];
+  tp.visibleStepIndices = [0, 1];
+  tp.selectedStepKey = tp.stepKey(tp.steps[0]);
+  tp.buildLines();
+  app.renderFrame();
+  const plain = app.screen.toPlain();
+  assert.ok(plain.includes("◆") && plain.includes("◇"), "轨迹 step prefix shows goal/plugin badges");
   // GoalPanel rounds block
-  app.showPanelPage(1);
+  app.showGoal();
   app.projections.goal = { goal: { id: "g", revision: 1, objective: "ship it", phase: "active", maxGoalRounds: 5 }, roundsStarted: 1 };
   app.chat.nodes = [{ kind: "goal-round", source: { kind: "goal", round: 3 }, id: "gr1", blocks: [{ type: "text", text: "自动续轮内容" }] }];
-  app.overlay.goTo(1);
-  app.overlay.pages[1].rebuild(); // nodes were set after construction
-  const lines = app.overlay.pages[1].lines.map((set) => set.map((s) => s.t).join(""));
+  app.overlay.rebuild(); // nodes were set after construction
+  const lines = app.overlay.lines.map((set) => set.map((s) => s.t).join(""));
   assert.ok(lines.some((l) => l.includes("目标延续轮")) && lines.some((l) => l.includes("3轮") && l.includes("自动续轮内容")), "goal page lists continuation rounds");
 });
 
@@ -4603,27 +4607,28 @@ test("panel pages refresh live from frame injection (subagent reload + tasks red
   const app = headlessApp();
   app.currentSession = "s1";
   app.sessions = [{ sessionId: "s1", agentPreset: "standard" }];
+  app.chat.sessionId = "s1";
   let calls = 0;
   app.api.call = async (method, payload) => {
     if (method === "subagent.list") { calls++; return { entries: [{ id: `sub-${calls}`, label: "s", activity: "running" }] }; }
     return { items: [] };
   };
   app.api.connectMux = () => {}; app.api.connectHost = () => {};
-  app.showPanelPage(2); // subagent page
+  app.setPane("subagent"); // subagent pane active
   await new Promise((r) => setTimeout(r, 5));
-  const page = app.overlay.pages[2];
+  const page = app.subagentPane;
   assert.equal(page.entries[0].id, "sub-1", "initial load");
   // projection frame with key "subagent" → throttled reload
   app.deliverFrame({ type: "session/projection", sessionId: "s1", key: "subagent", value: {} });
   await new Promise((r) => setTimeout(r, 5));
-  assert.equal(calls, 2, "the first subagent frame live-reloads the page");
+  assert.equal(calls, 2, "the first subagent frame live-reloads the pane");
   app.deliverFrame({ type: "session/projection", sessionId: "s1", key: "subagent", value: {} });
   await new Promise((r) => setTimeout(r, 5));
   assert.equal(calls, 2, "rapid consecutive frames are throttled to 1/s");
-  // jobs frame while the tasks page is open: overlay repaints from live data
-  app.showPanelPage(3);
+  // jobs frame while the tasks pane is active: repaint from live data
+  app.setPane("tasks");
   app.deliverFrame({ type: "session/jobs", sessionId: "s1", jobs: [{ status: "running", label: "x" }] });
-  assert.ok(true, "jobs frame fan-out accepts the container"); // no throw
+  assert.ok(true, "jobs frame fan-out accepts the pane"); // no throw
 });
 
 test("Ctrl+Space opens the prefix page and r fires rewind only there", () => {
@@ -4965,19 +4970,24 @@ test("JobsPanel shares one buffer with subagents and updates expand triangle", a
 test("Ctrl+Left/Right cycles pane focus and global Tab is unbound", () => {
   const app = headlessApp(); app.currentSession = "s";
   app.onEvent({ type: "key", name: "tab", ctrl: false, shift: false });
-  assert.equal(app.mode, "chat", "Tab no longer switches global panes");
+  assert.equal(app.mainPane, "chat", "Tab no longer switches global panes");
   assert.equal(app.focused, app.chat);
   app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
   assert.equal(app.focused, app.sidebar, "Ctrl+Left focuses workspace sidebar");
   app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.focused, app.chat, "Ctrl+Right returns to chat");
+  assert.equal(app.mainPane, "chat", "Ctrl+Right returns to chat");
+  assert.equal(app.focused, app.chat);
   app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.mode, "trajectory", "next pane is trajectory");
+  assert.equal(app.mainPane, "trajectory", "next pane is trajectory");
   app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.focused, app.sidebar, "pane sequence wraps");
+  assert.equal(app.mainPane, "subagent", "then subagent");
+  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
+  assert.equal(app.mainPane, "tasks", "then 后台任务");
+  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
+  assert.equal(app.focused, app.sidebar, "pane sequence wraps to sidebar");
   // A full-screen buffer is modal: pane cycling is swallowed until Esc, then
   // focus mode works again — buffers never fight the focus mode.
-  app.setMode("chat"); app.focus(app.chat);
+  app.setPane("chat"); app.focus(app.chat);
   app.showSettingsBuffer();
   assert.equal(app.fullBuffer, app.settingsPanel);
   app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
@@ -4993,15 +5003,21 @@ test("Ctrl+Left/Right cycles pane focus and global Tab is unbound", () => {
   assert.ok(app.chat.input.cursor <= beforeCursor);
 });
 
-test("pane cycling skips unavailable trajectory and hidden sidebar", () => {
+test("pane cycling includes every pane stop and hides the sidebar stop when collapsed", () => {
   const app = headlessApp(); app.currentSession = null; app.focus(app.chat);
+  // trajectory/subagent/tasks are reachable even without a session
   app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.focused, app.sidebar);
+  assert.equal(app.mainPane, "trajectory", "trajectory pane reached without a session");
   app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.focused, app.chat, "trajectory is skipped without a session");
-  app.sidebarWanted = false; app.layout(); app.focus(app.chat);
+  assert.equal(app.mainPane, "subagent");
   app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.focused, app.chat, "hidden sidebar and unavailable trajectory are both skipped");
+  assert.equal(app.mainPane, "tasks");
+  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
+  assert.equal(app.focused, app.sidebar, "sidebar stop follows 后台任务");
+  // a collapsed sidebar drops the sidebar stop from the ring
+  app.sidebarWanted = false; app.layout(); app.setPane("chat");
+  app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
+  assert.equal(app.mainPane, "tasks", "collapsed sidebar steps to the previous pane stop");
 });
 
 test("keybinding registry parses, matches, describes and validates two-slot specs", () => {
@@ -5410,53 +5426,81 @@ test("code-dispatch rejects self and ancestor cycles", () => {
   assert.equal(tool.subCalls[0].subCalls.length, 0, "cycle children rejected");
 });
 
-// ---- Unified panel container (轨迹 / 目标 / 子代理 / 后台任务) ----
+// ---- Main-area panes (轨迹 / 子代理 / 后台任务) + 目标 overlay ----
 
-test("subagent/jobs/queue keybindings are freed (prefix-page panel replaces them)", () => {
+test("subagent/jobs/queue/trajectory keybindings are freed (main-area panes replace them)", () => {
   const kb = keyBindings();
   assert.deepEqual(kb.subagent, { mode: "normal", key: "", key2: "" }, "subagent freed");
   assert.deepEqual(kb.jobs, { mode: "normal", key: "", key2: "" }, "jobs freed");
   assert.deepEqual(kb.queue, { mode: "normal", key: "", key2: "" }, "queue freed");
+  assert.deepEqual(kb.trajectory, { mode: "normal", key: "", key2: "" }, "trajectory freed (Ctrl+T unbound)");
   // the freed chords no longer match any binding
   assert.equal(bindingMatchFor({ type: "key", name: "char", key: "a", ctrl: true, alt: false, shift: false }, keyBindings(), false, KEYBINDING_ORDER), null, "Ctrl+A freed");
   assert.equal(bindingMatchFor({ type: "key", name: "char", key: "j", ctrl: true, alt: false, shift: false }, keyBindings(), false, KEYBINDING_ORDER), null, "Ctrl+J freed");
   assert.equal(bindingMatchFor({ type: "key", name: "char", key: "n", ctrl: true, alt: false, shift: false }, keyBindings(), false, KEYBINDING_ORDER), null, "Ctrl+N freed");
-  // trajectory still binds Ctrl+T and now opens the container page 0
-  assert.equal(kb.trajectory.key, "Ctrl+T");
+  assert.equal(bindingMatchFor({ type: "key", name: "char", key: "t", ctrl: true, alt: false, shift: false }, keyBindings(), false, KEYBINDING_ORDER), null, "Ctrl+T freed");
+  // goal stays Ctrl+G — not freed
+  assert.equal(kb.goal.key, "Ctrl+G");
 });
 
-test("Ctrl+T opens the unified panel container; Tab/Right/Backtab page; q closes", async () => {
+test("Ctrl+T matches nothing; Ctrl+G opens the GoalPanel; Ctrl+Right cycles the panes", async () => {
   const app = headlessApp(); app.currentSession = "s";
+  app.sessions = [{ sessionId: "s", agentPreset: "standard" }];
+  app.chat.sessionId = "s"; app.chat.loadOlder = async () => {};
   app.api.call = async (method) => {
     if (method === "session.history") return { events: [], hasMore: false, projections: { values: {} } };
-    if (method === "subagent.list") return { items: [] };
+    if (method === "subagent.list") return { items: [{ id: "sub-abc-1", label: "researcher", activity: "running", parentSessionId: "root" }] };
     if (method === "session.models") return { current: null };
     return {};
   };
+  // Ctrl+T matches nothing (no pane, no overlay)
   app.onEvent({ type: "key", name: "char", key: "t", ctrl: true, shift: false });
+  assert.ok(!app.overlay, "Ctrl+T no longer opens anything");
+  assert.equal(app.mainPane, "chat", "Ctrl+T does not switch panes");
+  // Ctrl+G opens a LARGER GoalPanel overlay
+  app.onEvent({ type: "key", name: "char", key: "g", ctrl: true, shift: false });
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.ok(app.overlay instanceof PanelContainer, "Ctrl+T opens the container");
-  assert.equal(app.overlay.pageIndex, 0, "opens at page 0 (轨迹)");
+  assert.ok(app.overlay instanceof GoalPanel, "Ctrl+G opens the GoalPanel");
+  assert.equal(app.overlay.title, "目标与任务");
+  assert.ok(app.overlay.w >= Math.min(96, app.screen.w - 8) - 1, "GoalPanel is the larger variant");
+  // Esc closes it
+  app.onEvent({ type: "key", name: "escape", ctrl: false });
+  assert.equal(app.overlay, null, "Esc closes the GoalPanel");
+  // Ctrl+Right cycles sidebar→chat→trajectory→subagent→tasks→sidebar
+  const expected = ["chat", "trajectory", "subagent", "tasks", "sidebar"];
+  const cycle = [];
+  app.focus(app.sidebar);
+  for (let i = 0; i < expected.length; i++) {
+    app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
+    const stop = app.focused === app.sidebar ? "sidebar" : app.mainPane;
+    cycle.push(stop);
+    if (expected[i] === "sidebar") assert.equal(app.focused, app.sidebar, "cycle wraps to sidebar");
+    else assert.equal(app.mainPane, expected[i], `cycle step ${i}`);
+  }
+  assert.deepEqual(cycle, expected);
+  // Each pane renders its own content in the main area
+  app.setPane("trajectory");
+  app.trajectoryPanel.steps = [{ step: 1, startSeq: 1, events: [{ type: "user/message", seq: 1, data: { source: { kind: "user" }, content: [{ type: "text", text: "hi" }] } }] }];
+  app.trajectoryPanel.visibleStepIndices = [0];
+  app.trajectoryPanel.selectedStepKey = app.trajectoryPanel.stepKey(app.trajectoryPanel.steps[0]);
+  app.trajectoryPanel.buildLines();
   app.renderFrame();
-  let plain = app.screen.toPlain();
-  assert.ok(plain.includes("轨 迹"), "tab bar shows 轨迹");
-  // Tab → page 1 (目标)
-  app.onEvent({ type: "key", name: "tab", ctrl: false, shift: false });
-  assert.equal(app.overlay.pageIndex, 1);
-  // Right → page 2 (子代理)
-  app.onEvent({ type: "key", name: "right", ctrl: false, shift: false });
-  assert.equal(app.overlay.pageIndex, 2);
-  // Backtab → page 1
-  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
-  assert.equal(app.overlay.pageIndex, 1);
-  // q closes the overlay back to chat
-  app.onEvent({ type: "key", name: "char", key: "q", text: "q", ctrl: false, alt: false, shift: false });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(app.overlay, null, "q closes the container");
+  assert.ok(app.screen.toPlain().replace(/\s+/g, "").includes("step"), "trajectory pane renders steps");
+  app.setPane("subagent");
+  await new Promise((r) => setTimeout(r, 5));
+  app.renderFrame();
+  assert.ok(app.screen.toPlain().includes("researcher"), "subagent pane renders rows");
+  app.jobs = [{ status: "completed", kind: "bash", label: "ls -la" }];
+  app.queueItems = [];
+  app.setPane("tasks");
+  app.renderFrame();
+  assert.ok(app.screen.toPlain().includes("ls -la"), "tasks pane renders groups");
 });
 
-test("subagent panel page renders entries and Enter opens a detail popup", async () => {
+test("subagent pane renders entries and Enter opens a detail popup", async () => {
   const app = headlessApp(); app.currentSession = "s";
+  app.sessions = [{ sessionId: "s", agentPreset: "standard" }];
+  app.chat.sessionId = "s";
   app.api.call = async (method) => {
     if (method === "subagent.list") return { items: [
       { id: "sub-abc-1", label: "researcher", sessionId: "sub-abc-1", mode: "continuable", activity: "running", model: "ds-v4", parentSessionId: "root", elapsed: 83000 },
@@ -5465,10 +5509,11 @@ test("subagent panel page renders entries and Enter opens a detail popup", async
     if (method === "session.history") return { events: [], hasMore: false, projections: { values: {} } };
     return {};
   };
-  app.showPanelPage(2);
+  app.setPane("subagent");
   await new Promise((resolve) => setTimeout(resolve, 0));
-  const page = app.overlay.pages[2];
+  const page = app.subagentPane;
   assert.ok(page instanceof SubagentPage);
+  app.focus(page);
   app.renderFrame();
   const plain = app.screen.toPlain();
   assert.ok(plain.includes("researcher"), "entry label rendered");
@@ -5477,10 +5522,11 @@ test("subagent panel page renders entries and Enter opens a detail popup", async
   assert.ok(page.rows.some((r) => r.kind === "header" && r.text.includes("root")), "parent group header rendered");
   // Enter opens a detail popup
   app.onEvent({ type: "key", name: "enter", ctrl: false, shift: false });
-  assert.ok(app.overlay !== app.panelContainer && app.overlay instanceof Popup, "Enter opens a popup");
-  // Escape returns to the container
+  assert.ok(app.overlay instanceof Popup, "Enter opens a popup");
+  // Escape returns to the pane
   app.onEvent({ type: "key", name: "escape", ctrl: false });
-  assert.equal(app.overlay, app.panelContainer, "Esc returns to the container");
+  assert.equal(app.mainPane, "subagent", "Esc keeps the subagent pane");
+  assert.ok(app.overlay === null, "Esc closes the popup back to the pane");
 });
 
 test("subagent panel groups by parentSessionId when present (flat fallback otherwise)", async () => {

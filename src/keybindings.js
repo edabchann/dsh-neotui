@@ -31,7 +31,7 @@ export const DEFAULT_KEYBINDINGS = {
   nextQuestion: { mode: "normal", key: "]", key2: "" },
   panel: { mode: "all", key: "Ctrl+Space", key2: "F7" },
   model: { mode: "normal", key: "", key2: "" }, // freed: model switch moved to the prefix page (m)
-  trajectory: { mode: "normal", key: "Ctrl+T", key2: "" },
+  trajectory: { mode: "normal", key: "", key2: "" }, // freed: panel container moved to the prefix page (t)
   panePrev: { mode: "normal", key: "Ctrl+Left", key2: "" },
   paneNext: { mode: "normal", key: "Ctrl+Right", key2: "" },
   permissionRotate: { mode: "normal", key: "", key2: "" }, // freed: permission modes moved to the prefix page (p)

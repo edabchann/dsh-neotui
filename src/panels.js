@@ -2309,7 +2309,7 @@ export class QueuePanel extends Popup {
 
 export class GoalPanel extends Popup {
   constructor(app) {
-    super({ x: 4, y: 2, w: Math.max(24, Math.min(84, app.screen.w - 8)), h: Math.max(10, Math.min(28, app.screen.h - 4)), title: "目标与任务", lines: [], buttons: [], scrollable: true });
+    super({ x: 4, y: 2, w: Math.max(24, Math.min(96, app.screen.w - 8)), h: Math.max(10, Math.min(app.screen.h - 4, 34)), title: "目标与任务", lines: [], buttons: [], scrollable: true });
     this.app = app; this.busy = false; this.actionSel = 0; this.actions = []; this.actionRows = []; this.rebuild();
   }
   /** Called by App when a live goal/todo projection arrives while open. */
@@ -4782,8 +4782,6 @@ export class SkillsPanel extends Widget {
   }
 }
 
-// ---- PanelContainer: unified full-screen panel with a tab bar ----
-
 /** Open a scrollable detail Popup over `returnTo` (restored as app.overlay on
  *  Escape/q). `lines` may be raw string lines or styled segment arrays. */
 function openDetailPopup(app, returnTo, title, lines) {
@@ -4829,113 +4827,7 @@ export function sourceLegend() {
   return "● 提问 · ◇ 注入 · ◆ 目标轮";
 }
 
-export class PanelContainer extends Widget {
-  constructor(app) {
-    super({ x: 0, y: 0, w: app.screen.w, h: app.screen.h });
-    this.app = app;
-    this.pages = null;
-    this.pageIndex = 0;
-    this.pageNames = ["轨迹", "目标", "子代理", "后台任务"];
-  }
-  ensurePages() {
-    if (this.pages) return;
-    this.pages = [
-      new TrajectoryPanel(this.app),
-      new GoalPanel(this.app),
-      new SubagentPage(this.app),
-      new TasksPage(this.app),
-    ];
-  }
-  activePage() { this.ensurePages(); return this.pages[this.pageIndex]; }
-  /** Lay every child at content rect (full width, below the tab row). */
-  relayoutAll() {
-    this.w = this.app.screen.w; this.h = this.app.screen.h;
-    const cy = 1, ch = Math.max(1, this.h - 1);
-    const page = this.pages?.[this.pageIndex];
-    if (!page) return;
-    if (typeof page.relayout === "function") page.relayout(0, cy, this.w, ch);
-    else { page.x = 0; page.y = cy; page.w = this.w; page.h = ch; }
-  }
-  /** Live frame injection: tasks read live data on every repaint; the
-   *  subagent page re-loads (throttled) when its frame/projection arrives. */
-  notifyLive(kind) {
-    if (kind === "tasks") { this.app.redraw(); return; }
-    if (kind === "subagent" && this.pageIndex === 2) {
-      const page = this.pages?.[2];
-      if (page && typeof page.reload === "function") page.reload();
-    }
-  }
-  goTo(index) {
-    this.ensurePages();
-    this.pageIndex = ((index % this.pages.length) + this.pages.length) % this.pages.length;
-    this.relayoutAll();
-    const page = this.pages[this.pageIndex];
-    if (typeof page.onActivate === "function") page.onActivate();
-    // Page 0 (TrajectoryPanel) loads the current session on activation; load()
-    // reuses the cached steps for a re-entry, so repeated activation is cheap.
-    if (this.pageIndex === 0 && typeof page.load === "function" && this.app.currentSession) {
-      page.load(this.app.currentSession);
-    }
-    this.app.redraw();
-  }
-  render(screen) {
-    this.ensurePages();
-    this.relayoutAll();
-    screen.fillRect(0, 0, this.w - 1, this.h - 1, " ", { bg: T.BG });
-    // tab bar on row 0
-    let tx = 1;
-    for (let i = 0; i < this.pageNames.length; i++) {
-      const sel = i === this.pageIndex;
-      const label = ` ${this.pageNames[i]} `;
-      screen.text(tx, 0, label, { fg: sel ? T.SELFG : K.DIM, bg: sel ? T.ACCENT : -1, attrs: sel ? 1 : 0 });
-      tx += strWidth(label);
-    }
-    screen.text(Math.max(tx, this.w - 28), 0, "Tab/←→ 翻页 · q/Esc 返回", { fg: K.FAINT });
-    const page = this.pages[this.pageIndex];
-    page.render(screen);
-  }
-  onMouse(ev) {
-    this.relayoutAll();
-    // Tab bar (row 0): a press switches page.
-    if (ev.kind === "press" && ev.button === 0 && ev.y === 0) {
-      let tx = 1;
-      for (let i = 0; i < this.pageNames.length; i++) {
-        const label = ` ${this.pageNames[i]} `;
-        if (ev.x >= tx && ev.x < tx + strWidth(label)) { this.goTo(i); return true; }
-        tx += strWidth(label);
-      }
-      return true;
-    }
-    // Everything else forwards to the active page (absolute coordinates — the
-    // page renders at y=1 below the tab bar). The container always swallows so
-    // clicks never leak into the chat surface beneath the overlay.
-    const page = this.pages[this.pageIndex];
-    try { if (page?.onMouse) page.onMouse(ev); } catch { /* swallow */ }
-    return true;
-  }
-  onKey(ev) {
-    this.relayoutAll();
-    // Container owns the only close + page-switch keys.
-    if (ev.type === "key") {
-      if (ev.name === "escape" || (ev.name === "char" && ev.key === "q" && !ev.ctrl)) { this.app.closeOverlay(); return true; }
-      if (ev.name === "tab" || ev.name === "right") { this.goTo(this.pageIndex + 1); return true; }
-      if (ev.name === "backtab" || ev.name === "left") { this.goTo(this.pageIndex - 1); return true; }
-    }
-    const page = this.pages[this.pageIndex];
-    // Forward to the active page, but never re-forward the keys we already own
-    // (escape/q/tab/left/right) so the child's own close/page handlers cannot
-    // double-handle a key the container has already consumed.
-    if (ev.type === "key") {
-      const name = ev.name;
-      if (name === "escape" || name === "tab" || name === "backtab" || name === "right" || name === "left") return false;
-      if (name === "char" && ev.key === "q" && !ev.ctrl) return false;
-    }
-    if (page?.onKey) return page.onKey(ev) === true;
-    return false;
-  }
-}
-
-// ---- SubagentPage (container page 2): single-column subagent list ----
+// ---- SubagentPage (main-area pane 子代理): single-column subagent list ----
 
 export class SubagentPage extends Widget {
   constructor(app) {
@@ -5076,7 +4968,7 @@ export class SubagentPage extends Widget {
       if (selLine < this.view.scrollY) this.view.scrollY = selLine;
       else if (selLine >= this.view.scrollY + this.view.h) this.view.scrollY = selLine - this.view.h + 1;
     }
-    screen.text(this.x + 1, this.y + this.h - 1, " ↑↓ 选择 · Enter 详情 · r 刷新 · Tab/←→ 翻页 · q/Esc 返回", { fg: K.FAINT });
+    screen.text(this.x + 1, this.y + this.h - 1, " ↑↓ 选择 · Enter 详情 · r 刷新 · q/Esc 返回聊天", { fg: K.FAINT });
   }
   openDetail() {
     const e = this.entries[this.selector[this.sel]];
@@ -5112,7 +5004,7 @@ export class SubagentPage extends Widget {
   }
 }
 
-// ---- TasksPage (container page 3): background jobs + queue, source-kind badges ----
+// ---- TasksPage (main-area pane 后台任务): background jobs + queue, source-kind badges ----
 
 export class TasksPage extends Widget {
   constructor(app) {
@@ -5202,7 +5094,7 @@ export class TasksPage extends Widget {
       return [{ t: row.text, fg: sel ? T.SELFG : K.TXT, bg: sel ? T.MENUSEL : -1, bold: sel }];
     }), { keep: true });
     this.view.render(screen);
-    screen.text(this.x + 1, this.y + this.h - 1, " ↑↓ 选择 · Enter 详情 · Tab/←→ 翻页 · q/Esc 返回", { fg: K.FAINT });
+    screen.text(this.x + 1, this.y + this.h - 1, " ↑↓ 选择 · Enter 详情 · q/Esc 返回聊天", { fg: K.FAINT });
   }
   openDetail() {
     const rowIdx = this.selector[this.sel];

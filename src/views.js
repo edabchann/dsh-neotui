@@ -18,7 +18,7 @@ import {
   modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker, AttachmentPanel,
   ImagePopup, kittyCapable, GoalPanel, SettingsPanel,
   SkillsPanel, ControlPanel, QueuePanel, ModelPanel, fmtMs, ThemePickerBuffer,
-  PanelContainer,
+  SubagentPage, TasksPage,
 } from "./panels.js";
 
 import { T, themeName, cycleTheme } from "./theme.js";
@@ -3763,8 +3763,10 @@ export class App {
     this.searchActive = false;
     this.overlay = null;       // Picker / Popup / ImagePopup modal
     this.fullBuffer = null;    // full-screen panel buffer (workspace/settings/models/subagent/skills)
-    this.panelContainer = null; // unified full-screen panel container (轨迹/目标/子代理/后台任务)
-    this.mode = "chat";        // chat | workspace | trajectory
+    this.mainPane = "chat";    // main-area pane: chat | trajectory | subagent | tasks (Ctrl+Left/Right cycles)
+    this.mode = "chat";        // chat | trajectory (legacy mirror of mainPane)
+    this.subagentPane = null;  // lazy SubagentPage (pane 子代理)
+    this.tasksPane = null;     // lazy TasksPage (pane 后台任务)
     this.sidebarWanted = true;
     this.sidebarVisible = true; // auto-collapses on narrow terminals
     this.tooSmall = false;
@@ -3813,7 +3815,10 @@ export class App {
     this.sidebar.x = 0; this.sidebar.y = 0; this.sidebar.w = this.sidebarWidth; this.sidebar.h = this.screen.h - 1;
     this.searchInput.w = this.sidebarWidth;
     this.chat.resize(x, 1, w, mainH);
-    if (this.trajectoryPanel?.relayout) this.trajectoryPanel.relayout(x, 1, w, mainH);
+    // The active main-area pane (trajectory/subagent/tasks) sits in exactly the
+    // rect the ChatView occupies; non-active panes keep their last geometry.
+    const pane = this.paneWidget();
+    if (pane?.relayout) pane.relayout(x, 1, w, mainH);
     if (this.fullBuffer?.relayout) this.fullBuffer.relayout(0, 0, this.screen.w, this.screen.h);
     this.status.y = this.screen.h - footerH;
     this.status.h = footerH;
@@ -3837,27 +3842,78 @@ export class App {
 
   toggleChatTrajectory() {
     if (!this.currentSession) { this.toast("先打开一个会话"); return; }
-    this.setMode(this.mode === "trajectory" ? "chat" : "trajectory");
+    this.setPane(this.mainPane === "trajectory" ? "chat" : "trajectory");
   }
 
-  /** tmux-style pane focus. The sequence wraps and skips unavailable panes. */
+  /** The main-area content rect — the exact rect the ChatView occupies. */
+  mainAreaRect() {
+    const x = this.sidebarVisible ? this.sidebarWidth : 0;
+    const w = Math.max(1, this.screen.w - x);
+    const footerH = Math.min(this.footerHeight(), Math.max(1, this.screen.h - 2));
+    const mainH = Math.max(1, this.screen.h - 1 - footerH);
+    return { x, y: 1, w, h: mainH };
+  }
+
+  /** The currently-active non-chat pane widget (null when the chat pane is
+   *  active). Does NOT construct — panes are only grown by setPane(). */
+  paneWidget() {
+    if (this.mainPane === "trajectory") return this.trajectoryPanel;
+    if (this.mainPane === "subagent") return this.subagentPane;
+    if (this.mainPane === "tasks") return this.tasksPane;
+    return null;
+  }
+  ensureTrajectoryPane() {
+    if (!this.trajectoryPanel) this.trajectoryPanel = new TrajectoryPanel(this);
+    return this.trajectoryPanel;
+  }
+  ensureSubagentPane() {
+    if (!this.subagentPane) this.subagentPane = new SubagentPage(this);
+    return this.subagentPane;
+  }
+  ensureTasksPane() {
+    if (!this.tasksPane) this.tasksPane = new TasksPage(this);
+    return this.tasksPane;
+  }
+
+  /** Set the main-area pane (chat | trajectory | subagent | tasks) and focus
+   *  it. Non-chat panes are lazy-grown and seeded on first entry; re-entry
+   *  (including a cycle back) keeps their live state. */
+  setPane(which) {
+    this.mainPane = which;
+    this.mode = which === "trajectory" ? "trajectory" : "chat";
+    let pane = null;
+    if (which === "trajectory") {
+      pane = this.ensureTrajectoryPane();
+      if (this.currentSession) pane.load(this.currentSession);
+    } else if (which === "subagent") {
+      pane = this.ensureSubagentPane();
+      pane.onActivate?.();
+    } else if (which === "tasks") {
+      pane = this.ensureTasksPane();
+      pane.onActivate?.();
+    }
+    this.layout();
+    if (pane) this.focus(pane);
+    else this.focus(this.chat);
+    this.redraw();
+  }
+
+  /** tmux-style pane focus over the fixed 5-stop ring:
+   *  sidebar → chat → 轨迹 → 子代理 → 后台任务 → (wrap). The sidebar stop is
+   *  omitted when it is hidden; the pane stops are always reachable. */
   focusPane(delta) {
     const panes = [];
     if (this.sidebarVisible) panes.push("sidebar");
-    panes.push("chat");
-    if (this.currentSession) panes.push("trajectory");
-    const current = this.focused === this.sidebar ? "sidebar" : this.mode === "trajectory" ? "trajectory" : "chat";
-    const next = panes[wrapIndex(Math.max(0, panes.indexOf(current)) + delta, panes.length)];
+    panes.push("chat", "trajectory", "subagent", "tasks");
+    const current = this.focused === this.sidebar ? "sidebar" : this.mainPane;
+    const idx = panes.indexOf(current);
+    const next = panes[wrapIndex(Math.max(0, idx) + delta, panes.length)];
     if (next === "sidebar") {
       this.focus(this.sidebar);
-    } else if (next === "trajectory") {
-      this.setMode("trajectory");
-      this.focus(this.trajectoryPanel ?? this.chat);
-    } else {
-      this.setMode("chat");
-      this.focus(this.chat);
+      this.redraw();
+      return true;
     }
-    this.redraw();
+    this.setPane(next);
     return true;
   }
 
@@ -3988,9 +4044,15 @@ export class App {
   }
 
   setStatus(msg) { this.statusMsg = msg; this.redraw(); }
-  /** Live-frame fan-out into the panel container (tasks/subagent pages). */
-  #notifyPanelLive(kind) {
-    if (this.overlay?.constructor?.name === "PanelContainer") this.overlay.notifyLive(kind);
+  /** Live-frame fan-out into the active main-area pane. The subagent pane
+   *  reloads (throttled); the tasks pane repaints (it reads live data). */
+  notifyPaneLive(kind) {
+    if (kind === "subagent" && this.mainPane === "subagent") {
+      const page = this.subagentPane;
+      if (page && typeof page.reload === "function") page.reload();
+    } else if (kind === "tasks" && this.mainPane === "tasks") {
+      this.redraw();
+    }
   }
 
   setJobs(jobs, sessionId = null) {
@@ -4010,7 +4072,7 @@ export class App {
       if (this.chat.sessionId) this.chat.pollTail();
       // session.list is expensive (~100ms); refresh the sidebar every ~5s, not
       // on every streaming poll.
-      if (ticks++ % 10 === 0) { this.refreshSessions(); this.refreshSubagentStats(); this.#notifyPanelLive("subagent"); }
+      if (ticks++ % 10 === 0) { this.refreshSessions(); this.refreshSubagentStats(); this.notifyPaneLive("subagent"); }
       const delay = this.chat.pollSlow ? 2000 : (this.chat.running ? 500 : 1500);
       this.pollTimer = setTimeout(tick, delay);
     };
@@ -4101,7 +4163,7 @@ export class App {
           if (frame.type === "session/queue") {
             this.queueItems = frame.items ?? [];
             if (this.overlay instanceof QueuePanel) this.overlay.syncItems(this.queueItems);
-            this.#notifyPanelLive("tasks");
+            this.notifyPaneLive("tasks");
           }
           this.chat.onFrame(frame);
         }
@@ -4113,7 +4175,7 @@ export class App {
         // connect-time baseline would otherwise be dropped by the filter
         // below and the footer would stick at "0已完成")
         this.setJobs(frame.jobs ?? [], frame.sessionId ?? null);
-        this.#notifyPanelLive("tasks");
+        this.notifyPaneLive("tasks");
         if (this.chat.sessionId === frame.sessionId) this.chat.onFrame(frame);
         break;
       case "session/projection": {
@@ -4129,7 +4191,7 @@ export class App {
         // Reflow immediately so the tail remains reachable above fixed docks.
         if (["todos", "goal", "subagent"].includes(frame.key)) this.chat.inputChanged();
         if (["todos", "goal"].includes(frame.key) && this.overlay instanceof GoalPanel) this.overlay.sync();
-        if (frame.key === "subagent") this.#notifyPanelLive("subagent");
+        if (frame.key === "subagent") this.notifyPaneLive("subagent");
         break;
       }
       case "approval/resolved":
@@ -4710,7 +4772,7 @@ export class App {
     this.chat.input?.setValue(this.draftsBySession.get(sessionId) ?? "");
     // A sidebar Enter intentionally preserves sidebar focus, but every
     // session-scoped panel must immediately follow the newly opened session.
-    if (this.mode === "trajectory" && this.trajectoryPanel) await this.trajectoryPanel.load(sessionId);
+    if (this.mainPane === "trajectory" && this.trajectoryPanel) await this.trajectoryPanel.load(sessionId);
     else if (this.fullBuffer && this.fullBuffer === this.subagentPanel) this.subagentPanel.load(sessionId);
     else if (this.fullBuffer && this.fullBuffer === this.skillsPanel) this.skillsPanel.load?.(sessionId);
     if (epoch !== this.sessionEpoch || sessionId !== this.currentSession) return;
@@ -4752,20 +4814,17 @@ export class App {
   }
 
   setMode(mode) {
-    this.mode = mode === "trajectory" ? "trajectory" : "chat";
-    if (this.mode === "trajectory") {
-      if (!this.currentSession) { this.toast("先打开一个会话"); this.mode = "chat"; this.redraw(); return; }
-      if (!this.trajectoryPanel) this.trajectoryPanel = new TrajectoryPanel(this);
-      this.trajectoryPanel.load(this.currentSession);
+    // Trajectory toggle requires an open session (tab-click / chat-toggle path);
+    // the pane ring (focusPane) reaches trajectory regardless.
+    if (mode === "trajectory" && !this.currentSession) {
+      this.toast("先打开一个会话");
+      this.setPane("chat");
+      return;
     }
-    const panel = this.panelForMode();
-    if (panel && this.focused !== this.sidebar) this.focus(panel);
-    else if (this.focused !== this.sidebar) this.focus(this.chat);
-    this.layout();
-    this.redraw();
+    this.setPane(mode === "trajectory" ? "trajectory" : "chat");
   }
 
-  panelForMode() { return this.mode === "trajectory" ? this.trajectoryPanel : null; }
+  panelForMode() { return this.paneWidget(); }
 
   /** Full-screen modal buffers replace the old tab-page modes: they coexist
    *  with the sidebar/chat/trajectory pane focus instead of fighting it. */
@@ -4795,7 +4854,7 @@ export class App {
   }
   showSettingsBuffer() { if (!this.settingsPanel) this.settingsPanel = new SettingsPanel(this); this.openFullBuffer(this.settingsPanel); this.settingsPanel.load(); }
   showModelsBuffer() { if (!this.modelPanel) this.modelPanel = new ModelPanel(this); this.openFullBuffer(this.modelPanel); this.modelPanel.load(); }
-  showSubagentBuffer() { this.showPanelPage(2); }
+  showSubagentBuffer() { this.setPane("subagent"); }
   showSkillsBuffer() {
     if (!this.currentSession) { this.toast("先打开一个会话"); return; }
     if (!this.skillsPanel) this.skillsPanel = new SkillsPanel(this);
@@ -4803,17 +4862,6 @@ export class App {
   }
 
   closeOverlay() { this.overlay = null; this.redraw(); }
-
-  /** Open the unified full-screen panel container at the given page index.
-   *  Keeps the container (and each page's state) alive so switching back
-   *  preserves scroll/selection state. */
-  showPanelPage(page) {
-    if (!this.panelContainer) this.panelContainer = new PanelContainer(this);
-    this.panelContainer.goTo(page);
-    this.overlay = this.panelContainer;
-    this.focus(this.panelContainer);
-    this.redraw();
-  }
 
   openSessionPicker() {
     const w = Math.min(70, this.screen.w - 4), h = Math.min(20, this.screen.h - 4);
@@ -4838,7 +4886,7 @@ export class App {
     else this.toast("先打开一个会话");
   }
 
-  showJobs() { this.showPanelPage(3); }
+  showJobs() { this.setPane("tasks"); }
   async refreshSubagentStats(sessionId = this.currentSession) {
     if (!sessionId) return;
     try {
@@ -4849,8 +4897,8 @@ export class App {
       if (sessionId === this.currentSession) this.redraw();
     } catch {}
   }
-  showQueue() { this.showPanelPage(3); }
-  showGoal() { this.showPanelPage(1); }
+  showQueue() { this.setPane("tasks"); }
+  showGoal() { this.overlay = new GoalPanel(this); this.focus(this.overlay); this.redraw(); }
   showModePicker() { this.overlay = buildModePicker(this); this.redraw(); }
   showThemePicker() { this.overlay = new ThemePickerBuffer(this); this.redraw(); }
 
@@ -4966,16 +5014,18 @@ export class App {
     this.popup = null;
     this.activePrompt = null;
     this.promptQueue = [];
-    for (const p of [this.workspacePanel, this.trajectoryPanel, this.settingsPanel, this.modelPanel, this.subagentPanel, this.skillsPanel]) {
+    for (const p of [this.workspacePanel, this.trajectoryPanel, this.settingsPanel, this.modelPanel, this.subagentPanel, this.skillsPanel, this.subagentPane, this.tasksPane]) {
       if (p?.dispose) { try { p.dispose(); } catch {} }
     }
     this.workspacePanel = this.trajectoryPanel = this.settingsPanel = this.modelPanel = this.subagentPanel = this.skillsPanel = null;
+    this.subagentPane = this.tasksPane = null;
     this.chat.cache.clear();
     this.chat.nodes = [];
     this.chat.collapsedBlocks.clear();
     this.chat.expanded.clear();
     this.chat.queueRebuild();
     this.chat.view.anchorLock = null;
+    this.mainPane = "chat";
     this.mode = "chat";
     this.focus(this.chat);
     this.toast("正在重新加载…");
@@ -5147,14 +5197,14 @@ export class App {
       case "editConfig": this.editConfigFile(); return true;
       case "quit": this.stop(); return true;
       case "model": this.overlay = buildModelPicker(this); this.redraw(); return true;
-      case "trajectory": this.showPanelPage(0); return true;
+      case "trajectory": this.setPane("trajectory"); return true;
       case "workspace": this.showWorkspaceBuffer(); return true;
       case "settings": this.showSettingsBuffer(); return true;
-      case "subagent": this.showPanelPage(2); return true;
+      case "subagent": this.setPane("subagent"); return true;
       case "skills": this.showSkillsBuffer(); return true;
-      case "goal": this.showPanelPage(1); return true;
-      case "jobs": this.showPanelPage(3); return true;
-      case "queue": this.showPanelPage(3); return true;
+      case "goal": this.showGoal(); return true;
+      case "jobs": this.setPane("tasks"); return true;
+      case "queue": this.setPane("tasks"); return true;
       case "busyEnter": {
         const next = busyEnter() === "queue" ? "steer" : "queue";
         saveTuiConfig({ busyEnter: next });
@@ -5381,22 +5431,45 @@ export class App {
       if (this.#clickTab(ev.x)) { this.redraw(); return; }
     }
     // mouse routes by position (click = focus + dispatch)
-    if (this.mode !== "chat") {
-      if (ev.type === "mouse" && this.sidebarVisible && this.sidebar.inside(ev.x, ev.y)) {
+    if (this.mainPane !== "chat") {
+      const panel = this.paneWidget();
+      if (panel && this.focused === panel) {
+        // The pane owns keyboard while it is focused. Intercept the pane-level
+        // close (q / Esc) and insert (i) keys BEFORE delegating — the panes'
+        // own close handlers would close an overlay; here they switch back to
+        // the chat pane. Tab/←/→ switch between panes (never leak into a pane).
+        if (ev.type === "key") {
+          if (ev.name === "escape" || (ev.name === "char" && ev.key === "q" && !ev.ctrl)) {
+            this.setPane("chat");
+            this.redraw();
+            return;
+          }
+          if (bindingMatchFor(ev, keyBindings(), false, ["insert"])?.id === "insert") {
+            this.setPane("chat");
+            this.focus(this.chat.input);
+            this.redraw();
+            return;
+          }
+        } else if (ev.type === "text" && graphemes(ev.text).length === 1) {
+          // Legacy terminals deliver q/i as text; mirror the key intercepts.
+          const t = graphemes(ev.text)[0].toLowerCase();
+          if (t === "q") { this.setPane("chat"); this.redraw(); return; }
+          if (t === "i") { this.setPane("chat"); this.focus(this.chat.input); this.redraw(); return; }
+        }
+        const paneSwitch = ev.type === "key" && ev.ctrl && (ev.name === "left" || ev.name === "right");
+        if (!paneSwitch) {
+          const handled = ev.type === "key" || ev.type === "text" || ev.type === "paste" ? panel.onKey(ev) : panel.onMouse(ev);
+          if (handled) { this.redraw(); return; }
+          // A visible panel owns non-global text/paste even when it declines
+          // the event; never leak it into the hidden chat/Input behind it.
+          if (ev.type === "text" || ev.type === "paste") { this.redraw(); return; }
+        }
+        // unhandled key events fall through to global shortcuts
+      } else if (ev.type === "mouse" && this.sidebarVisible && this.sidebar.inside(ev.x, ev.y)) {
         if (this.focused !== this.chat.input) this.focus(this.sidebar); // INSERT exits only via Esc
         if (this.sidebar.onMouse(ev)) this.redraw();
         return;
       }
-      const panel = this.panelForMode();
-      const paneSwitch = ev.type === "key" && ev.ctrl && (ev.name === "left" || ev.name === "right");
-      if (panel && this.focused !== this.sidebar && !paneSwitch) {
-        const handled = ev.type === "key" || ev.type === "text" || ev.type === "paste" ? panel.onKey(ev) : panel.onMouse(ev);
-        if (handled) { this.redraw(); return; }
-        // A visible modal panel owns non-global text/paste even when it declines
-        // the event; never leak it into the hidden chat/Input behind the panel.
-        if (ev.type === "text" || ev.type === "paste") { this.redraw(); return; }
-      }
-      // unhandled key events fall through to global shortcuts
     }
     if (ev.type === "mouse") {
       // input drag-selection: the gesture continues across motion events
@@ -5520,7 +5593,7 @@ export class App {
         // of focus); otherwise it steps back toward the chat view.
         if (this.#interruptIfRunning()) return;
         if (this.focused === this.sidebar) { this.focus(this.chat); this.redraw(); }
-        else if (this.mode !== "chat") this.setMode("chat");
+        else if (this.mainPane !== "chat") this.setPane("chat");
         return;
       }
     }
@@ -6314,8 +6387,13 @@ export class App {
       for (let y = 1; y < s.h - 1; y++) s.put(this.sidebar.w - 1, y, "│", { fg: T.BORDER });
     }
     const modePanel = this.panelForMode();
-    if (modePanel) modePanel.render(s);
-    else this.chat.render(s);
+    if (modePanel) {
+      // The active pane occupies exactly the chat-area rect; ensure it is
+      // relaid there (it may have diverged after the last resize).
+      const r = this.mainAreaRect();
+      if (modePanel.relayout) modePanel.relayout(r.x, r.y, r.w, r.h);
+      modePanel.render(s);
+    } else this.chat.render(s);
 
     // footer: multi-row powerline-style status
     const t = this.titleOf();
