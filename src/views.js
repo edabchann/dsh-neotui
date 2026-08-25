@@ -4913,7 +4913,7 @@ export class App {
       case "stepJump": this.quickJumpStep(); return true;
       case "sidebar": this.toggleSidebar(); return true;
       case "addWorkspace": this.addWorkspace(); return true;
-      case "commandPalette": this.overlay = new ControlPanel(this, { startPage: 1 }); this.redraw(); return true;
+      case "commandPalette": this.overlay = new ControlPanel(this, { startPage: 2 }); this.redraw(); return true;
       case "modePicker": this.showModePicker(); return true;
       case "themePicker": this.showThemePicker(); return true;
       case "logoPicker": this.showLogoPicker(); return true;

@@ -4396,6 +4396,24 @@ test("welcome shimmer sweeps periodically only on a tall blank welcome", () => {
   assert.ok(litI, "the glint sweeps across the trailing I columns");
 });
 
+test("Ctrl+Space opens the prefix page and r fires rewind only there", () => {
+  const app = headlessApp();
+  let rewound = 0;
+  app.showRewindPicker = () => { rewound++; app.overlay = null; };
+  app.onEvent({ type: "key", name: "char", key: " ", ctrl: true, shift: false });
+  assert.equal(app.overlay?.constructor?.name, "ControlPanel", "Ctrl+Space opens the control panel");
+  assert.equal(app.overlay.page, 0, "the prefix page is the start page");
+  app.onEvent({ type: "key", name: "char", key: "r", ctrl: false, alt: false, shift: false });
+  assert.equal(rewound, 1, "r on the prefix page fires the rewind action");
+  assert.ok(app.overlay === null, "the panel closes before the action");
+  // on any other page the same key does nothing
+  app.onEvent({ type: "key", name: "char", key: " ", ctrl: true, shift: false });
+  app.overlay.page = 1; // 快捷键 page
+  app.onEvent({ type: "key", name: "char", key: "r", ctrl: false, alt: false, shift: false });
+  assert.equal(rewound, 1, "r leaks nowhere else — prefix keys are page-local");
+  app.overlay = null;
+});
+
 test("/rewind forks before the chosen message and refills the input", async () => {
   const app = headlessApp();
   app.currentSession = "s1";

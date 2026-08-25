@@ -1716,7 +1716,10 @@ export class ControlPanel extends Widget {
     const h = Math.min(24, app.screen.h - 4);
     super({ x: Math.floor((app.screen.w - w) / 2), y: Math.floor((app.screen.h - h) / 2), w, h });
     this.app = app;
-    this.pages = ["快捷键", "命令", "设置", "插件"];
+    // Prefix-key page (leader, nvim-style EDITING logic only): a one-key
+    // command page as the START page; the keys fire only while this page is
+    // shown, so it never leaks into normal mode.
+    this.pages = ["前缀", "快捷键", "命令", "设置", "插件"];
     this.page = startPage;
     this.pluginQuery = ""; this.pluginFilter = false;
     this.sel = 0;
@@ -1752,9 +1755,15 @@ export class ControlPanel extends Widget {
       row("think","思考块 展开/折叠"),row("tools","工具块 展开/折叠"),row("insert","进入输入"),row("leaveInsert","退出输入"),row("sessionFilter","跨会话搜索"),row("newSession","新建会话"),row("top","跳到首个正文块"),row("bottom","跳到最新正文块"),row("prevQuestion","上一提问的终点"),row("nextQuestion","下一提问的终点"),row("expandInput","输入栏 展开/折叠"),row("copyInput","复制输入栏选区"),row("undoInput","输入撤销"),row("redoInput","输入重做"),row("insertFilePicker","输入中打开文件选择器"),row("pasteImage","输入中粘贴剪贴板图片"),row("copySelection","复制正文选区"),row("addWorkspace","添加工作区"),row("commandPalette","命令面板"),row("modePicker","模式选择器"),row("themePicker","配色主题选择器"),row("logoPicker","欢迎页 logo（预设/自定义/关闭）"),row("quitDouble","双击 Ctrl+C 退出"),row("panel","控制面板"),row("model","切换模型"),row("trajectory","轨迹视图"),row("panePrev","pane 焦点 ← 上一窗格"),row("paneNext","pane 焦点 → 下一窗格"),row("permissionRotate","权限模式轮换"),row("workspace","工作区"),row("settings","设置"),row("subagent","子代理"),row("skills","技能"),row("goal","目标"),row("jobs","后台任务"),row("queue","后台队列"),row("busyEnter","运行中 Enter 策略"),row("attachments","附件管理"),row("stepJump","步骤转跳"),row("sidebar","侧栏显示/隐藏"),row("editConfig","编辑配置文件（默认编辑器）"),row("quit","退出"),
     ];
   }
+  prefixRows() {
+    return [
+      ["r", "回退（分支会话 + 原消息回填）", "/rewind", () => { this.app.closeOverlay(); this.app.showRewindPicker(); }],
+    ];
+  }
   items() {
-    if (this.page === 0) return this.shortcutItems();
-    if (this.page === 1) {
+    if (this.page === 0) return this.prefixRows().map(([k, d, hint, action]) => [`${k}  ${d}`, hint, action]);
+    if (this.page === 1) return this.shortcutItems();
+    if (this.page === 2) {
       return this.commands.map((c) => [
         `/${c.name}${c.input?.hint ? " " + c.input.hint : ""}`,
         c.description,
@@ -1766,7 +1775,7 @@ export class ControlPanel extends Widget {
         },
       ]);
     }
-    if (this.page === 2) {
+    if (this.page === 3) {
       return [
         ["模型管理（含思考强度）", "切换模型并选择思考强度", () => { this.app.overlay = buildModelPicker(this.app); }],
         ["模式（Agent 预设）", "标准 / PTC / 极简 / 创造", () => { this.app.overlay = buildModePicker(this.app); this.app.redraw(); }],
@@ -1778,7 +1787,7 @@ export class ControlPanel extends Widget {
         ["复制会话 ID", "", () => this.app.copyText(this.app.currentSession ?? "")],
       ];
     }
-    if (this.plugins) {
+    if (this.page === 4 && this.plugins) {
       const q=this.pluginQuery.toLowerCase();
       return this.plugins.filter((pl)=>!q||`${pl.moduleName} ${pl.fiberPhase??""}`.toLowerCase().includes(q)).map((pl) => [`${pl.enabled ? "●" : "○"} ${pl.moduleName}`, pl.fiberPhase ?? "", null]);
     }
@@ -1801,7 +1810,8 @@ export class ControlPanel extends Widget {
     if (this.sel < this.scroll) this.scroll = this.sel;
     else if (this.sel >= this.scroll + visible) this.scroll = this.sel - visible + 1;
     this.scroll = Math.max(0, Math.min(Math.max(0, items.length - visible), this.scroll));
-    if(this.page===0){s.text(this.x+2,this.y+1,"MODE",{fg:T.PURPLE,bg:T.PANEL,attrs:1});s.text(this.x+13,this.y+1,"KEY1",{fg:T.ACCENT,bg:T.PANEL,attrs:1});s.text(this.x+31,this.y+1,"KEY2",{fg:T.ACCENT,bg:T.PANEL,attrs:1});s.text(this.x+49,this.y+1,"FUNCTION",{fg:T.OK,bg:T.PANEL,attrs:1});}
+    if(this.page===0){s.text(this.x+2,this.y+1,"KEY",{fg:T.PURPLE,bg:T.PANEL,attrs:1});s.text(this.x+13,this.y+1,"ACTION",{fg:T.OK,bg:T.PANEL,attrs:1});s.text(this.x+this.w-24,this.y+1,"等价命令",{fg:T.ACCENT,bg:T.PANEL,attrs:1});}
+    if(this.page===1){s.text(this.x+2,this.y+1,"MODE",{fg:T.PURPLE,bg:T.PANEL,attrs:1});s.text(this.x+13,this.y+1,"KEY1",{fg:T.ACCENT,bg:T.PANEL,attrs:1});s.text(this.x+31,this.y+1,"KEY2",{fg:T.ACCENT,bg:T.PANEL,attrs:1});s.text(this.x+49,this.y+1,"FUNCTION",{fg:T.OK,bg:T.PANEL,attrs:1});}
     if(this.page===3&&this.pluginFilter){s.text(this.x+2,this.y+1,`/ ${this.pluginQuery}`,{fg:T.ACCENT,bg:T.PANEL,attrs:1});}
     for (let i = 0; i < visible; i++) {
       const idx = this.scroll + i;
@@ -1810,10 +1820,11 @@ export class ControlPanel extends Widget {
       const sel = idx === this.sel;
       s.fillRect(this.x + 1, this.y + 2 + i, this.x + this.w - 2, this.y + 2 + i, " ", { bg: sel ? T.MENUSEL : T.PANEL });
       const label = it[0];
-      if(this.page===0){const [mode,key1,key2]=label.split("\t");s.text(this.x+2,this.y+2+i,pad(mode,9),{fg:T.PURPLE,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+13,this.y+2+i,pad(truncate(key1,16),17),{fg:T.ACCENT,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+31,this.y+2+i,pad(truncate(key2,16),17),{fg:T.ACCENT,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+49,this.y+2+i,truncate(it[1],this.w-52),{fg:T.OK,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});}
+      if(this.page===0){const [k, d2] = label.split("  ", 2);s.text(this.x+2,this.y+2+i,pad(k,9),{fg:T.PURPLE,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+13,this.y+2+i,pad(truncate(d2, 30), 32),{fg:T.OK,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+this.w-24,this.y+2+i,truncate(it[1]??"",22),{fg:T.ACCENT,bg:sel?T.MENUSEL:T.PANEL});}
+      else if(this.page===1){const [mode,key1,key2]=label.split("\t");s.text(this.x+2,this.y+2+i,pad(mode,9),{fg:T.PURPLE,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+13,this.y+2+i,pad(truncate(key1,16),17),{fg:T.ACCENT,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+31,this.y+2+i,pad(truncate(key2,16),17),{fg:T.ACCENT,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+49,this.y+2+i,truncate(it[1],this.w-52),{fg:T.OK,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});}
       else{s.text(this.x + 2, this.y + 2 + i, truncate(label, this.w - 34), { fg: sel ? T.BOLD : T.TXT, bg: sel ? T.MENUSEL : T.PANEL, attrs: sel ? 1 : 0 });if (it[1]) s.text(this.x + this.w - 30, this.y + 2 + i, truncate(it[1], 28), { fg: T.FAINT, bg: sel ? T.MENUSEL : T.PANEL });}
     }
-    s.text(this.x + 2, this.y + this.h - 1, this.page===0?"↑↓ 选择 · Enter 编辑 · Shift+Tab 轮换模式 · Alt+Enter 恢复默认 · Esc 关闭":this.page===3?`/ 筛选插件 · Ctrl+/ 清除 · ↑↓ 选择 · Esc 关闭${this.pluginQuery?` · ${this.pluginQuery}`:""}`:"↑↓ 选择 · Enter 执行 · Esc 关闭", { fg: T.FAINT });
+    s.text(this.x + 2, this.y + this.h - 1, this.page===0?"按 r 执行 · ↑↓/Enter 也可以 · Esc 关闭":this.page===1?"↑↓ 选择 · Enter 编辑 · Shift+Tab 轮换模式 · Alt+Enter 恢复默认 · Esc 关闭":this.page===3?`/ 筛选插件 · Ctrl+/ 清除 · ↑↓ 选择 · Esc 关闭${this.pluginQuery?` · ${this.pluginQuery}`:""}`:"↑↓ 选择 · Enter 执行 · Esc 关闭", { fg: T.FAINT });
   }
   onKey(ev) {
     if(this.page===3&&this.pluginFilter){if(ev.type==="text"){this.pluginQuery+=ev.text;this.sel=0;return true;}if(ev.type==="key"&&ev.name==="backspace"){this.pluginQuery=this.pluginQuery.slice(0,-1);this.sel=0;return true;}if(ev.type==="key"&&ev.name==="enter"){this.pluginFilter=false;return true;}if(ev.type==="key"&&ev.ctrl&&(ev.key==="/"||ev.key==="_")){this.pluginFilter=false;this.pluginQuery="";return true;}}
@@ -1822,6 +1833,12 @@ export class ControlPanel extends Widget {
     if(this.page===3&&ev.name==="char"&&ev.key==="/"){this.pluginFilter=true;this.pluginQuery="";return true;}
     if(this.page===3&&ev.ctrl&&(ev.key==="/"||ev.key==="_")){this.pluginQuery="";return true;}
     if (ev.name === "escape") { this.app.closeOverlay(); return true; }
+    // Prefix page: a plain one-key press fires the mapped command — but ONLY
+    // while the prefix page itself is on screen (leader-style EDITING logic).
+    if (this.page === 0 && ev.name === "char" && !ev.ctrl && !ev.alt) {
+      const row = this.prefixRows().find(([k]) => k === ev.key);
+      if (row) { row[3](); this.app.redraw(); return true; }
+    }
     if(this.page===0&&ev.name==="backtab"){const it=this.items()[this.sel],id=it?.[3];if(id){const b=keyBindings()[id],modes=["normal","insert","all"],mode=modes[(modes.indexOf(b.mode)+1)%3];setKeyBinding(id,{...b,mode});this.app.toast(`适用模式: ${mode.toUpperCase()}`);}return true;}
     if(this.page===0&&ev.alt&&ev.name==="enter"){const id=this.items()[this.sel]?.[3];if(id){resetKeyBinding(id);this.app.toast("已恢复默认快捷键");}return true;}
     if (ev.name === "tab" || ev.name === "right") {
