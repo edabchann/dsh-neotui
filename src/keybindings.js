@@ -22,7 +22,7 @@ export const DEFAULT_KEYBINDINGS = {
   expandInput: { mode: "insert", key: "Ctrl+L", key2: "" },
   undoInput: { mode: "insert", key: "Ctrl+Z", key2: "" },
   redoInput: { mode: "insert", key: "Ctrl+Y", key2: "" },
-  sessionFilter: { mode: "normal", key: "Ctrl+F", key2: "/" },
+  sessionFilter: { mode: "normal", key: "", key2: "" }, // freed: cross-session search lives on the Ctrl+Space prefix page (s)
   copySelection: { mode: "normal", key: "Ctrl+Shift+C", key2: "" },
   newSession: { mode: "normal", key: "n", key2: "" },
   top: { mode: "normal", key: "g g", key2: "" },

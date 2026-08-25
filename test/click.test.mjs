@@ -2199,12 +2199,15 @@ test("legacy one-slot keybinding values migrate to the new two-slot defaults", a
     skills: { mode: "normal", key: "Ctrl+K" },
   } });
   const kb = keyBindings();
-  assert.deepEqual(kb.sessionFilter, { mode: "normal", key: "Ctrl+F", key2: "/" });
+  assert.deepEqual(kb.sessionFilter, { mode: "normal", key: "", key2: "" }, "Ctrl+F and / are freed — search lives on the prefix page");
   assert.deepEqual(kb.panePrev, { mode: "normal", key: "Ctrl+Left", key2: "" });
   assert.deepEqual(kb.paneNext, { mode: "normal", key: "Ctrl+Right", key2: "" });
   assert.equal(kb.skills.key, "Ctrl+H");
   app.onEvent({ type: "key", name: "char", key: "f", ctrl: true, shift: false });
-  assert.equal(app.searchActive, true, "Ctrl+F works even with a legacy sessionFilter override in the config");
+  assert.equal(app.searchActive, false, "Ctrl+F is freed and no longer opens search");
+  app.onEvent({ type: "key", name: "char", key: " ", ctrl: true, shift: false });
+  app.onEvent({ type: "key", name: "char", key: "s", ctrl: false, alt: false, shift: false });
+  assert.equal(app.searchActive, true, "prefix page s opens the cross-session search");
   app.onEvent({ type: "key", name: "escape", ctrl: false });
   app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
   assert.equal(app.focused, app.sidebar, "Ctrl+Left works despite the legacy homeSwitch override");
@@ -4007,7 +4010,8 @@ test("Ctrl+F opens deferred full-screen search and Enter builds workspace/sessio
     ], hasMore: false };
     return { items: [] };
   };
-  app.onEvent({ type: "key", name: "char", key: "f", ctrl: true, shift: false });
+  app.onEvent({ type: "key", name: "char", key: " ", ctrl: true, shift: false });
+  app.onEvent({ type: "key", name: "char", key: "s", ctrl: false, alt: false, shift: false });
   assert.equal(app.searchActive, true); assert.equal(app.searchState.phase, "input");
   assert.equal(calls.length, 0, "opening search does not scan live");
   app.searchInput.setValue("needle");
@@ -4789,7 +4793,7 @@ test("keybinding registry parses, matches, describes and validates two-slot spec
   assert.equal(validateKeySpec("Bogus+F12").ok, false);
   assert.equal(validateKeySpec("g g g").ok, false, "chords cap at two presses");
   const hit = bindingMatchFor({ type: "key", name: "char", key: "/", ctrl: false }, keyBindings(), false, KEYBINDING_ORDER);
-  assert.equal(hit.id, "sessionFilter"); assert.equal(hit.slot, "key2");
+  assert.ok(hit === null, "freed keys no longer match any binding");
 });
 
 test("edited keybindings drive the real dispatchers in App, ChatView and Sidebar", () => {

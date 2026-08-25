@@ -1757,7 +1757,9 @@ export class ControlPanel extends Widget {
   }
   prefixRows() {
     return [
+      ["s", "跨会话全文搜索", "Ctrl+F 已释放", () => { this.app.closeOverlay(); this.app.startSearch(); this.app.redraw(); }],
       ["r", "回退（分支会话 + 原消息回填）", "/rewind", () => { this.app.closeOverlay(); this.app.showRewindPicker(); }],
+      ["c", "打开配置文件（tui-config.json）", "等价: Ctrl+K", () => { this.app.closeOverlay(); this.app.editConfigFile(); }],
     ];
   }
   items() {
