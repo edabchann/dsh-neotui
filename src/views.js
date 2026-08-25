@@ -1327,7 +1327,7 @@ class SidebarTree extends Widget {
         if (ev.ctrl) return false;
         // p (no ctrl): toggle the attached preview card (Tab now switches the
         // focused window at the App layer, so the preview trigger moved here).
-        if (ev.key === "v") {
+        if (ev.key === "p") {
           const row = this.currentRow();
           if (row?.kind === "session") { this.#togglePreview(); return true; }
           return false;

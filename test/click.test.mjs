@@ -4558,7 +4558,7 @@ test("sidebar p toggles an ATTACHED preview card (never a modal); Tab leaves the
   app.sidebar.setData([{ workspaceId: "w1", title: "工作区", path: "/tmp/x", sessionIds: ["s1", "s2"] }], app.sessions, new Set(), "s1");
   app.focus(app.sidebar);
   app.sidebar.sel = 2; // s2 row
-  app.sidebar.onKey({ type: "key", name: "char", key: "v", ctrl: false, alt: false, shift: false });
+  app.sidebar.onKey({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false });
   assert.equal(app.sidebar.preview.open, true, "p opens the card");
   assert.equal(app.overlay, null, "the card is NOT a modal overlay");
   assert.equal(app.focused, app.sidebar, "focus never leaves the tree");
@@ -4573,10 +4573,10 @@ test("sidebar p toggles an ATTACHED preview card (never a modal); Tab leaves the
   await new Promise((r) => setTimeout(r, 5));
   assert.deepEqual(historyCalls, ["s2", "s1"], "arrow moves the tree AND the card follows");
   // second p toggles it closed
-  app.sidebar.onKey({ type: "key", name: "char", key: "v", ctrl: false, alt: false, shift: false });
+  app.sidebar.onKey({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false });
   assert.equal(app.sidebar.preview.open, false, "second p closes");
   const calls = historyCalls.length;
-  app.sidebar.onKey({ type: "key", name: "char", key: "v", ctrl: false, alt: false, shift: false });
+  app.sidebar.onKey({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false });
   await new Promise((r) => setTimeout(r, 5));
   assert.ok(historyCalls.length >= calls, "re-open fetches again");
   // Enter opens the session and dismisses the card
