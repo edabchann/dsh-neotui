@@ -4401,6 +4401,44 @@ test("welcome shimmer sweeps periodically only on a tall blank welcome", () => {
   assert.ok(litI, "the glint sweeps across the trailing I columns");
 });
 
+test("side-question helper parses credentials, wraps the prompt and calls the API", async () => {
+  const m = await import("../src/side-question.mjs");
+  const creds = m.parseCredentials("DEEPSEEK_API_KEY=sk-test\nOYSTER_API_KEY=other\n");
+  assert.equal(creds.DEEPSEEK_API_KEY, "sk-test");
+  assert.equal(creds.OYSTER_API_KEY, "other");
+  const msgs = m.buildMessages("问题?", "前文");
+  assert.ok(msgs[0].content.includes("NO tools"), "system wrap forbids tools");
+  assert.deepEqual(msgs[1], { role: "user", content: "对话摘要（供参考，非问题本身）：\n前文" });
+  assert.deepEqual(msgs[2], { role: "user", content: "问题?" });
+  let sent = null;
+  const fakeFetch = async (url, opts) => {
+    sent = { url, body: JSON.parse(opts.body), auth: opts.headers.Authorization };
+    return { ok: true, json: async () => ({ choices: [{ message: { content: " 答案 " } }] }) };
+  };
+  const answer = await m.callDeepSeek("sk-test", msgs, { fetchImpl: fakeFetch });
+  assert.equal(answer, "答案");
+  assert.equal(sent.url, "https://api.deepseek.com/chat/completions");
+  assert.equal(sent.auth, "Bearer sk-test");
+  assert.ok(!sent.body.tools, "no tools in the request body");
+});
+
+test("/btw runs the side question and shows the answer in a popup", async () => {
+  const app = headlessApp();
+  app.chat.sessionId = "s1";
+  app.chat.nodes = [{ kind: "user", blocks: [{ type: "text", text: "前一句" }] }, { kind: "assistant", blocks: [{ type: "text", text: "回一句" }] }];
+  app.sideQuestionRunner = async (q, ctx) => {
+    assert.equal(q, "这个项目用什么语言写的?");
+    assert.ok(ctx.includes("前一句") && ctx.includes("回一句"), "context carries recent transcript");
+    return { answer: "TypeScript", err: null };
+  };
+  app.chat.send("/btw 这个项目用什么语言写的?");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(app.overlay?.constructor?.name === "Popup", "answer popup shown");
+  assert.ok(JSON.stringify(app.overlay.lines).includes("TypeScript"));
+  app.overlay.onAction?.({});
+  app.overlay = null;
+});
+
 test("prompt history persists, dedupes and the prefix h searches it", () => {
   const app = headlessApp();
   saveTuiConfig({ promptHistory: undefined });

@@ -3,8 +3,9 @@ import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
 import { truncate, strWidth, pad, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth, takeGraphemes, bytesLabel, prettyJson, looksLikeJson } from "./text.js";
 import { readFileSync, appendFileSync, mkdirSync, existsSync, statSync } from "node:fs";
-import { join, basename } from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { join, basename } from "node:path";
 import { createRequire } from "node:module";
 import { Widget, ScrollView, Input, Popup, Menu, StatusBar, wrapIndex } from "./widgets.js";
 import { UploadPicker } from "./file-picker.js";
@@ -1294,6 +1295,7 @@ class SidebarTree extends Widget {
 const SLASH_COMMANDS = [
   { name: "/reload", desc: "重新载入界面（不重启进程）" },
   { name: "/rewind", desc: "回退到某条提问之前（分支会话 + 原消息回填入输入框）" },
+  { name: "/btw", hint: "<问题>", desc: "侧问：不打断主回合的单轮问题（HoST 无通道时由 TUI 直连）" },
   { name: "/restart", desc: "重启 TUI 加载新版本" },
   { name: "/model", desc: "切换模型" },
   { name: "/theme", desc: "切换配色主题" },
@@ -1753,6 +1755,7 @@ export class ChatView extends Widget {
     if (Array.isArray(hist)) this.app.chat.input.history = [trimmed, ...hist.filter((x) => x !== trimmed)].slice(0, 50);
     if (trimmed === "/reload") { this.app.softReload(); return; }
     if (trimmed === "/rewind") { this.app.showRewindPicker(); return; }
+    if (trimmed.startsWith("/btw")) { void this.app.sideQuestion(trimmed.slice(4).trim()); return; }
     if (trimmed === "/restart") { this.app.restartApp(); return; }
     if (trimmed === "/model") { this.app.overlay = buildModelPicker(this.app); this.app.redraw(); return; }
     if (trimmed === "/theme") { this.app.showThemePicker(); return; }
@@ -3651,6 +3654,15 @@ export class App {
     this.logoData = null;       // decoded custom logo: { palette, grid }
     this.logoLoadError = null;
     this.brandShimmer = -1;     // welcome wordmark diagonal sweep phase (-1 = idle)
+    // /btw default transport: spawn the standalone helper (one-shot key read)
+    const helper = fileURLToPath(new URL("side-question.mjs", import.meta.url));
+    this.sideQuestionRunner = (q, ctx, helperPath = helper) => new Promise((resolve) => {
+      try {
+        const res = spawnSync(process.execPath, [helperPath, "--question", q, "--context", ctx], { timeout: 60000, encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
+        if (res.status === 0) { try { const data = JSON.parse(res.stdout); resolve({ answer: data.answer, err: null }); return; } catch { resolve({ answer: null, err: "答案解析失败" }); return; } }
+        resolve({ answer: null, err: (res.stderr || "子进程失败").split("\n")[0] });
+      } catch (e) { resolve({ answer: null, err: String(e?.message ?? e) }); }
+    });
     this.brandSweep0 = -1;
     this.brandShimmerNext = null;
     this.popup = null;
@@ -4237,6 +4249,41 @@ export class App {
 
   /** Fork the whole session, or — with `atSeq` — everything up to that message
    *  (web forkAt parity: branch from a chosen point of a completed turn). */
+  /** /btw side question: a single-turn, tool-less answer from the session
+   *  context without interrupting the running turn. Runs the standalone
+   *  side-question.mjs in a child process (the API key never enters this
+   *  process); the answer shows in a scrollable popup. */
+  async sideQuestion(question) {
+    const q = String(question ?? "").trim();
+    if (!q) { this.toast("/btw <问题> — 请输入问题"); return; }
+    this.toast("侧问中…（单轮、无工具，不打断主回合）");
+    // context: the most recent visible transcript lines, capped
+    const context = (this.chat.nodes ?? [])
+      .flatMap((n) => (n.blocks ?? []).map((b) => b.text ?? ""))
+      .filter((t) => t.trim())
+      .slice(-6).join("\n").slice(0, 6000);
+    let answer = null, err = null;
+    const run = this.sideQuestionRunner;
+    if (run) {
+      try { ({ answer, err } = await run(q, context)); } catch (e) { err = String(e?.message ?? e); }
+    } else {
+      err = "sideQuestionRunner 未配置";
+    }
+    if (err || answer == null) { this.toast(`侧问失败: ${err ?? "无返回"}`); return; }
+    const lines = answer.split("\n").map((l) => truncate(l, Math.min(78, this.screen.w - 8)));
+    const h = Math.min(Math.max(6, lines.length + 2), Math.max(8, this.screen.h - 6));
+    this.overlay = new Popup({
+      x: Math.max(0, Math.floor((this.screen.w - Math.min(80, this.screen.w - 4)) / 2)),
+      y: Math.max(0, Math.floor(this.screen.h / 2) - Math.floor(h / 2)),
+      w: Math.min(80, this.screen.w - 4), h,
+      title: `侧问 · ${truncate(q, 40)} · ↑↓ 滚动 · Esc 关闭`,
+      lines, scrollable: true, buttons: [],
+      onAction: () => { this.overlay = null; this.focus(this.chat); this.redraw(); },
+    });
+    this.focus(this.overlay);
+    this.redraw();
+  }
+
   /** Input-history search: filterable picker over the last ~50 typed prompts
    *  (persisted), Enter refills the input. Reached from the prefix page (h). */
   showHistorySearch() {
