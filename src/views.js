@@ -1235,8 +1235,9 @@ class SidebarTree extends Widget {
     }
     return false;
   }
-  /** Attached preview card (not a modal): Tab toggles it; it never steals
-   *  focus — ↑/↓ still moves the tree and the card follows the selection. */
+  /** Attached preview card (not a modal): p toggles it (Tab switched to the
+   *  window toggle); it never steals focus — ↑/↓ still moves the tree and the
+   *  card follows the selection. */
   #togglePreview() {
     const row = this.currentRow();
     if (!row || row.kind !== "session") return;
@@ -1321,15 +1322,16 @@ class SidebarTree extends Widget {
         if (row?.kind === "group") { this.sel = Math.min(this.rows.length - 1, this.sel + 1); this.#scrollToSel(); return true; }
         return false;
       }
-      case "tab": {
-        const row = this.currentRow();
-        if (row?.kind !== "session") return false;
-        this.#togglePreview();
-        return true;
-      }
       case "char":
         if (ev.ctrl && ev.key === "r") return this.openCurrentMenu();
         if (ev.ctrl) return false;
+        // p (no ctrl): toggle the attached preview card (Tab now switches the
+        // focused window at the App layer, so the preview trigger moved here).
+        if (ev.key === "v") {
+          const row = this.currentRow();
+          if (row?.kind === "session") { this.#togglePreview(); return true; }
+          return false;
+        }
         {
           const sbHit = bindingMatchFor(ev, keyBindings(), false, SIDEBAR_BINDING_ORDER);
           if (sbHit?.id === "insert") { this.app.focus(this.app.chat.input); this.app.redraw(); return true; }
@@ -3783,10 +3785,11 @@ export class App {
     this.searchActive = false;
     this.overlay = null;       // Picker / Popup / ImagePopup modal
     this.fullBuffer = null;    // full-screen panel buffer (workspace/settings/models/subagent/skills)
-    this.mainPane = "chat";    // main-area pane: chat | trajectory | subagent | tasks (Ctrl+Left/Right cycles)
-    this.mode = "chat";        // chat | trajectory (legacy mirror of mainPane)
-    this.subagentPane = null;  // lazy SubagentPage (pane 子代理)
-    this.tasksPane = null;     // lazy TasksPage (pane 后台任务)
+    this.mainTab = "chat";     // main-area tab: chat | trajectory | subagent | tasks (Shift+Tab cycles)
+    this.mode = "chat";        // chat | trajectory (legacy mirror of mainTab)
+    this.focusedWindow = "main"; // focused window: list (会话列表) | main (主窗口); Tab/Ctrl+Left+Right switch
+    this.subagentPane = null;  // lazy SubagentPage (tab 子代理)
+    this.tasksPane = null;     // lazy TasksPage (tab 后台任务)
     this.sidebarWanted = true;
     this.sidebarVisible = true; // auto-collapses on narrow terminals
     this.tooSmall = false;
@@ -3862,7 +3865,7 @@ export class App {
 
   toggleChatTrajectory() {
     if (!this.currentSession) { this.toast("先打开一个会话"); return; }
-    this.setPane(this.mainPane === "trajectory" ? "chat" : "trajectory");
+    this.setTab(this.mainTab === "trajectory" ? "chat" : "trajectory");
   }
 
   /** The main-area content rect — the exact rect the ChatView occupies. */
@@ -3874,12 +3877,12 @@ export class App {
     return { x, y: 1, w, h: mainH };
   }
 
-  /** The currently-active non-chat pane widget (null when the chat pane is
-   *  active). Does NOT construct — panes are only grown by setPane(). */
+  /** The currently-active non-chat pane widget (null when the chat tab is
+   *  active). Does NOT construct — panes are only grown by setTab(). */
   paneWidget() {
-    if (this.mainPane === "trajectory") return this.trajectoryPanel;
-    if (this.mainPane === "subagent") return this.subagentPane;
-    if (this.mainPane === "tasks") return this.tasksPane;
+    if (this.mainTab === "trajectory") return this.trajectoryPanel;
+    if (this.mainTab === "subagent") return this.subagentPane;
+    if (this.mainTab === "tasks") return this.tasksPane;
     return null;
   }
   ensureTrajectoryPane() {
@@ -3895,12 +3898,13 @@ export class App {
     return this.tasksPane;
   }
 
-  /** Set the main-area pane (chat | trajectory | subagent | tasks) and focus
-   *  it. Non-chat panes are lazy-grown and seeded on first entry; re-entry
-   *  (including a cycle back) keeps their live state. */
-  setPane(which) {
-    this.mainPane = which;
+  /** Set the main-area tab (chat | trajectory | subagent | tasks) and focus
+   *  the main window. Non-chat panes are lazy-grown and seeded on first entry;
+   *  re-entry (including a cycle back) keeps their live state. */
+  setTab(which) {
+    this.mainTab = which;
     this.mode = which === "trajectory" ? "trajectory" : "chat";
+    this.focusedWindow = "main";
     let pane = null;
     if (which === "trajectory") {
       pane = this.ensureTrajectoryPane();
@@ -3918,22 +3922,43 @@ export class App {
     this.redraw();
   }
 
-  /** tmux-style pane focus over the fixed 5-stop ring:
-   *  sidebar → chat → 轨迹 → 子代理 → 后台任务 → (wrap). The sidebar stop is
-   *  omitted when it is hidden; the pane stops are always reachable. */
-  focusPane(delta) {
-    const panes = [];
-    if (this.sidebarVisible) panes.push("sidebar");
-    panes.push("chat", "trajectory", "subagent", "tasks");
-    const current = this.focused === this.sidebar ? "sidebar" : this.mainPane;
-    const idx = panes.indexOf(current);
-    const next = panes[wrapIndex(Math.max(0, idx) + delta, panes.length)];
-    if (next === "sidebar") {
+  /** Window stops: list (会话列表) + main (主窗口). The list stop is omitted
+   *  when the sidebar is hidden. */
+  windowStops() {
+    return this.sidebarVisible ? ["list", "main"] : ["main"];
+  }
+
+  /** tmux-style window focus over the 2-stop ring (list ↔ main, wrap). The
+   *  list stop is omitted when the sidebar is hidden. */
+  focusWindow(delta) {
+    const stops = this.windowStops();
+    const idx = stops.indexOf(this.focusedWindow);
+    const next = stops[wrapIndex(Math.max(0, idx) + delta, stops.length)];
+    this.setFocusedWindow(next);
+    return true;
+  }
+
+  /** Focus the given window. "list" focuses the session list; "main" focuses
+   *  whatever the active tab hosts (chat or the active pane). */
+  setFocusedWindow(which) {
+    this.focusedWindow = which;
+    if (which === "list") {
       this.focus(this.sidebar);
-      this.redraw();
-      return true;
+    } else {
+      const pane = this.paneWidget();
+      if (pane) this.focus(pane);
+      else this.focus(this.chat);
     }
-    this.setPane(next);
+    this.redraw();
+  }
+
+  /** Cycle the main-window tab: chat → trajectory → subagent → tasks → chat.
+   *  Tabs are always reachable regardless of an open session. */
+  cycleTab(delta) {
+    const tabs = ["chat", "trajectory", "subagent", "tasks"];
+    const idx = tabs.indexOf(this.mainTab);
+    const next = tabs[wrapIndex(Math.max(0, idx) + delta, tabs.length)];
+    this.setTab(next);
     return true;
   }
 
@@ -4007,6 +4032,11 @@ export class App {
     this.focused = w;
     if (this.sidebar) this.sidebar.focused = w === this.sidebar;
     if (this.chat?.input) this.chat.inputActive = w === this.chat.input;
+    // The focused window follows what is actually focused: the session list when
+    // the sidebar is focused, the main window for chat / its input / the active
+    // tab's pane. Overlays (modal) never change the focused window.
+    if (w === this.sidebar) this.focusedWindow = "list";
+    else if (w === this.chat || w === this.chat?.input || w === this.paneWidget()) this.focusedWindow = "main";
   }
 
   openMenu(items, ev) {
@@ -4067,10 +4097,10 @@ export class App {
   /** Live-frame fan-out into the active main-area pane. The subagent pane
    *  reloads (throttled); the tasks pane repaints (it reads live data). */
   notifyPaneLive(kind) {
-    if (kind === "subagent" && this.mainPane === "subagent") {
+    if (kind === "subagent" && this.mainTab === "subagent") {
       const page = this.subagentPane;
       if (page && typeof page.reload === "function") page.reload();
-    } else if (kind === "tasks" && this.mainPane === "tasks") {
+    } else if (kind === "tasks" && this.mainTab === "tasks") {
       this.redraw();
     }
   }
@@ -4792,7 +4822,7 @@ export class App {
     this.chat.input?.setValue(this.draftsBySession.get(sessionId) ?? "");
     // A sidebar Enter intentionally preserves sidebar focus, but every
     // session-scoped panel must immediately follow the newly opened session.
-    if (this.mainPane === "trajectory" && this.trajectoryPanel) await this.trajectoryPanel.load(sessionId);
+    if (this.mainTab === "trajectory" && this.trajectoryPanel) await this.trajectoryPanel.load(sessionId);
     else if (this.fullBuffer && this.fullBuffer === this.subagentPanel) this.subagentPanel.load(sessionId);
     else if (this.fullBuffer && this.fullBuffer === this.skillsPanel) this.skillsPanel.load?.(sessionId);
     if (epoch !== this.sessionEpoch || sessionId !== this.currentSession) return;
@@ -4834,14 +4864,14 @@ export class App {
   }
 
   setMode(mode) {
-    // Trajectory toggle requires an open session (tab-click / chat-toggle path);
-    // the pane ring (focusPane) reaches trajectory regardless.
+    // Trajectory requires an open session (tab-click / chat-toggle path); the
+    // tab cycle (cycleTab) reaches trajectory regardless.
     if (mode === "trajectory" && !this.currentSession) {
       this.toast("先打开一个会话");
-      this.setPane("chat");
+      this.setTab("chat");
       return;
     }
-    this.setPane(mode === "trajectory" ? "trajectory" : "chat");
+    this.setTab(mode);
   }
 
   panelForMode() { return this.paneWidget(); }
@@ -4874,7 +4904,7 @@ export class App {
   }
   showSettingsBuffer() { if (!this.settingsPanel) this.settingsPanel = new SettingsPanel(this); this.openFullBuffer(this.settingsPanel); this.settingsPanel.load(); }
   showModelsBuffer() { if (!this.modelPanel) this.modelPanel = new ModelPanel(this); this.openFullBuffer(this.modelPanel); this.modelPanel.load(); }
-  showSubagentBuffer() { this.setPane("subagent"); }
+  showSubagentBuffer() { this.setTab("subagent"); }
   showSkillsBuffer() {
     if (!this.currentSession) { this.toast("先打开一个会话"); return; }
     if (!this.skillsPanel) this.skillsPanel = new SkillsPanel(this);
@@ -4906,7 +4936,7 @@ export class App {
     else this.toast("先打开一个会话");
   }
 
-  showJobs() { this.setPane("tasks"); }
+  showJobs() { this.setTab("tasks"); }
   async refreshSubagentStats(sessionId = this.currentSession) {
     if (!sessionId) return;
     try {
@@ -4917,7 +4947,7 @@ export class App {
       if (sessionId === this.currentSession) this.redraw();
     } catch {}
   }
-  showQueue() { this.setPane("tasks"); }
+  showQueue() { this.setTab("tasks"); }
   showGoal() { this.overlay = new GoalPanel(this); this.focus(this.overlay); this.redraw(); }
   showModePicker() { this.overlay = buildModePicker(this); this.redraw(); }
   showThemePicker() { this.overlay = new ThemePickerBuffer(this); this.redraw(); }
@@ -5045,8 +5075,9 @@ export class App {
     this.chat.expanded.clear();
     this.chat.queueRebuild();
     this.chat.view.anchorLock = null;
-    this.mainPane = "chat";
+    this.mainTab = "chat";
     this.mode = "chat";
+    this.focusedWindow = "main";
     this.focus(this.chat);
     this.toast("正在重新加载…");
     await this.refreshSessions();
@@ -5211,20 +5242,20 @@ export class App {
         this.redraw();
         return true;
       case "help": this.showHelp(); return true;
-      case "panePrev": this.focusPane(-1); return true;
-      case "paneNext": this.focusPane(1); return true;
+      case "panePrev": this.focusWindow(-1); return true;
+      case "paneNext": this.focusWindow(1); return true;
       case "permissionRotate": this.rotatePermission(); return true;
       case "editConfig": this.editConfigFile(); return true;
       case "quit": this.stop(); return true;
       case "model": this.overlay = buildModelPicker(this); this.redraw(); return true;
-      case "trajectory": this.setPane("trajectory"); return true;
+      case "trajectory": this.setTab("trajectory"); return true;
       case "workspace": this.showWorkspaceBuffer(); return true;
       case "settings": this.showSettingsBuffer(); return true;
-      case "subagent": this.setPane("subagent"); return true;
+      case "subagent": this.setTab("subagent"); return true;
       case "skills": this.showSkillsBuffer(); return true;
       case "goal": this.showGoal(); return true;
-      case "jobs": this.setPane("tasks"); return true;
-      case "queue": this.setPane("tasks"); return true;
+      case "jobs": this.setTab("tasks"); return true;
+      case "queue": this.setTab("tasks"); return true;
       case "busyEnter": {
         const next = busyEnter() === "queue" ? "steer" : "queue";
         saveTuiConfig({ busyEnter: next });
@@ -5302,10 +5333,12 @@ export class App {
   }
 
   #modeTabs() {
-    // Ctrl+Left/Right pane targets. The other panels are full-screen buffers.
+    // Main-window tab strip: 对话 | 轨迹 | 子代理 | 后台任务 (Shift+Tab cycles).
     return [
       ["chat", "对话"],
       ["trajectory", "轨迹"],
+      ["subagent", "子代理"],
+      ["tasks", "后台任务"],
     ];
   }
 
@@ -5315,14 +5348,22 @@ export class App {
     s.fillRect(x, 0, x + w - 1, 0, " ", { bg: T.PANEL });
     const tabs = [...this.#modeTabs()];
     let tx = x;
-    const sidebarFocused = this.focused === this.sidebar;
     for (const [id, label] of tabs) {
-      const sel = !sidebarFocused && id === this.mode;
+      const sel = id === this.mainTab;
       const seg = ` ${label} `;
-      s.text(tx, 0, seg, { fg: sel ? T.SELFG : T.DIM, bg: sel ? T.ACCENT : T.PANEL, attrs: sel ? 1 : 0 });
+      // The active tab stays highlighted even while the list window is focused;
+      // the strip simply indicates which tab would be active in the main window.
+      const fg = sel ? T.SELFG : T.DIM;
+      const bg = sel ? T.ACCENT : T.PANEL;
+      s.text(tx, 0, seg, { fg, bg, attrs: sel ? 1 : 0 });
       tx += strWidth(seg);
     }
-    if (this.currentSession == null) s.text(x + w - 16, 0, "未选会话", { fg: T.FAINT, bg: T.PANEL });
+    // Flow the key hint right after the tabs: it never overlaps the sidebar,
+    // and clips at the right edge on narrow mains (Screen.text truncates).
+    const hint = " Shift+Tab 切标签 · Tab/Ctrl+←→ 切窗口 ";
+    s.text(tx, 0, truncate(hint, Math.max(0, x + w - tx)), { fg: T.FAINT, bg: T.PANEL });
+    tx += strWidth(hint);
+    if (this.currentSession == null) s.text(tx + 1, 0, "未选会话", { fg: T.FAINT, bg: T.PANEL });
   }
 
   #clickTab(px) {
@@ -5336,6 +5377,35 @@ export class App {
         return true;
       }
       tx += strWidth(seg);
+    }
+    return false;
+  }
+
+  /** Whether an editor (INSERT) surface owns the keyboard: the chat input or a
+   *  pane's own message input (subagent/tasks inputMode). */
+  #inInsertMode() {
+    if (this.focused === this.chat?.input) return true;
+    return this.focused?.inputMode === true;
+  }
+
+  /** Structural window/tab keys (NORMAL mode only; see dispatch). Returns true
+   *  when handled so the key never reaches a binding or the focused widget.
+   *  Ctrl+Left/Right (panePrev/paneNext) are editable bindings and route through
+   *  the binding matcher to focusWindow; here we only own Tab/Backtab. */
+  #handleStructuralKey(ev) {
+    if (ev.type !== "key") return false;
+    if (this.#inInsertMode()) return false; // INSERT keeps editor semantics
+    if (ev.name === "tab" && !ev.ctrl && !ev.alt) {
+      // Toggle focused window: list ↔ main (fast toggle, same as the cycle).
+      if (this.sidebarVisible) this.focusWindow(1);
+      else this.setFocusedWindow("main");
+      return true;
+    }
+    if (ev.name === "backtab" && !ev.ctrl && !ev.alt) {
+      // Cycle the main-window tabs. From the list window, focus main first.
+      if (this.focusedWindow !== "main") this.setFocusedWindow("main");
+      this.cycleTab(1);
+      return true;
     }
     return false;
   }
@@ -5451,24 +5521,26 @@ export class App {
       if (this.#clickTab(ev.x)) { this.redraw(); return; }
     }
     // mouse routes by position (click = focus + dispatch)
-    if (this.mainPane !== "chat") {
+    if (this.mainTab !== "chat") {
       const panel = this.paneWidget();
       if (panel && this.focused === panel) {
         // The pane owns keyboard while it is focused. Intercept the pane-level
         // close (q / Esc) and insert (i) keys BEFORE delegating — the panes'
         // own close handlers would close an overlay; here they switch back to
-        // the chat pane. Tab/←/→ switch between panes (never leak into a pane).
+        // the chat tab. Tab/Shift+Tab (window/tab layer) and Ctrl+Left/Right
+        // (panePrev/paneNext) never leak into a pane: they fall through to the
+        // global shortcuts below and are switched at the window/tab layer.
         if (ev.type === "key") {
           if (ev.name === "escape" || (ev.name === "char" && ev.key === "q" && !ev.ctrl)) {
-            this.setPane("chat");
+            this.setTab("chat");
             this.redraw();
             return;
           }
           if (bindingMatchFor(ev, keyBindings(), false, ["insert"])?.id === "insert") {
-            // In the 子代理 pane, i/Tab belong to the pane (focus its message
+            // In the 子代理 pane, i belongs to the pane (focus its message
             // input); elsewhere i returns to chat and focuses the input.
-            if (this.mainPane !== "subagent") {
-              this.setPane("chat");
+            if (this.mainTab !== "subagent") {
+              this.setTab("chat");
               this.focus(this.chat.input);
               this.redraw();
               return;
@@ -5477,17 +5549,14 @@ export class App {
         } else if (ev.type === "text" && graphemes(ev.text).length === 1) {
           // Legacy terminals deliver q/i as text; mirror the key intercepts.
           const t = graphemes(ev.text)[0].toLowerCase();
-          if (t === "q") { this.setPane("chat"); this.redraw(); return; }
-          if (t === "i") { this.setPane("chat"); this.focus(this.chat.input); this.redraw(); return; }
+          if (t === "q") { this.setTab("chat"); this.redraw(); return; }
+          if (t === "i") { this.setTab("chat"); this.focus(this.chat.input); this.redraw(); return; }
         }
-        const paneSwitch = ev.type === "key" && ev.ctrl && (ev.name === "left" || ev.name === "right");
-        if (!paneSwitch) {
-          const handled = ev.type === "key" || ev.type === "text" || ev.type === "paste" ? panel.onKey(ev) : panel.onMouse(ev);
-          if (handled) { this.redraw(); return; }
-          // A visible panel owns non-global text/paste even when it declines
-          // the event; never leak it into the hidden chat/Input behind it.
-          if (ev.type === "text" || ev.type === "paste") { this.redraw(); return; }
-        }
+        const handled = ev.type === "key" || ev.type === "text" || ev.type === "paste" ? panel.onKey(ev) : panel.onMouse(ev);
+        if (handled) { this.redraw(); return; }
+        // A visible panel owns non-global text/paste even when it declines
+        // the event; never leak it into the hidden chat/Input behind it.
+        if (ev.type === "text" || ev.type === "paste") { this.redraw(); return; }
         // unhandled key events fall through to global shortcuts
       } else if (ev.type === "mouse" && this.sidebarVisible && this.sidebar.inside(ev.x, ev.y)) {
         if (this.focused !== this.chat.input) this.focus(this.sidebar); // INSERT exits only via Esc
@@ -5592,6 +5661,13 @@ export class App {
         this.redraw();
         return;
       }
+      // Structural window/tab keys (NORMAL mode only — INSERT keeps editor
+      // semantics: Tab still completes in the input, Ctrl+Left/Right are editor
+      // motions). Tab toggles the focused window (list ↔ main); Backtab cycles
+      // the main-window tabs (chat → trajectory → subagent → tasks). Ctrl+Left/
+      // Right (panePrev/paneNext) are editable bindings matched below and also
+      // switch the focused window.
+      if (this.#handleStructuralKey(ev)) return;
       // Editable global bindings: two slots per function, resolved by the
       // keybindings registry (tui-config.json keyBindings.<id>).
       const hit = bindingMatchFor(ev, keyBindings(), false, KEYBINDING_ORDER);
@@ -5616,8 +5692,8 @@ export class App {
         // Esc in NORMAL mode interrupts a running turn (one press, regardless
         // of focus); otherwise it steps back toward the chat view.
         if (this.#interruptIfRunning()) return;
-        if (this.focused === this.sidebar) { this.focus(this.chat); this.redraw(); }
-        else if (this.mainPane !== "chat") this.setPane("chat");
+        if (this.focused === this.sidebar) { this.setFocusedWindow("main"); this.focus(this.chat); this.redraw(); }
+        else if (this.mainTab !== "chat") this.setTab("chat");
         return;
       }
     }

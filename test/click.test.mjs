@@ -4256,7 +4256,7 @@ test("loading older history preserves the selected transcript block identity", a
 });
 
 test("opening a new session while trajectory is visible reloads that trajectory", async () => {
-  const app = headlessApp(); app.currentSession = "A"; app.mainPane = "trajectory";
+  const app = headlessApp(); app.currentSession = "A"; app.mainTab = "trajectory";
   const loads = [];
   app.trajectoryPanel = { relayout() {}, render() {}, onKey() { return false; }, onMouse() { return false; }, async load(id) { loads.push(id); this.sessionId = id; } };
   app.api.call = async (method, payload) => {
@@ -4535,7 +4535,7 @@ test("? (Shift+/) opens a per-scenario help buffer and returns to the pane", () 
   app.overlay = null;
 });
 
-test("sidebar Tab toggles an ATTACHED preview card (never a modal)", async () => {
+test("sidebar p toggles an ATTACHED preview card (never a modal); Tab leaves the list window", async () => {
   const app = headlessApp();
   app.currentSession = "s1";
   app.sessions = [
@@ -4558,8 +4558,8 @@ test("sidebar Tab toggles an ATTACHED preview card (never a modal)", async () =>
   app.sidebar.setData([{ workspaceId: "w1", title: "工作区", path: "/tmp/x", sessionIds: ["s1", "s2"] }], app.sessions, new Set(), "s1");
   app.focus(app.sidebar);
   app.sidebar.sel = 2; // s2 row
-  app.sidebar.onKey({ type: "key", name: "tab" });
-  assert.equal(app.sidebar.preview.open, true, "Tab opens the card");
+  app.sidebar.onKey({ type: "key", name: "char", key: "v", ctrl: false, alt: false, shift: false });
+  assert.equal(app.sidebar.preview.open, true, "p opens the card");
   assert.equal(app.overlay, null, "the card is NOT a modal overlay");
   assert.equal(app.focused, app.sidebar, "focus never leaves the tree");
   await new Promise((r) => setTimeout(r, 5));
@@ -4572,17 +4572,24 @@ test("sidebar Tab toggles an ATTACHED preview card (never a modal)", async () =>
   app.sidebar.onKey({ type: "key", name: "up" });
   await new Promise((r) => setTimeout(r, 5));
   assert.deepEqual(historyCalls, ["s2", "s1"], "arrow moves the tree AND the card follows");
-  // second Tab toggles it closed
-  app.sidebar.onKey({ type: "key", name: "tab" });
-  assert.equal(app.sidebar.preview.open, false, "second Tab closes");
+  // second p toggles it closed
+  app.sidebar.onKey({ type: "key", name: "char", key: "v", ctrl: false, alt: false, shift: false });
+  assert.equal(app.sidebar.preview.open, false, "second p closes");
   const calls = historyCalls.length;
-  app.sidebar.onKey({ type: "key", name: "tab" });
+  app.sidebar.onKey({ type: "key", name: "char", key: "v", ctrl: false, alt: false, shift: false });
   await new Promise((r) => setTimeout(r, 5));
   assert.ok(historyCalls.length >= calls, "re-open fetches again");
   // Enter opens the session and dismisses the card
   app.sidebar.preview.open = true;
   app.sidebar.onKey({ type: "key", name: "enter" });
   assert.equal(app.sidebar.preview.open, false, "Enter dismisses the card");
+  // A plain Tab from the list window is the window toggle, NOT a preview toggle:
+  // it exits the list window to the main window (and does not touch the card).
+  app.focus(app.sidebar); app.focusedWindow = "list";
+  app.sidebar.preview.open = true;
+  app.onEvent({ type: "key", name: "tab", ctrl: false, shift: false });
+  assert.equal(app.focusedWindow, "main", "Tab leaves the list window");
+  assert.ok(app.sidebar.preview.open, "Tab does not toggle the preview card");
 });
 
 test("source badges: shared helpers, trajectory step prefix and goal rounds", () => {
@@ -4596,7 +4603,7 @@ test("source badges: shared helpers, trajectory step prefix and goal rounds", ()
   app.chat.loadOlder = async () => {};
   app.chat.minSeq = 1;
   // trajectory steps with plugin-/goal-sourced initiating messages render badges
-  app.setPane("trajectory");
+  app.setTab("trajectory");
   const tp = app.trajectoryPanel;
   tp.steps = [
     { step: 1, startSeq: 1, events: [{ type: "user/message", seq: 1, data: { source: { kind: "plugin", plugin: "cron" }, content: [{ type: "text", text: "cron tick" }] } }], firstSeq: 1 },
@@ -4628,7 +4635,7 @@ test("panel pages refresh live from frame injection (subagent reload + tasks red
     return { items: [] };
   };
   app.api.connectMux = () => {}; app.api.connectHost = () => {};
-  app.setPane("subagent"); // subagent pane active
+  app.setTab("subagent"); // subagent pane active
   await new Promise((r) => setTimeout(r, 5));
   const page = app.subagentPane;
   assert.equal(page.entries[0].id, "sub-1", "initial load");
@@ -4640,7 +4647,7 @@ test("panel pages refresh live from frame injection (subagent reload + tasks red
   await new Promise((r) => setTimeout(r, 5));
   assert.equal(calls, 2, "rapid consecutive frames are throttled to 1/s");
   // jobs frame while the tasks pane is active: repaint from live data
-  app.setPane("tasks");
+  app.setTab("tasks");
   app.deliverFrame({ type: "session/jobs", sessionId: "s1", jobs: [{ status: "running", label: "x" }] });
   assert.ok(true, "jobs frame fan-out accepts the pane"); // no throw
 });
@@ -5012,27 +5019,36 @@ test("JobsPanel shares one buffer with subagents and updates expand triangle", a
   assert.equal(panel.page, "jobs");
 });
 
-test("Ctrl+Left/Right cycles pane focus and global Tab is unbound", () => {
+test("Ctrl+Left/Right toggles window focus; Tab toggles too while Shift+Tab cycles tabs", () => {
   const app = headlessApp(); app.currentSession = "s";
-  app.onEvent({ type: "key", name: "tab", ctrl: false, shift: false });
-  assert.equal(app.mainPane, "chat", "Tab no longer switches global panes");
-  assert.equal(app.focused, app.chat);
+  app.focus(app.chat); app.focusedWindow = "main"; app.mainTab = "chat";
+  // Ctrl+Left: main window → list window (会话列表)
   app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
+  assert.equal(app.focusedWindow, "list", "Ctrl+Left focuses the list window");
   assert.equal(app.focused, app.sidebar, "Ctrl+Left focuses workspace sidebar");
+  // Ctrl+Right: list → main
   app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.mainPane, "chat", "Ctrl+Right returns to chat");
+  assert.equal(app.focusedWindow, "main", "Ctrl+Right returns to the main window");
   assert.equal(app.focused, app.chat);
-  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.mainPane, "trajectory", "next pane is trajectory");
-  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.mainPane, "subagent", "then subagent");
-  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.mainPane, "tasks", "then 后台任务");
-  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.focused, app.sidebar, "pane sequence wraps to sidebar");
-  // A full-screen buffer is modal: pane cycling is swallowed until Esc, then
-  // focus mode works again — buffers never fight the focus mode.
-  app.setPane("chat"); app.focus(app.chat);
+  assert.equal(app.mainTab, "chat", "chat tab is unchanged by a window switch");
+  // plain Tab is the same fast window toggle
+  app.onEvent({ type: "key", name: "tab", ctrl: false, shift: false });
+  assert.equal(app.focusedWindow, "list", "Tab toggles to the list window");
+  app.onEvent({ type: "key", name: "tab", ctrl: false, shift: false });
+  assert.equal(app.focusedWindow, "main", "Tab toggles back to the main window");
+  // Shift+Tab cycles the main-window tabs (chat → trajectory → subagent → tasks → chat)
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "trajectory", "Shift+Tab → trajectory");
+  assert.equal(app.focusedWindow, "main");
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "subagent", "Shift+Tab → subagent");
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "tasks", "Shift+Tab → 后台任务");
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "chat", "tab cycle wraps to chat");
+  // A full-screen buffer is modal: window/tab keys are owned by the buffer
+  // until Esc, then window switching works again — buffers never fight it.
+  app.setTab("chat"); app.focus(app.chat);
   app.showSettingsBuffer();
   assert.equal(app.fullBuffer, app.settingsPanel);
   app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
@@ -5041,28 +5057,70 @@ test("Ctrl+Left/Right cycles pane focus and global Tab is unbound", () => {
   app.onEvent({ type: "key", name: "escape", ctrl: false, shift: false });
   assert.equal(app.fullBuffer, null);
   app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
-  assert.equal(app.focused, app.sidebar, "Ctrl+Left cycles panes again after Esc closes the buffer");
+  assert.equal(app.focusedWindow, "list", "window switching works after Esc closes the buffer");
+  // Mouse clicks keep the focused window in sync (a single Tab returns to main)
+  app.onEvent({ type: "mouse", kind: "press", button: 0, x: 60, y: 10, ctrl: false, shift: false, alt: false, motion: false });
+  assert.equal(app.focusedWindow, "main", "clicking the main area focuses the main window");
+  app.onEvent({ type: "mouse", kind: "press", button: 0, x: 10, y: 5, ctrl: false, shift: false, alt: false, motion: false });
+  assert.equal(app.focusedWindow, "list", "clicking the list focuses the list window");
+  app.onEvent({ type: "key", name: "tab", ctrl: false, shift: false });
+  assert.equal(app.focusedWindow, "main", "one Tab from the clicked list returns to main");
+  // INSERT keeps editor semantics: Ctrl+Left is an editor motion, not a window switch
   app.focus(app.chat.input); const beforeCursor = app.chat.input.cursor;
   app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
   assert.equal(app.focused, app.chat.input, "Ctrl+Left remains an editor motion in INSERT");
   assert.ok(app.chat.input.cursor <= beforeCursor);
 });
 
-test("pane cycling includes every pane stop and hides the sidebar stop when collapsed", () => {
-  const app = headlessApp(); app.currentSession = null; app.focus(app.chat);
-  // trajectory/subagent/tasks are reachable even without a session
-  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.mainPane, "trajectory", "trajectory pane reached without a session");
-  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.mainPane, "subagent");
-  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.mainPane, "tasks");
-  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-  assert.equal(app.focused, app.sidebar, "sidebar stop follows 后台任务");
-  // a collapsed sidebar drops the sidebar stop from the ring
-  app.sidebarWanted = false; app.layout(); app.setPane("chat");
+test("tab cycling reaches every tab and collapses the list window when the sidebar is hidden", () => {
+  const app = headlessApp(); app.currentSession = null; app.focus(app.chat); app.focusedWindow = "main"; app.mainTab = "chat";
+  // Shift+Tab reaches trajectory/subagent/tasks even without a session
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "trajectory", "trajectory tab reached without a session");
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "subagent");
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "tasks");
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "chat", "tab cycle wraps to chat");
+  // Backtab from the list window focuses the main window first, then cycles a tab
+  app.focusedWindow = "list"; app.focus(app.sidebar);
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.focusedWindow, "main", "backtab from the list window focuses the main window");
+  assert.equal(app.mainTab, "trajectory", "and cycles to a tab");
+  // a collapsed sidebar removes the list window stop: window keys stay in main
+  app.sidebarWanted = false; app.layout(); app.setTab("chat"); app.focusedWindow = "main";
+  app.onEvent({ type: "key", name: "tab", ctrl: false, shift: false });
+  assert.equal(app.focusedWindow, "main", "collapsed sidebar keeps a single main window");
   app.onEvent({ type: "key", name: "left", ctrl: true, shift: false });
-  assert.equal(app.mainPane, "tasks", "collapsed sidebar steps to the previous pane stop");
+  assert.equal(app.focusedWindow, "main", "Ctrl+Left cannot reach a hidden list window");
+});
+
+test("the main-window tab strip renders all four tabs and the Shift+Tab key hint", () => {
+  const app = headlessApp(); app.currentSession = "s";
+  app.layout();
+  app.renderFrame();
+  // toPlain() pads CJK wide glyphs with spaces, so compare space-agnostically.
+  const row0 = (app.screen.toPlain().split("\n")[0] ?? "").replace(/\s+/g, "");
+  for (const label of ["对话", "轨迹", "子代理", "后台任务"]) {
+    assert.ok(row0.includes(label), `tab strip renders ${label}`);
+  }
+  assert.ok(row0.includes("Shift+Tab"), "tab strip shows the Shift+Tab key hint");
+  // switching tabs keeps the strip visible (never blank) as the tab changes
+  app.setTab("subagent");
+  app.renderFrame();
+  const row0b = (app.screen.toPlain().split("\n")[0] ?? "").replace(/\s+/g, "");
+  assert.ok(row0b.includes("子代理"), "strip still shows tabs on the subagent tab");
+  app.setTab("tasks");
+  app.renderFrame();
+  const row0c = (app.screen.toPlain().split("\n")[0] ?? "").replace(/\s+/g, "");
+  assert.ok(row0c.includes("后台任务"), "strip reflects the tasks tab");
+  // clicking a tab routes to it (row 0 of the main area, right of the divider)
+  const x0 = app.sidebarVisible ? app.sidebarWidth : 0;
+  app.onEvent({ type: "mouse", kind: "press", button: 0, x: x0 + 8, y: 0, ctrl: false, shift: false, alt: false, motion: false });
+  assert.equal(app.mainTab, "trajectory", "clicking the 轨迹 tab selects it");
+  app.onEvent({ type: "mouse", kind: "press", button: 0, x: x0 + 25, y: 0, ctrl: false, shift: false, alt: false, motion: false });
+  assert.equal(app.mainTab, "tasks", "clicking the 后台任务 tab selects it");
 });
 
 test("keybinding registry parses, matches, describes and validates two-slot specs", () => {
@@ -5488,7 +5546,7 @@ test("subagent/jobs/queue/trajectory keybindings are freed (main-area panes repl
   assert.equal(kb.goal.key, "Ctrl+G");
 });
 
-test("Ctrl+T matches nothing; Ctrl+G opens the GoalPanel; Ctrl+Right cycles the panes", async () => {
+test("Ctrl+T matches nothing; Ctrl+G opens the GoalPanel; Ctrl+Right toggles windows & Shift+Tab cycles tabs", async () => {
   const app = headlessApp(); app.currentSession = "s";
   app.sessions = [{ sessionId: "s", agentPreset: "standard" }];
   app.chat.sessionId = "s"; app.chat.loadOlder = async () => {};
@@ -5501,7 +5559,7 @@ test("Ctrl+T matches nothing; Ctrl+G opens the GoalPanel; Ctrl+Right cycles the 
   // Ctrl+T matches nothing (no pane, no overlay)
   app.onEvent({ type: "key", name: "char", key: "t", ctrl: true, shift: false });
   assert.ok(!app.overlay, "Ctrl+T no longer opens anything");
-  assert.equal(app.mainPane, "chat", "Ctrl+T does not switch panes");
+  assert.equal(app.mainTab, "chat", "Ctrl+T does not switch tabs");
   // Ctrl+G opens a LARGER GoalPanel overlay
   app.onEvent({ type: "key", name: "char", key: "g", ctrl: true, shift: false });
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -5511,33 +5569,39 @@ test("Ctrl+T matches nothing; Ctrl+G opens the GoalPanel; Ctrl+Right cycles the 
   // Esc closes it
   app.onEvent({ type: "key", name: "escape", ctrl: false });
   assert.equal(app.overlay, null, "Esc closes the GoalPanel");
-  // Ctrl+Right cycles sidebar→chat→trajectory→subagent→tasks→sidebar
-  const expected = ["chat", "trajectory", "subagent", "tasks", "sidebar"];
-  const cycle = [];
-  app.focus(app.sidebar);
-  for (let i = 0; i < expected.length; i++) {
-    app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
-    const stop = app.focused === app.sidebar ? "sidebar" : app.mainPane;
-    cycle.push(stop);
-    if (expected[i] === "sidebar") assert.equal(app.focused, app.sidebar, "cycle wraps to sidebar");
-    else assert.equal(app.mainPane, expected[i], `cycle step ${i}`);
-  }
-  assert.deepEqual(cycle, expected);
-  // Each pane renders its own content in the main area
-  app.setPane("trajectory");
+  // Ctrl+Right toggles window focus: main ↔ list (2 stops, wraps)
+  app.focus(app.chat); app.focusedWindow = "main";
+  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
+  assert.equal(app.focusedWindow, "list", "Ctrl+Right → list window");
+  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
+  assert.equal(app.focusedWindow, "main", "Ctrl+Right wraps back to the main window");
+  app.onEvent({ type: "key", name: "right", ctrl: true, shift: false });
+  assert.equal(app.focusedWindow, "list", "Ctrl+Right toggles again");
+  // Shift+Tab cycles the main-window tabs once back in the main window
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true }); // from list → main + trajectory
+  assert.equal(app.focusedWindow, "main", "backtab leaves the list window");
+  assert.equal(app.mainTab, "trajectory", "and cycles to trajectory");
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "subagent", "then subagent");
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "tasks", "then 后台任务");
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "chat", "then wraps to chat");
+  // Each tab renders its own content in the main area
+  app.setTab("trajectory");
   app.trajectoryPanel.steps = [{ step: 1, startSeq: 1, events: [{ type: "user/message", seq: 1, data: { source: { kind: "user" }, content: [{ type: "text", text: "hi" }] } }] }];
   app.trajectoryPanel.visibleStepIndices = [0];
   app.trajectoryPanel.selectedStepKey = app.trajectoryPanel.stepKey(app.trajectoryPanel.steps[0]);
   app.trajectoryPanel.buildLines();
   app.renderFrame();
   assert.ok(app.screen.toPlain().replace(/\s+/g, "").includes("step"), "trajectory pane renders steps");
-  app.setPane("subagent");
+  app.setTab("subagent");
   await new Promise((r) => setTimeout(r, 5));
   app.renderFrame();
   assert.ok(app.screen.toPlain().includes("researcher"), "subagent pane renders rows");
   app.jobs = [{ status: "completed", kind: "bash", label: "ls -la" }];
   app.queueItems = [];
-  app.setPane("tasks");
+  app.setTab("tasks");
   app.renderFrame();
   assert.ok(app.screen.toPlain().includes("ls -la"), "tasks pane renders groups");
 });
@@ -5552,7 +5616,7 @@ test("subagent pane sends a continuable message via its input (i focuses, Esc re
     if (method === "subagent.prompt") { sent = payload; return {}; }
     return { items: [] };
   };
-  app.setPane("subagent");
+  app.setTab("subagent");
   await new Promise((r) => setTimeout(r, 5));
   const pane = app.subagentPane;
   app.focus(pane);

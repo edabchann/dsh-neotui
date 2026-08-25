@@ -4844,7 +4844,7 @@ export class SubagentPage extends Widget {
     this.inputMode = false;
     this.input = new Input({
       x: this.x, y: this.y + this.h - 1, w: this.w, h: 1,
-      placeholder: "给选中子代理发消息…（continuable · i 或 Tab 聚焦 · Esc 回列表）",
+      placeholder: "给选中子代理发消息…（continuable · i 聚焦 · Esc 回列表）",
       onEnter: (v) => this.send(v),
     });
   }
@@ -4976,7 +4976,7 @@ export class SubagentPage extends Widget {
       else if (selLine >= this.view.scrollY + this.view.h) this.view.scrollY = selLine - this.view.h + 1;
     }
     screen.fillRect(this.x, this.y + this.h - 2, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: this.inputMode ? T.BG2 : T.BG });
-    screen.text(this.x + 1, this.y + this.h - 2, " ↑↓ 选择 · Enter 详情 · r 刷新 · i/Tab 给子代理发消息 · q/Esc 返回聊天", { fg: K.FAINT });
+    screen.text(this.x + 1, this.y + this.h - 2, " ↑↓ 选择 · Enter 详情 · r 刷新 · i 给子代理发消息 · q/Esc 返回聊天", { fg: K.FAINT });
     this.input.render(screen);
   }
   /** Continuable message to the selected subagent (original panel parity). */
