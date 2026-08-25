@@ -1759,6 +1759,9 @@ export class ControlPanel extends Widget {
     return [
       ["s", "跨会话全文搜索", "Ctrl+F 已释放", () => { this.app.closeOverlay(); this.app.startSearch(); this.app.redraw(); }],
       ["r", "回退（分支会话 + 原消息回填）", "/rewind", () => { this.app.closeOverlay(); this.app.showRewindPicker(); }],
+      ["m", "切换模型", "Ctrl+M 已释放", () => { this.app.closeOverlay(); this.app.overlay = buildModelPicker(this.app); this.app.redraw(); }],
+      ["d", "配色主题", "Ctrl+D 已释放", () => { this.app.closeOverlay(); this.app.showThemePicker(); }],
+      ["p", "权限模式（沙箱 + 审批）", "F8 已释放", () => { this.app.closeOverlay(); this.app.showPermissionPicker(); }],
       ["c", "打开配置文件（tui-config.json）", "等价: Ctrl+K", () => { this.app.closeOverlay(); this.app.editConfigFile(); }],
     ];
   }

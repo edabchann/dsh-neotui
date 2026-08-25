@@ -30,11 +30,11 @@ export const DEFAULT_KEYBINDINGS = {
   prevQuestion: { mode: "normal", key: "[", key2: "" },
   nextQuestion: { mode: "normal", key: "]", key2: "" },
   panel: { mode: "all", key: "Ctrl+Space", key2: "F7" },
-  model: { mode: "normal", key: "Ctrl+M", key2: "" },
+  model: { mode: "normal", key: "", key2: "" }, // freed: model switch moved to the prefix page (m)
   trajectory: { mode: "normal", key: "Ctrl+T", key2: "" },
   panePrev: { mode: "normal", key: "Ctrl+Left", key2: "" },
   paneNext: { mode: "normal", key: "Ctrl+Right", key2: "" },
-  permissionRotate: { mode: "normal", key: "F8", key2: "" },
+  permissionRotate: { mode: "normal", key: "", key2: "" }, // freed: permission modes moved to the prefix page (p)
   workspace: { mode: "normal", key: "Ctrl+W", key2: "" },
   settings: { mode: "normal", key: "Ctrl+S", key2: "" },
   subagent: { mode: "normal", key: "Ctrl+A", key2: "" },
@@ -50,7 +50,7 @@ export const DEFAULT_KEYBINDINGS = {
   addWorkspace: { mode: "normal", key: "Ctrl+Shift+W", key2: "" },
   commandPalette: { mode: "normal", key: "Ctrl+P", key2: "" },
   modePicker: { mode: "normal", key: "F9", key2: "" },
-  themePicker: { mode: "normal", key: "Ctrl+D", key2: "" },
+  themePicker: { mode: "normal", key: "", key2: "" }, // freed: theme picker moved to the Ctrl+Space prefix page (d)
   logoPicker: { mode: "normal", key: "Ctrl+R", key2: "" },
   quitDouble: { mode: "normal", key: "Ctrl+C", key2: "" },
   quit: { mode: "all", key: "Ctrl+Q", key2: "" },

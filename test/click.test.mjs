@@ -2071,8 +2071,9 @@ test("the theme picker opens from /theme, Ctrl+D and the command palette", () =>
   assert.equal(app.overlay.names.length, names.length, "every scheme is listed");
   app.overlay.onKey({ type: "key", name: "escape" });
   assert.equal(app.overlay, null, "Esc closes");
-  app.onEvent({ type: "key", name: "char", key: "d", ctrl: true, shift: false });
-  assert.ok(app.overlay instanceof ThemePickerBuffer, "Ctrl+D opens the selector");
+  app.onEvent({ type: "key", name: "char", key: " ", ctrl: true, shift: false });
+  app.onEvent({ type: "key", name: "char", key: "d", ctrl: false, alt: false, shift: false });
+  assert.ok(app.overlay instanceof ThemePickerBuffer, "prefix page d opens the theme selector");
   app.overlay.onKey({ type: "key", name: "escape" });
   assert.ok(setKeyBinding("themePicker", { mode: "normal", key: "Ctrl+9", key2: "" }));
   app.onEvent({ type: "key", name: "char", key: "9", ctrl: true, shift: false });
