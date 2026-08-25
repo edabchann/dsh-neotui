@@ -4343,7 +4343,7 @@ test("blank welcome shows logo, TUI-drawn brand wordmarks and a bottom mode hint
   app.currentSession = "blank";
   app.sessions = [{ sessionId: "blank", blank: true, agentPreset: "cordis" }];
   app.dshVersion = "0.1.0-rc.6";
-  const latestTui = `${TUI_VERSION.split(".").slice(0, 2).join(".")}.${Number(TUI_VERSION.split(".")[2]) + 1}`;
+  const latestTui = `${TUI_VERSION.split(".").slice(0, 2).join(".")}.${Number((TUI_VERSION.match(/^(\d+)\.(\d+)\.(\d+)/) ?? [])[3] ?? 0) + 1}`;
   app.versionChecks = { dsh: { state: "current", latest: "0.1.0-rc.6" }, tui: { state: "update", latest: latestTui } };
   app.chat.sessionId = "blank";
   app.chat.nodes = [];
@@ -5230,7 +5230,7 @@ test("installed version helpers expose usable package versions", () => {
 test("welcome update checks compare both npm packages without blocking", async () => {
   const seen = [];
   const screen = new Screen(100, 30), term = { output: { write() {} } };
-  const latestTui = `${TUI_VERSION.split(".").slice(0, 2).join(".")}.${Number(TUI_VERSION.split(".")[2]) + 1}`;
+  const latestTui = `${TUI_VERSION.split(".").slice(0, 2).join(".")}.${Number((TUI_VERSION.match(/^(\d+)\.(\d+)\.(\d+)/) ?? [])[3] ?? 0) + 1}`;
   const app = new App({ screen, term, api: {}, versionFetcher: async (name) => { seen.push(name); return name === "dsh-neotui" ? latestTui : "0.1.0-rc.6"; } });
   app.dshVersion = "0.1.0-rc.6";
   await app.checkUpdates();
