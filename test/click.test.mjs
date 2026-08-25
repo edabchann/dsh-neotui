@@ -5546,6 +5546,50 @@ test("subagent/jobs/queue/trajectory keybindings are freed (main-area panes repl
   assert.equal(kb.goal.key, "Ctrl+G");
 });
 
+test("Ctrl+W opens the small workspace picker and moves the current session", async () => {
+  const app = headlessApp();
+  app.currentSession = "s";
+  app.sessions = [{ sessionId: "s", agentPreset: "standard" }];
+  app.workspaceItems = [
+    { workspaceId: "w1", title: "项目A", path: "/a", sessionIds: [] },
+    { workspaceId: "w2", title: "项目B", path: "/b", sessionIds: [] },
+  ];
+  let moved = null;
+  app.api.call = async (method, payload) => { if (method === "workspace.insertSessionBefore") { moved = payload; return {}; } return { items: [] }; };
+  app.refreshSessions = async () => {};
+  app.focus(app.chat);
+  app.onEvent({ type: "key", name: "char", key: "w", ctrl: true, shift: false });
+  assert.ok(app.overlay?.constructor?.name === "Picker", "Ctrl+W opens the small picker");
+  assert.ok(app.overlay.items.some((i) => i.label.includes("项目A")), "workspaces listed");
+  assert.ok(app.overlay.items.some((i) => i.rename || i.create), "管理行存在 (重命名/新建)");
+  app.overlay.onPick(app.overlay.items[1]); // 项目B
+  await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(moved, { workspaceId: "w2", sessionId: "s" }, "current session moved to the chosen workspace");
+  app.overlay = null;
+});
+
+test("split divider drag resizes the ratio (mouse, clamped)", () => {
+  const screen = new Screen(160, 40);
+  const app = new App({ screen, term: { output: { chunks: [], write: () => {} } }, api: { call: async () => ({ items: [] }) }, log: () => {} });
+  app.currentSession = "s"; app.sessions = [{ sessionId: "s", agentPreset: "standard" }];
+  app.focus(app.chat);
+  app.onEvent({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false });
+  app.onEvent({ type: "key", name: "char", key: "r", ctrl: false, alt: false, shift: false });
+  const inner = app.winTree?.b; // split(m1, m2) inside the root split(list, …)
+  assert.equal(inner?.type, "split", "two main windows under the root");
+  // the INNER divider (m1 | m2) sits at x = 96 + half of 64 = 128
+  app.onEvent({ type: "mouse", kind: "press", button: 0, x: 128, y: 10 });
+  app.onEvent({ type: "mouse", kind: "drag", button: 0, x: 140, y: 10 });
+  assert.ok(inner.ratio > 0.55, `drag moved the ratio: ${inner.ratio}`);
+  app.onEvent({ type: "mouse", kind: "drag", button: 0, x: 500, y: 10 });
+  assert.ok(inner.ratio <= 0.8, "ratio clamped to 0.8");
+  app.onEvent({ type: "mouse", kind: "release", button: 0, x: 500, y: 10 });
+  // a later drag must no longer resize once released
+  const before = inner.ratio;
+  app.onEvent({ type: "mouse", kind: "drag", button: 0, x: 40, y: 10 });
+  assert.equal(inner.ratio, before, "no drag after release");
+});
+
 test("p prefix: arms from the main window, hint shows, Esc/unknown/timeout cancel", async () => {
   const app = headlessApp();
   app.currentSession = "s"; app.sessions = [{ sessionId: "s", agentPreset: "standard" }];

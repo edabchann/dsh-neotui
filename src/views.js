@@ -3726,6 +3726,8 @@ export class ApprovalPopup extends Popup {
 // ---- App ----
 
 export class App {
+  #workspacePicker = null; // Ctrl+W 工作区选择小 buffer（用于重命名行取选中项）
+  #splitDrag = null;       // { node, axis, rect } — dragging a split divider
   constructor({ screen, term, api, base, log, versionFetcher = latestNpmVersion, launcherAnime = false }) {
     this.screen = screen;
     this.term = term;
@@ -4046,7 +4048,8 @@ export class App {
       const border = 1;
       if (node.dir === "right" || node.dir === "left") {
         const total = Math.max(2, rect.w - border);
-        const aW = Math.max(1, Math.floor(total / 2));
+        const r = Math.min(0.8, Math.max(0.2, node.ratio ?? 0.5));
+        const aW = Math.max(1, Math.round(total * r));
         const bW = Math.max(1, total - aW);
         if (node.dir === "right") {
           place(node.a, { ...rect, w: aW }, depth + 1);
@@ -4057,7 +4060,8 @@ export class App {
         }
       } else {
         const total = Math.max(2, rect.h - border);
-        const aH = Math.max(1, Math.floor(total / 2));
+        const r = Math.min(0.8, Math.max(0.2, node.ratio ?? 0.5));
+        const aH = Math.max(1, Math.round(total * r));
         const bH = Math.max(1, total - aH);
         if (node.dir === "down") {
           place(node.a, { ...rect, h: aH }, depth + 1);
@@ -4094,7 +4098,7 @@ export class App {
     if ((dir === "right" || dir === "left") && r.w < 40 * 2 + 1) { this.toast("空间不足：分屏后各窗口需 ≥40 列"); return false; }
     if ((dir === "up" || dir === "down") && r.h < 12 * 2 + 1) { this.toast("空间不足：分屏后各窗口需 ≥12 行"); return false; }
     const newLeaf = { type: "leaf", kind: "main", id: `m${Date.now()}`, sessionId: null, mainTab: "chat" };
-    const node = { type: "split", dir, a: leaf, b: newLeaf };
+    const node = { type: "split", dir, a: leaf, b: newLeaf, ratio: 0.5 };
     this.#replaceLeaf(leaf, node);
     this.focusedLeaf = newLeaf;
     this.lastMainLeaf = newLeaf;
@@ -4159,6 +4163,35 @@ export class App {
       if (leaf.sessionId && leaf.sessionId !== this.chat.sessionId) this.openSession(leaf.sessionId);
     }
     this.redraw();
+  }
+
+  /** Hit-test a split separator position (within ±1). */
+  #hitSplitSeparator(px, py) {
+    const walk = (node, rect) => {
+      if (node.type !== "split") return null;
+      const border = 1;
+      if (node.dir === "right" || node.dir === "left") {
+        const total = Math.max(2, rect.w - border);
+        const r = Math.min(0.8, Math.max(0.2, node.ratio ?? 0.5));
+        const aW = Math.max(1, Math.round(total * r));
+        const x = rect.x + aW;
+        if (Math.abs(px - x) <= 1 && py >= rect.y && py < rect.y + rect.h) return { node, rect };
+        // recurse into the child containing the pointer
+        const child = px < x ? node.a : node.b;
+        const childRect = px < x ? { ...rect, w: aW } : { x: rect.x + aW + border, y: rect.y, w: Math.max(1, total - aW), h: rect.h };
+        return walk(child, childRect);
+      }
+      const total = Math.max(2, rect.h - border);
+      const r = Math.min(0.8, Math.max(0.2, node.ratio ?? 0.5));
+      const aH = Math.max(1, Math.round(total * r));
+      const y = rect.y + aH;
+      if (Math.abs(py - y) <= 1 && px >= rect.x && px < rect.x + rect.w) return { node, rect };
+      const child = py < y ? node.a : node.b;
+      const childRect = py < y ? { ...rect, h: aH } : { x: rect.x, y: rect.y + aH + border, w: rect.w, h: Math.max(1, total - aH) };
+      return walk(child, childRect);
+    };
+    const rootRect = { x: this.sidebarVisible ? this.sidebarWidth : 0, y: 1, w: this.mainAreaRect().w, h: this.mainAreaRect().h };
+    return walk(this.winTree, rootRect);
   }
 
   /** Public window-tree inspection (tests/diagnostics). */
@@ -5096,6 +5129,56 @@ export class App {
     this.redraw();
     return true;
   }
+  /** Ctrl+W: small workspace picker — choose the current session's workspace
+   *  (move), rename it, or add a new one from a path. */
+  showWorkspacePicker() {
+    const items = (this.workspaceItems ?? []).map((w) => ({
+      label: truncate(w.title ?? w.path ?? w.workspaceId, 40),
+      hint: w.path ?? "",
+      workspace: w,
+    }));
+    items.push({ label: "✎ 重命名当前工作区…", hint: "选中后重命名所选工作区", rename: true });
+    items.push({ label: "+ 新建工作区…", hint: "输入路径", create: true });
+    const w = Math.max(1, Math.min(72, this.screen.w - 4)), ph = Math.max(1, Math.min(14, this.screen.h - 4));
+    this.overlay = new Picker({
+      x: Math.floor((this.screen.w - w) / 2), y: Math.floor((this.screen.h - ph) / 2),
+      w, h: ph, title: "工作区 · Enter 选择/执行 · Esc 关闭",
+      items,
+      onPick: (it) => {
+        this.closeOverlay();
+        if (it.create) { this.addWorkspace(); return; }
+        if (it.rename) { const ws = this.#workspacePicker?.items?.[this.#workspacePicker.sel]?.workspace; this.#beginWorkspaceRename(ws); return; }
+        if (it.workspace) { void this.#moveCurrentToWorkspace(it.workspace); }
+      },
+      onCancel: () => this.closeOverlay(),
+    });
+    // remember selection index for the rename row
+    this.#workspacePicker = this.overlay;
+    this.focus(this.overlay);
+    this.redraw();
+  }
+  /** Move the current session into a workspace (append at its end). */
+  async #moveCurrentToWorkspace(ws) {
+    if (!this.currentSession) { this.toast("先打开一个会话"); return; }
+    if ((ws.sessionIds ?? []).includes(this.currentSession)) { this.toast("当前会话已在该工作区"); return; }
+    try {
+      await this.api.call("workspace.insertSessionBefore", { workspaceId: ws.workspaceId, sessionId: this.currentSession });
+      await this.refreshSessions();
+      this.toast(`已移动到工作区: ${truncate(ws.title ?? ws.path ?? ws.workspaceId, 20)}`);
+    } catch (e) { this.toast(`移动失败: ${e.message}`); }
+  }
+  /** Begin the inline rename of a workspace (reuses the existing rename UI). */
+  #beginWorkspaceRename(ws) {
+    const group = this.sidebar.groups.find((g) => g.workspaceId === ws?.workspaceId) ?? null;
+    if (!group) { this.toast("未找到该工作区"); return; }
+    // the existing rename flow is driven by the sidebar group; reuse its input
+    const input = new Input({ x: this.sidebar.x + 2, y: 1, w: this.sidebar.w - 4, h: 1, prompt: "新标题: ", allowEmptyEnter: true, onEnter: () => this.#commitWorkspaceRename(group, input), onKey: (ev) => { if (ev?.name === "escape") { this.#closeRename(); return true; } return Input.prototype?.onKey ? false : false; } });
+    input.value = group.title ?? "";
+    input.cursor = graphemes(input.value).length;
+    this.renameInput = input;
+    this.redraw();
+  }
+
   showWorkspaceBuffer() { if (!this.workspacePanel) this.workspacePanel = new WorkspacePanel(this); this.openFullBuffer(this.workspacePanel); this.workspacePanel.load(); }
   /** Open a local file path in the workspace panel's preview pane. */
   openWorkspaceFile(path) {
@@ -5452,7 +5535,7 @@ export class App {
       case "quit": this.stop(); return true;
       case "model": this.overlay = buildModelPicker(this); this.redraw(); return true;
       case "trajectory": this.setTab("trajectory"); return true;
-      case "workspace": this.showWorkspaceBuffer(); return true;
+      case "workspace": this.showWorkspacePicker(); return true;
       case "settings": this.showSettingsBuffer(); return true;
       case "subagent": this.setTab("subagent"); return true;
       case "skills": this.showSkillsBuffer(); return true;
@@ -5871,6 +5954,24 @@ export class App {
         this.inputDrag = false;
         if (this.chat.input.onMouse(ev)) this.redraw();
         return;
+      }
+      // Split-window divider drag: press within ±1 of a split separator.
+      if (this.winTree && ev.kind === "press" && ev.button === 0 && !this.draggingDivider) {
+        const sep = this.#hitSplitSeparator(ev.x, ev.y);
+        if (sep) { this.#splitDrag = sep; this.redraw(); return; }
+      }
+      if (this.#splitDrag) {
+        const sd = this.#splitDrag;
+        if (ev.kind === "drag" && ev.button === 0) {
+          const { node, rect } = sd;
+          const horizontal = node.dir === "right" || node.dir === "left";
+          const span = horizontal ? Math.max(2, rect.w - 1) : Math.max(2, rect.h - 1);
+          const pos = horizontal ? (ev.x - rect.x) : (ev.y - rect.y);
+          node.ratio = Math.min(0.8, Math.max(0.2, pos / span));
+          this.layout(); this.redraw();
+          return;
+        }
+        if (ev.kind === "release" && ev.button === 0) { this.#splitDrag = null; this.redraw(); return; }
       }
       // Draggable sidebar divider: press on the boundary column (±1) starts a
       // resize; drag events (motion flag) update the width live.
@@ -6825,8 +6926,10 @@ export class App {
     if (rawGoal && !["complete", "completed", "cleared"].includes(rawGoal.phase)) {
       row0.left.push({ t: ` 🎯 ${truncate(rawGoal.objective ?? "目标", 14)} · Ctrl+G `, fg: 0x000000, bg: T.WARN, bold: true });
     }
-    if (this.sidebarVisible) row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });
-    else row0.left.push({ t: " " + truncate(t || "（未选择会话）", 40) + " ", fg: T.TXT, bg: T.STATUSBG });
+    const winTag = this.winTree ? `W${(this.splitLeaves().indexOf(this.focusedLeaf) + 1) || 1} · ` : "";
+    const titleSeg = winTag + truncate((winTag ? t : t || "（未选择会话）"), 40);
+    if (this.sidebarVisible) row0.left.push({ t: " " + titleSeg + " ", fg: T.TXT, bg: T.STATUSBG });
+    else row0.left.push({ t: " " + titleSeg + " ", fg: T.TXT, bg: T.STATUSBG });
     if (cur?.running) row0.left.push({ t: " ●运行 ", fg: T.OK, bg: T.STATUSBG });
     // session elapsed/start: effective time (model+tool work, not wall clock)
     // right after the session name; start = the earliest event time loaded
