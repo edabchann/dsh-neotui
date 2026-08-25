@@ -73,6 +73,22 @@ export function busyEnter() {
 }
 
 /** Persist the newest 20 unique cross-session search queries (oldest→newest). */
+
+
+/** Last ~50 user prompts typed into the chat input (persisted, deduped). */
+export function promptHistory() {
+  const raw = loadTuiConfig().promptHistory;
+  return Array.isArray(raw) ? raw.filter((x) => typeof x === "string") : [];
+}
+
+export function rememberPrompt(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return promptHistory();
+  const next = [t, ...promptHistory().filter((x) => x !== t)].slice(0, 50);
+  saveTuiConfig({ promptHistory: next });
+  return next;
+}
+
 export function searchHistory() {
   const raw = loadTuiConfig().searchHistory;
   if (!Array.isArray(raw)) return [];

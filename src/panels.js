@@ -1758,6 +1758,7 @@ export class ControlPanel extends Widget {
   prefixRows() {
     return [
       ["s", "跨会话全文搜索", "Ctrl+F 已释放", () => { this.app.closeOverlay(); this.app.startSearch(); this.app.redraw(); }],
+      ["h", "输入历史搜索（可筛选）", "最近 50 条提问", () => { this.app.closeOverlay(); this.app.showHistorySearch(); }],
       ["r", "回退（分支会话 + 原消息回填）", "/rewind", () => { this.app.closeOverlay(); this.app.showRewindPicker(); }],
       ["m", "切换模型", "Ctrl+M 已释放", () => { this.app.closeOverlay(); this.app.overlay = buildModelPicker(this.app); this.app.redraw(); }],
       ["d", "配色主题", "Ctrl+D 已释放", () => { this.app.closeOverlay(); this.app.showThemePicker(); }],

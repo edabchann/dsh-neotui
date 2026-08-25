@@ -5,7 +5,7 @@ import { userInfo } from "node:os";
 import { mkdtempSync, writeFileSync, unlinkSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
-import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion, drawBootSplash } from "../src/views.js";
+import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion, drawBootSplash, promptHistory, rememberPrompt } from "../src/views.js";
 import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker, AttachmentPanel, ThemePickerBuffer } from "../src/panels.js";
 import { setTheme, themeName, THEMES, renderedThemeName, clearThemePreview } from "../src/theme.js";
 import { fmtDuration, strWidth, pad, graphemeWidth, graphemes } from "../src/text.js";
@@ -4399,6 +4399,24 @@ test("welcome shimmer sweeps periodically only on a tall blank welcome", () => {
   }
   app.brandShimmer = -1;
   assert.ok(litI, "the glint sweeps across the trailing I columns");
+});
+
+test("prompt history persists, dedupes and the prefix h searches it", () => {
+  const app = headlessApp();
+  saveTuiConfig({ promptHistory: undefined });
+  app.chat.input.history = [];
+  rememberPrompt("第一个问题");
+  rememberPrompt("第二个问题");
+  rememberPrompt("第一个问题");
+  assert.deepEqual(promptHistory(), ["第一个问题", "第二个问题"], "recorded newest-first, deduped");
+  app.chat.input.history = ["第三个问题"];
+  app.onEvent({ type: "key", name: "char", key: " ", ctrl: true, shift: false });
+  app.onEvent({ type: "key", name: "char", key: "h", ctrl: false, alt: false, shift: false });
+  assert.ok(app.overlay?.constructor?.name === "Picker", "prefix h opens the history picker");
+  assert.ok(app.overlay.items.some((it) => it.text === "第三个问题"), "session history merged in");
+  app.overlay.onPick({ text: "第二个问题" });
+  assert.equal(app.chat.input.value, "第二个问题", "Enter refills the input");
+  saveTuiConfig({ promptHistory: [] });
 });
 
 test("Ctrl+Space opens the prefix page and r fires rewind only there", () => {

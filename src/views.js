@@ -8,9 +8,9 @@ import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { Widget, ScrollView, Input, Popup, Menu, StatusBar, wrapIndex } from "./widgets.js";
 import { UploadPicker } from "./file-picker.js";
-import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, keyBindings, tuiConfigFile, reloadTuiConfig, searchHistory, rememberSearchQuery } from "./config.js";
+import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, keyBindings, tuiConfigFile, reloadTuiConfig, searchHistory, rememberSearchQuery, promptHistory, rememberPrompt } from "./config.js";
 import { bindingMatchFor, matchKeyBinding, CHAT_BINDING_ORDER, SIDEBAR_BINDING_ORDER, KEYBINDING_ORDER, INPUT_BINDING_ORDER, INPUT_EDIT_BINDING_ORDER } from "./keybindings.js";
-export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults } from "./config.js";
+export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, promptHistory, rememberPrompt } from "./config.js";
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
   modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker, AttachmentPanel,
@@ -1748,6 +1748,9 @@ export class ChatView extends Widget {
   send(text) {
     if (!this.sessionId) return;
     const trimmed = text.trim();
+    if (!trimmed.startsWith("/")) rememberPrompt(trimmed);
+    const hist = this.app.chat?.input?.history;
+    if (Array.isArray(hist)) this.app.chat.input.history = [trimmed, ...hist.filter((x) => x !== trimmed)].slice(0, 50);
     if (trimmed === "/reload") { this.app.softReload(); return; }
     if (trimmed === "/rewind") { this.app.showRewindPicker(); return; }
     if (trimmed === "/restart") { this.app.restartApp(); return; }
@@ -4234,6 +4237,35 @@ export class App {
 
   /** Fork the whole session, or — with `atSeq` — everything up to that message
    *  (web forkAt parity: branch from a chosen point of a completed turn). */
+  /** Input-history search: filterable picker over the last ~50 typed prompts
+   *  (persisted), Enter refills the input. Reached from the prefix page (h). */
+  showHistorySearch() {
+    const merged = [];
+    const seen = new Set();
+    for (const t of [...this.chat.input.history, ...promptHistory()]) {
+      const s = String(t ?? "").trim();
+      if (!s || seen.has(s)) continue;
+      seen.add(s); merged.push(s);
+    }
+    if (!merged.length) { this.toast("还没有输入历史"); return; }
+    const items = merged.slice(0, 50).map((t) => ({ label: truncate(t.replace(/\s+/g, " "), 56), hint: "回车填入输入框", text: t }));
+    const w = Math.max(1, Math.min(76, this.screen.w - 4)), ph = Math.max(1, Math.min(14, this.screen.h - 4));
+    this.overlay = new Picker({
+      x: Math.floor((this.screen.w - w) / 2), y: Math.floor((this.screen.h - ph) / 2),
+      w, h: ph, title: "输入历史（输入过滤 / ↑↓ 选择 / Esc 取消）",
+      items,
+      onPick: (it) => {
+        this.closeOverlay();
+        const input = this.chat.input;
+        input.setValue(it.text);
+        this.focus(input);
+        this.redraw();
+      },
+      onCancel: () => this.closeOverlay(),
+    });
+    this.redraw();
+  }
+
   /** Rewind: pick a previous user message, fork the session before that turn,
    *  reopen the branch and put the original message back into the input.
    *  Reached from /rewind (deliberately not a double-Esc global). */
