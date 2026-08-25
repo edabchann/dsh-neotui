@@ -1293,6 +1293,7 @@ class SidebarTree extends Widget {
 /** Slash commands offered by the input's candidate bar (Tab completes). */
 const SLASH_COMMANDS = [
   { name: "/reload", desc: "重新载入界面（不重启进程）" },
+  { name: "/rewind", desc: "回退到某条提问之前（分支会话 + 原消息回填入输入框）" },
   { name: "/restart", desc: "重启 TUI 加载新版本" },
   { name: "/model", desc: "切换模型" },
   { name: "/theme", desc: "切换配色主题" },
@@ -1748,6 +1749,7 @@ export class ChatView extends Widget {
     if (!this.sessionId) return;
     const trimmed = text.trim();
     if (trimmed === "/reload") { this.app.softReload(); return; }
+    if (trimmed === "/rewind") { this.app.showRewindPicker(); return; }
     if (trimmed === "/restart") { this.app.restartApp(); return; }
     if (trimmed === "/model") { this.app.overlay = buildModelPicker(this.app); this.app.redraw(); return; }
     if (trimmed === "/theme") { this.app.showThemePicker(); return; }
@@ -4232,6 +4234,66 @@ export class App {
 
   /** Fork the whole session, or — with `atSeq` — everything up to that message
    *  (web forkAt parity: branch from a chosen point of a completed turn). */
+  /** Rewind: pick a previous user message, fork the session before that turn,
+   *  reopen the branch and put the original message back into the input.
+   *  Reached from /rewind (deliberately not a double-Esc global). */
+  showRewindPicker() {
+    const nodes = this.chat.nodes ?? [];
+    const messages = [];
+    for (const node of nodes) {
+      if (node?.kind !== "user" || node.firstSeq == null) continue;
+      const text = (node.blocks ?? []).filter((b) => b?.type === "text").map((b) => b.text ?? "").join("").trim();
+      if (!text) continue;
+      messages.push({ seq: node.firstSeq, text });
+    }
+    if (!messages.length) { this.toast("当前会话没有可回退的用户提问"); return; }
+    const items = [...messages].reverse().map((m, i) => ({
+      label: `${String(messages.length - i).padStart(2, " ")} ${truncate(m.text.replace(/\s+/g, " "), 40)}`,
+      hint: `第 ${m.seq} 步`,
+      seq: m.seq, text: m.text,
+    }));
+    const w = Math.max(1, Math.min(76, this.screen.w - 4)), ph = Math.max(1, Math.min(14, this.screen.h - 4));
+    this.overlay = new Picker({
+      x: Math.floor((this.screen.w - w) / 2), y: Math.floor((this.screen.h - ph) / 2),
+      w, h: ph, title: "回退到…（Esc 取消）",
+      items,
+      onPick: (it) => this.#confirmRewind(it),
+      onCancel: () => this.closeOverlay(),
+    });
+    this.redraw();
+  }
+
+  #confirmRewind(it) {
+    const title = "确认真回溯？";
+    const lines = [`将回退到这条提问所属回合开始之前，并创建分支会话：`, "", `  ${truncate(it.text, Math.min(56, this.screen.w - 10))}`, "", "原消息会放回输入框供修改重发（原会话不变）。"];
+    const popup = new Popup({
+      x: Math.max(0, Math.floor((this.screen.w - Math.min(72, this.screen.w - 4)) / 2)),
+      y: Math.max(0, Math.floor(this.screen.h / 2) - 4), w: Math.min(72, this.screen.w - 4), h: lines.length + 3,
+      title, lines, buttons: [{ label: "是 (y)", action: "yes" }, { label: "否 (n)", action: "no" }],
+      onAction: (b) => {
+        this.closeOverlay();
+        if (b?.action === "yes") void this.#executeRewind(it);
+        else this.redraw();
+      },
+    });
+    this.overlay = popup; this.focus(popup); this.redraw();
+  }
+
+  async #executeRewind(it) {
+    const s = this.sessions.find((x) => x.sessionId === this.currentSession);
+    if (!s) return;
+    if (it.seq <= 1) { this.toast("第一条消息不能作为回退边界"); return; }
+    if (this.chat.running || s.running) { this.cancelSession({ sessionId: s.sessionId }); this.toast("已请求中断当前回合…"); await new Promise((r) => setTimeout(r, 600)); }
+    try {
+      const { sessionId } = await this.api.call("session.fork", { sessionId: s.sessionId, atSeq: it.seq - 1 });
+      await this.refreshSessions();
+      this.openSession(sessionId);
+      const input = this.chat.input;
+      if (!input.value) { input.setValue(it.text); this.focus(input); }
+      this.toast(`已回退并分支: ${sessionId.slice(0, 8)}；原消息已回到输入框`);
+    } catch (e) { this.toast(`回退失败: ${e.message}`); }
+  }
+
   async forkSession(s, atSeq = null) {
     try {
       const { sessionId } = await this.api.call("session.fork", { sessionId: s.sessionId, ...(atSeq != null ? { atSeq } : {}) });

@@ -4396,6 +4396,36 @@ test("welcome shimmer sweeps periodically only on a tall blank welcome", () => {
   assert.ok(litI, "the glint sweeps across the trailing I columns");
 });
 
+test("/rewind forks before the chosen message and refills the input", async () => {
+  const app = headlessApp();
+  app.currentSession = "s1";
+  app.sessions = [{ sessionId: "s1", agentPreset: "standard", cwd: process.cwd() }];
+  let forked = null;
+  app.api.call = async (method, payload) => {
+    if (method === "session.fork") { forked = payload; return { sessionId: "branch-1" }; }
+    return { items: [] };
+  };
+  let opened = null;
+  app.openSession = (id) => { opened = id; };
+  app.refreshSessions = async () => {};
+  app.chat.nodes = [
+    { kind: "user", id: "u1", firstSeq: 1, blocks: [{ type: "text", text: "第一条" }] },
+    { kind: "assistant", id: "a1", firstSeq: 5, blocks: [] },
+    { kind: "user", id: "u2", firstSeq: 10, blocks: [{ type: "text", text: "请分析这个 repo 的结构" }] },
+  ];
+  app.chat.sessionId = "s1";
+  app.showRewindPicker();
+  assert.ok(app.overlay?.constructor?.name === "Picker", "/rewind opens the message picker");
+  app.overlay.onPick({ action: "x", seq: 10, text: "请分析这个 repo 的结构" });
+  assert.equal(app.overlay?.constructor?.name, "Popup", "confirm popup shown");
+  app.overlay.onAction({ action: "yes" });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(forked, { sessionId: "s1", atSeq: 9 }, "fork boundary = turn start - 1");
+  assert.equal(opened, "branch-1", "branch session opened");
+  assert.equal(app.chat.input.value, "请分析这个 repo 的结构", "original message refilled into the input");
+  app.overlay = null;
+});
+
 test("Tab completes file paths in the input (dirs get a trailing slash)", () => {
   const app = headlessApp();
   const dir = mkdtempSync(join(tmpdir(), "tui-fc-"));
