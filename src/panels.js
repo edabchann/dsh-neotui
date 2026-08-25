@@ -1361,7 +1361,12 @@ export class TrajectoryPanel extends Widget {
       const flash = this.flashKey === this.stepKey(step) && Date.now() < this.flashUntil;
       const rowBg = flash ? T.ACCENT : bg;
       const selected = this.stepKey(step) === this.selectedStepKey;
-      const label = `${selected ? "=>" : "  "} ${open ? "▾" : "▸"} step ${String(step.step).padStart(3)}  ${pad(dur, 8)}  ${summary}  ${open ? "[折叠]" : "[展开]"}`;
+      const srcKind = (step.events ?? []).find((e) => e.type === "user/message")?.data?.source?.kind;
+      let summary2 = summary;
+      let srcPrefix = "";
+      const srcLabel = srcKind ? sourceBadge(srcKind) : "";
+      if (srcKind === "plugin" || srcKind === "goal") { srcPrefix = `${sourceBadge(srcKind)} `; summary2 = `${srcKind === "goal" ? `目标轮 ${step.events.find((e) => e.type === "user/message")?.data?.source?.round ?? "?"}` : "注入上下文"} · ${summary}`; }
+      const label = `${selected ? "=>" : "  "} ${open ? "▾" : "▸"} ${srcPrefix}step ${String(step.step).padStart(3)}  ${pad(dur, 8)}  ${summary2}  ${open ? "[折叠]" : "[展开]"}`;
       const segs = [{ t: label, fg: flash ? T.SELFG : K.TXT, bg: rowBg, bold: true }];
       const fill = w - strWidth(label);
       if (fill > 0) segs.push({ t: " ".repeat(fill), bg: rowBg });
@@ -2315,6 +2320,14 @@ export class GoalPanel extends Popup {
     else {
       lines.push([{ t: ` 目标: ${goal.objective ?? goal}`, fg: K.TXT, bold: true }]);
       lines.push([{ t: ` 阶段: ${goal.phase ?? "active"} · 轮次 ${this.app.goalData?.roundsStarted ?? 0}/${goal.maxGoalRounds ?? "∞"} · 修订 ${goal.revision ?? "?"}`, fg: K.DIM }]);
+      const rounds = (this.app.chat?.nodes ?? []).filter((n) => n?.kind === "goal-round" || n?.source?.kind === "goal");
+      if (rounds.length) {
+        lines.push([{ t: "" }, { t: " ◆ 目标延续轮（自动进入）", fg: K.PURPLE, bold: true }]);
+        for (const r of rounds) {
+          const text = (r.blocks ?? []).filter((b) => b?.type === "text").map((b) => b.text ?? "").join("").replace(/\s+/g, " ").trim();
+          lines.push([{ t: `  ◆ ${r.source?.round ?? "?"}轮 · ${truncate(text || r.id || "（无文本）", Math.max(12, this.w - 12))}`, fg: K.DIM }]);
+        }
+      }
       if (goal.blockedReason?.message) lines.push([{ t: ` 阻塞: ${goal.blockedReason.message}`, fg: K.ERR }]);
     }
     this.actions = goal ? [
@@ -4800,6 +4813,19 @@ function detailText(value) {
   return (s ?? JSON.stringify(value, null, 2) ?? String(value)).slice(0, 6000);
 }
 
+/** Message-source badge: ● direct prompt (user) · ◇ injected context
+ *  (plugin: cron/inject/skill…) · ◆ goal continuation round · ● unknown. */
+export function sourceBadge(kind) {
+  return kind === "user" ? "●" : kind === "plugin" ? "◇" : kind === "goal" ? "◆" : "●";
+}
+export function sourceGroup(kind) {
+  return kind === "user" ? "排队提问" : kind === "plugin" ? "注入上下文" : kind === "goal" ? "目标延续" : "排队提问";
+}
+/** 徽标图例（页脚小字）。 */
+export function sourceLegend() {
+  return "● 提问 · ◇ 注入 · ◆ 目标轮";
+}
+
 export class PanelContainer extends Widget {
   constructor(app) {
     super({ x: 0, y: 0, w: app.screen.w, h: app.screen.h });
@@ -5112,8 +5138,8 @@ export class TasksPage extends Widget {
     }
     return out;
   }
-  #badgeFor(src) { return src === "user" ? "●" : src === "plugin" ? "◇" : src === "goal" ? "◆" : "●"; }
-  #groupFor(src) { return src === "user" ? "排队提问" : src === "plugin" ? "注入上下文" : src === "goal" ? "目标延续" : "排队提问"; }
+  #badgeFor(src) { return sourceBadge(src); }
+  #groupFor(src) { return sourceGroup(src); }
   #queueSummary(item) {
     const text = partsText(item?.message?.content).replace(/\s+/g, " ").trim();
     return truncate(text || item?.id || "（无文本）", 56);

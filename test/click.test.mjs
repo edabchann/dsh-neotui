@@ -6,7 +6,7 @@ import { mkdtempSync, writeFileSync, unlinkSync, mkdirSync, rmSync } from "node:
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion, drawBootSplash, promptHistory, rememberPrompt } from "../src/views.js";
-import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker, AttachmentPanel, ThemePickerBuffer, PanelContainer, SubagentPage, TasksPage } from "../src/panels.js";
+import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker, AttachmentPanel, ThemePickerBuffer, PanelContainer, SubagentPage, TasksPage, sourceBadge, sourceGroup } from "../src/panels.js";
 import { setTheme, themeName, THEMES, renderedThemeName, clearThemePreview } from "../src/theme.js";
 import { fmtDuration, strWidth, pad, graphemeWidth, graphemes } from "../src/text.js";
 import { renderMd, wrapSegs } from "../src/md.js";
@@ -4455,6 +4455,34 @@ test("prompt history persists, dedupes and the prefix h searches it", () => {
   app.overlay.onPick({ text: "第二个问题" });
   assert.equal(app.chat.input.value, "第二个问题", "Enter refills the input");
   saveTuiConfig({ promptHistory: [] });
+});
+
+test("source badges: shared helpers, trajectory step prefix and goal rounds", () => {
+  assert.equal(sourceBadge("user"), "●");
+  assert.equal(sourceBadge("plugin"), "◇");
+  assert.equal(sourceBadge("goal"), "◆");
+  assert.equal(sourceGroup("goal"), "目标延续");
+  const app = headlessApp();
+  app.currentSession = "s"; app.sessions = [{ sessionId: "s", blank: true, agentPreset: "standard" }];
+  app.chat.sessionId = "s"; app.chat.nodes = [];
+  app.chat.loadOlder = async () => {};
+  app.chat.minSeq = 1;
+  // trajectory steps with a plugin-sourced initiating message
+  const page0 = app.overlay ?? null;
+  app.showPanelPage(0);
+  const tp = app.overlay.pages[0];
+  tp.steps = [{ step: 1, startSeq: 1, events: [{ type: "user/message", seq: 1, data: { source: { kind: "plugin", plugin: "cron" }, content: [{ type: "text", text: "cron tick" }] } }], firstSeq: 1 }];
+  tp.visibleStepIndices = [0];
+  tp.selectedStepKey = null;
+  app.overlay.goTo(0);
+  // GoalPanel rounds block
+  app.showPanelPage(1);
+  app.projections.goal = { goal: { id: "g", revision: 1, objective: "ship it", phase: "active", maxGoalRounds: 5 }, roundsStarted: 1 };
+  app.chat.nodes = [{ kind: "goal-round", source: { kind: "goal", round: 3 }, id: "gr1", blocks: [{ type: "text", text: "自动续轮内容" }] }];
+  app.overlay.goTo(1);
+  app.overlay.pages[1].rebuild(); // nodes were set after construction
+  const lines = app.overlay.pages[1].lines.map((set) => set.map((s) => s.t).join(""));
+  assert.ok(lines.some((l) => l.includes("目标延续轮")) && lines.some((l) => l.includes("3轮") && l.includes("自动续轮内容")), "goal page lists continuation rounds");
 });
 
 test("panel pages refresh live from frame injection (subagent reload + tasks redraw)", async () => {
