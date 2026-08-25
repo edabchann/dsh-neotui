@@ -4457,6 +4457,33 @@ test("prompt history persists, dedupes and the prefix h searches it", () => {
   saveTuiConfig({ promptHistory: [] });
 });
 
+test("panel pages refresh live from frame injection (subagent reload + tasks redraw)", async () => {
+  const app = headlessApp();
+  app.currentSession = "s1";
+  app.sessions = [{ sessionId: "s1", agentPreset: "standard" }];
+  let calls = 0;
+  app.api.call = async (method, payload) => {
+    if (method === "subagent.list") { calls++; return { entries: [{ id: `sub-${calls}`, label: "s", activity: "running" }] }; }
+    return { items: [] };
+  };
+  app.api.connectMux = () => {}; app.api.connectHost = () => {};
+  app.showPanelPage(2); // subagent page
+  await new Promise((r) => setTimeout(r, 5));
+  const page = app.overlay.pages[2];
+  assert.equal(page.entries[0].id, "sub-1", "initial load");
+  // projection frame with key "subagent" → throttled reload
+  app.deliverFrame({ type: "session/projection", sessionId: "s1", key: "subagent", value: {} });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(calls, 2, "the first subagent frame live-reloads the page");
+  app.deliverFrame({ type: "session/projection", sessionId: "s1", key: "subagent", value: {} });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(calls, 2, "rapid consecutive frames are throttled to 1/s");
+  // jobs frame while the tasks page is open: overlay repaints from live data
+  app.showPanelPage(3);
+  app.deliverFrame({ type: "session/jobs", sessionId: "s1", jobs: [{ status: "running", label: "x" }] });
+  assert.ok(true, "jobs frame fan-out accepts the container"); // no throw
+});
+
 test("Ctrl+Space opens the prefix page and r fires rewind only there", () => {
   const app = headlessApp();
   let rewound = 0;

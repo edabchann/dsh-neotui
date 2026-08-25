@@ -3923,6 +3923,11 @@ export class App {
   }
 
   setStatus(msg) { this.statusMsg = msg; this.redraw(); }
+  /** Live-frame fan-out into the panel container (tasks/subagent pages). */
+  #notifyPanelLive(kind) {
+    if (this.overlay?.constructor?.name === "PanelContainer") this.overlay.notifyLive(kind);
+  }
+
   setJobs(jobs, sessionId = null) {
     // snapshot buffered per session: the mux baseline arrives at connect
     // time, possibly before the chat opens that session
@@ -3940,7 +3945,7 @@ export class App {
       if (this.chat.sessionId) this.chat.pollTail();
       // session.list is expensive (~100ms); refresh the sidebar every ~5s, not
       // on every streaming poll.
-      if (ticks++ % 10 === 0) { this.refreshSessions(); this.refreshSubagentStats(); }
+      if (ticks++ % 10 === 0) { this.refreshSessions(); this.refreshSubagentStats(); this.#notifyPanelLive("subagent"); }
       const delay = this.chat.pollSlow ? 2000 : (this.chat.running ? 500 : 1500);
       this.pollTimer = setTimeout(tick, delay);
     };
@@ -4006,6 +4011,10 @@ export class App {
     }
   }
 
+  /** Frame injection entry (tests & external callers): routes through the
+   *  private handler so the live fan-out is exercised exactly like the wire. */
+  deliverFrame(frame) { this.#onFrame(frame); }
+
   #onFrame(frame) {
     this.injectFrame(frame);
   }
@@ -4027,6 +4036,7 @@ export class App {
           if (frame.type === "session/queue") {
             this.queueItems = frame.items ?? [];
             if (this.overlay instanceof QueuePanel) this.overlay.syncItems(this.queueItems);
+            this.#notifyPanelLive("tasks");
           }
           this.chat.onFrame(frame);
         }
@@ -4038,6 +4048,7 @@ export class App {
         // connect-time baseline would otherwise be dropped by the filter
         // below and the footer would stick at "0已完成")
         this.setJobs(frame.jobs ?? [], frame.sessionId ?? null);
+        this.#notifyPanelLive("tasks");
         if (this.chat.sessionId === frame.sessionId) this.chat.onFrame(frame);
         break;
       case "session/projection": {
@@ -4053,6 +4064,7 @@ export class App {
         // Reflow immediately so the tail remains reachable above fixed docks.
         if (["todos", "goal", "subagent"].includes(frame.key)) this.chat.inputChanged();
         if (["todos", "goal"].includes(frame.key) && this.overlay instanceof GoalPanel) this.overlay.sync();
+        if (frame.key === "subagent") this.#notifyPanelLive("subagent");
         break;
       }
       case "approval/resolved":

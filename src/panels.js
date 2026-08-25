@@ -4827,6 +4827,15 @@ export class PanelContainer extends Widget {
     if (typeof page.relayout === "function") page.relayout(0, cy, this.w, ch);
     else { page.x = 0; page.y = cy; page.w = this.w; page.h = ch; }
   }
+  /** Live frame injection: tasks read live data on every repaint; the
+   *  subagent page re-loads (throttled) when its frame/projection arrives. */
+  notifyLive(kind) {
+    if (kind === "tasks") { this.app.redraw(); return; }
+    if (kind === "subagent" && this.pageIndex === 2) {
+      const page = this.pages?.[2];
+      if (page && typeof page.reload === "function") page.reload();
+    }
+  }
   goTo(index) {
     this.ensurePages();
     this.pageIndex = ((index % this.pages.length) + this.pages.length) % this.pages.length;
@@ -4919,6 +4928,14 @@ export class SubagentPage extends Widget {
   onActivate() { this.ensureLoaded(); }
   ensureLoaded() {
     if (this.loading || (this.entries.length > 0 && this.error == null)) return;
+    this.load();
+  }
+  /** Live refresh (frame injection), throttled to one call per second. */
+  reload() {
+    const now = Date.now();
+    if (this.loading) return;
+    if (this.lastReloadAt != null && now - this.lastReloadAt < 1000) return;
+    this.lastReloadAt = now;
     this.load();
   }
   async load() {
