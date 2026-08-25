@@ -1054,6 +1054,8 @@ class SidebarTree extends Widget {
     this.sel = 0;
     this.focused = false;
     this.collapsed = new Set(); // group keys
+    this.preview = { open: false, sessionId: null, title: "", lines: [], loading: false, error: null };
+    this.previewToken = 0;
   }
   setData(workspaces, sessions, archivedIds, currentSessionId) {
     const archived = new Set(archivedIds ?? []);
@@ -1232,11 +1234,67 @@ class SidebarTree extends Widget {
     }
     return false;
   }
+  /** Attached preview card (not a modal): Tab toggles it; it never steals
+   *  focus — ↑/↓ still moves the tree and the card follows the selection. */
+  #togglePreview() {
+    const row = this.currentRow();
+    if (!row || row.kind !== "session") return;
+    if (this.preview.open && this.preview.sessionId === row.session.sessionId) {
+      this.preview.open = false;
+      this.app.redraw();
+      return;
+    }
+    this.preview.open = true;
+    void this.#refreshPreview(row.session, true);
+  }
+  /** Load the preview for a session (token-guarded, throttled at 250ms). */
+  async #refreshPreview(session, force = false) {
+    const app = this.app;
+    const token = ++this.previewToken;
+    this.preview.sessionId = session.sessionId;
+    this.preview.title = session.title ?? session.sessionId.slice(0, 8);
+    this.preview.loading = true;
+    this.preview.error = null;
+    this.preview.lines = [];
+    app.redraw();
+    try {
+      const res = await app.api.call("session.history", { sessionId: session.sessionId, maxMessages: 12 });
+      if (token !== this.previewToken) return; // stale
+      const lines = [];
+      for (const item of (res?.events ?? [])) {
+        const ev = item?.event ?? item;
+        const event = ev?.event ?? ev;
+        const type = event?.type ?? ev?.type;
+        const data = event?.data ?? ev?.data ?? {};
+        if (type === "user/message") {
+          const d = data.message ?? data;
+          const text = partsToText(data.content ?? d.content ?? []).replace(/\s+/g, " ").trim();
+          lines.push(["你", truncate(text || data.id || "（无文本）", 28)]);
+        } else if (type === "assistant/message") {
+          const d = data.message ?? data;
+          const text = partsToText(d.content ?? []).replace(/\s+/g, " ").trim();
+          lines.push(["AI", truncate(text || "（无文本）", 28)]);
+        } else if (type === "tool/call") {
+          const name = (data.call ?? data).name ?? data.name ?? "tool";
+          lines.push(["⚙", truncate(String(name), 28)]);
+        }
+      }
+      this.preview.lines = lines;
+    } catch (e) {
+      if (token === this.previewToken) this.preview.error = e.message;
+    }
+    if (token === this.previewToken) { this.preview.loading = false; app.redraw(); }
+  }
+
   onKey(ev) {
     if (ev.type !== "key") return false;
     switch (ev.name) {
-      case "up": return this.move(-1);
-      case "down": return this.move(1);
+      case "up":
+        if (this.move(-1)) { if (this.preview.open) { const r = this.currentRow(); if (r?.kind === "session") void this.#refreshPreview(r.session); } return true; }
+        return false;
+      case "down":
+        if (this.move(1)) { if (this.preview.open) { const r = this.currentRow(); if (r?.kind === "session") void this.#refreshPreview(r.session); } return true; }
+        return false;
       case "pgup": this.scroll(-this.h); return true;
       case "pgdn": this.scroll(this.h); return true;
       case "home": this.sel = 0; this.#scrollToSel(); return true;
@@ -1245,7 +1303,7 @@ class SidebarTree extends Widget {
         const row = this.currentRow();
         if (!row) return false;
         if (row.kind === "group") { this.toggle(row.group); this.app.redraw(); }
-        else this.app.openSession(row.session.sessionId); // pane focus intentionally stays here
+        else { this.preview.open = false; this.app.openSession(row.session.sessionId); } // pane focus intentionally stays here
         return true;
       }
       case "left": {
@@ -1261,6 +1319,12 @@ class SidebarTree extends Widget {
         if (row?.kind === "group" && this.collapsed.has(row.group.key)) { this.toggle(row.group); this.app.redraw(); return true; }
         if (row?.kind === "group") { this.sel = Math.min(this.rows.length - 1, this.sel + 1); this.#scrollToSel(); return true; }
         return false;
+      }
+      case "tab": {
+        const row = this.currentRow();
+        if (row?.kind !== "session") return false;
+        this.#togglePreview();
+        return true;
       }
       case "char":
         if (ev.ctrl && ev.key === "r") return this.openCurrentMenu();
@@ -6149,6 +6213,7 @@ export class App {
       if (this.popup) this.popup.render(s);
       if (this.menu) this.menu.render(s);
       if (this.overlay) this.overlay.render(s);
+      if (this.sidebar.preview.open) this.#renderPreviewCard(s);
       this.#renderToast(s);
       this.term.output.write(s.render() + "\x1b[?25l");
       return;
@@ -6321,6 +6386,32 @@ export class App {
     if (cell) tail = tail + `\x1b[?25h\x1b[${cell.y + 1};${cell.x + 1}H`;
     else tail = tail + "\x1b[?25l";
     this.term.output.write(out + tail);
+  }
+
+  /** Attached preview card beside the sidebar: purely rendered state, never
+   *  a modal — the tree keeps focus and the card follows the selection. */
+  #renderPreviewCard(s) {
+    const p = this.sidebar.preview;
+    const x = this.sidebarWidth + 1;
+    const w = Math.min(34, Math.max(20, this.screen.w - x - 2));
+    const y = 1, h = Math.max(5, this.screen.h - 2);
+    s.fillRect(x, y, x + w - 1, y + h - 1, " ", { bg: T.PANEL });
+    s.box(x, y, x + w - 1, y + h - 1, { fg: T.ACCENT, bg: T.PANEL }, ` 预览 · ${truncate(p.title ?? "", 14)} · Tab 关闭`);
+    const rows = h - 4;
+    if (p.loading) { s.text(x + 2, y + 2, "加载中…", { fg: T.FAINT, bg: T.PANEL }); }
+    else if (p.error) { s.text(x + 2, y + 2, truncate(`读取失败: ${p.error}`, w - 6), { fg: T.ERR, bg: T.PANEL }); }
+    else if (!p.lines.length) { s.text(x + 2, y + 2, "（还没有往来记录）", { fg: T.FAINT, bg: T.PANEL }); }
+    else {
+      for (let i = 0; i < rows; i++) {
+        const [kind, text] = p.lines[i];
+        if (!kind) break;
+        const fg = kind === "你" ? T.OK : kind === "AI" ? T.TXT : T.PURPLE;
+        s.text(x + 2, y + 2 + i, kind, { fg, bg: T.PANEL, bold: kind === "你", attrs: kind === "你" ? 1 : 0 });
+        s.text(x + 5, y + 2 + i, truncate(text, w - 7), { fg: T.TXT, bg: T.PANEL });
+      }
+      if (p.lines.length > rows) s.text(x + w - 4, y + h - 1, `…${p.lines.length - rows} 更多`, { fg: T.FAINT, bg: T.PANEL });
+    }
+    s.text(x + 2, y + h - 1, "↑↓ 随选区更新 · Tab 关闭", { fg: T.FAINT, bg: T.PANEL });
   }
 
   #renderToast(s) {

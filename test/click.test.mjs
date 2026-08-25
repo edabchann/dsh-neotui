@@ -4457,6 +4457,56 @@ test("prompt history persists, dedupes and the prefix h searches it", () => {
   saveTuiConfig({ promptHistory: [] });
 });
 
+test("sidebar Tab toggles an ATTACHED preview card (never a modal)", async () => {
+  const app = headlessApp();
+  app.currentSession = "s1";
+  app.sessions = [
+    { sessionId: "s1", title: "工作", agentPreset: "standard", blank: false },
+    { sessionId: "s2", title: "副会话", agentPreset: "standard", blank: false },
+  ];
+  let historyCalls = [];
+  app.api.call = async (method, payload) => {
+    if (method === "session.history") {
+      historyCalls.push(payload.sessionId);
+      return { events: [
+        { event: { type: "user/message", seq: 1, data: { source: { kind: "user" }, content: [{ type: "text", text: "第一条提问" }] } } },
+        { event: { type: "assistant/message", seq: 2, data: { message: { content: [{ type: "text", text: "回答一下" }] } } } },
+        { event: { type: "tool/call", seq: 3, data: { call: { name: "bash" } } } },
+      ] };
+    }
+    return { items: [] };
+  };
+  app.layout();
+  app.sidebar.setData([{ workspaceId: "w1", title: "工作区", path: "/tmp/x", sessionIds: ["s1", "s2"] }], app.sessions, new Set(), "s1");
+  app.focus(app.sidebar);
+  app.sidebar.sel = 2; // s2 row
+  app.sidebar.onKey({ type: "key", name: "tab" });
+  assert.equal(app.sidebar.preview.open, true, "Tab opens the card");
+  assert.equal(app.overlay, null, "the card is NOT a modal overlay");
+  assert.equal(app.focused, app.sidebar, "focus never leaves the tree");
+  await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(historyCalls, ["s2"], "fetches the selected session");
+  const lines = app.sidebar.preview.lines;
+  assert.ok(lines.some(([k, t]) => k === "你" && t.includes("第一条提问")), "user line");
+  assert.ok(lines.some(([k, t]) => k === "AI" && t.includes("回答一下")), "assistant line");
+  assert.ok(lines.some(([k, t]) => k === "⚙" && t.includes("bash")), "tool line");
+  // the card follows ↑/↓ without any extra toggle
+  app.sidebar.onKey({ type: "key", name: "up" });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(historyCalls, ["s2", "s1"], "arrow moves the tree AND the card follows");
+  // second Tab toggles it closed
+  app.sidebar.onKey({ type: "key", name: "tab" });
+  assert.equal(app.sidebar.preview.open, false, "second Tab closes");
+  const calls = historyCalls.length;
+  app.sidebar.onKey({ type: "key", name: "tab" });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.ok(historyCalls.length >= calls, "re-open fetches again");
+  // Enter opens the session and dismisses the card
+  app.sidebar.preview.open = true;
+  app.sidebar.onKey({ type: "key", name: "enter" });
+  assert.equal(app.sidebar.preview.open, false, "Enter dismisses the card");
+});
+
 test("source badges: shared helpers, trajectory step prefix and goal rounds", () => {
   assert.equal(sourceBadge("user"), "●");
   assert.equal(sourceBadge("plugin"), "◇");
