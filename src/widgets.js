@@ -1,6 +1,9 @@
 // widgets.js — Minimal widget layer: hit-testing, lists, scroll views, input,
 // popups, context menus, status bar. Keyboard-first, with mouse hit-testing as an auxiliary path.
 import { truncate, pad, strWidth, graphemes } from "./text.js";
+import { readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, isAbsolute } from "node:path";
 import { T } from "./theme.js";
 
 /** Circular cursor movement shared by every finite choice list. Text cursors
@@ -276,6 +279,9 @@ export class Input extends Widget {
     this.cmdOpen = false;              // the candidate bar is showing
     this.cmdIdx = 0;                   // highlighted candidate
     this.cmds = [];                    // filtered candidates
+    this.fileRoot = null;              // completion base dir (session cwd)
+    this.fileCands = [];               // file-path completion candidates
+    this.fileIdx = 0;
     this.onChange = opts.onChange ?? null;
     this.allowEmptyEnter = opts.allowEmptyEnter ?? false;
     this.history = [];
@@ -339,6 +345,7 @@ export class Input extends Widget {
   /** Rendered height: 1, or wrapped rows capped at maxLines when multi. */
   height() { return this.multi ? Math.max(1, Math.min(this.maxLines, this.#visualRows().length)) : 1; }
   setValue(v, opts = {}) {
+    this.fileLast = null; // any value change resets file-completion cycling
     this.#touch();
     this.value = String(v);
     this.cursor = this.#cps().length;
@@ -366,6 +373,64 @@ export class Input extends Widget {
     }
     this.#edit(at, at, text);
   }
+  /** File-path completion: Tab completes the token before the caret when it
+   *  looks like a path (contains "/" or starts with "."/"~"). Repeated Tab
+   *  cycles the candidates; directories complete with a trailing "/". */
+  #completeFile() {
+    const cps = this.#cps();
+    const before = cps.slice(0, this.cursor).join("");
+    const m = /([^\s\n]*)$/.exec(before);
+    const token = m ? m[1] : "";
+    if (!token || token.startsWith("/") || token.includes("\n")) return false;
+    const pathy = token.includes("/") || token.startsWith(".") || token.startsWith("~");
+    if (!pathy) return false;
+    const root = this.fileRoot ?? process.cwd();
+    let dirPart, base;
+    if (token.startsWith("~")) {
+      const tail = token.slice(1);
+      const cut = tail.indexOf("/");
+      dirPart = cut < 0 ? (base = "", homedir()) : (base = tail.slice(cut + 1), join(homedir(), tail.slice(0, cut)));
+    } else if (token.startsWith("/")) {
+      const cut = token.lastIndexOf("/");
+      dirPart = cut <= 0 ? "/" : token.slice(0, cut);
+      base = token.slice(cut + 1);
+    } else {
+      const cut = token.lastIndexOf("/");
+      dirPart = cut < 0 ? root : (cut === 0 ? "/" : token.slice(0, cut));
+      base = token.slice(cut + 1);
+      if (cut < 0) {} else if (!isAbsolute(dirPart)) dirPart = join(root, dirPart);
+    }
+    if (dirPart.startsWith("~")) dirPart = join(homedir(), dirPart.slice(1));
+    if (!isAbsolute(dirPart)) dirPart = join(root, dirPart);
+    let names = [];
+    try {
+      names = readdirSync(dirPart, { withFileTypes: true })
+        .filter((e) => e.name.startsWith(base) && (base.startsWith(".") ? e.name.startsWith(".") : !e.name.startsWith(".")))
+        .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
+        .map((e) => e.isDirectory() ? e.name + "/" : e.name);
+    } catch { names = []; }
+    if (!names.length) { this.fileCands = []; this.fileLast = null; return false; }
+    if (this.fileLast === this.value && this.fileCands.length > 1) {
+      // unedited: cycle through the already-listed candidates
+      this.fileIdx = (this.fileIdx + 1) % this.fileCands.length;
+    } else {
+      this.fileCands = names;
+      this.fileIdx = 0;
+    }
+    const name = this.fileCands[this.fileIdx];
+    // keep the user's own spelling ("./" stays "./", "~/x" stays "~/x")
+    const slash = token.lastIndexOf("/");
+    const dirDisplay = slash >= 0 ? token.slice(0, slash + 1) : "";
+    const replace = `${dirDisplay}${name}`;
+    const head = before.slice(0, before.length - token.length);
+    const tail = cps.slice(this.cursor).join("");
+    const next = head + replace + tail;
+    this.setValue(next);
+    this.cursor = graphemes(head + replace).length;
+    this.fileLast = next; // built by completion: unchanged → cycle on Tab
+    return true;
+  }
+
   /** The / command candidate bar opens while the value is a bare "/…" prefix. */
   #updateCmds() {
     const v = this.value;
@@ -386,6 +451,7 @@ export class Input extends Widget {
    *  replaces it, edits elsewhere just shift it. Always notifies onChange —
    *  the second-paste swap must reflow the layout just like typing. */
   #edit(from, to, text = "") {
+    this.fileLast = null;
     this.#pushUndo();
     this.selStart = this.selEnd = null; // edits consume the selection
     const cps = this.#cps();
@@ -725,7 +791,7 @@ export class Input extends Widget {
           this.cmdOpen = false;
           return true;
         }
-        return false;
+        return this.#completeFile();
       case "char":
         if (ev.ctrl) {
           switch (ev.key) {

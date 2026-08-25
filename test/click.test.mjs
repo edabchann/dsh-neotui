@@ -2,13 +2,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { userInfo } from "node:os";
-import { mkdtempSync, writeFileSync, unlinkSync } from "node:fs";
+import { mkdtempSync, writeFileSync, unlinkSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion, drawBootSplash } from "../src/views.js";
 import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker, AttachmentPanel, ThemePickerBuffer } from "../src/panels.js";
 import { setTheme, themeName, THEMES, renderedThemeName, clearThemePreview } from "../src/theme.js";
-import { fmtDuration, strWidth, pad, graphemeWidth } from "../src/text.js";
+import { fmtDuration, strWidth, pad, graphemeWidth, graphemes } from "../src/text.js";
 import { renderMd, wrapSegs } from "../src/md.js";
 import { Input, List } from "../src/widgets.js";
 import { Screen } from "../src/screen.js";
@@ -4394,6 +4394,36 @@ test("welcome shimmer sweeps periodically only on a tall blank welcome", () => {
   }
   app.brandShimmer = -1;
   assert.ok(litI, "the glint sweeps across the trailing I columns");
+});
+
+test("Tab completes file paths in the input (dirs get a trailing slash)", () => {
+  const app = headlessApp();
+  const dir = mkdtempSync(join(tmpdir(), "tui-fc-"));
+  writeFileSync(join(dir, "alpha.txt"), "x");
+  writeFileSync(join(dir, "betabeta.txt"), "x");
+  mkdirSync(join(dir, "subdir"), { recursive: true });
+  const chat = app.chat;
+  chat.input.fileRoot = dir;
+  chat.input.setValue("open ./al");
+  chat.input.cursor = graphemes("open ./al").length;
+  assert.equal(chat.input.onKey({ type: "key", name: "tab" }), true, "Tab consumes the pathy token");
+  assert.equal(chat.input.value, "open ./alpha.txt");
+  // second Tab cycles to the next candidate (same query prefix)
+  chat.input.setValue("open ./");
+  chat.input.cursor = graphemes("open ./").length;
+  chat.input.onKey({ type: "key", name: "tab" });
+  chat.input.onKey({ type: "key", name: "tab" });
+  assert.ok(chat.input.value !== "open ./alpha.txt", "repeated Tab cycles through candidates");
+  // directories complete with "/"
+  chat.input.setValue("open ./sub");
+  chat.input.cursor = graphemes("open ./sub").length;
+  chat.input.onKey({ type: "key", name: "tab" });
+  assert.equal(chat.input.value, "open ./subdir/");
+  // plain words are NOT completed (only path-looking tokens)
+  chat.input.setValue("hello wor");
+  chat.input.cursor = graphemes("hello wor").length;
+  assert.equal(chat.input.onKey({ type: "key", name: "tab" }), false);
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("logo picker: Ctrl+R buffer switches preset / custom file / none and persists", () => {

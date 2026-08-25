@@ -1332,7 +1332,7 @@ export class ChatView extends Widget {
       x: this.x, y: this.y + this.h - 2, w: this.w, h: 1,
       multi: true, maxLines: 6, app: this.app, commands: SLASH_COMMANDS,
       bg: T.PANEL,
-      placeholder: "输入消息…（Shift+Enter/Ctrl+J 换行，Ctrl+L 展开，↑/↓ 历史，Tab 补全 / 命令，Enter 发送）",
+      placeholder: "输入消息…（Shift+Enter/Ctrl+J 换行，Ctrl+L 展开，↑/↓ 历史，Tab 补全 / 命令 / 文件，Enter 发送）",
       onEnter: (v) => this.send(v),
       onChange: () => this.inputChanged(),
     });
@@ -1553,6 +1553,8 @@ export class ChatView extends Widget {
   async open(sessionId, epoch = this.app.sessionEpoch, maxMessages = 80) {
     this.sessionId = sessionId;
     this.nodes = [];
+    const cwd = this.app.sessions?.find((s) => s.sessionId === sessionId)?.cwd;
+    if (cwd) this.input.fileRoot = cwd; // file-path completion base
     this.blockSel = -1;
     this.cursorMode = "block";
     this.visualAnchor = null;
@@ -3035,8 +3037,23 @@ export class ChatView extends Widget {
     screen.text(Math.max(this.x + 1, this.x + this.w - 22), y, "Ctrl+O 附件管理器", { fg: K.FAINT, bg: T.BG2 });
   }
 
-  /** / command candidate bar above the input (↑/↓ cycle, Tab completes). */
+  /** / command candidate bar above the input (↑/↓ cycle, Tab completes);
+   *  also shows file-path completion candidates. */
   #renderCmdBar(screen) {
+    const inp = this.input;
+    if (!inp.cmdOpen && inp.fileCands.length === 0) return;
+    if (inp.cmdOpen && inp.cmds.length > 0) { this.#renderCmdBarCommands(screen); return; }
+    // file completion hint line
+    const n = 1;
+    const w = Math.min(this.view.w, 44);
+    const y0 = Math.max(this.view.y, inp.y - n - 1);
+    screen.fillRect(this.x, y0, this.x + w - 1, y0 + n - 1, " ", { bg: T.BG2 });
+    const shown = inp.fileCands.slice(0, 6).join("  ");
+    screen.text(this.x + 1, y0, `▸ ${truncate(shown, w - 3)}`, { fg: T.SELFG, bg: T.BG2 });
+    return;
+  }
+
+  #renderCmdBarCommands(screen) {
     const inp = this.input;
     if (!inp.cmdOpen || inp.cmds.length === 0) return;
     const n = Math.min(inp.cmds.length, 6);
