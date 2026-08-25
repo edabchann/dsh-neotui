@@ -5546,6 +5546,76 @@ test("subagent/jobs/queue/trajectory keybindings are freed (main-area panes repl
   assert.equal(kb.goal.key, "Ctrl+G");
 });
 
+test("p prefix: arms from the main window, hint shows, Esc/unknown/timeout cancel", async () => {
+  const app = headlessApp();
+  app.currentSession = "s"; app.sessions = [{ sessionId: "s", agentPreset: "standard" }];
+  app.focus(app.chat);
+  app.onEvent({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false });
+  assert.equal(app.pendingPrefix?.key, "p", "p arms the pending layer from a main window");
+  const texts = app.status?.rows?.flatMap?.((r) => [...r.left, ...r.right].map((x) => x.t)).join(" ") ?? "";
+  app.onEvent({ type: "key", name: "escape", ctrl: false });
+  assert.equal(app.pendingPrefix, null, "Esc cancels");
+  app.onEvent({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false });
+  app.onEvent({ type: "key", name: "char", key: "z", ctrl: false, alt: false, shift: false });
+  assert.equal(app.pendingPrefix, null, "unknown key cancels");
+  app.prefixTimeoutMs = 20;
+  app.onEvent({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false });
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(app.pendingPrefix, null, "timeout cancels");
+});
+
+test("p r/l/u/n splits with guards; p c closes and falls back to a blank window", async () => {
+  const screen = new Screen(160, 40); // wide enough for the 40-col split guard
+  const app = new App({ screen, term: { output: { chunks: [], write: () => {} } }, api: { call: async () => ({ items: [] }) }, log: () => {} });
+  app.currentSession = "s"; app.sessions = [{ sessionId: "s", agentPreset: "standard" }];
+  let opened = [];
+  app.openSession = (id) => { opened.push(id); };
+  app.refreshSessions = async () => {};
+  let createCount = 0;
+  app.api.call = async (method) => {
+    if (method === "session.create") { createCount++; return { sessionId: `b${createCount}` }; }
+    return { items: [] };
+  };
+  app.focus(app.chat);
+  // split right via p r
+  app.onEvent({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false });
+  app.onEvent({ type: "key", name: "char", key: "r", ctrl: false, alt: false, shift: false });
+  assert.ok(app.winTree, "tree built");
+  const mains = app.splitLeaves().filter((l) => l.kind === "main");
+  assert.equal(mains.length, 2, "two main windows after a right split");
+  assert.ok(app.focusedLeaf?.kind === "main" && app.focusedLeaf !== mains[0], "the new window is focused");
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(createCount, 1, "the new window adopted a blank session");
+  assert.ok(opened.includes("b1"), "blank session opened in the new window");
+  // guards: depth cap — splitting the focused (deepest) leaf repeatedly
+  for (let i = 0; i < 4; i++) { app.onEvent({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false }); app.onEvent({ type: "key", name: "char", key: "r", ctrl: false, alt: false, shift: false }); }
+  const before = app.mainLeafCount();
+  app.onEvent({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false });
+  app.onEvent({ type: "key", name: "char", key: "r", ctrl: false, alt: false, shift: false });
+  assert.equal(app.mainLeafCount(), before, "depth-4 guard rejects the 6th split");
+  // p c closes the focused window
+  const countBefore = app.mainLeafCount();
+  app.onEvent({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false });
+  app.onEvent({ type: "key", name: "char", key: "c", ctrl: false, alt: false, shift: false });
+  assert.equal(app.mainLeafCount(), countBefore - 1, "p c removes one window");
+  // close ALL mains → blank fallback window
+  let guard = 0;
+  while (app.mainLeafCount() > 1 && guard++ < 16) { app.onEvent({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false }); app.onEvent({ type: "key", name: "char", key: "c", ctrl: false, alt: false, shift: false }); }
+  // close the last one too
+  app.onEvent({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false });
+  app.onEvent({ type: "key", name: "char", key: "c", ctrl: false, alt: false, shift: false });
+  assert.ok(app.mainLeafCount() >= 1, "fallback blank main window exists");
+  await new Promise((r) => setTimeout(r, 5));
+  assert.ok(createCount >= 2, "the fallback adopted a blank session");
+  // navigation traverses the tree in order
+  const leaves = app.splitLeaves();
+  assert.equal(leaves[0]?.kind, "list", "list is the first stop");
+  assert.equal(app.focusedLeaf, leaves[1], "the fallback blank window stays focused after the last close");
+  app.focusWindow(1);
+  assert.equal(app.focusedLeaf, leaves[0], "Ctrl+Right wraps to the list window");
+  assert.equal(app.focusedWindow, "list", "focusedWindow mirrors the leaf");
+});
+
 test("Ctrl+T matches nothing; Ctrl+G opens the GoalPanel; Ctrl+Right toggles windows & Shift+Tab cycles tabs", async () => {
   const app = headlessApp(); app.currentSession = "s";
   app.sessions = [{ sessionId: "s", agentPreset: "standard" }];

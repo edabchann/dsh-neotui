@@ -3788,6 +3788,11 @@ export class App {
     this.mainTab = "chat";     // main-area tab: chat | trajectory | subagent | tasks (Shift+Tab cycles)
     this.mode = "chat";        // chat | trajectory (legacy mirror of mainTab)
     this.focusedWindow = "main"; // focused window: list (会话列表) | main (主窗口); Tab/Ctrl+Left+Right switch
+    this.winTree = null;         // split window tree (built lazily on the first split)
+    this.focusedLeaf = null;     // current leaf node of winTree
+    this.lastMainLeaf = null;    // Tab: list ↔ last focused main window
+    this.pendingPrefix = null;   // nvim-style pending layer (prefix tables)
+    this.prefixTimeoutMs = 2000; // pending-layer timeout (tests may override)
     this.subagentPane = null;  // lazy SubagentPage (tab 子代理)
     this.tasksPane = null;     // lazy TasksPage (tab 后台任务)
     this.sidebarWanted = true;
@@ -3931,16 +3936,28 @@ export class App {
   /** tmux-style window focus over the 2-stop ring (list ↔ main, wrap). The
    *  list stop is omitted when the sidebar is hidden. */
   focusWindow(delta) {
-    const stops = this.windowStops();
-    const idx = stops.indexOf(this.focusedWindow);
-    const next = stops[wrapIndex(Math.max(0, idx) + delta, stops.length)];
-    this.setFocusedWindow(next);
+    if (!this.winTree) {
+      const stops = this.windowStops();
+      const idx = stops.indexOf(this.focusedWindow);
+      const next = stops[wrapIndex(Math.max(0, idx) + delta, stops.length)];
+      this.setFocusedWindow(next);
+      return true;
+    }
+    const leaves = this.#leaves();
+    const idx = leaves.indexOf(this.focusedLeaf ?? (this.focusedWindow === "list" ? this.#leafList() : this.#mainLeaves()[0]));
+    const next = leaves[wrapIndex(Math.max(0, idx) + delta, leaves.length)];
+    this.#focusLeaf(next);
     return true;
   }
 
   /** Focus the given window. "list" focuses the session list; "main" focuses
    *  whatever the active tab hosts (chat or the active pane). */
   setFocusedWindow(which) {
+    if (this.winTree) {
+      if (which === "list") this.#focusLeaf(this.#leafList());
+      else this.#focusLeaf(this.lastMainLeaf ?? this.#mainLeaves()[0] ?? this.focusedLeaf);
+      return;
+    }
     this.focusedWindow = which;
     if (which === "list") {
       this.focus(this.sidebar);
@@ -3961,6 +3978,192 @@ export class App {
     this.setTab(next);
     return true;
   }
+
+  // ---- Window split tree + prefix layers ----
+
+  /** Lazy window tree: built when the first split happens (list + one main). */
+  #ensureWinTree() {
+    if (this.winTree) return;
+    const main = { type: "leaf", kind: "main", id: "m1", sessionId: this.currentSession, mainTab: this.mainTab };
+    const list = { type: "leaf", kind: "list", id: "list" };
+    this.winTree = { type: "split", dir: "right", a: list, b: main };
+    this.focusedLeaf = this.focusedWindow === "list" ? list : main;
+    this.lastMainLeaf = main;
+  }
+  /** Leaves in visual order (left→right, top→bottom). */
+  #leaves(node = this.winTree) {
+    if (!node) return [];
+    if (node.type === "leaf") return [node];
+    const l = this.#leaves(node.a), r = this.#leaves(node.b);
+    return (node.dir === "left" || node.dir === "up") ? [...r, ...l] : [...l, ...r];
+  }
+  #mainLeaves() { return this.#leaves().filter((l) => l.kind === "main"); }
+  #leafList(node = this.winTree) { return this.#leaves(node).find((l) => l.kind === "list"); }
+  #contains(node, target) {
+    if (!node || node.type === "leaf") return node === target;
+    return this.#contains(node.a, target) || this.#contains(node.b, target);
+  }
+  #leafDepth(node, target, d = 0) {
+    if (node.type === "leaf") return d;
+    if (this.#contains(node.a, target) || this.#contains(node.b, target)) {
+      const d1 = node.a.type === "split" || node.a === target || this.#contains(node.a, target) ? this.#leafDepth(node.a, target, d + 1) : d + 1;
+      return this.#leafDepth(this.#contains(node.a, target) ? node.a : node.b, target, d + 1);
+    }
+    return d;
+  }
+  /** Replace leaf with a node in the tree (mutating). */
+  #replaceLeaf(leaf, withNode, node = this.winTree) {
+    if (!node || node.type === "leaf") return;
+    if (node.a === leaf) { node.a = withNode; return; }
+    if (node.b === leaf) { node.b = withNode; return; }
+    if (this.#contains(node.a, leaf)) this.#replaceLeaf(leaf, withNode, node.a);
+    else if (this.#contains(node.b, leaf)) this.#replaceLeaf(leaf, withNode, node.b);
+  }
+  /** Prune the parent split of target; returns the new root. */
+  #prune(node, target) {
+    if (node.type !== "split") return node;
+    if (node.a === target) return node.b;
+    if (node.b === target) return node.a;
+    if (this.#contains(node.a, target)) return { ...node, a: this.#prune(node.a, target) };
+    if (this.#contains(node.b, target)) return { ...node, b: this.#prune(node.b, target) };
+    return node;
+  }
+  /** Rect of a leaf; the main-area rect for main leaves, the sidebar slot for list. */
+  #leafRect(leaf) {
+    const main = this.mainAreaRect();
+    if (leaf.kind === "list") return { x: 0, y: 0, w: this.sidebarVisible ? this.sidebarWidth : 0, h: this.screen.h - 1 };
+    return main;
+  }
+  /** Recompute the leaf rects and render each leaf (focused leaf renders its real
+   *  content; others draw a placeholder cell). Returns the rect map. */
+  #layoutLeaves() {
+    const map = new Map();
+    const main = this.mainAreaRect();
+    const listRect = { x: 0, y: 0, w: this.sidebarVisible ? this.sidebarWidth : 0, h: this.screen.h - 1 };
+    // simple recursive rect assignment with 1-cell separators
+    const place = (node, rect, depth = 0) => {
+      if (node.type === "leaf") { map.set(node, rect); return; }
+      const border = 1;
+      if (node.dir === "right" || node.dir === "left") {
+        const total = Math.max(2, rect.w - border);
+        const aW = Math.max(1, Math.floor(total / 2));
+        const bW = Math.max(1, total - aW);
+        if (node.dir === "right") {
+          place(node.a, { ...rect, w: aW }, depth + 1);
+          place(node.b, { x: rect.x + aW + border, y: rect.y, w: bW, h: rect.h }, depth + 1);
+        } else {
+          place(node.b, { ...rect, w: bW }, depth + 1);
+          place(node.a, { x: rect.x + bW + border, y: rect.y, w: aW, h: rect.h }, depth + 1);
+        }
+      } else {
+        const total = Math.max(2, rect.h - border);
+        const aH = Math.max(1, Math.floor(total / 2));
+        const bH = Math.max(1, total - aH);
+        if (node.dir === "down") {
+          place(node.a, { ...rect, h: aH }, depth + 1);
+          place(node.b, { x: rect.x, y: rect.y + aH + border, w: rect.w, h: bH }, depth + 1);
+        } else {
+          place(node.b, { ...rect, h: bH }, depth + 1);
+          place(node.a, { x: rect.x, y: rect.y + bH + border, w: rect.w, h: aH }, depth + 1);
+        }
+      }
+    };
+    if (!this.winTree) { map.set(null, main); return map; }
+    place(this.winTree, this.winTree.b?.kind === "main" && this.#leafList() === this.winTree.a ? main : main);
+    // The tree root's split spans the WHOLE area, but the list leaf must occupy
+    // the sidebar slot and mains the remaining main area. Handle that by
+    // placing the list specially when it is a direct child:
+    if (this.winTree.type === "split" && this.winTree.a?.kind === "list") {
+      map.set(this.winTree.a, listRect);
+      place(this.winTree.b, main);
+    } else {
+      place(this.winTree, { x: this.sidebarVisible ? this.sidebarWidth : 0, y: 1, w: main.w, h: main.h });
+      if (this.#leafList()) map.set(this.#leafList(), listRect);
+    }
+    return map;
+  }
+  /** Split the focused leaf in a direction; the new window is a main window
+   *  adopting a blank session. Guards: 8 windows, depth 4, min 40x12. */
+  splitWindow(dir) {
+    this.#ensureWinTree();
+    const leaf = this.focusedLeaf ?? (this.focusedWindow === "list" ? this.#leafList() : this.#mainLeaves()[0]);
+    if (!leaf) { this.toast("请先打开一个会话"); return false; }
+    if (this.#leaves().length >= 8) { this.toast("窗口已达上限 (8)"); return false; }
+    if (this.#leafDepth(this.winTree, leaf) >= 4) { this.toast("分屏嵌套已达深度上限 (4)"); return false; }
+    const r = this.#leafRect(leaf);
+    if ((dir === "right" || dir === "left") && r.w < 40 * 2 + 1) { this.toast("空间不足：分屏后各窗口需 ≥40 列"); return false; }
+    if ((dir === "up" || dir === "down") && r.h < 12 * 2 + 1) { this.toast("空间不足：分屏后各窗口需 ≥12 行"); return false; }
+    const newLeaf = { type: "leaf", kind: "main", id: `m${Date.now()}`, sessionId: null, mainTab: "chat" };
+    const node = { type: "split", dir, a: leaf, b: newLeaf };
+    this.#replaceLeaf(leaf, node);
+    this.focusedLeaf = newLeaf;
+    this.lastMainLeaf = newLeaf;
+    this.focusedWindow = "main";
+    void this.#adoptBlankSession(newLeaf);
+    this.layout();
+    this.redraw();
+    return true;
+  }
+  /** Close the focused main window (p c). Never deletes the session; if no
+   *  main window remains, a fresh blank-session main window appears. */
+  closeWindow() {
+    if (!this.winTree) { this.toast("还没有可分屏窗口"); return false; }
+    const leaf = this.focusedLeaf ?? (this.focusedWindow === "list" ? this.#leafList() : this.#mainLeaves()[0]);
+    if (!leaf || leaf.kind === "list") { this.toast("不能关闭会话列表"); return false; }
+    const closedSession = leaf.sessionId;
+    this.winTree = this.#prune(this.winTree, leaf);
+    const mains = this.#mainLeaves();
+    if (mains.length === 0) {
+      const blank = { type: "leaf", kind: "main", id: `m${Date.now()}`, sessionId: null, mainTab: "chat" };
+      const list = this.#leafList();
+      this.winTree = list ? { type: "split", dir: "right", a: list, b: blank } : blank;
+      this.focusedLeaf = blank;
+      this.lastMainLeaf = blank;
+      void this.#adoptBlankSession(blank);
+    } else {
+      this.focusedLeaf = mains[0];
+      this.lastMainLeaf = mains[0];
+      if (mains[0].sessionId && mains[0].sessionId !== this.chat.sessionId) this.openSession(mains[0].sessionId);
+    }
+    this.toast(closedSession ? `已关闭窗口（会话保留在侧栏）` : "已关闭窗口");
+    this.layout();
+    this.redraw();
+    return true;
+  }
+  /** A blank session for a new window (reuse drafts like newSessionIn). */
+  async #adoptBlankSession(leaf) {
+    try {
+      const blanks = this.sessions.filter((s) => s.blank && !s.running && s.sessionId !== this.currentSession);
+      const blank = blanks.find((s) => s.cwd === process.cwd()) ?? blanks[0];
+      if (blank) { await this.refreshSessions(); leaf.sessionId = blank.sessionId; this.openSession(blank.sessionId); return; }
+      const { sessionId } = await this.api.call("session.create", { cwd: process.cwd() });
+      if (typeof sessionId !== "string" || !sessionId) throw new Error("Host 未返回会话 ID");
+      await this.refreshSessions();
+      leaf.sessionId = sessionId;
+      this.openSession(sessionId);
+    } catch (e) { this.toast(`新建会话失败: ${e.message}`); }
+  }
+  /** Focus the given leaf (tree-aware). */
+  #focusLeaf(leaf) {
+    if (!leaf) return;
+    this.focusedLeaf = leaf;
+    if (leaf.kind === "list") {
+      this.focusedWindow = "list";
+      this.focus(this.sidebar);
+    } else {
+      this.focusedWindow = "main";
+      this.lastMainLeaf = leaf;
+      const tab = leaf.mainTab ?? "chat";
+      if (tab !== this.mainTab) this.setTab(tab);
+      else { const pane = this.paneWidget(); this.focus(pane ?? this.chat); }
+      if (leaf.sessionId && leaf.sessionId !== this.chat.sessionId) this.openSession(leaf.sessionId);
+    }
+    this.redraw();
+  }
+
+  /** Public window-tree inspection (tests/diagnostics). */
+  splitLeaves() { return this.#leaves(); }
+  mainLeafCount() { return this.#mainLeaves().length; }
 
   async checkUpdates(target = null, notify = false) {
     const specs = {
@@ -5342,6 +5545,53 @@ export class App {
     ];
   }
 
+  /** Draw the split-tree chrome: the focused main leaf keeps its real content
+   *  (rendered above); every OTHER leaf gets a faint placeholder cell with its
+   *  window id + short session, and the separators get border chars. */
+  #renderSplitOverlay(s) {
+    const map = this.#layoutLeaves();
+    const leaves = this.#leaves();
+    const focused = this.focusedLeaf ?? (this.focusedWindow === "list" ? this.#leafList() : this.#mainLeaves()[0]);
+    // separators: for each split node, draw the border line between a and b
+    const drawSep = (node, rect) => {
+      if (node.type === "leaf") return;
+      const border = 1;
+      if (node.dir === "right" || node.dir === "left") {
+        const total = Math.max(2, rect.w - border);
+        const aW = Math.max(1, Math.floor(total / 2));
+        const x = rect.x + aW;
+        for (let y = Math.max(0, rect.y); y < rect.y + rect.h; y++) s.put(x, y, "│", { fg: T.BORDER });
+      } else {
+        const total = Math.max(2, rect.h - border);
+        const aH = Math.max(1, Math.floor(total / 2));
+        const y = rect.y + aH;
+        for (let x = Math.max(0, rect.x); x < rect.x + rect.w; x++) s.put(x, y, "─", { fg: T.BORDER });
+      }
+      drawSep(node.a, { ...rect, ...(node.dir === "right" || node.dir === "left" ? { w: Math.max(1, Math.floor(total / 2)) } : { h: Math.max(1, Math.floor(total / 2)) }) });
+      drawSep(node.b, { ...rect, ...(node.dir === "right" || node.dir === "left" ? { x: rect.x + (node.dir === "right" ? Math.max(1, Math.floor(total / 2)) + border : 0), w: Math.max(1, total - Math.floor(total / 2)) } : { y: rect.y + (node.dir === "down" ? Math.max(1, Math.floor(total / 2)) + border : 0), h: Math.max(1, total - Math.floor(total / 2)) }) });
+    };
+    const rootRect = { x: this.sidebarVisible ? this.sidebarWidth : 0, y: 1, w: this.mainAreaRect().w, h: this.mainAreaRect().h };
+    if (leaves.length > 2) drawSep(this.winTree, rootRect);
+    // placeholders for non-focused leaves
+    let n = 1;
+    for (const leaf of leaves) {
+      if (leaf.kind === "main") {
+        const rect = map.get(leaf);
+        if (leaf === focused || !rect || rect.w < 8 || rect.h < 3) continue;
+        const label = `W${n} · ${leaf.sessionId ? leaf.sessionId.slice(0, 8) : "空白会话"} · Shift+Tab/Ctrl+←→ 切换`;
+        s.fillRect(rect.x + 1, rect.y, rect.x + rect.w - 1, rect.y + rect.h - 1, " ", { bg: T.BG });
+        s.text(rect.x + 2, rect.y + 1, truncate(label, Math.max(0, rect.w - 4)), { fg: T.FAINT, bg: T.BG });
+      }
+      n++;
+    }
+    // the focused leaf also gets a small W# marker at its top-left
+    const frect = map.get(focused);
+    if (frect && focused?.kind === "main") {
+      const idx = leaves.indexOf(focused) + 1;
+      s.text(frect.x + 1, frect.y, `W${idx}`, { fg: T.DIM, bg: T.PANEL });
+    }
+  }
+
   #renderTabBar(s) {
     const x = this.sidebarVisible ? this.sidebarWidth : 0;
     const w = this.screen.w - x;
@@ -5408,6 +5658,55 @@ export class App {
       return true;
     }
     return false;
+  }
+
+  // ---- chained prefix layers (nvim-style pending keys) ----
+
+  /** Generic pending-layer tables. The p table is the first user; future
+   *  g/z tables register here too. Entries: (ev) => run. */
+  #prefixTables() {
+    return {
+      p: {
+        hint: "p · r=右 l=左 u=上 n=下 c=关窗 · Esc/2s 取消",
+        entries: {
+          r: () => this.splitWindow("right"),
+          l: () => this.splitWindow("left"),
+          u: () => this.splitWindow("up"),
+          n: () => this.splitWindow("down"),
+          c: () => this.closeWindow(),
+        },
+      },
+    };
+  }
+  #handlePrefixKey(ev) {
+    if (ev.type !== "key") return false;
+    const pending = this.pendingPrefix;
+    if (pending) {
+      if (ev.name === "escape") { this.#cancelPrefix(); return true; }
+      const entry = pending.table.entries[ev.key];
+      if (entry) { pending.table; this.#cancelPrefix(); entry(ev); return true; }
+      this.#cancelPrefix("已取消 p 前缀");
+      return true;
+    }
+    // Arm only from a main window, not in INSERT (list window: p = preview).
+    if (ev.name === "char" && ev.key === "p" && !ev.ctrl && !ev.alt && !ev.shift
+        && this.focusedWindow === "main" && !this.#inInsertMode()) {
+      const table = this.#prefixTables().p;
+      this.pendingPrefix = { table, key: "p", timer: null };
+      this.pendingPrefix.timer = setTimeout(() => {
+        if (this.pendingPrefix?.key === "p") this.#cancelPrefix();
+      }, this.prefixTimeoutMs);
+      this.redraw();
+      return true;
+    }
+    return false;
+  }
+  #cancelPrefix(message = "") {
+    if (!this.pendingPrefix) return;
+    if (this.pendingPrefix.timer) clearTimeout(this.pendingPrefix.timer);
+    this.pendingPrefix = null;
+    if (message) this.toast(message);
+    this.redraw();
   }
 
   // ---- dispatch ----
@@ -5516,6 +5815,7 @@ export class App {
       return;
     }
 
+    if (this.#handlePrefixKey(ev)) return;
     // tab bar clicks (row 0 of the main area)
     if (ev.type === "mouse" && ev.kind === "press" && ev.button === 0 && ev.y === 0 && ev.x >= (this.sidebarVisible ? this.sidebarWidth : 0)) {
       if (this.#clickTab(ev.x)) { this.redraw(); return; }
@@ -6494,6 +6794,7 @@ export class App {
       if (modePanel.relayout) modePanel.relayout(r.x, r.y, r.w, r.h);
       modePanel.render(s);
     } else this.chat.render(s);
+    if (this.winTree) this.#renderSplitOverlay(s);
 
     // footer: multi-row powerline-style status
     const t = this.titleOf();
@@ -6512,6 +6813,7 @@ export class App {
     // Ctrl+Space (command panel) earns the prime spot right after the mode
     // badge — the shortcut every session needs to discover first.
     row0.left.push({ t: " Ctrl+Space 面板 ", fg: T.DIM, bg: T.STATUSBG });
+    if (this.pendingPrefix) row0.left.push({ t: ` ${this.pendingPrefix.table.hint} `, fg: 0x000000, bg: T.WARN, bold: true });
     // Left badge: the session's permission/mode (e.g. "工作区写入/创造模式"),
     // which is far more meaningful than a static "工作区" label.
     const perm = this.projections.permissions?.currentValue;
