@@ -143,9 +143,11 @@ export class UploadPicker extends Widget {
     const inner=this.w-4,l=Math.floor(inner*.25),m=Math.floor(inner*.38),x=this.x+5+l+m,y=this.y+4;
     const sourceAspect=p.pixelWidth&&p.pixelHeight?p.pixelWidth/p.pixelHeight:1;
     // WezTerm does not consistently infer the missing dimension. Compute an
-    // aspect-fit box ourselves using the terminal's ~2:1 cell height ratio.
-    let cols=Math.max(4,p.width),rows=Math.max(3,Math.round(cols/sourceAspect/2));
-    if(rows>p.height){rows=Math.max(3,p.height);cols=Math.max(4,Math.min(p.width,Math.round(rows*sourceAspect*2)));}
+    // aspect-fit box ourselves; use the probed cell ratio (CSI 14t/16t) when
+    // the terminal answered, otherwise fall back to the ~2:1 cell ratio.
+    const ratio = this.app.term?.cellAspect?.ratio ?? 0.5;
+    let cols=Math.max(4,p.width),rows=Math.max(3,Math.round(cols/sourceAspect*ratio));
+    if(rows>p.height){rows=Math.max(3,p.height);cols=Math.max(4,Math.min(p.width,Math.round(rows*sourceAspect/ratio)));}
     return payload+`\x1b[${y};${x}H\x1b_Ga=p,i=${this.kittyId},c=${cols},r=${rows},q=2\x1b\\`;
   }
   clearKitty(){if(this.kittyId&&this.app.term?.output)this.app.term.output.write(`\x1b_Ga=d,d=i,i=${this.kittyId},q=2\x1b\\`);this.kittyId=null;this.kittyShownKey=null;this.imagePreview=null;if(this.app.screen){this.app.screen.prev=null;this.app.redraw();}}

@@ -281,6 +281,9 @@ export class Input extends Widget {
     this.cmds = [];                    // filtered candidates
     this.fileRoot = null;              // completion base dir (session cwd)
     this.fileCands = [];               // file-path completion candidates
+    this.atCands = [];                // @-mention candidates
+    this.atIdx = 0;
+    this.atLast = null;
     this.fileIdx = 0;
     this.onChange = opts.onChange ?? null;
     this.allowEmptyEnter = opts.allowEmptyEnter ?? false;
@@ -346,6 +349,7 @@ export class Input extends Widget {
   height() { return this.multi ? Math.max(1, Math.min(this.maxLines, this.#visualRows().length)) : 1; }
   setValue(v, opts = {}) {
     this.fileLast = null; // any value change resets file-completion cycling
+    this.atLast = null;
     this.#touch();
     this.value = String(v);
     this.cursor = this.#cps().length;
@@ -373,6 +377,43 @@ export class Input extends Widget {
     }
     this.#edit(at, at, text);
   }
+  /** @-mention completion: the token after "@" is completed against the
+   *  session cwd (dir scans stay bounded); Tab cycles the candidates. */
+  #completeAtMention() {
+    const cps = this.#cps();
+    const before = cps.slice(0, this.cursor).join("");
+    const m = /(?<=^|\s)@([^\s]*)$/.exec(before);
+    if (!m) return false;
+    const token = m[1];
+    if (!token) return false;
+    const root = this.fileRoot ?? process.cwd();
+    const slash = token.lastIndexOf("/");
+    const dirPart = slash < 0 ? root : (token.startsWith("/") || token.startsWith(".") || token.startsWith("~") ? token.slice(0, slash) : join(root, token.slice(0, slash)));
+    const base = token.slice(slash + 1);
+    const dirResolved = token.startsWith("~") ? join(homedir(), dirPart.slice(1)) : dirPart;
+    let names = [];
+    try {
+      names = readdirSync(dirResolved, { withFileTypes: true })
+        .filter((e) => e.name.startsWith(base) && (base.startsWith(".") ? e.name.startsWith(".") : !e.name.startsWith(".")))
+        .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
+        .slice(0, 12)
+        .map((e) => `${e.isDirectory() ? e.name + "/" : e.name}`);
+    } catch { names = []; }
+    if (!names.length) { this.atCands = []; return false; }
+    if (this.atLast === this.value && this.atCands.length > 1) this.atIdx = (this.atIdx + 1) % this.atCands.length;
+    else { this.atCands = names; this.atIdx = 0; }
+    const name = this.atCands[this.atIdx];
+    const dirDisplay = slash >= 0 ? token.slice(0, slash + 1) : "";
+    const repl = `@${dirDisplay}${name}`;
+    const head = before.slice(0, m.index) + "@"; // keep the space before the @
+    const tail = cps.slice(this.cursor).join("");
+    const next = head + dirDisplay + name + tail;
+    this.setValue(next);
+    this.cursor = graphemes(head + dirDisplay + name).length;
+    this.atLast = next;
+    return true;
+  }
+
   /** File-path completion: Tab completes the token before the caret when it
    *  looks like a path (contains "/" or starts with "."/"~"). Repeated Tab
    *  cycles the candidates; directories complete with a trailing "/". */
@@ -791,6 +832,7 @@ export class Input extends Widget {
           this.cmdOpen = false;
           return true;
         }
+        if (this.#completeAtMention()) return true;
         return this.#completeFile();
       case "char":
         if (ev.ctrl) {

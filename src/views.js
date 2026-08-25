@@ -6,7 +6,7 @@ import { readFileSync, appendFileSync, mkdirSync, existsSync, statSync, unlinkSy
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join, basename } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { createRequire } from "node:module";
 import { Widget, ScrollView, Input, Popup, Menu, StatusBar, wrapIndex } from "./widgets.js";
 import { UploadPicker } from "./file-picker.js";
@@ -1834,6 +1834,25 @@ export class ChatView extends Widget {
       },
     });
     for (const e of errors) this.app.toast(`图片读取失败: ${e}`);
+    // @-mentioned non-image files/directories attach as bounded text blocks
+    // (Claude-Code parity; the token stays in the prompt as a reference).
+    const atRoot = this.app.sessions?.find((s) => s.sessionId === this.sessionId)?.cwd ?? process.cwd();
+    for (const m of trimmed.matchAll(/@([^\s@]+)/g)) {
+      const ref = m[1];
+      if (IMAGE_EXT.test(ref)) continue;
+      const full = ref.startsWith("~") ? join(homedir(), ref.slice(1)) : join(atRoot, ref);
+      if (!existsSync(full)) continue;
+      const display = `@${ref}`;
+      try {
+        if (statSync(full).isDirectory()) {
+          const names = readdirSync(full).slice(0, 200);
+          parts.push({ type: "text", text: `\n<${display} 目录内容>\n${names.join("\n")}`.slice(0, 8192) });
+        } else {
+          const buf = readFileSync(full, "utf8");
+          parts.push({ type: "text", text: `\n<${display} 文件内容>\n${buf}`.slice(0, 8192) });
+        }
+      } catch (e) { this.app.toast(`@${ref} 读取失败: ${e.message}`); }
+    }
     const clipParts = this.clipboardImages.map(({ mediaType, data, name }) => ({ type: "image", mediaType, data, name }));
     const clipboardCount = clipParts.length;
     parts.push(...clipParts);
@@ -3115,14 +3134,15 @@ export class ChatView extends Widget {
    *  also shows file-path completion candidates. */
   #renderCmdBar(screen) {
     const inp = this.input;
-    if (!inp.cmdOpen && inp.fileCands.length === 0) return;
+    if (!inp.cmdOpen && inp.fileCands.length === 0 && inp.atCands.length === 0) return;
     if (inp.cmdOpen && inp.cmds.length > 0) { this.#renderCmdBarCommands(screen); return; }
     // file completion hint line
     const n = 1;
     const w = Math.min(this.view.w, 44);
     const y0 = Math.max(this.view.y, inp.y - n - 1);
     screen.fillRect(this.x, y0, this.x + w - 1, y0 + n - 1, " ", { bg: T.BG2 });
-    const shown = inp.fileCands.slice(0, 6).join("  ");
+    const cands = inp.atCands.length ? inp.atCands : inp.fileCands;
+    const shown = cands.slice(0, 6).map((n) => n.startsWith("@") ? n : n).join("  ");
     screen.text(this.x + 1, y0, `▸ ${truncate(shown, w - 3)}`, { fg: T.SELFG, bg: T.BG2 });
     return;
   }
@@ -5445,10 +5465,14 @@ export class App {
             return;
           }
           if (bindingMatchFor(ev, keyBindings(), false, ["insert"])?.id === "insert") {
-            this.setPane("chat");
-            this.focus(this.chat.input);
-            this.redraw();
-            return;
+            // In the 子代理 pane, i/Tab belong to the pane (focus its message
+            // input); elsewhere i returns to chat and focuses the input.
+            if (this.mainPane !== "subagent") {
+              this.setPane("chat");
+              this.focus(this.chat.input);
+              this.redraw();
+              return;
+            }
           }
         } else if (ev.type === "text" && graphemes(ev.text).length === 1) {
           // Legacy terminals deliver q/i as text; mirror the key intercepts.

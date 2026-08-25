@@ -30,6 +30,8 @@ export class Term {
     this.onResize = onResize ?? (() => {});
     this.kitty = kitty;
     this.kittyActive = false;  // set when the terminal answers the CSI ? u query
+    this.cellSize = null;      // [w, h] chars + pixels from CSI 6/4 t replies
+    this.pixelSize = null;     // [w, h] pixels
     this.handoff = process.env.DSH_TUI_RESTART_HANDOFF === "1";
     this.escTimer = null;      // pending lone-ESC fallback (split-sequence safety)
     this.decoder = new StringDecoder("utf8");
@@ -58,6 +60,8 @@ export class Term {
     o.write("\x1b[?2004h"); // bracketed paste
     o.write("\x1b[?7l");    // no autowrap (we clip ourselves)
     if (this.kitty) { o.write("\x1b[>1u"); o.write("\x1b[?u"); }
+    // Cell/pixel geometry probes (XTerm rep): CSI 14 t → pixels, CSI 16 t → chars.
+    o.write("\x1b[14t\x1b[16t");
     this.resizeHandler = () => this.#resize();
     process.on("SIGWINCH", this.resizeHandler);
     this.#resize();
@@ -285,6 +289,23 @@ export class Term {
       return; // other private responses (cursor pos) stay ignored
     }
     if (prefix === ">") return;
+    if (prefix === "" && (final === "t") && params.startsWith("4;")) {
+      const [, ph, pw] = params.split(";").map(Number);
+      if (ph && pw) this.pixelSize = [pw, ph];
+      return;
+    }
+    if (prefix === "" && final === "t" && params.startsWith("6;")) {
+      const [, chh, chw] = params.split(";").map(Number);
+      if (chh && chw) {
+        this.cellSize = [chw, chh];
+        if (this.pixelSize) {
+          // exact cell aspect ratio (pixels per char) — 实际几何而非假设 2:1
+          const [pw, ph] = this.pixelSize, [cw, ch] = this.cellSize;
+          this.cellAspect = { w: pw / cw, h: ph / ch, ratio: (pw / cw) / (ph / ch) };
+        }
+      }
+      return;
+    }
     if (final === "Z") { // Shift+Tab (backtab)
       this.#emit({ type: "key", name: "backtab", ctrl: false, alt: false, shift: true });
       return;

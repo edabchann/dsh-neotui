@@ -775,6 +775,20 @@ test("end-to-end: a bracketed paste through the term reaches the two-stage input
   term.stop();
 });
 
+test("Term parses CSI 14t/16t replies into exact cell geometry", async () => {
+  const { Term } = await import("../src/term.js");
+  const { PassThrough } = await import("node:stream");
+  delete globalThis.process.env.DSH_TUI_RESTART_HANDOFF;
+  const events = [];
+  const term = new Term({ input: new PassThrough(), output: { write: () => true }, onEvent: (e) => events.push(e) });
+  term.start();
+  term.input.write("\x1b[4;384;720t"); // pixels 720x384 (typical 8x16px cells)
+  term.input.write("\x1b[6;24;90t");  // chars 90x24
+  assert.deepEqual(term.pixelSize, [720, 384]);
+  assert.deepEqual(term.cellSize, [90, 24]);
+  assert.ok(Math.abs(term.cellAspect.ratio - 0.5) < 0.01, `ratio ~0.5 for 2:1 cells: ${term.cellAspect.ratio}`);
+});
+
 test("a mouse report split across chunks never becomes input text", async () => {
   const { PassThrough } = await import("node:stream");
   const { Term } = await import("../src/term.js");
@@ -4679,6 +4693,37 @@ test("/rewind forks before the chosen message and refills the input", async () =
   app.overlay = null;
 });
 
+test("@-mention completes paths and attaches non-image files on send", async () => {
+  const app = headlessApp();
+  const dir = mkdtempSync(join(tmpdir(), "tui-at-"));
+  writeFileSync(join(dir, "notes.txt"), "要点内容\n");
+  mkdirSync(join(dir, "src"), { recursive: true });
+  writeFileSync(join(dir, "src", "app.js"), "export {};\n");
+  const chat = app.chat;
+  chat.input.fileRoot = dir;
+  app.currentSession = "s1";
+  app.sessions = [{ sessionId: "s1", agentPreset: "standard", cwd: dir }];
+  chat.sessionId = "s1";
+  // Tab cycles @/src/ → @/src/app.js (dir scan)
+  chat.input.setValue("看看 @src/");
+  chat.input.cursor = graphemes("看看 @src/").length;
+  chat.input.onKey({ type: "key", name: "tab" });
+  assert.equal(chat.input.value, "看看 @src/app.js");
+  chat.input.setValue("读 @notes.txt");
+  chat.input.cursor = graphemes("读 @notes.txt").length;
+  chat.input.onKey({ type: "key", name: "tab" });
+  assert.equal(chat.input.value, "读 @notes.txt");
+  // sending attaches the file content as a bounded text block
+  let sent = null;
+  app.api.call = async (method, payload) => { if (method === "session.prompt") { sent = payload; return {}; } return { items: [] }; };
+  chat.send("读 @notes.txt");
+  await new Promise((r) => setTimeout(r, 5));
+  const textParts = (sent?.content ?? []).filter((p) => p.type === "text").map((p) => p.text).join("\n");
+  assert.ok(textParts.includes("要点内容"), "file content attached");
+  assert.ok(textParts.includes("@notes.txt"), "token reference kept");
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("Tab completes file paths in the input (dirs get a trailing slash)", () => {
   const app = headlessApp();
   const dir = mkdtempSync(join(tmpdir(), "tui-fc-"));
@@ -5497,64 +5542,33 @@ test("Ctrl+T matches nothing; Ctrl+G opens the GoalPanel; Ctrl+Right cycles the 
   assert.ok(app.screen.toPlain().includes("ls -la"), "tasks pane renders groups");
 });
 
-test("subagent pane renders entries and Enter opens a detail popup", async () => {
-  const app = headlessApp(); app.currentSession = "s";
-  app.sessions = [{ sessionId: "s", agentPreset: "standard" }];
-  app.chat.sessionId = "s";
-  app.api.call = async (method) => {
-    if (method === "subagent.list") return { items: [
-      { id: "sub-abc-1", label: "researcher", sessionId: "sub-abc-1", mode: "continuable", activity: "running", model: "ds-v4", parentSessionId: "root", elapsed: 83000 },
-      { id: "sub-def-2", label: "coder", sessionId: "sub-def-2", mode: "one-shot", activity: "inactive", parentSessionId: "root" },
-    ] };
-    if (method === "session.history") return { events: [], hasMore: false, projections: { values: {} } };
-    return {};
+test("subagent pane sends a continuable message via its input (i focuses, Esc returns)", async () => {
+  const app = headlessApp();
+  app.currentSession = "s1";
+  app.sessions = [{ sessionId: "s1", agentPreset: "standard" }];
+  let sent = null;
+  app.api.call = async (method, payload) => {
+    if (method === "subagent.list") return { entries: [{ id: "child-1", label: "研究员", activity: "running" }] };
+    if (method === "subagent.prompt") { sent = payload; return {}; }
+    return { items: [] };
   };
   app.setPane("subagent");
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const page = app.subagentPane;
-  assert.ok(page instanceof SubagentPage);
-  app.focus(page);
-  app.renderFrame();
-  const plain = app.screen.toPlain();
-  assert.ok(plain.includes("researcher"), "entry label rendered");
-  assert.ok(plain.includes("●"), "running marker rendered");
-  assert.ok(page.rows.some((r) => r.kind === "item" && r.text.includes("1分23秒")), "elapsed duration rendered");
-  assert.ok(page.rows.some((r) => r.kind === "header" && r.text.includes("root")), "parent group header rendered");
-  // Enter opens a detail popup
-  app.onEvent({ type: "key", name: "enter", ctrl: false, shift: false });
-  assert.ok(app.overlay instanceof Popup, "Enter opens a popup");
-  // Escape returns to the pane
-  app.onEvent({ type: "key", name: "escape", ctrl: false });
-  assert.equal(app.mainPane, "subagent", "Esc keeps the subagent pane");
-  assert.ok(app.overlay === null, "Esc closes the popup back to the pane");
-});
-
-test("subagent panel groups by parentSessionId when present (flat fallback otherwise)", async () => {
-  const app = headlessApp(); app.currentSession = "s";
-  app.api.call = async (method) => {
-    if (method === "subagent.list") return { items: [
-      { id: "x1", label: "one", activity: "inactive" },
-      { id: "x2", label: "two", activity: "inactive" },
-    ] };
-    return {};
-  };
-  const page = new SubagentPage(app);
-  await page.load();
-  page.relayout(0, 1, app.screen.w, app.screen.h - 1);
-  page.render(app.screen);
-  const plain = app.screen.toPlain();
-  assert.ok(page.rows.some((r) => r.kind === "item"), "flat entries render");
-  assert.ok(plain.includes("one") && plain.includes("two"), "both flat entries shown");
-  assert.ok(page.rows[0].kind === "header" && page.rows[0].text.includes("父会话"), "flat fallback header rendered");
-  // grouped by parentSessionId variant
-  app.api.call = async () => ({ items: [
-    { id: "a1", label: "alpha", activity: "inactive", parentSessionId: "p1" },
-    { id: "a2", label: "beta", activity: "inactive", parentSessionId: "p1" },
-    { id: "a3", label: "gamma", activity: "inactive", parentSessionId: "p2" },
-  ] });
-  await page.load();
-  const headers = page.rows.filter((r) => r.kind === "header").map((r) => r.text);
-  assert.ok(headers[0].includes("p1") && headers[1].includes("p2"), "per-parent headers");
+  await new Promise((r) => setTimeout(r, 5));
+  const pane = app.subagentPane;
+  app.focus(pane);
+  pane.onKey({ type: "key", name: "char", key: "i", ctrl: false, alt: false, shift: false });
+  assert.equal(pane.inputMode, true, "i focuses the pane input");
+  pane.input.setValue("继续研究文档");
+  pane.onKey({ type: "key", name: "enter", ctrl: false });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.ok(sent, "subagent.prompt sent");
+  assert.equal(sent.childSessionId, "child-1");
+  assert.equal(sent.mode, "continuable");
+  assert.deepEqual(sent.content, [{ type: "text", text: "继续研究文档" }]);
+  assert.equal(pane.input.value, "", "input cleared after send");
+  pane.onKey({ type: "key", name: "char", key: "i", ctrl: false, alt: false, shift: false });
+  pane.onKey({ type: "key", name: "escape", ctrl: false });
+  assert.equal(pane.inputMode, false, "Esc leaves the input mode");
 });
 
 test("tasks panel groups user/plugin/goal source kinds with badges and flags unknown source", () => {

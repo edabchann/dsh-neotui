@@ -4841,10 +4841,17 @@ export class SubagentPage extends Widget {
     this.selector = [];   // entry indices selectable in order
     this.view = new ScrollView({ x: this.x, y: this.y, w: this.w, h: this.h, showScrollbar: true });
     this.loadToken = 0;
+    this.inputMode = false;
+    this.input = new Input({
+      x: this.x, y: this.y + this.h - 1, w: this.w, h: 1,
+      placeholder: "给选中子代理发消息…（continuable · i 或 Tab 聚焦 · Esc 回列表）",
+      onEnter: (v) => this.send(v),
+    });
   }
   relayout(x, y, w, h) {
     this.x = x; this.y = y; this.w = w; this.h = h;
-    this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = h;
+    this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = Math.max(1, h - 1);
+    this.input.x = x; this.input.y = y + h - 1; this.input.w = w;
   }
   onActivate() { this.ensureLoaded(); }
   ensureLoaded() {
@@ -4968,7 +4975,26 @@ export class SubagentPage extends Widget {
       if (selLine < this.view.scrollY) this.view.scrollY = selLine;
       else if (selLine >= this.view.scrollY + this.view.h) this.view.scrollY = selLine - this.view.h + 1;
     }
-    screen.text(this.x + 1, this.y + this.h - 1, " ↑↓ 选择 · Enter 详情 · r 刷新 · q/Esc 返回聊天", { fg: K.FAINT });
+    screen.fillRect(this.x, this.y + this.h - 2, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: this.inputMode ? T.BG2 : T.BG });
+    screen.text(this.x + 1, this.y + this.h - 2, " ↑↓ 选择 · Enter 详情 · r 刷新 · i/Tab 给子代理发消息 · q/Esc 返回聊天", { fg: K.FAINT });
+    this.input.render(screen);
+  }
+  /** Continuable message to the selected subagent (original panel parity). */
+  async send(text) {
+    const child = this.entries[this.selector[this.sel]];
+    if (!child) { this.app.toast("先选择子代理"); return; }
+    try {
+      await this.app.api.call("subagent.prompt", {
+        parentSessionId: this.app.currentSession,
+        childSessionId: child.id,
+        mode: "continuable",
+        content: [{ type: "text", text }],
+        clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      });
+      this.app.toast(`已发送给 ${child.id.slice(0, 8)}`);
+      this.input.setValue("");
+      this.reload();
+    } catch (e) { this.app.toast(`发送失败: ${e.message}`); }
   }
   openDetail() {
     const e = this.entries[this.selector[this.sel]];
@@ -4977,6 +5003,13 @@ export class SubagentPage extends Widget {
   }
   onKey(ev) {
     if (ev.type !== "key") return false;
+    if (this.inputMode) {
+      if (ev.name === "escape") { this.inputMode = false; this.input.setValue(""); this.app.redraw(); return true; }
+      this.input.onKey(ev);
+      return true;
+    }
+    if (ev.name === "char" && (ev.key === "i" || ev.key === "I") && !ev.ctrl) { this.inputMode = true; this.app.redraw(); return true; }
+    if (ev.name === "tab") { this.inputMode = true; this.app.redraw(); return true; }
     if (ev.name === "char" && ev.key === "r" && !ev.ctrl) { this.load(); return true; }
     if (ev.name === "up" || ev.name === "down") {
       if (this.selector.length === 0) return false;
