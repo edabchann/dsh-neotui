@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { userInfo } from "node:os";
-import { mkdtempSync, writeFileSync, unlinkSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, unlinkSync, mkdirSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion, drawBootSplash, promptHistory, rememberPrompt } from "../src/views.js";
@@ -4455,6 +4455,44 @@ test("prompt history persists, dedupes and the prefix h searches it", () => {
   app.overlay.onPick({ text: "第二个问题" });
   assert.equal(app.chat.input.value, "第二个问题", "Enter refills the input");
   saveTuiConfig({ promptHistory: [] });
+});
+
+test("external editor edits the input draft (clean exit refills, :cq keeps the original)", async () => {
+  const app = headlessApp();
+  app.chat.input.setValue("原始草稿");
+  app.chat.input.cursor = 4;
+  globalThis.process.env.VISUAL = "vim";
+  let last = null;
+  app.externalEditRunner = (file) => {
+    last = { file, before: readFileSync(file, "utf8") };
+    writeFileSync(file, "改过的草稿\n");
+    return 0;
+  };
+  app.editExternal();
+  assert.ok(last, "editor ran");
+  assert.equal(last.before, "原始草稿", "draft written to the temp file");
+  // runner holds the temp file until the return; clean exit refills
+  assert.equal(app.chat.input.value, "改过的草稿", "clean exit refills the input");
+  assert.ok(!existsSync(last.file), "temp file removed");
+  // :cq (non-zero) keeps the original draft untouched
+  app.chat.input.setValue("第二版");
+  app.externalEditRunner = () => 130;
+  app.editExternal();
+  assert.equal(app.chat.input.value, "第二版", "non-zero exit keeps the original");
+  // empty file abandons without clearing
+  app.chat.input.setValue("别丢我");
+  app.externalEditRunner = () => { writeFileSync(last.file, "\n"); return 0; };
+  app.editExternal();
+  assert.equal(app.chat.input.value, "别丢我", "empty editor result abandons the edit");
+  // prefix key G (Shift+g) triggers it — from a NON-insert pane (input focus
+  // deliberately disables every global shortcut, Ctrl+Space included)
+  app.externalEditRunner = (file) => { writeFileSync(file, "前缀触发\n"); return 0; };
+  app.chat.input.setValue("x");
+  app.focus(app.chat);
+  app.onEvent({ type: "key", name: "char", key: " ", ctrl: true, shift: false });
+  app.onEvent({ type: "key", name: "char", key: "g", ctrl: false, alt: false, shift: true });
+  assert.equal(app.chat.input.value, "前缀触发", "prefix G opens the external editor");
+  app.overlay = null;
 });
 
 test("? (Shift+/) opens a per-scenario help buffer and returns to the pane", () => {

@@ -1765,6 +1765,7 @@ export class ControlPanel extends Widget {
       ["s", "跨会话全文搜索", "Ctrl+F 已释放", () => { this.app.closeOverlay(); this.app.startSearch(); this.app.redraw(); }],
       ["h", "输入历史搜索（可筛选）", "最近 50 条提问", () => { this.app.closeOverlay(); this.app.showHistorySearch(); }],
       ["?", "帮助（按场景）", "Shift+/ 或前缀 ?", () => { this.app.closeOverlay(); this.app.showHelp(this.app.focusBeforePanel ?? null); }],
+      ["G", "外部编辑器编辑输入", "$VISUAL · 非零退出保留原稿", () => { this.app.closeOverlay(); this.app.editExternal(); }],
       ["r", "回退（分支会话 + 原消息回填）", "/rewind", () => { this.app.closeOverlay(); this.app.showRewindPicker(); }],
       ["m", "切换模型", "Ctrl+M 已释放", () => { this.app.closeOverlay(); this.app.overlay = buildModelPicker(this.app); this.app.redraw(); }],
       ["d", "配色主题", "Ctrl+D 已释放", () => { this.app.closeOverlay(); this.app.showThemePicker(); }],
@@ -1848,7 +1849,8 @@ export class ControlPanel extends Widget {
     // Prefix page: a plain one-key press fires the mapped command — but ONLY
     // while the prefix page itself is on screen (leader-style EDITING logic).
     if (this.page === 0 && ev.name === "char" && !ev.ctrl && !ev.alt) {
-      const row = this.prefixRows().find(([k]) => k === ev.key);
+      const key = ev.key ?? "";
+      const row = this.prefixRows().find(([k]) => k === key || (k === key.toUpperCase() && ev.shift && k !== key));
       if (row) { row[3](); this.app.redraw(); return true; }
     }
     if(this.page===0&&ev.name==="backtab"){const it=this.items()[this.sel],id=it?.[3];if(id){const b=keyBindings()[id],modes=["normal","insert","all"],mode=modes[(modes.indexOf(b.mode)+1)%3];setKeyBinding(id,{...b,mode});this.app.toast(`适用模式: ${mode.toUpperCase()}`);}return true;}

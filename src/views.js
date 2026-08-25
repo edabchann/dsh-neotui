@@ -2,10 +2,11 @@
 import { Screen } from "./screen.js";
 import { renderMd, C } from "./md.js";
 import { truncate, strWidth, pad, bars, fmtDuration, fmtClock, fmtDateTime, graphemes, graphemeWidth, takeGraphemes, bytesLabel, prettyJson, looksLikeJson } from "./text.js";
-import { readFileSync, appendFileSync, mkdirSync, existsSync, statSync } from "node:fs";
+import { readFileSync, appendFileSync, mkdirSync, existsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join, basename } from "node:path";
+import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { Widget, ScrollView, Input, Popup, Menu, StatusBar, wrapIndex } from "./widgets.js";
 import { UploadPicker } from "./file-picker.js";
@@ -4414,6 +4415,34 @@ export class App {
       onAction: () => { this.overlay = null; this.focus(focusTarget ?? this.chat); this.redraw(); },
     });
     this.overlay = popup; this.focus(popup); this.redraw();
+  }
+
+  /** External editor for the input draft (Claude-Code Ctrl+G parity, prefix e):
+   *  $VISUAL/$EDITOR edits the current draft in a temp file; a clean exit
+   *  refills the input, a non-zero exit (:cq) keeps the original draft,
+   *  and clearing the file abandons the edit. */
+  editExternal() {
+    const input = this.chat.input;
+    const editor = process.env.VISUAL || process.env.EDITOR || "";
+    if (!editor) { this.toast("未设置 $VISUAL/$EDITOR，无法打开外部编辑器"); return; }
+    const tmp = join(tmpdir(), `dsh-tui-draft-${process.pid}-${Date.now()}.txt`);
+    try { writeFileSync(tmp, input.value, "utf8"); } catch (e) { this.toast(`草稿写入失败: ${e.message}`); return; }
+    const runner = this.externalEditRunner ?? ((file) => {
+      const res = spawnSync(editor, [file], { stdio: "inherit" });
+      return res.status;
+    });
+    let status = 0;
+    try { status = Number(runner(tmp) ?? 0); } catch (e) { status = 1; this.toast(`编辑器失败: ${e.message}`); }
+    let content = null;
+    try { content = readFileSync(tmp, "utf8"); } catch {}
+    try { unlinkSync(tmp); } catch {}
+    if (status !== 0) { this.toast("编辑器非零退出（:cq）；保留原稿"); return; }
+    if (content == null || content.trim() === "") { this.toast("内容为空：放弃编辑"); return; }
+    const old = input.value;
+    input.setValue(content.replace(/\n$/, ""));
+    if (input.value === old) this.toast("内容未变化");
+    else { this.focus(input); this.toast("已从外部编辑器回填"); }
+    this.redraw();
   }
 
   /** Input-history search: filterable picker over the last ~50 typed prompts
