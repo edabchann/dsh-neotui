@@ -15,8 +15,9 @@ export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefa
 import {
   Picker, buildCommandPalette, buildModelPicker, buildModePicker, buildPermissionPicker,
   modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker, AttachmentPanel,
-  ImagePopup, kittyCapable, buildGoalPopup, GoalPanel, SettingsPanel, SubagentPanel,
-  SkillsPanel, ControlPanel, JobsPanel, QueuePanel, ModelPanel, fmtMs, ThemePickerBuffer,
+  ImagePopup, kittyCapable, GoalPanel, SettingsPanel,
+  SkillsPanel, ControlPanel, QueuePanel, ModelPanel, fmtMs, ThemePickerBuffer,
+  PanelContainer,
 } from "./panels.js";
 
 import { T, themeName, cycleTheme } from "./theme.js";
@@ -3697,6 +3698,7 @@ export class App {
     this.searchActive = false;
     this.overlay = null;       // Picker / Popup / ImagePopup modal
     this.fullBuffer = null;    // full-screen panel buffer (workspace/settings/models/subagent/skills)
+    this.panelContainer = null; // unified full-screen panel container (轨迹/目标/子代理/后台任务)
     this.mode = "chat";        // chat | workspace | trajectory
     this.sidebarWanted = true;
     this.sidebarVisible = true; // auto-collapses on narrow terminals
@@ -4634,11 +4636,7 @@ export class App {
   }
   showSettingsBuffer() { if (!this.settingsPanel) this.settingsPanel = new SettingsPanel(this); this.openFullBuffer(this.settingsPanel); this.settingsPanel.load(); }
   showModelsBuffer() { if (!this.modelPanel) this.modelPanel = new ModelPanel(this); this.openFullBuffer(this.modelPanel); this.modelPanel.load(); }
-  showSubagentBuffer() {
-    if (!this.currentSession) { this.toast("先打开一个会话"); return; }
-    if (!this.subagentPanel) this.subagentPanel = new SubagentPanel(this);
-    this.openFullBuffer(this.subagentPanel); this.subagentPanel.load(this.currentSession);
-  }
+  showSubagentBuffer() { this.showPanelPage(2); }
   showSkillsBuffer() {
     if (!this.currentSession) { this.toast("先打开一个会话"); return; }
     if (!this.skillsPanel) this.skillsPanel = new SkillsPanel(this);
@@ -4646,6 +4644,17 @@ export class App {
   }
 
   closeOverlay() { this.overlay = null; this.redraw(); }
+
+  /** Open the unified full-screen panel container at the given page index.
+   *  Keeps the container (and each page's state) alive so switching back
+   *  preserves scroll/selection state. */
+  showPanelPage(page) {
+    if (!this.panelContainer) this.panelContainer = new PanelContainer(this);
+    this.panelContainer.goTo(page);
+    this.overlay = this.panelContainer;
+    this.focus(this.panelContainer);
+    this.redraw();
+  }
 
   openSessionPicker() {
     const w = Math.min(70, this.screen.w - 4), h = Math.min(20, this.screen.h - 4);
@@ -4670,7 +4679,7 @@ export class App {
     else this.toast("先打开一个会话");
   }
 
-  showJobs() { this.overlay = new JobsPanel(this); this.refreshSubagentStats(); this.redraw(); }
+  showJobs() { this.showPanelPage(3); }
   async refreshSubagentStats(sessionId = this.currentSession) {
     if (!sessionId) return;
     try {
@@ -4681,8 +4690,8 @@ export class App {
       if (sessionId === this.currentSession) this.redraw();
     } catch {}
   }
-  showQueue() { this.overlay = new QueuePanel(this); this.redraw(); }
-  showGoal() { this.overlay = buildGoalPopup(this); this.redraw(); }
+  showQueue() { this.showPanelPage(3); }
+  showGoal() { this.showPanelPage(1); }
   showModePicker() { this.overlay = buildModePicker(this); this.redraw(); }
   showThemePicker() { this.overlay = new ThemePickerBuffer(this); this.redraw(); }
 
@@ -4974,14 +4983,14 @@ export class App {
       case "editConfig": this.editConfigFile(); return true;
       case "quit": this.stop(); return true;
       case "model": this.overlay = buildModelPicker(this); this.redraw(); return true;
-      case "trajectory": this.setMode("trajectory"); return true;
+      case "trajectory": this.showPanelPage(0); return true;
       case "workspace": this.showWorkspaceBuffer(); return true;
       case "settings": this.showSettingsBuffer(); return true;
-      case "subagent": this.showSubagentBuffer(); return true;
+      case "subagent": this.showPanelPage(2); return true;
       case "skills": this.showSkillsBuffer(); return true;
-      case "goal": this.showGoal(); return true;
-      case "jobs": this.showJobs(); return true;
-      case "queue": this.showQueue(); return true;
+      case "goal": this.showPanelPage(1); return true;
+      case "jobs": this.showPanelPage(3); return true;
+      case "queue": this.showPanelPage(3); return true;
       case "busyEnter": {
         const next = busyEnter() === "queue" ? "steer" : "queue";
         saveTuiConfig({ busyEnter: next });
@@ -6270,12 +6279,12 @@ export class App {
       });
       // Ctrl+J belongs beside the two activity summaries it opens, not alone
       // at the far-right edge (especially once the queue badge also appears).
-      row2.left.push({ t: " Ctrl+J 任务/子代理 ", fg: T.DIM, bg: T.STATUSBG });
+      row2.left.push({ t: " 任务/子代理 · Ctrl+Space ", fg: T.DIM, bg: T.STATUSBG });
       if (sub) row2.left.push({
         t: ` ◇ ${truncate(sub.label ?? sub.mode ?? "子代理", 20)} `,
         fg: subStats.running > 0 ? T.WARN : subStats.completed > 0 ? T.OK : T.FAINT, bg: T.STATUSBG,
       });
-      if(this.queueItems.length)row2.left.push({t:` 有${this.queueItems.length}条命令正在排队 Ctrl+N查看详情 `,fg:0x000000,bg:T.WARN,bold:true});
+      if(this.queueItems.length)row2.left.push({t:` 排队${this.queueItems.length}条 · Ctrl+Space→任务 查看 `,fg:0x000000,bg:T.WARN,bold:true});
       rows.push(row2);
     }
     this.status.rows = rows;

@@ -37,11 +37,11 @@ export const DEFAULT_KEYBINDINGS = {
   permissionRotate: { mode: "normal", key: "", key2: "" }, // freed: permission modes moved to the prefix page (p)
   workspace: { mode: "normal", key: "Ctrl+W", key2: "" },
   settings: { mode: "normal", key: "Ctrl+S", key2: "" },
-  subagent: { mode: "normal", key: "Ctrl+A", key2: "" },
+  subagent: { mode: "normal", key: "", key2: "" }, // freed: subagent lives on the unified panel page 2 (Ctrl+T → Tab)
   skills: { mode: "normal", key: "Ctrl+H", key2: "" },
   goal: { mode: "normal", key: "Ctrl+G", key2: "" },
-  jobs: { mode: "normal", key: "Ctrl+J", key2: "" },
-  queue: { mode: "normal", key: "Ctrl+N", key2: "" },
+  jobs: { mode: "normal", key: "", key2: "" }, // freed: jobs live on the unified panel page 3 (Ctrl+T → Tab)
+  queue: { mode: "normal", key: "", key2: "" }, // freed: queue lives on the unified panel page 3 (Ctrl+T → Tab)
   busyEnter: { mode: "normal", key: "Ctrl+Y", key2: "" },
   attachments: { mode: "normal", key: "Ctrl+O", key2: "" },
   stepJump: { mode: "normal", key: "Ctrl+E", key2: "" },

@@ -6,11 +6,11 @@ import { mkdtempSync, writeFileSync, unlinkSync, mkdirSync, rmSync } from "node:
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { ChatView, App, ApprovalPopup, QuestionPopup, userPrefix, saveTuiConfig, nodeForEvents, loadTuiConfig, TUI_VERSION, installedDshVersion, drawBootSplash, promptHistory, rememberPrompt } from "../src/views.js";
-import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker, AttachmentPanel, ThemePickerBuffer } from "../src/panels.js";
+import { TrajectoryPanel, JobsPanel, QueuePanel, GoalPanel, SettingsPanel, ModelPanel, WorkspacePanel, Picker, ControlPanel, ModelPickerBuffer, buildModelPicker, AttachmentPanel, ThemePickerBuffer, PanelContainer, SubagentPage, TasksPage } from "../src/panels.js";
 import { setTheme, themeName, THEMES, renderedThemeName, clearThemePreview } from "../src/theme.js";
 import { fmtDuration, strWidth, pad, graphemeWidth, graphemes } from "../src/text.js";
 import { renderMd, wrapSegs } from "../src/md.js";
-import { Input, List } from "../src/widgets.js";
+import { Input, List, Popup } from "../src/widgets.js";
 import { Screen } from "../src/screen.js";
 import { T } from "../src/theme.js";
 import { keyBindings, setKeyBinding, resetKeyBinding, tuiConfigFile, searchHistory, rememberSearchQuery } from "../src/config.js";
@@ -4318,7 +4318,7 @@ test("footer jobs row is a single 后台任务 summary", () => {
   const text = [...(row2?.left ?? []), ...(row2?.right ?? [])].map((s) => s.t).join(" ");
   assert.ok(text.includes("2 个后台任务运行中"), text);
   assert.ok(text.includes("1已完成 · 1失败"), text);
-  assert.ok(text.includes("Ctrl+J 任务/子代理"), text);
+  assert.ok(text.includes("任务/子代理 · Ctrl+Space"), text);
   // no per-job noise rows
   assert.equal(app.status.rows.length, 3, "footer has exactly one jobs row");
 });
@@ -4681,7 +4681,7 @@ test("goal and queued-command footer badges use black text on yellow", () => {
   app.queueItems = [{ id: "q", placement: "queued", message: { content: [{ type: "text", text: "later" }] } }];
   app.renderFrame();
   const goal = app.status.rows[0].left.find((seg) => seg.t.includes("ship it"));
-  const queue = app.status.rows[2].left.find((seg) => seg.t.includes("命令正在排队"));
+  const queue = app.status.rows[2].left.find((seg) => seg.t.includes("排队") && seg.t.includes("Ctrl+Space"));
   assert.equal(goal?.bg, T.WARN); assert.equal(goal?.fg, 0x000000);
   assert.equal(queue?.bg, T.WARN); assert.equal(queue?.fg, 0x000000);
 });
@@ -4696,12 +4696,12 @@ test("footer task/subagent colors are symmetric and Ctrl+J stays beside both sum
   const taskDone = row.left.find((seg) => seg.t.includes("1已完成"));
   const subRun = row.left.find((seg) => seg.t.includes("子代理运行中"));
   const subDone = row.left.find((seg) => seg.t.includes("11已完成"));
-  const shortcut = row.left.find((seg) => seg.t.includes("Ctrl+J"));
+  const shortcut = row.left.find((seg) => seg.t.includes("任务/子代理"));
   assert.equal(taskRun?.fg, T.WARN); assert.equal(subRun?.fg, T.WARN, "running colors match");
   assert.equal(taskDone?.fg, T.OK); assert.equal(subDone?.fg, T.OK, "completed colors match");
-  assert.ok(shortcut, "Ctrl+J moved beside activity summaries");
-  assert.ok(row.left.indexOf(shortcut) > row.left.indexOf(subDone), "shortcut follows both task/subagent groups");
-  assert.ok(!row.right.some((seg) => seg.t.includes("Ctrl+J")), "Ctrl+J no longer floats at the far right");
+  assert.ok(shortcut, "subagent/tasks hint follows the activity summaries");
+  assert.ok(row.left.indexOf(shortcut) > row.left.indexOf(subDone), "hint follows both task/subagent groups");
+  assert.ok(!row.right.some((seg) => seg.t.includes("任务/子代理")), "hint no longer floats at the far right");
 
   app.jobs = [];
   app.subagentStatsBySession.set("s", { running: 0, completed: 0, total: 0 });
@@ -5239,4 +5239,133 @@ test("code-dispatch rejects self and ancestor cycles", () => {
   const tool = dispatchTool(nodes, "run1");
   assert.equal(tool.subCalls.length, 1, "only the valid child exists");
   assert.equal(tool.subCalls[0].subCalls.length, 0, "cycle children rejected");
+});
+
+// ---- Unified panel container (轨迹 / 目标 / 子代理 / 后台任务) ----
+
+test("subagent/jobs/queue keybindings are freed (prefix-page panel replaces them)", () => {
+  const kb = keyBindings();
+  assert.deepEqual(kb.subagent, { mode: "normal", key: "", key2: "" }, "subagent freed");
+  assert.deepEqual(kb.jobs, { mode: "normal", key: "", key2: "" }, "jobs freed");
+  assert.deepEqual(kb.queue, { mode: "normal", key: "", key2: "" }, "queue freed");
+  // the freed chords no longer match any binding
+  assert.equal(bindingMatchFor({ type: "key", name: "char", key: "a", ctrl: true, alt: false, shift: false }, keyBindings(), false, KEYBINDING_ORDER), null, "Ctrl+A freed");
+  assert.equal(bindingMatchFor({ type: "key", name: "char", key: "j", ctrl: true, alt: false, shift: false }, keyBindings(), false, KEYBINDING_ORDER), null, "Ctrl+J freed");
+  assert.equal(bindingMatchFor({ type: "key", name: "char", key: "n", ctrl: true, alt: false, shift: false }, keyBindings(), false, KEYBINDING_ORDER), null, "Ctrl+N freed");
+  // trajectory still binds Ctrl+T and now opens the container page 0
+  assert.equal(kb.trajectory.key, "Ctrl+T");
+});
+
+test("Ctrl+T opens the unified panel container; Tab/Right/Backtab page; q closes", async () => {
+  const app = headlessApp(); app.currentSession = "s";
+  app.api.call = async (method) => {
+    if (method === "session.history") return { events: [], hasMore: false, projections: { values: {} } };
+    if (method === "subagent.list") return { items: [] };
+    if (method === "session.models") return { current: null };
+    return {};
+  };
+  app.onEvent({ type: "key", name: "char", key: "t", ctrl: true, shift: false });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(app.overlay instanceof PanelContainer, "Ctrl+T opens the container");
+  assert.equal(app.overlay.pageIndex, 0, "opens at page 0 (轨迹)");
+  app.renderFrame();
+  let plain = app.screen.toPlain();
+  assert.ok(plain.includes("轨 迹"), "tab bar shows 轨迹");
+  // Tab → page 1 (目标)
+  app.onEvent({ type: "key", name: "tab", ctrl: false, shift: false });
+  assert.equal(app.overlay.pageIndex, 1);
+  // Right → page 2 (子代理)
+  app.onEvent({ type: "key", name: "right", ctrl: false, shift: false });
+  assert.equal(app.overlay.pageIndex, 2);
+  // Backtab → page 1
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.overlay.pageIndex, 1);
+  // q closes the overlay back to chat
+  app.onEvent({ type: "key", name: "char", key: "q", text: "q", ctrl: false, alt: false, shift: false });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(app.overlay, null, "q closes the container");
+});
+
+test("subagent panel page renders entries and Enter opens a detail popup", async () => {
+  const app = headlessApp(); app.currentSession = "s";
+  app.api.call = async (method) => {
+    if (method === "subagent.list") return { items: [
+      { id: "sub-abc-1", label: "researcher", sessionId: "sub-abc-1", mode: "continuable", activity: "running", model: "ds-v4", parentSessionId: "root", elapsed: 83000 },
+      { id: "sub-def-2", label: "coder", sessionId: "sub-def-2", mode: "one-shot", activity: "inactive", parentSessionId: "root" },
+    ] };
+    if (method === "session.history") return { events: [], hasMore: false, projections: { values: {} } };
+    return {};
+  };
+  app.showPanelPage(2);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const page = app.overlay.pages[2];
+  assert.ok(page instanceof SubagentPage);
+  app.renderFrame();
+  const plain = app.screen.toPlain();
+  assert.ok(plain.includes("researcher"), "entry label rendered");
+  assert.ok(plain.includes("●"), "running marker rendered");
+  assert.ok(page.rows.some((r) => r.kind === "item" && r.text.includes("1分23秒")), "elapsed duration rendered");
+  assert.ok(page.rows.some((r) => r.kind === "header" && r.text.includes("root")), "parent group header rendered");
+  // Enter opens a detail popup
+  app.onEvent({ type: "key", name: "enter", ctrl: false, shift: false });
+  assert.ok(app.overlay !== app.panelContainer && app.overlay instanceof Popup, "Enter opens a popup");
+  // Escape returns to the container
+  app.onEvent({ type: "key", name: "escape", ctrl: false });
+  assert.equal(app.overlay, app.panelContainer, "Esc returns to the container");
+});
+
+test("subagent panel groups by parentSessionId when present (flat fallback otherwise)", async () => {
+  const app = headlessApp(); app.currentSession = "s";
+  app.api.call = async (method) => {
+    if (method === "subagent.list") return { items: [
+      { id: "x1", label: "one", activity: "inactive" },
+      { id: "x2", label: "two", activity: "inactive" },
+    ] };
+    return {};
+  };
+  const page = new SubagentPage(app);
+  await page.load();
+  page.relayout(0, 1, app.screen.w, app.screen.h - 1);
+  page.render(app.screen);
+  const plain = app.screen.toPlain();
+  assert.ok(page.rows.some((r) => r.kind === "item"), "flat entries render");
+  assert.ok(plain.includes("one") && plain.includes("two"), "both flat entries shown");
+  assert.ok(page.rows[0].kind === "header" && page.rows[0].text.includes("父会话"), "flat fallback header rendered");
+  // grouped by parentSessionId variant
+  app.api.call = async () => ({ items: [
+    { id: "a1", label: "alpha", activity: "inactive", parentSessionId: "p1" },
+    { id: "a2", label: "beta", activity: "inactive", parentSessionId: "p1" },
+    { id: "a3", label: "gamma", activity: "inactive", parentSessionId: "p2" },
+  ] });
+  await page.load();
+  const headers = page.rows.filter((r) => r.kind === "header").map((r) => r.text);
+  assert.ok(headers[0].includes("p1") && headers[1].includes("p2"), "per-parent headers");
+});
+
+test("tasks panel groups user/plugin/goal source kinds with badges and flags unknown source", () => {
+  const app = headlessApp(); app.currentSession = "s";
+  app.queueItems = [
+    { id: "q1", placement: "queued", message: { source: { kind: "user" }, content: [{ type: "text", text: "summarize the paper" }] } },
+    { id: "q2", placement: "steering", message: { source: { kind: "plugin" }, content: [{ type: "text", text: "inject context notes" }] } },
+    { id: "q3", placement: "context", message: { source: { kind: "goal" }, content: [{ type: "text", text: "continue round 3" }] } },
+    { id: "q4", placement: "queued", message: { content: [{ type: "text", text: "orphan without source" }] } },
+  ];
+  app.jobs = [{ status: "completed", kind: "bash", label: "ls -la", startedAt: Date.now() - 60000, finishedAt: Date.now() }];
+  const page = new TasksPage(app);
+  page.onActivate();
+  const headerTexts = page.groups.filter((r) => r.kind === "header").map((r) => r.text);
+  assert.ok(headerTexts.some((t) => t.includes("排队提问")), "user group heading");
+  assert.ok(headerTexts.some((t) => t.includes("注入上下文")), "plugin group heading");
+  assert.ok(headerTexts.some((t) => t.includes("目标延续")), "goal group heading");
+  assert.ok(headerTexts.some((t) => t.startsWith("●") && t.includes("排队提问")), "user group heading badge");
+  assert.ok(headerTexts.some((t) => t.startsWith("◇") && t.includes("注入上下文")), "plugin badge");
+  assert.ok(headerTexts.some((t) => t.startsWith("◆") && t.includes("目标延续")), "goal badge");
+  // unknown-source entries (orphan queue item + job) flagged under 排队提问
+  const unknown = page.groups.filter((r) => r.kind === "item" && r.text.includes("(unknown source)"));
+  assert.ok(unknown.length >= 2, "unknown source flagged on both queue orphan and job");
+  const itemsText = page.groups.filter((r) => r.kind === "item").map((r) => r.text).join("\n");
+  assert.ok(itemsText.includes("ls -la"), "job shown");
+  // Enter opens a detail popup
+  page.onKey({ type: "key", name: "enter", ctrl: false, shift: false });
+  assert.ok(app.overlay instanceof Popup, "Enter opens a detail popup");
 });

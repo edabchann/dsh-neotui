@@ -2,7 +2,7 @@
 // timeline, jobs/goal panels, and the terminal image viewer (kitty graphics
 // protocol with external-viewer / chafa fallbacks).
 import { Widget, ScrollView, Input, Popup, wrapIndex } from "./widgets.js";
-import { strWidth, truncate, pad, graphemes, graphemeWidth, bytesLabel, prettyJson } from "./text.js";
+import { strWidth, truncate, pad, graphemes, graphemeWidth, bytesLabel, prettyJson, fmtDuration } from "./text.js";
 import { renderMd, C } from "./md.js";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -4763,5 +4763,428 @@ export class SkillsPanel extends Widget {
       return true;
     }
     return false;
+  }
+}
+
+// ---- PanelContainer: unified full-screen panel with a tab bar ----
+
+/** Open a scrollable detail Popup over `returnTo` (restored as app.overlay on
+ *  Escape/q). `lines` may be raw string lines or styled segment arrays. */
+function openDetailPopup(app, returnTo, title, lines) {
+  const w = Math.max(40, Math.min(110, app.screen.w - 4));
+  const h = Math.max(12, Math.min(36, app.screen.h - 4));
+  const pop = new Popup({
+    x: Math.max(0, Math.floor((app.screen.w - w) / 2)),
+    y: Math.max(0, Math.floor((app.screen.h - h) / 2)),
+    w, h, title, lines: [], buttons: [], scrollable: true,
+    onAction: () => { app.overlay = returnTo; app.redraw(); },
+  });
+  for (const line of (lines ?? [])) {
+    pop.lines.push(Array.isArray(line) ? line.map((seg) => ({ ...seg })) : [{ t: String(line), fg: K.TXT }]);
+  }
+  const base = pop.onKey.bind(pop);
+  pop.onKey = (ev) => {
+    if (ev.type === "key" && (ev.name === "escape" || (ev.name === "char" && ev.key === "q" && !ev.ctrl))) {
+      app.overlay = returnTo; app.redraw(); return true;
+    }
+    return base(ev);
+  };
+  app.overlay = pop;
+  app.redraw();
+  return pop;
+}
+
+/** Pretty, bounded JSON-ish summary of an entry for the detail popup. */
+function detailText(value) {
+  const s = prettyJson(JSON.stringify(value));
+  return (s ?? JSON.stringify(value, null, 2) ?? String(value)).slice(0, 6000);
+}
+
+export class PanelContainer extends Widget {
+  constructor(app) {
+    super({ x: 0, y: 0, w: app.screen.w, h: app.screen.h });
+    this.app = app;
+    this.pages = null;
+    this.pageIndex = 0;
+    this.pageNames = ["轨迹", "目标", "子代理", "后台任务"];
+  }
+  ensurePages() {
+    if (this.pages) return;
+    this.pages = [
+      new TrajectoryPanel(this.app),
+      new GoalPanel(this.app),
+      new SubagentPage(this.app),
+      new TasksPage(this.app),
+    ];
+  }
+  activePage() { this.ensurePages(); return this.pages[this.pageIndex]; }
+  /** Lay every child at content rect (full width, below the tab row). */
+  relayoutAll() {
+    this.w = this.app.screen.w; this.h = this.app.screen.h;
+    const cy = 1, ch = Math.max(1, this.h - 1);
+    const page = this.pages?.[this.pageIndex];
+    if (!page) return;
+    if (typeof page.relayout === "function") page.relayout(0, cy, this.w, ch);
+    else { page.x = 0; page.y = cy; page.w = this.w; page.h = ch; }
+  }
+  goTo(index) {
+    this.ensurePages();
+    this.pageIndex = ((index % this.pages.length) + this.pages.length) % this.pages.length;
+    this.relayoutAll();
+    const page = this.pages[this.pageIndex];
+    if (typeof page.onActivate === "function") page.onActivate();
+    // Page 0 (TrajectoryPanel) loads the current session on activation; load()
+    // reuses the cached steps for a re-entry, so repeated activation is cheap.
+    if (this.pageIndex === 0 && typeof page.load === "function" && this.app.currentSession) {
+      page.load(this.app.currentSession);
+    }
+    this.app.redraw();
+  }
+  render(screen) {
+    this.ensurePages();
+    this.relayoutAll();
+    screen.fillRect(0, 0, this.w - 1, this.h - 1, " ", { bg: T.BG });
+    // tab bar on row 0
+    let tx = 1;
+    for (let i = 0; i < this.pageNames.length; i++) {
+      const sel = i === this.pageIndex;
+      const label = ` ${this.pageNames[i]} `;
+      screen.text(tx, 0, label, { fg: sel ? T.SELFG : K.DIM, bg: sel ? T.ACCENT : -1, attrs: sel ? 1 : 0 });
+      tx += strWidth(label);
+    }
+    screen.text(Math.max(tx, this.w - 28), 0, "Tab/←→ 翻页 · q/Esc 返回", { fg: K.FAINT });
+    const page = this.pages[this.pageIndex];
+    page.render(screen);
+  }
+  onMouse(ev) {
+    this.relayoutAll();
+    // Tab bar (row 0): a press switches page.
+    if (ev.kind === "press" && ev.button === 0 && ev.y === 0) {
+      let tx = 1;
+      for (let i = 0; i < this.pageNames.length; i++) {
+        const label = ` ${this.pageNames[i]} `;
+        if (ev.x >= tx && ev.x < tx + strWidth(label)) { this.goTo(i); return true; }
+        tx += strWidth(label);
+      }
+      return true;
+    }
+    // Everything else forwards to the active page (absolute coordinates — the
+    // page renders at y=1 below the tab bar). The container always swallows so
+    // clicks never leak into the chat surface beneath the overlay.
+    const page = this.pages[this.pageIndex];
+    try { if (page?.onMouse) page.onMouse(ev); } catch { /* swallow */ }
+    return true;
+  }
+  onKey(ev) {
+    this.relayoutAll();
+    // Container owns the only close + page-switch keys.
+    if (ev.type === "key") {
+      if (ev.name === "escape" || (ev.name === "char" && ev.key === "q" && !ev.ctrl)) { this.app.closeOverlay(); return true; }
+      if (ev.name === "tab" || ev.name === "right") { this.goTo(this.pageIndex + 1); return true; }
+      if (ev.name === "backtab" || ev.name === "left") { this.goTo(this.pageIndex - 1); return true; }
+    }
+    const page = this.pages[this.pageIndex];
+    // Forward to the active page, but never re-forward the keys we already own
+    // (escape/q/tab/left/right) so the child's own close/page handlers cannot
+    // double-handle a key the container has already consumed.
+    if (ev.type === "key") {
+      const name = ev.name;
+      if (name === "escape" || name === "tab" || name === "backtab" || name === "right" || name === "left") return false;
+      if (name === "char" && ev.key === "q" && !ev.ctrl) return false;
+    }
+    if (page?.onKey) return page.onKey(ev) === true;
+    return false;
+  }
+}
+
+// ---- SubagentPage (container page 2): single-column subagent list ----
+
+export class SubagentPage extends Widget {
+  constructor(app) {
+    super({ x: 0, y: 1, w: app.screen.w, h: Math.max(2, app.screen.h - 1) });
+    this.app = app;
+    this.entries = [];
+    this.error = null;
+    this.loading = false;
+    this.sel = 0;
+    this.rows = [];       // { kind:"header"|"item", item? } flattened selectable view
+    this.selector = [];   // entry indices selectable in order
+    this.view = new ScrollView({ x: this.x, y: this.y, w: this.w, h: this.h, showScrollbar: true });
+    this.loadToken = 0;
+  }
+  relayout(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = h;
+  }
+  onActivate() { this.ensureLoaded(); }
+  ensureLoaded() {
+    if (this.loading || (this.entries.length > 0 && this.error == null)) return;
+    this.load();
+  }
+  async load() {
+    const token = ++this.loadToken;
+    this.loading = true;
+    this.error = null;
+    try {
+      const res = await this.app.api.call("subagent.list", { parentSessionId: this.app.currentSession });
+      if (token !== this.loadToken) return;
+      this.entries = res.items ?? res.entries ?? [];
+    } catch (e) {
+      if (token !== this.loadToken) return;
+      this.entries = [];
+      this.error = e.message;
+      this.app.toast(`子代理加载失败: ${e.message}`);
+    }
+    this.loading = false;
+    this.sel = 0;
+    this.#rebuild();
+    this.app.redraw();
+  }
+  #parentOf(e) { return e.parentSessionId ?? e.parentId ?? e.parent ?? null; }
+  #statusOf(e) {
+    return e.activity ?? e.state ?? e.status ?? (e.done ? "inactive" : "idle");
+  }
+  #elapsedMs(e) {
+    if (e.elapsed != null) return e.elapsed;
+    if (e.duration != null) return e.duration;
+    if (typeof e.settledMs === "number") return e.settledMs;
+    if (typeof e.timing?.settledMs === "number") return e.timing.settledMs;
+    if (typeof e.startedAt === "number" && typeof e.finishedAt === "number") return e.finishedAt - e.startedAt;
+    if (typeof e.startedAt === "number") return Date.now() - e.startedAt;
+    return null;
+  }
+  #modelOf(e) {
+    if (typeof e.model === "string") return e.model;
+    if (e.model?.id) return `${e.model.provider ? e.model.provider + "/" : ""}${e.model.id}`;
+    if (typeof e.modelId === "string") return e.modelId;
+    return null;
+  }
+  #tokensOf(e) {
+    const t = e.tokenUsage ?? e.tokens ?? e.tokenCount;
+    if (t == null) return null;
+    const total = typeof t === "object" ? (t.total ?? t.input + (t.output ?? 0) ?? null) : t;
+    return total == null ? null : total;
+  }
+  #exitReason(e) {
+    return e.exitReason ?? e.stoppedReason ?? e.reason ?? e.error?.message ?? null;
+  }
+  #shortId(e, w) {
+    const label = e.label ?? e.sessionId ?? e.id;
+    return truncate(String(label ?? "子代理"), w);
+  }
+  #rebuild() {
+    const w = Math.max(20, this.w - 2);
+    const rows = [], selector = [];
+    for (let i = 0; i < this.entries.length; i++) {
+      const e = this.entries[i];
+      const parent = this.#parentOf(e);
+      if (parent != null) {
+        const prev = i > 0 ? this.#parentOf(this.entries[i - 1]) : undefined;
+        if (prev !== parent) rows.push({ kind: "header", text: `▼ 父会话 ${truncate(String(parent), 30)} / 子代理` });
+      } else if (i === 0) {
+        rows.push({ kind: "header", text: "▼ 父会话 / 子代理" });
+      }
+      const running = this.#statusOf(e) === "running";
+      const model = this.#modelOf(e);
+      const elapsed = this.#elapsedMs(e);
+      const tokens = this.#tokensOf(e);
+      const exit = this.#exitReason(e);
+      const idw = Math.max(10, w - 14);
+      let line = `${running ? "●" : "○"} ${this.#shortId(e, idw)}`;
+      if (model) line += ` · ${truncate(String(model), 18)}`;
+      if (elapsed != null) line += ` · ${fmtDuration(elapsed)}`;
+      if (tokens != null) line += ` · ${tokens} tok`;
+      if (exit) line += ` · ${truncate(String(exit), 22)}`;
+      rows.push({ kind: "item", item: e, index: i, text: line, running });
+      selector.push(i);
+    }
+    if (this.entries.length === 0) {
+      rows.push({ kind: "empty", text: this.error ? ` 子代理加载失败: ${this.error}` : " 暂无子代理" });
+    }
+    this.rows = rows;
+    this.selector = selector;
+    if (this.sel >= selector.length) this.sel = Math.max(0, selector.length - 1);
+  }
+  render(screen) {
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.BG });
+    if (this.entries.length === 0 && !this.loading) {
+      const msg = this.error ? `子代理加载失败: ${this.error}` : "暂无子代理";
+      screen.text(this.x + 1, this.y + 1, msg, { fg: this.error ? K.ERR : K.FAINT });
+      return;
+    }
+    // Render rows through the shared ScrollView so scrolling works.
+    this.view.setLines(this.rows.map((row) => {
+      if (row.kind === "header") return [{ t: row.text, fg: K.ACCENT, bold: true }];
+      if (row.kind === "empty") return [{ t: row.text, fg: row.text.startsWith("子代理加载失败") ? K.ERR : K.FAINT }];
+      const sel = this.selector[this.sel] === row.index;
+      const fg = row.running ? K.OK : sel ? T.SELFG : K.TXT;
+      const bg = sel ? T.MENUSEL : -1;
+      return [{ t: row.text, fg, bg, bold: sel }];
+    }), { keep: true });
+    this.view.render(screen);
+    // selection highlight is handled above via bg; ensure selected row visible
+    const selIdx = this.selector[this.sel];
+    if (selIdx != null) {
+      const rowPos = this.rows.findIndex((r) => r.kind === "item" && r.index === selIdx);
+      const selLine = this.rows.slice(0, rowPos + 1).filter((r) => r.kind !== "empty").length - 1;
+      if (selLine < this.view.scrollY) this.view.scrollY = selLine;
+      else if (selLine >= this.view.scrollY + this.view.h) this.view.scrollY = selLine - this.view.h + 1;
+    }
+    screen.text(this.x + 1, this.y + this.h - 1, " ↑↓ 选择 · Enter 详情 · r 刷新 · Tab/←→ 翻页 · q/Esc 返回", { fg: K.FAINT });
+  }
+  openDetail() {
+    const e = this.entries[this.selector[this.sel]];
+    if (!e) return;
+    openDetailPopup(this.app, this.app.overlay, "子代理详情", detailText(e).split("\n"));
+  }
+  onKey(ev) {
+    if (ev.type !== "key") return false;
+    if (ev.name === "char" && ev.key === "r" && !ev.ctrl) { this.load(); return true; }
+    if (ev.name === "up" || ev.name === "down") {
+      if (this.selector.length === 0) return false;
+      const next = wrapIndex(this.sel + (ev.name === "up" ? -1 : 1), this.selector.length);
+      this.sel = next;
+      this.app.redraw();
+      return true;
+    }
+    if (ev.name === "enter") { this.openDetail(); return true; }
+    if (ev.name === "pgup") { this.view.scroll(-this.view.h); this.app.redraw(); return true; }
+    if (ev.name === "pgdn") { this.view.scroll(this.view.h); this.app.redraw(); return true; }
+    return false;
+  }
+  onMouse(ev) {
+    if (ev.kind === "press" && ev.button === 0) {
+      const line = ev.y - this.view.y + this.view.scrollY;
+      const row = this.rows[line];
+      if (row?.kind === "item") {
+        this.sel = this.selector.indexOf(row.index);
+        this.openDetail();
+      }
+      return true;
+    }
+    return this.view.onMouse(ev);
+  }
+}
+
+// ---- TasksPage (container page 3): background jobs + queue, source-kind badges ----
+
+export class TasksPage extends Widget {
+  constructor(app) {
+    super({ x: 0, y: 1, w: app.screen.w, h: Math.max(2, app.screen.h - 1) });
+    this.app = app;
+    this.sel = 0;
+    this.groups = [];
+    this.selector = [];
+    this.view = new ScrollView({ x: this.x, y: this.y, w: this.w, h: this.h, showScrollbar: true });
+  }
+  relayout(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = h;
+  }
+  onActivate() { this.#rebuild(); }
+  /** One normalized entry: queue item or job. */
+  #entries() {
+    const out = [];
+    for (const item of (this.app.queueItems ?? [])) {
+      const src = item?.source?.kind ?? item?.message?.source?.kind ?? "unknown";
+      out.push({ kind: "queue", badge: this.#badgeFor(src), group: this.#groupFor(src), src, item, text: this.#queueSummary(item) });
+    }
+    for (const job of (this.app.jobs ?? [])) {
+      const src = job?.source?.kind ?? "unknown";
+      out.push({ kind: "job", badge: this.#badgeFor(src), group: this.#groupFor(src), src, job, text: this.#jobSummary(job) });
+    }
+    return out;
+  }
+  #badgeFor(src) { return src === "user" ? "●" : src === "plugin" ? "◇" : src === "goal" ? "◆" : "●"; }
+  #groupFor(src) { return src === "user" ? "排队提问" : src === "plugin" ? "注入上下文" : src === "goal" ? "目标延续" : "排队提问"; }
+  #queueSummary(item) {
+    const text = partsText(item?.message?.content).replace(/\s+/g, " ").trim();
+    return truncate(text || item?.id || "（无文本）", 56);
+  }
+  #jobSummary(job) {
+    let s = truncate(job?.label ?? job?.kind ?? "任务", 56);
+    if (job?.status) s += ` · ${job.status}`;
+    return s;
+  }
+  #durationMs(entry) {
+    const e = entry.kind === "job" ? entry.job : entry.item;
+    if (e?.elapsed != null) return e.elapsed;
+    if (e?.duration != null) return e.duration;
+    if (typeof e?.startedAt === "number" && typeof e?.finishedAt === "number") return e.finishedAt - e.startedAt;
+    if (typeof e?.startedAt === "number") return Date.now() - e.startedAt;
+    return null;
+  }
+  #hasLogTail(entry) {
+    const e = entry.kind === "job" ? entry.job : entry.item;
+    return !!(e?.logTail ?? e?.tail ?? e?.result);
+  }
+  #exitCode(entry) {
+    const e = entry.kind === "job" ? entry.job : entry.item;
+    return e?.exitCode ?? e?.code ?? (e?.status === "failed" ? 1 : null);
+  }
+  #rebuild() {
+    const entries = this.#entries();
+    const groupOrder = [{ name: "排队提问", badge: "●" }, { name: "注入上下文", badge: "◇" }, { name: "目标延续", badge: "◆" }];
+    const rows = [], selector = [];
+    for (const g of groupOrder) {
+      const members = entries.filter((e) => e.group === g.name);
+      if (members.length === 0) continue;
+      rows.push({ kind: "header", text: `${g.badge} ${g.name}（${members.length}）` });
+      for (const entry of members) {
+        const srcTag = entry.src === "unknown" ? " (unknown source)" : "";
+        let text = `${entry.badge} ${entry.text}${srcTag}`;
+        const dur = this.#durationMs(entry);
+        if (dur != null) text += ` · ${fmtDuration(dur)}`;
+        const code = this.#exitCode(entry);
+        if (code != null) text += ` · exit ${code}`;
+        if (this.#hasLogTail(entry)) text += " …";
+        rows.push({ kind: "item", entry, text, index: selector.length });
+        selector.push(entries.indexOf(entry));
+      }
+    }
+    if (rows.length === 0) rows.push({ kind: "empty", text: " 暂无后台任务或排队命令" });
+    this.groups = rows;
+    this.selector = selector;
+    if (this.sel >= selector.length) this.sel = Math.max(0, selector.length - 1);
+  }
+  render(screen) {
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.BG });
+    this.view.setLines(this.groups.map((row) => {
+      if (row.kind === "header") return [{ t: row.text, fg: K.ACCENT, bold: true }];
+      if (row.kind === "empty") return [{ t: row.text, fg: K.FAINT }];
+      const sel = this.selector[this.sel] === row.index;
+      return [{ t: row.text, fg: sel ? T.SELFG : K.TXT, bg: sel ? T.MENUSEL : -1, bold: sel }];
+    }), { keep: true });
+    this.view.render(screen);
+    screen.text(this.x + 1, this.y + this.h - 1, " ↑↓ 选择 · Enter 详情 · Tab/←→ 翻页 · q/Esc 返回", { fg: K.FAINT });
+  }
+  openDetail() {
+    const rowIdx = this.selector[this.sel];
+    const entry = this.#entries()[rowIdx];
+    if (!entry) return;
+    const raw = entry.kind === "job" ? entry.job : entry.item;
+    openDetailPopup(this.app, this.app.overlay, "任务详情", detailText(raw).split("\n"));
+  }
+  onKey(ev) {
+    if (ev.type !== "key") return false;
+    if (ev.name === "up" || ev.name === "down") {
+      if (this.selector.length === 0) return false;
+      this.sel = wrapIndex(this.sel + (ev.name === "up" ? -1 : 1), this.selector.length);
+      this.app.redraw();
+      return true;
+    }
+    if (ev.name === "enter") { this.openDetail(); return true; }
+    if (ev.name === "pgup") { this.view.scroll(-this.view.h); this.app.redraw(); return true; }
+    if (ev.name === "pgdn") { this.view.scroll(this.view.h); this.app.redraw(); return true; }
+    return false;
+  }
+  onMouse(ev) {
+    if (ev.type === "mouse" && ev.kind === "press" && ev.button === 0) {
+      const line = ev.y - this.view.y + this.view.scrollY;
+      const row = this.groups[line];
+      if (row?.kind === "item") { this.sel = this.selector.indexOf(row.index); this.openDetail(); }
+      return true;
+    }
+    return this.view.onMouse(ev);
   }
 }
