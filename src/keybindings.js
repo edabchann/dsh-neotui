@@ -38,7 +38,7 @@ export const DEFAULT_KEYBINDINGS = {
   workspace: { mode: "normal", key: "Ctrl+W", key2: "" },
   settings: { mode: "normal", key: "Ctrl+S", key2: "" },
   subagent: { mode: "normal", key: "", key2: "" }, // freed: subagent lives on the unified panel page 2 (Ctrl+T → Tab)
-  skills: { mode: "normal", key: "Ctrl+H", key2: "" },
+  skills: { mode: "normal", key: "", key2: "" }, // freed: Ctrl+H is now tabPrev
   goal: { mode: "normal", key: "Ctrl+G", key2: "" },
   jobs: { mode: "normal", key: "", key2: "" }, // freed: jobs live on the unified panel page 3 (Ctrl+T → Tab)
   queue: { mode: "normal", key: "", key2: "" }, // freed: queue lives on the unified panel page 3 (Ctrl+T → Tab)
@@ -53,13 +53,15 @@ export const DEFAULT_KEYBINDINGS = {
   themePicker: { mode: "normal", key: "", key2: "" }, // freed: theme picker moved to the Ctrl+Space prefix page (d)
   logoPicker: { mode: "normal", key: "Ctrl+R", key2: "" },
   help: { mode: "normal", key: "Shift+/", key2: "Shift+?" }, // 场景帮助（Shift+/ 或 Shift+?）——按焦点路由
+  tabNext: { mode: "normal", key: "Ctrl+L", key2: "" }, // 主窗口标签页下一页
+  tabPrev: { mode: "normal", key: "Ctrl+H", key2: "" }, // 主窗口标签页上一页
   quitDouble: { mode: "normal", key: "Ctrl+C", key2: "" },
   quit: { mode: "all", key: "Ctrl+Q", key2: "" },
 };
 
 /** App-level dispatch precedence: the first matching binding wins. */
 export const KEYBINDING_ORDER = [
-  "sessionFilter", "help", "panel", "panePrev", "paneNext", "permissionRotate", "editConfig", "addWorkspace", "commandPalette", "modePicker", "themePicker", "logoPicker", "copySelection", "quitDouble", "quit",
+  "sessionFilter", "help", "tabNext", "tabPrev", "panel", "panePrev", "paneNext", "permissionRotate", "editConfig", "addWorkspace", "commandPalette", "modePicker", "themePicker", "logoPicker", "copySelection", "quitDouble", "quit",
   "model", "trajectory", "workspace", "settings", "subagent", "skills", "goal",
   "jobs", "queue", "busyEnter", "attachments", "stepJump", "sidebar",
 ];

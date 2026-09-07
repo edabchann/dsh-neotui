@@ -1761,17 +1761,8 @@ export class ControlPanel extends Widget {
     ];
   }
   prefixRows() {
-    return [
-      ["s", "跨会话全文搜索", "Ctrl+F 已释放", () => { this.app.closeOverlay(); this.app.startSearch(); this.app.redraw(); }],
-      ["h", "输入历史搜索（可筛选）", "最近 50 条提问", () => { this.app.closeOverlay(); this.app.showHistorySearch(); }],
-      ["?", "帮助（按场景）", "Shift+/ 或前缀 ?", () => { this.app.closeOverlay(); this.app.showHelp(this.app.focusBeforePanel ?? null); }],
-      ["G", "外部编辑器编辑输入", "$VISUAL · 非零退出保留原稿", () => { this.app.closeOverlay(); this.app.editExternal(); }],
-      ["r", "回退（分支会话 + 原消息回填）", "/rewind", () => { this.app.closeOverlay(); this.app.showRewindPicker(); }],
-      ["m", "切换模型", "Ctrl+M 已释放", () => { this.app.closeOverlay(); this.app.overlay = buildModelPicker(this.app); this.app.redraw(); }],
-      ["d", "配色主题", "Ctrl+D 已释放", () => { this.app.closeOverlay(); this.app.showThemePicker(); }],
-      ["p", "权限模式（沙箱 + 审批）", "F8 已释放", () => { this.app.closeOverlay(); this.app.showPermissionPicker(); }],
-      ["c", "打开配置文件（tui-config.json）", "等价: Ctrl+K", () => { this.app.closeOverlay(); this.app.editConfigFile(); }],
-    ];
+    // 前缀页 = 引擎同一张表的可视化（which-key）；键路由走同一引擎。
+    return this.app.prefixRowsData();
   }
   items() {
     if (this.page === 0) return this.prefixRows().map(([k, d, hint, action]) => [`${k}  ${d}`, hint, action]);
@@ -1837,7 +1828,7 @@ export class ControlPanel extends Widget {
       else if(this.page===1){const [mode,key1,key2]=label.split("\t");s.text(this.x+2,this.y+2+i,pad(mode,9),{fg:T.PURPLE,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+13,this.y+2+i,pad(truncate(key1,16),17),{fg:T.ACCENT,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+31,this.y+2+i,pad(truncate(key2,16),17),{fg:T.ACCENT,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});s.text(this.x+49,this.y+2+i,truncate(it[1],this.w-52),{fg:T.OK,bg:sel?T.MENUSEL:T.PANEL,attrs:sel?1:0});}
       else{s.text(this.x + 2, this.y + 2 + i, truncate(label, this.w - 34), { fg: sel ? T.BOLD : T.TXT, bg: sel ? T.MENUSEL : T.PANEL, attrs: sel ? 1 : 0 });if (it[1]) s.text(this.x + this.w - 30, this.y + 2 + i, truncate(it[1], 28), { fg: T.FAINT, bg: sel ? T.MENUSEL : T.PANEL });}
     }
-    s.text(this.x + 2, this.y + this.h - 1, this.page===0?"按 r 执行 · ↑↓/Enter 也可以 · Esc 关闭":this.page===1?"↑↓ 选择 · Enter 编辑 · Shift+Tab 轮换模式 · Alt+Enter 恢复默认 · Esc 关闭":this.page===3?`/ 筛选插件 · Ctrl+/ 清除 · ↑↓ 选择 · Esc 关闭${this.pluginQuery?` · ${this.pluginQuery}`:""}`:"↑↓ 选择 · Enter 执行 · Esc 关闭", { fg: T.FAINT });
+    s.text(this.x + 2, this.y + this.h - 1, this.page===0?"按行首键执行（同 NORMAL 前缀层） · ↑↓/Enter 也可以 · Esc 关闭":this.page===1?"↑↓ 选择 · Enter 编辑 · Shift+Tab 轮换模式 · Alt+Enter 恢复默认 · Esc 关闭":this.page===3?`/ 筛选插件 · Ctrl+/ 清除 · ↑↓ 选择 · Esc 关闭${this.pluginQuery?` · ${this.pluginQuery}`:""}`:"↑↓ 选择 · Enter 执行 · Esc 关闭", { fg: T.FAINT });
   }
   onKey(ev) {
     if(this.page===3&&this.pluginFilter){if(ev.type==="text"){this.pluginQuery+=ev.text;this.sel=0;return true;}if(ev.type==="key"&&ev.name==="backspace"){this.pluginQuery=this.pluginQuery.slice(0,-1);this.sel=0;return true;}if(ev.type==="key"&&ev.name==="enter"){this.pluginFilter=false;return true;}if(ev.type==="key"&&ev.ctrl&&(ev.key==="/"||ev.key==="_")){this.pluginFilter=false;this.pluginQuery="";return true;}}

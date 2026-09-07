@@ -75,6 +75,21 @@ export function busyEnter() {
 /** Persist the newest 20 unique cross-session search queries (oldest→newest). */
 
 
+/** 前缀键字符表（leader/面板首屏与窗格子表共用）。可在 tui-config.json 的
+ *  prefixKeys 段覆盖单键（如 { "rewind": "R" }）；非法字符回退默认。 */
+const PREFIX_KEY_DEFAULTS = {
+  search: "s", model: "m", theme: "d", history: "h", rewind: "r",
+  config: "c", help: "?", editor: "G", permission: "a", panes: "p",
+};
+export function prefixKeys() {
+  const raw = loadTuiConfig().prefixKeys ?? {};
+  const out = { ...PREFIX_KEY_DEFAULTS };
+  for (const [k, v] of Object.entries(raw)) {
+    if (k in out && typeof v === "string" && v.length === 1) out[k] = v;
+  }
+  return out;
+}
+
 /** Last ~50 user prompts typed into the chat input (persisted, deduped). */
 export function promptHistory() {
   const raw = loadTuiConfig().promptHistory;

@@ -2217,7 +2217,7 @@ test("legacy one-slot keybinding values migrate to the new two-slot defaults", a
   assert.deepEqual(kb.sessionFilter, { mode: "normal", key: "", key2: "" }, "Ctrl+F and / are freed — search lives on the prefix page");
   assert.deepEqual(kb.panePrev, { mode: "normal", key: "Ctrl+Left", key2: "" });
   assert.deepEqual(kb.paneNext, { mode: "normal", key: "Ctrl+Right", key2: "" });
-  assert.equal(kb.skills.key, "Ctrl+H");
+  assert.equal(kb.skills.key, "", "skills freed — Ctrl+H is now tabPrev");
   app.onEvent({ type: "key", name: "char", key: "f", ctrl: true, shift: false });
   assert.equal(app.searchActive, false, "Ctrl+F is freed and no longer opens search");
   app.onEvent({ type: "key", name: "char", key: " ", ctrl: true, shift: false });
@@ -5588,6 +5588,36 @@ test("split divider drag resizes the ratio (mouse, clamped)", () => {
   const before = inner.ratio;
   app.onEvent({ type: "mouse", kind: "drag", button: 0, x: 40, y: 10 });
   assert.equal(inner.ratio, before, "no drag after release");
+});
+
+test("tab cycling via Ctrl+H/L bindings and prefixKeys config override", () => {
+  const app = headlessApp();
+  app.currentSession = "s"; app.sessions = [{ sessionId: "s", agentPreset: "standard" }];
+  app.focus(app.chat);
+  // Ctrl+L = next tab, Ctrl+H = previous tab (from chat focus)
+  app.onEvent({ type: "key", name: "char", key: "l", ctrl: true, shift: false });
+  assert.equal(app.mainTab, "trajectory", "Ctrl+L cycles to the next tab");
+  app.onEvent({ type: "key", name: "char", key: "h", ctrl: true, shift: false });
+  assert.equal(app.mainTab, "chat", "Ctrl+H cycles back");
+  // 前缀键字符可用 tui-config prefixKeys 覆盖（回退键 r → R）
+  saveTuiConfig({ prefixKeys: { rewind: "R" } });
+  app.reloadTuiConfig?.();
+  app.onEvent({ type: "key", name: "char", key: "p", ctrl: false, alt: false, shift: false });
+  assert.equal(app.pendingPrefix?.key, "p", "pane prefix armed");
+  app.onEvent({ type: "key", name: "char", key: "c", ctrl: false, alt: false, shift: false });
+  assert.equal(app.pendingPrefix, null, "pane sub-table closes via c");
+  saveTuiConfig({ prefixKeys: {} });
+  // 面板首屏 = 引擎同一张表（r 仍是回退；p 行链入窗格子表）
+  app.onEvent({ type: "key", name: "char", key: " ", ctrl: true, shift: false });
+  const rows = app.overlay.prefixRows();
+  assert.ok(rows.some(([ch]) => ch === "r"), "panel reference lists r=rewind from the engine table");
+  assert.ok(rows.some(([ch]) => ch === "p"), "panel reference lists p=panes");
+  const rewindRow = rows.find(([ch]) => ch === "r");
+  app.overlay = null;
+  app.chat.nodes = [{ kind: "user", id: "u1", firstSeq: 2, blocks: [{ type: "text", text: "x" }] }];
+  rewindRow[3](); // run → closes overlay + opens the rewind picker
+  assert.ok(app.overlay?.constructor?.name === "Picker", "panel r executes rewind through the engine");
+  app.overlay = null;
 });
 
 test("p prefix: arms from the main window, hint shows, Esc/unknown/timeout cancel", async () => {

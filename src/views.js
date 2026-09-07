@@ -10,7 +10,7 @@ import { tmpdir, homedir } from "node:os";
 import { createRequire } from "node:module";
 import { Widget, ScrollView, Input, Popup, Menu, StatusBar, wrapIndex } from "./widgets.js";
 import { UploadPicker } from "./file-picker.js";
-import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, keyBindings, tuiConfigFile, reloadTuiConfig, searchHistory, rememberSearchQuery, promptHistory, rememberPrompt } from "./config.js";
+import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, keyBindings, tuiConfigFile, reloadTuiConfig, searchHistory, rememberSearchQuery, promptHistory, rememberPrompt, prefixKeys } from "./config.js";
 import { bindingMatchFor, matchKeyBinding, CHAT_BINDING_ORDER, SIDEBAR_BINDING_ORDER, KEYBINDING_ORDER, INPUT_BINDING_ORDER, INPUT_EDIT_BINDING_ORDER } from "./keybindings.js";
 export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, promptHistory, rememberPrompt } from "./config.js";
 import {
@@ -4194,6 +4194,28 @@ export class App {
     return walk(this.winTree, rootRect);
   }
 
+  /** Prefix rows for the panel reference page — THE SAME table the engine
+   *  dispatches (single source of truth; chars from prefixKeys config). */
+  prefixRowsData() {
+    const k = prefixKeys();
+    const t = this.#prefixTables().main;
+    const meta = [
+      ["search", "跨会话全文搜索", "Ctrl+F 已释放"],
+      ["history", "输入历史搜索（可筛选）", "最近 50 条提问"],
+      ["rewind", "回退（分支会话 + 原消息回填）", "/rewind"],
+      ["model", "切换模型", "Ctrl+M 已释放"],
+      ["theme", "配色主题", "Ctrl+D 已释放"],
+      ["permission", "权限模式（沙箱 + 审批）", "F8 已释放"],
+      ["config", "打开配置文件（改 prefixKeys 前缀键）", "Ctrl+K"],
+      ["help", "帮助（按场景）", "Shift+/ 或前缀 ?"],
+      ["editor", "外部编辑器编辑输入", "$VISUAL · 非零退出保留原稿"],
+      ["panes", "窗格/分屏子表", "p r/l/u/n/c（NORMAL 亦可用）"],
+    ];
+    return meta
+      .filter(([action]) => t.entries[k[action]])
+      .map(([action, desc, hint]) => [k[action], desc, hint, () => { this.closeOverlay(); t.entries[k[action]](); }]);
+  }
+
   /** Public window-tree inspection (tests/diagnostics). */
   splitLeaves() { return this.#leaves(); }
   mainLeafCount() { return this.#mainLeaves().length; }
@@ -5530,6 +5552,8 @@ export class App {
       case "help": this.showHelp(); return true;
       case "panePrev": this.focusWindow(-1); return true;
       case "paneNext": this.focusWindow(1); return true;
+      case "tabNext": this.#tabCycle(1); return true;
+      case "tabPrev": this.#tabCycle(-1); return true;
       case "permissionRotate": this.rotatePermission(); return true;
       case "editConfig": this.editConfigFile(); return true;
       case "quit": this.stop(); return true;
@@ -5743,12 +5767,37 @@ export class App {
     return false;
   }
 
+  /** Tab cycling shared by Shift+Tab (structural) and Ctrl+H/L bindings:
+   *  from the list window, focus the main window first. */
+  #tabCycle(delta) {
+    if (this.focusedWindow !== "main") this.setFocusedWindow("main");
+    this.cycleTab(delta);
+    return true;
+  }
+
   // ---- chained prefix layers (nvim-style pending keys) ----
 
   /** Generic pending-layer tables. The p table is the first user; future
    *  g/z tables register here too. Entries: (ev) => run. */
   #prefixTables() {
+    const k = prefixKeys();
     return {
+      // 主表：Ctrl+Space 面板首屏与 NORMAL 前缀层共用（同一张表，同一语义）
+      main: {
+        hint: `${k.search}=搜索 ${k.model}=模型 ${k.theme}=主题 ${k.history}=历史 ${k.rewind}=回退 ${k.config}=配置 ${k.help}=帮助 ${k.editor}=编辑 ${k.permission}=权限 ${k.panes}=窗格 · Esc 取消`,
+        entries: {
+          [k.search]: () => { this.closeOverlay(); this.startSearch(); this.redraw(); },
+          [k.model]: () => { this.closeOverlay(); this.overlay = buildModelPicker(this); this.redraw(); },
+          [k.theme]: () => { this.closeOverlay(); this.showThemePicker(); },
+          [k.history]: () => { this.closeOverlay(); this.showHistorySearch(); },
+          [k.rewind]: () => { this.closeOverlay(); this.showRewindPicker(); },
+          [k.config]: () => { this.closeOverlay(); this.editConfigFile(); },
+          [k.help]: () => { this.closeOverlay(); this.showHelp(this.focusBeforePanel ?? null); },
+          [k.editor]: () => { this.closeOverlay(); this.editExternal(); },
+          [k.permission]: () => { this.closeOverlay(); this.showPermissionPicker(); },
+          [k.panes]: () => { this.closeOverlay(); this.armPrefix("p"); },
+        },
+      },
       p: {
         hint: "p · r=右 l=左 u=上 n=下 c=关窗 · Esc/2s 取消",
         entries: {
@@ -5760,6 +5809,17 @@ export class App {
         },
       },
     };
+  }
+  /** Arm a pending layer programmatically (e.g. the panel chaining into p). */
+  armPrefix(key) {
+    const table = this.#prefixTables()[key];
+    if (!table) return false;
+    this.pendingPrefix = { table, key, timer: null };
+    this.pendingPrefix.timer = setTimeout(() => {
+      if (this.pendingPrefix?.key === key) this.#cancelPrefix();
+    }, this.prefixTimeoutMs);
+    this.redraw();
+    return true;
   }
   #handlePrefixKey(ev) {
     if (ev.type !== "key") return false;
@@ -5774,12 +5834,7 @@ export class App {
     // Arm only from a main window, not in INSERT (list window: p = preview).
     if (ev.name === "char" && ev.key === "p" && !ev.ctrl && !ev.alt && !ev.shift
         && this.focusedWindow === "main" && !this.#inInsertMode()) {
-      const table = this.#prefixTables().p;
-      this.pendingPrefix = { table, key: "p", timer: null };
-      this.pendingPrefix.timer = setTimeout(() => {
-        if (this.pendingPrefix?.key === "p") this.#cancelPrefix();
-      }, this.prefixTimeoutMs);
-      this.redraw();
+      this.armPrefix("p");
       return true;
     }
     return false;
