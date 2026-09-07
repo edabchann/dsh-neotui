@@ -1,10 +1,14 @@
 # Changelog
 
-## 0.4.4-pre.0 — 2026-08-26
+## 0.4.4 — 2026-08-26
 
-> PRE-RELEASE：`npm install dsh-neotui@pre`；`latest` 仍为 0.4.3，不会自动升级。
+### Fixed
+
+- **兼容 dsh 0.1.2-rc.1**：dsh-base 收编 storage 行与 session-projection-cache 后，组合树同 id 条目按新加载器规则去重（app 补丁仅保留裸 id 覆盖行做 attach 隔离）；`dsh-host-apiproxy` 包停更，其 /api 网关职责并入 connection 行的 node 半端（旧包在新版下启动即崩）；补挂 message-feedback 行。
 
 ### Added
+
+- **统一前缀体系**：Ctrl+Space 面板前缀页与前缀引擎共用同一张表（which-key 模式）——面板内按键与 NORMAL 前缀同义，`p` 在面板内链入窗格子表（权限迁至 `a`）；`Ctrl+H`/`Ctrl+L` 切换主窗口标签页（上一/下一，`Shift+Tab` 保留；`Ctrl+H` 原技能键释放）；前缀触发字符可在 tui-config.json `prefixKeys` 段重定义（`Ctrl+K` 打开配置）。
 
 - **窗口/标签页操作模型重构**：会话列表/窗口模式——`Ctrl+←→` 或 `Tab` 在「会话列表 ↔ 主窗口」间切换，`Shift+Tab` 在主窗口内循环标签页（对话/轨迹/子代理/后台任务，顶部标签条）；INSERT 内所有结构键保持编辑语义不冲突；侧栏预览卡片触发键 `p`（仅列表窗口作用域生效）。
 - **nvim 式逐层前缀键**：NORMAL 下按 `p` 进入待定层（状态栏提示 + Esc/2s/错误键取消），
