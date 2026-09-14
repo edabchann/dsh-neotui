@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-09-14
 
 ### Added
 
@@ -22,8 +22,6 @@
 - **单一 seq 游标合并路径（幂等）**：`session/follow` 与 `pollTail()` 共用 `ChatView.acceptRecords()`——只接受 `event.seq` 严格递增的记录，同一事件无论哪一路先到都只应用一次，乱序/重复 seq 直接丢弃；无 seq 的进程内 chunk 以帧上的 `stream:{attemptId,index}` 为身份在同一处按稠密下标去重（mux 重连重投累积流不会重复追加），`open()` 重建会话时重置该游标以便基线回放。
 - **轮询策略**：`session/follow` 健康时 `pollTail` 退化为 ~15s 安全网（只对账、不重复应用）；流不可用（旧协议 Host、mux 不可达、流出错）时恢复原有每 tick 节奏，行为不回归。
 - **会话列表自适应刷新**：0.1.5 无工作区推送，侧栏只能定时刷新——`会话列表` 窗口聚焦时 ~2s 并在进入该窗口时立即刷一次，其余情况保持原有 ~5s；本地变更（重命名/归档/新建/移动）后的立即刷新不变。README 明确写出「工作区无推送」这一限制。
-
-### Added
 
 - **Host 文件访问（文件内容一律来自 Host，而不是本机磁盘）**：新增 `src/host-files.js`，把文件列表/统计/读取/字节读取/补全候选/改动流/附件上传封装为带 TTL 异步缓存与请求去重的 Host 客户端（`workspaceFiles/list`、`stat`、`read`、`readBytes`、`readAll`、`fileReferences/list`、`fileUploads/upload`），并新增 `Api.subscribeRemote()`：UI 侧的长连流（`workspaceFiles/changes`）与 `session/follow` 共用同一个 `/api/remote.mux` socket，重连时自动重开。迁移的调用点：`@` 提及与 Tab 路径补全（`fileReferences/list`，Host 索引，缺失时回退本地扫描）、文件选择器三栏列表与预览（文本 `read`、图片 `readAll` 并以字节直接解析 PNG/JPEG/GIF/WebP 尺寸，Kitty 传输用 Host 字节）、工作区树列表与预览、溢出/截断输出预览（`[output truncated; full output: <path>]` 指向的 Host 文件）、发送时的 `@` 引用内联与图片字节读取。**not-found 由 Host 判定为权威**：Host 说没有就绝不回退本机同名文件；只有 Host 文件接口不可用（旧协议、未声明命名空间、传输失败）或调用点明确处理本机路径（`$EDITOR` 草稿、`tui-config.json`）时才读本地。
 - **「文件/改动」主窗口标签**：新增 `ChangesPage`（`对话 | 轨迹 | 子代理 | 后台任务 | 文件/改动`，`Shift+Tab` / `Ctrl+H` / `Ctrl+L` 循环或点击标签）。订阅 Host 的 `workspaceFiles/changes`（`ready` 后每帧 `{absolutePath, version|absent:true}`），按路径累积为 `M/A/D` 行（相对工作区路径、大小，payload 带 `±lines`/patch 时一并渲染）；`Enter` 用 `workspaceFiles/read` 分页读取内容（`PgDn` 续读），`h` 返回列表，`r` 重新订阅并重算每行状态，`q`/`Esc` 返回对话，Host 无改动时显示空状态；任何畸形帧都被忽略而不抛错。
