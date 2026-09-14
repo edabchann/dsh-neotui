@@ -1,14 +1,20 @@
 // api.js — DeepSeek Harness wire client: unary RPC over HTTP POST, live frames
-// over the /api/events.mux WebSocket, responses over /api/respond.
+// over a WebSocket, responses over /api/respond (legacy) or $events/result (0.1.5).
 //
 // Two host generations are supported behind one legacy call surface so every
 // existing caller (and the unit tests that stub `app.api.call`) stays unchanged:
 //
 //   legacy (the pre-0.1.2 dotted surface this client was written against)
 //     request  → POST /api/<dotted.method>  {type:"client-request", rpcId, method, payload:{...}}
+//     frames   → WS /api/events.mux + /api/events.host server-request frames
+//     respond  → POST /api/respond {type:"client-response", rpcId, result}
 //   modern (dsh 0.1.5; 0.1.2-rc.1 already exposes the same namespaces)
 //     request  → POST /api/<namespace>/<method>
 //                {type:"client-request", rpcId, method, payload:{args:{...}}}
+//     frames   → WS /api/remote.mux, logical streams `$events` (forwarded Host
+//                events) and `session/control` (jobs / queue / projection),
+//                translated back into the legacy frame vocabulary below
+//     respond  → POST /api/$events/result {args:{clientId, eventId, outcome}}
 //
 // The callers keep speaking the legacy surface: the dotted method name plus the
 // flat request body. Everything below translates that into a modern call.
@@ -21,9 +27,7 @@
 // use `invoke`.
 //
 //   response → {type:"server-response", rpcId, result:{ok:true,value} | {ok:false,error}}
-//   frames   → WS /api/events.mux server-request {type:"server-request", rpcId, method, payload}
-//   respond  → POST /api/respond  {type:"client-response", rpcId, result}
-//   streams  → WS /api/remote.mux {type:"open",streamId,endpoint,payload:{args}} /
+//   streams  → WS {type:"open",streamId,endpoint,payload:{args}} /
 //              {type:"item"|"end"|"error", streamId, ...}
 
 export class ApiError extends Error {
@@ -314,6 +318,186 @@ export const METHODS_015 = {
   "goal.clear": { wire: "goals/clear", args: asAgent, result: () => ({ cleared: true }) },
 };
 
+// ---- 0.1.5 forwarded events ($events) --------------------------------------
+/**
+ * The Host-side allowlist this client consumes
+ * (`@deepseek-ai/dsh-api-remotes` API_REMOTE_FORWARDED_EVENTS, probed live on
+ * 0.1.5-rc.1). Every member is either:
+ *
+ *  - `emit`      fire-and-forget; the wire item is `{type:"emit", event, args}`
+ *                where `args` is the ORIGINAL Cordis argument array, and no
+ *                answer is expected (the official client never answers these);
+ *  - `waterfall` a scoped Host decision that BLOCKS until this client answers
+ *                through `$events/result` (`{kind:"next"}` delegates to the next
+ *                answerer — fail closed for approvals —, `{kind:"result",value}`
+ *                resolves it, `{kind:"rejected"}` rejects it).
+ *
+ * `frame` projects the wire payload into the TUI's pre-existing frame
+ * vocabulary so `src/views.js` needs no changes; `answer`/`reject` project the
+ * TUI's answer value back onto the waterfall result.
+ */
+export const REMOTE_EVENTS_015 = {
+  // ---- session lifecycle (Host-wide broadcasts) --------------------------
+  /** `ctx.emit("api-session/added", summary)` */
+  "api-session/added": {
+    mode: "emit",
+    frame: (args) => (typeof args[0]?.sessionId === "string" ? [{ type: "host/session-added", sessionId: args[0].sessionId }] : []),
+  },
+  /** `ctx.emit("api-session/removed", sessionId)` */
+  "api-session/removed": {
+    mode: "emit",
+    frame: (args) => (typeof args[0] === "string" ? [{ type: "host/session-removed", sessionId: args[0] }] : []),
+  },
+  /** `ctx.emit("api-session/status", agentId, running)` */
+  "api-session/status": {
+    mode: "emit",
+    frame: (args) => (typeof args[0] === "string" ? [{ type: "host/session-status", sessionId: args[0], running: args[1] === true }] : []),
+  },
+  /** `ctx.emit("api-session/error", agentId, errorChain(error) | message)` */
+  "api-session/error": {
+    mode: "emit",
+    frame: (args) => (typeof args[0] === "string" ? [{ type: "host/agent-error", sessionId: args[0], message: messageText(args[1]) }] : []),
+  },
+  // `api-session/activity(sessionId, time)` mirrors the durable
+  // `session/activity` marker the sidebar already refreshes by polling; the TUI
+  // has no frame for it, so it is acknowledged by ignoring it.
+  "api-session/activity": { mode: "emit", frame: () => [] },
+
+  // ---- forwarded emits with no TUI surface (documented, deliberately no-op)
+  "agent-preset/selected": { mode: "emit", frame: () => [] },
+  "commands/change": { mode: "emit", frame: () => [] },
+  "credentials/reference-updated": { mode: "emit", frame: () => [] },
+  "settings/document-updated": { mode: "emit", frame: () => [] },
+  "llm/adapters-updated": { mode: "emit", frame: () => [] },
+  "goal/activation-changed": { mode: "emit", frame: () => [] },
+  "cordis/request-run": { mode: "emit", frame: () => [] },
+  "cordis/request-run-resolved": { mode: "emit", frame: () => [] },
+  "cordis/dynamic-package": { mode: "emit", frame: () => [] },
+  "cordis/dynamic-retract": { mode: "emit", frame: () => [] },
+  "cordis/inspect-query": { mode: "emit", frame: () => [] },
+  "cordis/inspect-query-resolved": { mode: "emit", frame: () => [] },
+
+  // ---- blocking decisions -------------------------------------------------
+  /**
+   * `approval/request` waterfall, request `{toolName, callId?, reason?}`
+   * (the Host strips `agent`/`signal` before forwarding). Answering resolves
+   * the approval gate itself, so this must stay pending until the human chose:
+   * the TUI's answer value `{sessionId, approvalId, outcome}` maps to the
+   * closed outcome string the Host accepts.
+   */
+  "approval/request": {
+    mode: "waterfall",
+    frame: (request, context) => [{
+      type: "approval/requested",
+      sessionId: context.agentId,
+      approvalId: context.eventId,
+      callId: request?.callId,
+      toolName: request?.toolName,
+      reason: request?.reason,
+      __rpcId: context.eventId,
+    }],
+    answer: (value) => (typeof value === "string" ? value : value?.outcome),
+  },
+  /**
+   * `user-questions/request` waterfall, request `{questions:[{id, question,
+   * header?, detail?, options?, multiSelect?, intent?}]}` — the shape the TUI's
+   * QuestionPopup already renders. The answer value is the whole
+   * `{answers:[{id, selected, custom?}]}` batch; cancellation mirrors the
+   * official client's `UserQuestionError("ASK_CANCELLED")`.
+   */
+  "user-questions/request": {
+    mode: "waterfall",
+    frame: (request, context) => [{
+      type: "question/requested",
+      sessionId: context.agentId,
+      questions: request?.questions ?? [],
+      __rpcId: context.eventId,
+    }],
+    answer: (value) => (value && typeof value === "object" && "answer" in value ? value.answer : value),
+    reject: { name: "UserQuestionError", message: "the user cancelled ask_user_question", code: "ASK_CANCELLED" },
+  },
+};
+
+/** Human-readable text for a forwarded error argument (string or error chain). */
+function messageText(value) {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") {
+    if (typeof value.message === "string") return value.message;
+    try { return JSON.stringify(value); } catch { return String(value); }
+  }
+  return String(value ?? "");
+}
+
+/**
+ * One `$events` item -> zero or more TUI frames (pure; unit-tested).
+ * `waterfall` items also report the correlation the answer path needs.
+ * @returns {{frames:object[], waterfall?:{eventId:string,kind:string,entry:object}}}
+ */
+export function translateRemoteItem(value) {
+  if (value?.type === "emit") {
+    const entry = REMOTE_EVENTS_015[value.event];
+    if (entry === undefined || entry.mode !== "emit") return { frames: [] };
+    const args = Array.isArray(value.args) ? value.args : [];
+    return { frames: entry.frame(args, value) };
+  }
+  if (value?.type === "waterfall") {
+    const entry = REMOTE_EVENTS_015[value.event];
+    if (entry === undefined || entry.mode !== "waterfall") return { frames: [] };
+    const context = { eventId: value.eventId, agentId: value.agentId };
+    return {
+      frames: entry.frame(value.request ?? {}, context),
+      waterfall: { eventId: value.eventId, kind: value.event, entry },
+    };
+  }
+  if (value?.type === "cancel") {
+    // The Host withdrew a pending decision (turn cancelled, agent released):
+    // close whichever popup is showing that event.
+    return {
+      frames: [
+        { type: "approval/resolved", approvalId: value.eventId },
+        { type: "question/resolved", questionRpcId: value.eventId },
+      ],
+      cancelled: value.eventId,
+    };
+  }
+  return { frames: [] };
+}
+
+/**
+ * One `session/control` stream item -> the TUI's jobs/queue/projection frames.
+ * `baseline` expands into one snapshot frame per session so a fresh connection
+ * carries the same per-session state the legacy mux pushed at subscribe time.
+ */
+export function translateControlItem(value) {
+  switch (value?.type) {
+    case "jobs":
+      return [{ type: "session/jobs", sessionId: value.sessionId, jobs: value.jobs ?? [] }];
+    case "queue":
+      return [{ type: "session/queue", sessionId: value.sessionId, items: value.items ?? [] }];
+    case "projection":
+      return [
+        { type: "session/projection", sessionId: value.sessionId, key: value.key, value: value.value, seq: value.seq },
+        // A title projection is what the sidebar renders: the legacy vocabulary
+        // signalled it separately, so keep delivering that frame too.
+        ...(value.key === "title" ? [{ type: "session/title", sessionId: value.sessionId }] : []),
+      ];
+    case "baseline": {
+      const frames = [];
+      for (const [sessionId, jobs] of Object.entries(value.value?.jobs ?? {})) frames.push({ type: "session/jobs", sessionId, jobs });
+      for (const [sessionId, items] of Object.entries(value.value?.queues ?? {})) frames.push({ type: "session/queue", sessionId, items });
+      for (const [sessionId, block] of Object.entries(value.value?.projections ?? {})) {
+        for (const [key, projected] of Object.entries(block?.values ?? {})) {
+          frames.push({ type: "session/projection", sessionId, key, value: projected, seq: block?.asOfSeq });
+          if (key === "title") frames.push({ type: "session/title", sessionId });
+        }
+      }
+      return frames;
+    }
+    default:
+      return [];
+  }
+}
+
 export class Api {
   constructor({
     base = DEFAULT_BASE,
@@ -350,6 +534,9 @@ export class Api {
       mux: { ws: null, connected: false, retryDelay: 500, timer: null, unsupported: false },
       host: { ws: null, connected: false, retryDelay: 500, timer: null, unsupported: false },
     };
+    // 0.1.5 remote-mux state: the `$events` generation identity plus the
+    // blocking decisions this client currently holds (eventId -> descriptor).
+    this.remoteState = { clientId: null, events: null, control: null, pending: new Map(), answered: new Set() };
     this.#cursorBySession = new Map();
     this.#selectionBySession = new Map();
     this.#degraded = new Set();
@@ -614,17 +801,64 @@ export class Api {
     });
   }
 
-  /** Answer an approval/question frame successfully. */
+  /**
+   * Answer an approval/question frame successfully.
+   *
+   * On a 0.1.5 host the frame IS a Host waterfall: the answer travels through
+   * `$events/result` with this connection's `clientId` and the decision is
+   * applied by the Host. On a legacy host the pre-0.1.5 `/api/respond` envelope
+   * is used unchanged.
+   */
   async respond(rpcId, value) {
-    return this.#respondEnvelope(rpcId, { ok: true, value });
+    const pending = this.remoteState.pending.get(rpcId);
+    if (pending === undefined) return this.#respondEnvelope(rpcId, { ok: true, value });
+    return this.#answerRemote(pending, { kind: "result", value: pending.entry.answer(value) });
   }
 
   /** Cancel an answerable question using the gateway's fail-closed envelope. */
   async cancelResponse(rpcId) {
+    const pending = this.remoteState.pending.get(rpcId);
+    if (pending !== undefined) {
+      // A cancelled prompt is a rejected waterfall: the Host restores the error
+      // (name + code survive) exactly as the official client's ASK_CANCELLED.
+      const rejection = pending.entry.reject ?? { name: "Error", message: "cancelled by the TUI user", code: "cancelled" };
+      return this.#answerRemote(pending, { kind: "rejected", error: rejection });
+    }
     return this.#respondEnvelope(rpcId, {
       ok: false,
       error: { code: "cancelled", message: "cancelled by the TUI user" },
     });
+  }
+
+  /** Answer one pending `$events` waterfall by eventId + the live clientId. */
+  async #answerRemote(pending, outcome) {
+    const { clientId } = this.remoteState;
+    if (clientId === null) {
+      throw new ApiError({ code: "transport", message: "实时事件流未连接，无法回答该请求" });
+    }
+    this.remoteState.pending.delete(pending.eventId);
+    this.#rememberSettled(pending.eventId);
+    try {
+      const receipt = await this.callModern("$events/result", { clientId, eventId: pending.eventId, outcome });
+      this.log(`[api] answered ${pending.kind} ${pending.eventId} (${outcome.kind})`);
+      return receipt ?? { ok: true };
+    } catch (error) {
+      // Losing the answer would leave the Host waterfall blocked: put it back
+      // so the caller's toast and a retry can still resolve it.
+      this.remoteState.pending.set(pending.eventId, pending);
+      this.degrade("answer-failed", `回答上报失败（${error?.message ?? error}）；该请求仍由 Host 挂起`);
+      throw error;
+    }
+  }
+
+  /** Bound the settled-event ledger used to ignore re-delivered duplicates. */
+  #rememberSettled(eventId) {
+    const answered = this.remoteState.answered;
+    answered.add(eventId);
+    if (answered.size > 256) {
+      const oldest = answered.values().next().value;
+      answered.delete(oldest);
+    }
   }
 
   async #respondEnvelope(rpcId, result) {
@@ -647,22 +881,218 @@ export class Api {
     return receipt;
   }
 
+  /**
+   * Connect the live-frame downlink.
+   *
+   * 0.1.5 removed `/api/events.mux` (approvals, questions, host state) and
+   * `/api/events.host`; both are carried instead by the single Remote mux on
+   * `/api/remote.mux`, where `$events` forwards the Host event allowlist and
+   * `session/control` forwards jobs/queue/projection. The legacy path is kept
+   * for pre-0.1.2 hosts.
+   */
   connectMux() {
-    void this.#connectWhenReady(this.wsUrl("events.mux"), "mux");
+    void this.#connectWhenReady("mux");
   }
 
+  /**
+   * The Host-event downlink. On 0.1.5 `/api/events.host` is gone and the
+   * `api-session/*` broadcasts ride the `$events` stream of the SAME mux
+   * socket `connectMux()` opens, so this only connects the legacy downlink.
+   */
   connectHost() {
-    void this.#connectWhenReady(this.wsUrl("events.host"), "host");
+    void this.#connectWhenReady("host");
   }
 
-  async #connectWhenReady(url, kind) {
+  async #connectWhenReady(kind) {
     await this.detectProtocol();
     await this.ensureAuth();
-    this.#connect(url, kind);
+    if (this.modern) {
+      // Both live channels share one socket: the second call must not open
+      // another generation (that would double every frame and leave a zombie
+      // client holding deliveries).
+      if (kind === "host") return;
+      this.#connectRemote();
+      return;
+    }
+    this.#connect(this.wsUrl(kind === "mux" ? "events.mux" : "events.host"), kind);
   }
 
   wsUrl(path) {
     return `${this.base.replace(/^http/, "ws")}/api/${path}`;
+  }
+
+  // ---- 0.1.5 Remote mux ---------------------------------------------------
+  /**
+   * One socket carries every logical stream. `$events` opens with an empty args
+   * object and answers `{type:"ready", clientId, host}` first; `session/control`
+   * opens with an empty args object and answers its baseline first.
+   */
+  #connectRemote() {
+    if (this.closed) return;
+    const state = this.connectionState.mux;
+    if (state.unsupported) return;
+    if (typeof this.WebSocketImpl !== "function") {
+      this.#markStreamsUnsupported("no WebSocket implementation available");
+      return;
+    }
+    if (state.ws !== null) return; // one generation at a time
+    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+    const options = this.cookie ? { headers: { cookie: this.cookie } } : undefined;
+    let ws;
+    try {
+      ws = new this.WebSocketImpl(`${this.base.replace(/^http/, "ws")}/api/remote.mux`, options);
+    } catch (error) {
+      this.#markStreamsUnsupported(`remote mux socket failed: ${error.message}`);
+      return;
+    }
+    state.ws = ws;
+    this.muxWs = ws;
+    this.ws = ws; // most recent socket (diagnostics only)
+    this.remoteState.clientId = null;
+    this.remoteState.events = null;
+    this.remoteState.control = null;
+    const openStream = (endpoint) => {
+      const streamId = mintId("stream");
+      try { ws.send(JSON.stringify({ type: "open", streamId, endpoint, payload: { args: {} } })); }
+      catch (error) { this.log(`[api] ${endpoint} stream open failed: ${error.message}`); return null; }
+      return streamId;
+    };
+    ws.onopen = () => {
+      if (state.ws !== ws || this.closed) return;
+      state.connected = true;
+      state.everOpened = true;
+      state.retryDelay = 500;
+      this.remoteState.events = openStream("$events");
+      this.remoteState.control = openStream("session/control");
+      this.log("[api] remote mux connected ($events + session/control)");
+      this.#publishConnectionState();
+    };
+    ws.onmessage = (m) => {
+      if (state.ws !== ws || this.closed) return;
+      let frame;
+      try { frame = JSON.parse(String(m.data)); } catch { return; }
+      this.#onRemoteFrame(frame);
+    };
+    ws.onclose = () => {
+      if (state.ws !== ws) return;
+      state.connected = false;
+      state.ws = null;
+      this.remoteState.clientId = null;
+      this.remoteState.events = null;
+      this.remoteState.control = null;
+      this.#publishConnectionState();
+      if (this.closed || state.unsupported) return;
+      if (!state.everOpened) {
+        // Nothing ever answered on this host: give up once (visible toast) and
+        // let the pollers carry the UI instead of reconnecting forever.
+        this.#markStreamsUnsupported("0.1.5 remote mux unreachable");
+        return;
+      }
+      const delay = state.retryDelay;
+      this.log(`[api] remote mux closed, reconnecting in ${delay}ms`);
+      state.timer = setTimeout(() => {
+        state.timer = null;
+        this.#connectRemote();
+      }, delay);
+      state.retryDelay = Math.max(500, Math.min(delay * 2, 15000));
+    };
+    ws.onerror = () => { /* onclose follows */ };
+  }
+
+  /** One wire item from the Remote mux: dispatch it to the owning logical stream. */
+  #onRemoteFrame(frame) {
+    const { streamId } = frame ?? {};
+    if (streamId === undefined) return;
+    if (streamId === this.remoteState.events) {
+      if (frame.type === "item") this.#onRemoteEvent(frame.value);
+      else if (frame.type === "error") this.#onRemoteStreamError("$events", frame.error);
+      else if (frame.type === "end") this.#markStreamsUnsupported("$events stream ended (host has no forwarded event source)");
+      return;
+    }
+    if (streamId === this.remoteState.control) {
+      if (frame.type === "item") for (const tuiFrame of translateControlItem(frame.value)) this.#deliver(tuiFrame);
+      else if (frame.type === "error") this.#onRemoteStreamError("session/control", frame.error);
+      // An ended control stream only loses jobs/queue push; sessions still poll.
+      return;
+    }
+  }
+
+  /**
+   * Fan one translated frame out to the handler the legacy vocabulary used:
+   * `host/*` frames belonged to the events.host channel, everything else to the
+   * events.mux channel. One socket carries both on 0.1.5, so route by family.
+   * A consumer fault must never kill the live socket (the official client
+   * reports and continues the same way).
+   */
+  #deliver(frame) {
+    try {
+      if (typeof frame?.type === "string" && frame.type.startsWith("host/")) this.onHostFrame(frame);
+      else this.onFrame(frame);
+    } catch (error) {
+      this.log(`[api] frame ${frame?.type} handler threw: ${error?.message ?? error}`);
+    }
+  }
+
+  /** One forwarded `$events` item -> TUI frames, keeping waterfall state. */
+  #onRemoteEvent(value) {
+    if (value?.type === "ready") {
+      this.remoteState.clientId = value.clientId;
+      this.connectionState.mux.connected = true;
+      this.log(`[api] $events ready (clientId ${String(value.clientId).slice(0, 8)}, home ${value.host?.home ?? "?"})`);
+      this.#publishConnectionState();
+      return;
+    }
+    const translated = translateRemoteItem(value);
+    if (value?.type === "waterfall" && translated.waterfall === undefined) {
+      // A blocking Host event this client cannot present must never wedge the
+      // turn: delegate it so the next answerer (or the fail-closed default)
+      // decides, exactly as an unanswerable popup would.
+      this.log(`[api] unhandled waterfall ${value.event}; delegating`);
+      void this.#delegateRemote(value.eventId);
+      return;
+    }
+    if (translated.waterfall !== undefined) {
+      const { eventId, kind, entry } = translated.waterfall;
+      // A Host decision blocks until answered; a reconnect re-delivers the very
+      // same eventId, so an already-settled decision must never reopen a popup.
+      if (this.remoteState.answered.has(eventId)) return;
+      this.remoteState.pending.set(eventId, { eventId, kind, entry });
+      this.log(`[api] ${kind} ${eventId} pending (${this.remoteState.pending.size} open)`);
+    }
+    if (translated.cancelled !== undefined) {
+      this.remoteState.pending.delete(translated.cancelled);
+      this.log(`[api] waterfall ${translated.cancelled} cancelled by the host`);
+    }
+    for (const tuiFrame of translated.frames) this.#deliver(tuiFrame);
+  }
+
+  /** Best-effort `next` for a binding this client cannot present. */
+  async #delegateRemote(eventId) {
+    const { clientId } = this.remoteState;
+    if (clientId === null) return;
+    try {
+      await this.callModern("$events/result", { clientId, eventId, outcome: { kind: "next" } });
+    } catch (error) {
+      this.log(`[api] could not delegate ${eventId}: ${error.message}`);
+    }
+  }
+
+  #onRemoteStreamError(endpoint, error) {
+    const apiError = new ApiError(error ?? { code: "stream", message: `${endpoint} stream failed` });
+    this.log(`[api] ${endpoint} stream error: ${apiError.message}`);
+    this.#deliver({ type: "stream/error", message: apiError.message });
+    if (endpoint === "$events") this.#markStreamsUnsupported(apiError.message);
+  }
+
+  /** The mux cannot carry live frames here: say so once and poll instead. */
+  #markStreamsUnsupported(reason) {
+    const mux = this.connectionState.mux;
+    const host = this.connectionState.host;
+    if (!mux.unsupported) mux.unsupported = true;
+    // The Host-event channel rides the same socket on 0.1.5, so it is gone too.
+    host.unsupported = true;
+    this.degrade("live-streams", `实时事件流不可用（${reason}），改为轮询刷新`);
+    this.#publishConnectionState();
   }
 
   #connect(url, kind) {
@@ -699,13 +1129,11 @@ export class Api {
       state.connected = false;
       state.ws = null;
       this.#publishConnectionState();
-      if (this.closed) return;
+      if (this.closed || state.unsupported) return;
       // The legacy event downlinks do not exist on a 0.1.5 host: stop retrying
       // (and say so once) instead of reconnecting forever.
       if (!state.everOpened && this.modern) {
-        state.unsupported = true;
-        this.degrade("live-streams", `${kind} 事件流在该 Host 上不可用（0.1.5 已移除），改为轮询刷新`);
-        this.#publishConnectionState();
+        this.#markStreamsUnsupported(`${kind} 事件流在该 Host 上不可用`);
         return;
       }
       const delay = state.retryDelay;
@@ -721,7 +1149,8 @@ export class Api {
 
   #publishConnectionState() {
     const mux = this.connectionState.mux.connected;
-    const host = this.connectionState.host.connected;
+    // On 0.1.5 both downlinks share the Remote mux socket.
+    const host = this.modern ? mux : this.connectionState.host.connected;
     const gone = this.connectionState.mux.unsupported && this.connectionState.host.unsupported;
     this.connected = mux;
     this.onStateChange(mux && host ? "connected" : (mux || host ? "degraded" : (gone && this.modern ? "polling" : "disconnected")));
@@ -743,7 +1172,8 @@ export class Api {
   /** Reconnect the mux stream. The host re-pushes the session baseline
    *  (session/subscribed + session/jobs snapshots) on every fresh mux
    *  connection, so this doubles as a "refresh jobs snapshots" request —
-   *  e.g. when the connect-time snapshot arrived before a session opened. */
+   *  e.g. when the connect-time snapshot arrived before a session opened.
+   *  On 0.1.5 the `session/control` stream re-sends its baseline the same way. */
   refreshMux() {
     if (this.closed) return;
     const state = this.connectionState.mux;
@@ -752,16 +1182,25 @@ export class Api {
     if (state.timer) { clearTimeout(state.timer); state.timer = null; }
     if (state.ws) {
       try { state.ws.close(); } catch { /* already closed */ }
+    } else if (this.modern) {
+      this.#connectRemote();
     } else {
       this.#connect(this.wsUrl("events.mux"), "mux");
     }
   }
 
   get muxConnected() { return this.connectionState.mux.connected; }
-  get hostConnected() { return this.connectionState.host.connected; }
+  get hostConnected() { return this.modern ? this.connectionState.mux.connected : this.connectionState.host.connected; }
 
   close() {
     this.closed = true;
+    // A pending Host waterfall blocks the agent until somebody answers. On exit
+    // nobody will: delegate each one (`next`) so the Host fails closed with
+    // "no approval channel available" instead of hanging the turn forever.
+    for (const pending of [...this.remoteState.pending.values()]) {
+      void this.#answerRemote(pending, { kind: "next" }).catch((error) => this.log(`[api] could not release ${pending.eventId}: ${error.message}`));
+    }
+    this.remoteState.pending.clear();
     for (const state of Object.values(this.connectionState)) {
       if (state.timer) clearTimeout(state.timer);
       state.timer = null;

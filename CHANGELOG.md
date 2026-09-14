@@ -7,12 +7,18 @@
 - **dsh 0.1.5 协议适配（双协议）**：`src/api.js` 的 `call()`/`rpcCall()` 内新增 wire 级适配层——方法名翻译表（`session.history→session/page`、`agentPreset.*→agentPresets.*`、`skill.list→skills/list`、`subagent.*→subagents.*`、`host.listDirectory→directoryPicker/list`、`host.describe→session/modelCatalog`、`goal.*→goals/*` 等）、args 包裹（`payload:{args:{...}}`，含 `session/list` 的 `_request`、其余 `request` 包裹、`subagent.prompt` 补 `requestId`/`delivery`、`session.prompt` 补 `requestId`）与返回值还原（`records→events`、`{providers}`、`{models}`、`{ref}` 等）。连接后自动探测协议（先试 0.1.5 形式，404/未声明端点回退 legacy），`protocol` 缓存；legacy 路径保持 0.1.2 及更早的旧行为不变（点号方法名 + 平铺 payload）。
 - **`workspace.list` 替代**：0.1.5 移除了该端点，改由 `/api/remote.mux` 的 `workspace/follow` 流首帧 `baseline`（`{items, archivedSessionIds}`）还原；`session.history`（含 `subagent.history`）改由 `session/follow` 首帧快照 + `session/page` 游标分页实现（游标取自 `session/list` 的 `projections.asOfSeq` 或快照 cursor）。
 - **Host 访问令牌支持**：0.1.5 的 `/api` 需要浏览器会话 cookie，`--token` / `DSH_TUI_TOKEN` / base URL 的 `?token=` 会先做根路径令牌交换再携带 cookie（HTTP 与 WebSocket 均携带）；自托管模式下由 connection 行的 `authenticatedUrl` 自动注入。tui profile 新增 `--token` 选项。
-- **降级提示**：0.1.5 已移除 `/api/events.mux`、`/api/events.host` 事件下行，首次异常关闭后停止重连并一次性 toast 提示改为轮询刷新；工作区分组不可用时一次性提示并按「未分组」渲染；缺少令牌时提示 `--token`。
+- **实时推送通道迁移到 0.1.5 Remote mux**：0.1.5 移除 `/api/events.mux` / `/api/events.host` 后，审批、提问、会话状态等实时帧改由 `WS /api/remote.mux` 的逻辑流承载——
+  - `$events` 流（首帧 `{type:"ready", clientId, host}`）转发 `@deepseek-ai/dsh-api-remotes` 白名单：`approval/request`、`user-questions/request`（阻塞式 waterfall）与 `api-session/added|removed|status|error|activity`、`commands/change` 等 emit 广播；
+  - 帧按 TUI 既有词汇还原，`src/views.js` 无需改动：waterfall→`approval/requested`/`question/requested`，emit→`host/session-added|removed|status`、`host/agent-error`，Host `cancel` 帧→`approval/resolved`/`question/resolved`；
+  - 回答走一元端点 `POST /api/$events/result`（`{clientId, eventId, outcome}`）：审批结果为 `{kind:"result", value:"allowed-once"|"rejected"}`，提问为 `{kind:"result", value:{answers}}`，取消提问为 `{kind:"rejected", error:{name:"UserQuestionError", code:"ASK_CANCELLED"}}`；未适配的阻塞事件与退出时的挂起项一律回 `{kind:"next"}`，避免 Host 回合被永久挂住；
+  - 同一 socket 另开 `session/control` 流，把 `baseline`/`jobs`/`queue`/`projection` 还原为 `session/jobs`、`session/queue`、`session/projection`（`title` 额外补 `session/title`），取代连接期快照轮询；
+  - 重连退避 500ms→15s；重连后 Host 会重投同一 `eventId`，已决事件按 `eventId` 去重不再弹窗；mux 不可达时仍保持「一次性 toast + 轮询」降级。
+- **降级提示**：工作区分组不可用时一次性提示并按「未分组」渲染；缺少令牌时提示 `--token`；mux 不可达时一次性 toast 提示改为轮询刷新。
 
 ### Changed
 
-- `test/api.test.mjs`：按 0.1.5 线格式重写传输断言，新增适配表单测（名称翻译、args/结果包裹、协议探测与 legacy 回退、令牌交换、流式替代、`commands/execute` 的 0.1.2 `images` 兼容重试）。
-- `test/pty-crash.py`：新增 RPC 数据阶段——起一个私有 `dsh --profile web` 实例、经公开 HTTP API 播种一个带唯一标题与消息标记的会话，再用该实例的令牌 attach TUI，断言渲染帧里出现 Host 返回的标题（`session/list`）与消息文本（`session/page`）。
+- `test/api.test.mjs`：按 0.1.5 线格式重写传输断言，新增适配表单测（名称翻译、args/结果包裹、协议探测与 legacy 回退、令牌交换、流式替代、`commands/execute` 的 0.1.2 `images` 兼容重试）；新增 Remote mux 单测（`$events`+`session/control` 订阅与 ready、转发事件/控制帧的翻译表、审批与提问的 `$events/result` 回答、重复事件去重、Host `cancel`、断线退避重连、退出时 `next` 释放、不可达降级、白名单覆盖）。
+- `test/pty-crash.py`：新增 RPC 数据阶段——起一个私有 `dsh --profile web` 实例、经公开 HTTP API 播种一个带唯一标题与消息标记的会话，再用该实例的令牌 attach TUI，断言渲染帧里出现 Host 返回的标题（`session/list`）与消息文本（`session/page`）；新增审批推送阶段——把模型路由指向本地 SSE 桩（`DEEPSEEK_BASE_URL`），桩请求一次 `danger-full-access` 沙箱提权，从而触发真实 `approval/request` waterfall，断言 TUI 渲染出审批弹窗（推送到位）、按下允许后 Host 记录 `allowed-once` 且提权命令真的执行（回答经 `$events/result` 生效）。
 
 ## 0.4.4 — 2026-08-26
 

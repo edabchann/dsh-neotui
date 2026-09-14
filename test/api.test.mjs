@@ -3,7 +3,7 @@
 // table and the protocol detector that chooses between them.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Api, ApiError, METHODS_015, PROTOCOL_015, PROTOCOL_LEGACY } from "../src/api.js";
+import { Api, ApiError, METHODS_015, PROTOCOL_015, PROTOCOL_LEGACY, REMOTE_EVENTS_015, translateControlItem, translateRemoteItem } from "../src/api.js";
 
 /** Capture every unary POST and answer from a scripted result map. */
 function harness({ protocol = PROTOCOL_015, result = () => ({ ok: true }) } = {}) {
@@ -447,4 +447,299 @@ test("ApiError carries the gateway code and http status", async () => {
     assert.equal(error.code, "gateway/arguments-invalid");
     return true;
   });
+});
+
+// ---- 0.1.5 Remote mux ($events + session/control) --------------------------
+
+/**
+ * Scripted `/api/remote.mux` double: records every client frame, replays the
+ * `$events` ready discriminator on its first open, and lets a test push any
+ * item into either logical stream.
+ */
+function muxHarness() {
+  class FakeSocket {
+    constructor(url, options) {
+      this.url = url;
+      this.options = options;
+      this.sent = [];
+      this.closed = false;
+      FakeSocket.instances.push(this);
+      queueMicrotask(() => { if (!this.closed) this.onopen?.(); });
+    }
+    send(text) {
+      const message = JSON.parse(text);
+      this.sent.push(message);
+      if (message.type === "open" && message.endpoint === "$events") {
+        this.item(message.streamId, { type: "ready", clientId: "client-generation-1", host: { home: "/home/probe" } });
+      }
+    }
+    /** The stream id this socket opened for one logical endpoint. */
+    streamOf(endpoint) { return this.sent.find((message) => message.type === "open" && message.endpoint === endpoint)?.streamId; }
+    /** Push one Host item into a logical stream (by stream id). */
+    item(streamId, value) { return this.push({ type: "item", streamId, value }); }
+    push(frame) {
+      queueMicrotask(() => { if (!this.closed) this.onmessage?.({ data: JSON.stringify(frame) }); });
+    }
+    close() { if (this.closed) return; this.closed = true; this.onclose?.({ code: 1000 }); }
+  }
+  FakeSocket.instances = [];
+  return { FakeSocket };
+}
+
+/** One connected 0.1.5 Api whose frames, host frames and POSTs are captured. */
+async function muxClient(harness = muxHarness()) {
+  const frames = [];
+  const hostFrames = [];
+  const notices = [];
+  const posts = [];
+  const fetchImpl = async (url, init) => {
+    const body = init?.body === undefined ? undefined : JSON.parse(init.body);
+    if (init?.method === "GET") return { ok: true, status: 303, headers: { getSetCookie: () => [] } };
+    posts.push({ url, body });
+    return { ok: true, status: 200, json: async () => ({ type: "server-response", rpcId: body?.rpcId, result: { ok: true, value: undefined } }) };
+  };
+  const api = new Api({
+    protocol: PROTOCOL_015,
+    fetchImpl,
+    webSocket: harness.FakeSocket,
+    onFrame: (frame) => frames.push(frame),
+    onHostFrame: (frame) => hostFrames.push(frame),
+    onDegrade: (kind, message) => notices.push([kind, message]),
+  });
+  api.connectMux();
+  api.connectHost(); // must NOT open a second generation on 0.1.5
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  return { api, frames, hostFrames, notices, posts, harness, socket: harness.FakeSocket.instances.at(-1) };
+}
+
+test("0.1.5 mux subscribes $events + session/control with an empty args object", async () => {
+  const { api, socket, harness } = await muxClient();
+  const opens = socket.sent.filter((message) => message.type === "open");
+  assert.deepEqual(opens.map((message) => message.endpoint), ["$events", "session/control"]);
+  for (const open of opens) assert.deepEqual(open.payload, { args: {} });
+  assert.equal(socket.url, "ws://127.0.0.1:3080/api/remote.mux");
+  // One socket only: connectHost() rides the same mux on 0.1.5.
+  assert.equal(harness.FakeSocket.instances.length, 1);
+  assert.equal(api.muxConnected, true);
+  assert.equal(api.hostConnected, true, "host frames share the mux socket");
+});
+
+test("0.1.5 forwarded emits become the TUI's host/* frames", async () => {
+  const { api, hostFrames, frames, socket } = await muxClient();
+  const events = socket.streamOf("$events");
+  socket.item(events, { type: "emit", event: "api-session/status", args: ["session-1", true] });
+  socket.item(events, { type: "emit", event: "api-session/added", args: [{ sessionId: "session-2" }] });
+  socket.item(events, { type: "emit", event: "api-session/removed", args: ["session-3"] });
+  socket.item(events, { type: "emit", event: "api-session/error", args: ["session-4", "boom"] });
+  socket.item(events, { type: "emit", event: "commands/change", args: [] });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(hostFrames, [
+    { type: "host/session-status", sessionId: "session-1", running: true },
+    { type: "host/session-added", sessionId: "session-2" },
+    { type: "host/session-removed", sessionId: "session-3" },
+    { type: "host/agent-error", sessionId: "session-4", message: "boom" },
+  ]);
+  assert.deepEqual(frames, [], "unmapped emits produce no TUI frame");
+  api.close();
+});
+
+test("the session/control stream becomes jobs, queue and projection frames", async () => {
+  const { api, frames, socket } = await muxClient();
+  const control = socket.streamOf("session/control");
+  socket.item(control, { type: "jobs", sessionId: "s1", jobs: [{ id: "job-1" }] });
+  socket.item(control, { type: "queue", sessionId: "s1", items: [{ id: "q1" }] });
+  socket.item(control, { type: "projection", sessionId: "s1", key: "title", value: "T", seq: 7 });
+  socket.item(control, { type: "projection", sessionId: "s1", key: "todos", value: [], seq: 8 });
+  socket.item(control, { type: "baseline", value: { jobs: { s2: [] }, queues: { s2: [] }, projections: { s2: { asOfSeq: 3, values: { title: "B" } } } } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(frames.map((frame) => frame.type), [
+    "session/jobs", "session/queue", "session/projection", "session/title", "session/projection",
+    "session/jobs", "session/queue", "session/projection", "session/title",
+  ]);
+  assert.deepEqual(frames[0], { type: "session/jobs", sessionId: "s1", jobs: [{ id: "job-1" }] });
+  assert.deepEqual(frames[8], { type: "session/title", sessionId: "s2" });
+  api.close();
+});
+
+test("a blocking approval is delivered and answered through $events/result", async () => {
+  const { api, frames, posts, socket } = await muxClient();
+  const events = socket.streamOf("$events");
+  socket.item(events, {
+    type: "waterfall",
+    event: "approval/request",
+    eventId: "evt-1",
+    agentId: "session-9",
+    request: { toolName: "bash", callId: "call-1", reason: "escalate sandbox" },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(frames, [{
+    type: "approval/requested",
+    sessionId: "session-9",
+    approvalId: "evt-1",
+    callId: "call-1",
+    toolName: "bash",
+    reason: "escalate sandbox",
+    __rpcId: "evt-1",
+  }]);
+  const receipt = await api.respond("evt-1", { sessionId: "session-9", approvalId: "evt-1", outcome: "allowed-once" });
+  assert.deepEqual(receipt, { ok: true });
+  assert.equal(posts.at(-1).url, "http://127.0.0.1:3080/api/$events/result");
+  assert.deepEqual(posts.at(-1).body.payload, {
+    args: { clientId: "client-generation-1", eventId: "evt-1", outcome: { kind: "result", value: "allowed-once" } },
+  });
+  assert.equal(api.remoteState.pending.size, 0);
+  api.close();
+});
+
+test("a blocking question answers with the batch and cancels as ASK_CANCELLED", async () => {
+  const { api, frames, posts, socket } = await muxClient();
+  const events = socket.streamOf("$events");
+  const questions = [{ id: "q1", question: "Which?", header: "Pick", options: [{ label: "A" }, { label: "B" }] }];
+  socket.item(events, { type: "waterfall", event: "user-questions/request", eventId: "evt-2", agentId: "session-9", request: { questions } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(frames.at(-1), { type: "question/requested", sessionId: "session-9", questions, __rpcId: "evt-2" });
+  await api.respond("evt-2", { sessionId: "session-9", answer: { answers: [{ id: "q1", selected: ["A"] }] } });
+  assert.deepEqual(posts.at(-1).body.payload.args.outcome, { kind: "result", value: { answers: [{ id: "q1", selected: ["A"] }] } });
+
+  socket.item(events, { type: "waterfall", event: "user-questions/request", eventId: "evt-3", agentId: "session-9", request: { questions } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await api.cancelResponse("evt-3");
+  assert.deepEqual(posts.at(-1).body.payload.args.outcome, {
+    kind: "rejected",
+    error: { name: "UserQuestionError", message: "the user cancelled ask_user_question", code: "ASK_CANCELLED" },
+  });
+  api.close();
+});
+
+test("a re-delivered decision never reopens: duplicates are ignored", async () => {
+  const { api, frames, socket } = await muxClient();
+  const events = socket.streamOf("$events");
+  const frame = { type: "waterfall", event: "approval/request", eventId: "evt-4", agentId: "session-9", request: { toolName: "bash" } };
+  socket.item(events, frame);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await api.respond("evt-4", { approvalId: "evt-4", outcome: "rejected" });
+  socket.item(events, frame); // the Host re-delivers on reconnect
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(frames.filter((entry) => entry.type === "approval/requested").length, 1);
+  api.close();
+});
+
+test("a Host cancel frame dismisses the pending decision", async () => {
+  const { api, frames, socket } = await muxClient();
+  const events = socket.streamOf("$events");
+  socket.item(events, { type: "waterfall", event: "approval/request", eventId: "evt-5", agentId: "session-9", request: { toolName: "bash" } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(api.remoteState.pending.size, 1);
+  socket.push({ type: "item", streamId: events, value: { type: "cancel", eventId: "evt-5" } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(frames.slice(-2), [
+    { type: "approval/resolved", approvalId: "evt-5" },
+    { type: "question/resolved", questionRpcId: "evt-5" },
+  ]);
+  assert.equal(api.remoteState.pending.size, 0);
+  api.close();
+});
+
+test("mux close() releases pending decisions with next so the Host fails closed", async () => {
+  const { api, posts, socket } = await muxClient();
+  const events = socket.streamOf("$events");
+  socket.item(events, { type: "waterfall", event: "approval/request", eventId: "evt-6", agentId: "session-9", request: { toolName: "bash" } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  api.close();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(posts.at(-1).body.payload.args.outcome, { kind: "next" });
+});
+
+test("an established mux reconnects with backoff instead of giving up", async () => {
+  const harness = muxHarness();
+  const { api, socket } = await muxClient(harness);
+  socket.close();
+  assert.equal(api.connectionState.mux.connected, false);
+  assert.notEqual(api.connectionState.mux.timer, null, "a retry is armed after an established connection drops");
+  assert.equal(api.connectionState.mux.retryDelay, 1000);
+  api.close();
+  assert.equal(api.connectionState.mux.timer, null);
+});
+
+test("a stream error on $events degrades to polling exactly once", async () => {
+  const { api, notices, frames, socket } = await muxClient();
+  const events = socket.streamOf("$events");
+  socket.push({ type: "error", streamId: events, error: { code: "gateway/service-unavailable", message: "forwarded Remote event source is unavailable" } });
+  socket.push({ type: "error", streamId: events, error: { code: "gateway/service-unavailable", message: "forwarded Remote event source is unavailable" } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(notices.map(([kind]) => kind), ["live-streams"]);
+  assert.equal(api.connectionState.mux.unsupported, true);
+  assert.equal(frames.at(-1).type, "stream/error");
+  api.close();
+});
+
+test("the forwarded-event table covers the Host allowlist with a closed frame set", () => {
+  // The Host forwards exactly these names (@deepseek-ai/dsh-api-remotes).
+  const forwarded = {
+    emit: [
+      "agent-preset/selected", "api-session/activity", "api-session/added", "api-session/error",
+      "api-session/removed", "api-session/status", "commands/change", "credentials/reference-updated",
+      "goal/activation-changed", "cordis/request-run", "cordis/request-run-resolved",
+      "cordis/dynamic-package", "cordis/dynamic-retract", "cordis/inspect-query",
+      "cordis/inspect-query-resolved", "llm/adapters-updated", "settings/document-updated",
+    ],
+    waterfall: ["approval/request", "user-questions/request"],
+  };
+  const vocabulary = new Set([
+    "host/session-added", "host/session-removed", "host/session-status", "host/agent-error",
+    "approval/requested", "question/requested", "approval/resolved", "question/resolved",
+  ]);
+  for (const [mode, names] of Object.entries(forwarded)) {
+    for (const name of names) {
+      const entry = REMOTE_EVENTS_015[name];
+      assert.ok(entry, `${name} is forwarded but not translated`);
+      assert.equal(entry.mode, mode, `${name} mode`);
+    }
+  }
+  for (const [name, entry] of Object.entries(REMOTE_EVENTS_015)) {
+    const known = forwarded.emit.includes(name) || forwarded.waterfall.includes(name);
+    assert.ok(known, `${name} is not in the Host allowlist`);
+    assert.ok(entry.mode === "emit" || entry.mode === "waterfall", name);
+    if (entry.mode === "waterfall") assert.equal(typeof entry.answer, "function", `${name} has no answer projection`);
+  }
+  // Every frame a waterfall entry emits is part of the TUI's frame vocabulary.
+  for (const frame of translateRemoteItem({ type: "waterfall", event: "approval/request", eventId: "e", agentId: "a", request: {} }).frames) {
+    assert.ok(vocabulary.has(frame.type), frame.type);
+  }
+  for (const frame of translateRemoteItem({ type: "waterfall", event: "user-questions/request", eventId: "e", agentId: "a", request: {} }).frames) {
+    assert.ok(vocabulary.has(frame.type), frame.type);
+  }
+});
+
+test("unmapped wire items translate to nothing instead of guessing", () => {
+  assert.deepEqual(translateRemoteItem({ type: "emit", event: "not-forwarded", args: [] }), { frames: [] });
+  assert.deepEqual(translateRemoteItem({ type: "emit", event: "approval/request", args: [] }), { frames: [] }, "a waterfall name is not an emit");
+  assert.deepEqual(translateRemoteItem({ type: "waterfall", event: "api-session/status", eventId: "e" }), { frames: [] });
+  assert.deepEqual(translateRemoteItem(undefined), { frames: [] });
+  assert.deepEqual(translateControlItem({ type: "unknown" }), []);
+  assert.deepEqual(translateControlItem(undefined), []);
+});
+
+test("an unanswerable blocking waterfall is delegated, never left pending", async () => {
+  const { api, frames, posts, socket } = await muxClient();
+  const events = socket.streamOf("$events");
+  // A future Host allowlist entry this client cannot present.
+  socket.item(events, { type: "waterfall", event: "cordis/request-run", eventId: "evt-7", agentId: "session-9", request: {} });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(frames, [], "no frame is invented for an unknown waterfall");
+  assert.equal(api.remoteState.pending.size, 0);
+  assert.deepEqual(posts.at(-1).body.payload.args, { clientId: "client-generation-1", eventId: "evt-7", outcome: { kind: "next" } });
+  api.close();
+});
+
+test("malformed forwarded emits produce no frame and never throw", async () => {
+  const { api, frames, hostFrames, socket } = await muxClient();
+  const events = socket.streamOf("$events");
+  socket.item(events, { type: "emit", event: "api-session/status", args: [] });
+  socket.item(events, { type: "emit", event: "api-session/added", args: [null] });
+  socket.item(events, { type: "emit", event: "api-session/error", args: [42, { message: "chained" }] });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(hostFrames, []);
+  assert.deepEqual(frames, []);
+  api.close();
 });
