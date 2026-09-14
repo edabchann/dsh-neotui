@@ -10,6 +10,7 @@ import { tmpdir, homedir } from "node:os";
 import { createRequire } from "node:module";
 import { Widget, ScrollView, Input, Popup, Menu, StatusBar, wrapIndex } from "./widgets.js";
 import { UploadPicker } from "./file-picker.js";
+import { HostFiles } from "./host-files.js";
 import { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, keyBindings, tuiConfigFile, reloadTuiConfig, searchHistory, rememberSearchQuery, promptHistory, rememberPrompt, prefixKeys } from "./config.js";
 import { bindingMatchFor, matchKeyBinding, CHAT_BINDING_ORDER, SIDEBAR_BINDING_ORDER, KEYBINDING_ORDER, INPUT_BINDING_ORDER, INPUT_EDIT_BINDING_ORDER } from "./keybindings.js";
 export { userPrefix, saveTuiConfig, loadTuiConfig, userName, busyEnter, foldDefaults, promptHistory, rememberPrompt } from "./config.js";
@@ -18,7 +19,7 @@ import {
   modeName, permName, WorkspacePanel, TrajectoryPanel, DirPicker, AttachmentPanel,
   ImagePopup, kittyCapable, GoalPanel, SettingsPanel,
   SkillsPanel, ControlPanel, QueuePanel, ModelPanel, fmtMs, ThemePickerBuffer,
-  SubagentPage, TasksPage,
+  SubagentPage, TasksPage, ChangesPage,
 } from "./panels.js";
 
 import { T, themeName, cycleTheme } from "./theme.js";
@@ -1914,39 +1915,76 @@ export class ChatView extends Widget {
     if (trimmed === "/permission") { this.app.showPermissionPicker(); return; }
     if (trimmed === "/goal") { this.app.showGoal(); return; }
     if (!trimmed && this.clipboardImages.length === 0) return;
+    void this.#submit(trimmed);
+  }
+
+  /** The send body. Everything that reads a file goes through the HOST: the
+   *  session workspace lives on the Host, so a local read would attach whatever
+   *  this terminal happens to have at the same path. */
+  async #submit(trimmed) {
+    const files = this.app?.files ?? null;
+    const hosted = files?.usable === true;
+    const atRoot = this.app.sessions?.find((s) => s.sessionId === this.sessionId)?.cwd ?? process.cwd();
+    // Image @-mentions: the Host owns the bytes.
+    const hostImages = new Map();
+    for (const m of trimmed.matchAll(/@([^\s@]+)/g)) {
+      const ref = m[1];
+      if (!IMAGE_EXT.test(ref) || hostImages.has(ref)) continue;
+      const full = ref.startsWith("~") ? join(homedir(), ref.slice(1)) : join(atRoot, ref);
+      const bytes = hosted ? await files.readAll(full) : { ok: false };
+      if (bytes.ok) hostImages.set(ref, { full, data: bytes.value.data.toString("base64") });
+      else if (!hosted) {
+        try { hostImages.set(ref, { full, data: readFileSync(full, "base64") }); } catch { /* reported below */ }
+      }
+    }
     const { parts, images, errors } = buildPromptParts(trimmed, {
       readFile: (p) => {
+        const hit = hostImages.get(p) ?? hostImages.get(basename(p));
+        if (hit) return hit.data;
+        if (hosted) return null; // the Host has no such image — never a local look-alike
         try { return readFileSync(p, "base64"); } catch { return null; }
       },
     });
     for (const e of errors) this.app.toast(`图片读取失败: ${e}`);
     // @-mentioned non-image files/directories attach as bounded text blocks
     // (Claude-Code parity; the token stays in the prompt as a reference).
-    const atRoot = this.app.sessions?.find((s) => s.sessionId === this.sessionId)?.cwd ?? process.cwd();
     for (const m of trimmed.matchAll(/@([^\s@]+)/g)) {
       const ref = m[1];
       if (IMAGE_EXT.test(ref)) continue;
       const full = ref.startsWith("~") ? join(homedir(), ref.slice(1)) : join(atRoot, ref);
-      if (!existsSync(full)) continue;
       const display = `@${ref}`;
+      const localOnly = !hosted;
       try {
-        if (statSync(full).isDirectory()) {
-          const names = readdirSync(full).slice(0, 200);
-          parts.push({ type: "text", text: `\n<${display} 目录内容>\n${names.join("\n")}`.slice(0, 8192) });
-        } else {
+        const isDir = hosted ? await files.isDirectory(full) : statSync(full).isDirectory();
+        if (isDir) {
+          const listing = hosted ? await files.list(full) : { ok: false };
+          let names;
+          if (listing.ok) names = listing.value.map((row) => row.name);
+          else if (localOnly) names = readdirSync(full).map((name) => name);
+          else continue; // the Host does not list this directory: attach nothing
+          parts.push({ type: "text", text: `\n<${display} 目录内容>\n${names.slice(0, 200).join("\n")}`.slice(0, 8192) });
+          continue;
+        }
+        const page = hosted ? await files.readText(full, { offset: 1, limit: 800 }) : { ok: false };
+        if (page.ok) {
+          parts.push({ type: "text", text: `\n<${display} 文件内容>\n${page.value.text}`.slice(0, 8192) });
+        } else if (localOnly) {
           const buf = readFileSync(full, "utf8");
           parts.push({ type: "text", text: `\n<${display} 文件内容>\n${buf}`.slice(0, 8192) });
         }
+        // Host-authoritative miss: the mention stays a plain token.
       } catch (e) { this.app.toast(`@${ref} 读取失败: ${e.message}`); }
     }
     const clipParts = this.clipboardImages.map(({ mediaType, data, name }) => ({ type: "image", mediaType, data, name }));
+    // Host-uploaded attachments ride the prompt as receipt references.
+    const fileParts = this.attachments.filter((a) => typeof a.receiptId === "string" && a.receiptId !== "").map((a) => ({ type: "file", receiptId: a.receiptId }));
     const clipboardCount = clipParts.length;
-    parts.push(...clipParts);
-    this.app.log(`[chat] prompt → ${this.sessionId.slice(0, 8)}: ${truncate(trimmed, 60)}${images.length + clipboardCount ? ` (+${images.length + clipboardCount} 图)` : ""}`);
+    parts.push(...clipParts, ...fileParts);
+    this.app.log(`[chat] prompt → ${this.sessionId.slice(0, 8)}: ${truncate(trimmed, 60)}${images.length + clipboardCount ? ` (+${images.length + clipboardCount} 图)` : ""}${fileParts.length ? ` (+${fileParts.length} 附件)` : ""}`);
     this.app.api.call("session.prompt", {
       sessionId: this.sessionId,
       mode: this.running ? busyEnter() : "queue",
-      content: parts.filter((p) => p.type === "image" || (p.text ?? "").trim() !== ""),
+      content: parts.filter((p) => p.type === "image" || p.type === "file" || (p.text ?? "").trim() !== ""),
       clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     }).then((res) => {
       this.clipboardImages = [];
@@ -2820,24 +2858,63 @@ export class ChatView extends Widget {
     return this.#toggleAt({ nodeIdx: item.nodeIdx, blockIdx: item.blockIdx });
   }
 
-  /** Existing absolute file paths mentioned in tool args/results (deduped,
-   *  max 3) — the local ones can be opened in the workspace preview. */
-  #existingPathsIn(...texts) {
-    const out = [];
+  /** Absolute file paths mentioned in tool args/results (deduped, capped). */
+  #pathCandidatesIn(...texts) {
     const seen = new Set();
+    const candidates = [];
     for (const s of texts) {
       if (s == null) continue;
       const flat = typeof s === "object" ? JSON.stringify(s) : String(s ?? "");
       for (const m of flat.matchAll(/(?:^|[\s"'`:=(])(\/[^\s"'`,;)\]]+)/g)) {
         const p = m[1]?.replace(/[),.;]+$/, "");
-        if (p && !seen.has(p) && existsSync(p)) {
-          seen.add(p);
-          out.push(p);
-          if (out.length >= 3) return out;
-        }
+        if (p && !seen.has(p)) { seen.add(p); candidates.push(p); }
+        if (candidates.length >= 24) break;
       }
     }
+    return candidates;
+  }
+
+  /** The subset the HOST can see, from cache only (the menu opens in the same
+   *  keystroke; #fillMenuPaths adds late answers). A path only this machine has
+   *  is never offered — the preview would show the wrong file. */
+  #existingPathsCached(candidates) {
+    const files = this.app?.files;
+    const out = [];
+    for (const p of candidates) {
+      if (out.length >= 3) break;
+      if (files?.peekStat(p)) { out.push(p); continue; }
+      if (files?.usable !== true && existsSync(p)) out.push(p);
+    }
     return out;
+  }
+
+  /** Ask the Host about the remaining candidates and grow the open menu when
+   *  the answers land (a remote stat takes a round trip). */
+  async #fillMenuPaths(menu, candidates, shown, spill) {
+    const files = this.app?.files;
+    if (!files?.usable) return;
+    for (const p of candidates) {
+      if (shown.has(p)) continue;
+      const host = await files.stat(p);
+      const visible = host.ok ? host.value !== null : existsSync(p);
+      if (!visible) continue;
+      shown.add(p);
+      if (this.app.menu !== menu) return;   // the user closed or replaced it
+      menu.items.push({ label: `文件预览: ${basename(p)}`, action: () => this.app.openWorkspaceFile(p) });
+      menu.h = menu.items.length + 2;
+      this.app.redraw();
+    }
+    if (spill && !shown.has(spill)) {
+      const host = await files.stat(spill);
+      if (!host.ok) return;
+      if (!menu.items.some((entry) => entry.label === "TUI 内预览完整输出")) {
+        if (this.app.menu !== menu) return;
+        menu.items.splice(Math.max(0, menu.items.findIndex((entry) => entry.label === "复制完整输出路径") + 1), 0,
+          { label: "TUI 内预览完整输出", action: () => void this.#openSpillPreview(spill) });
+        menu.h = menu.items.length + 2;
+        this.app.redraw();
+      }
+    }
   }
 
   /** Open a Host spill file: the gateway's host.openPath works from anywhere
@@ -2852,22 +2929,38 @@ export class ChatView extends Widget {
     } catch (error) {
       this.app.log("host.openPath failed:", error?.message ?? error);
     }
-    if (existsSync(path)) {
-      const cmd = process.platform === "win32" ? ["cmd", ["/c", "start", "", path]] : process.platform === "darwin" ? ["open", [path]] : ["xdg-open", [path]];
-      const run = spawnSync(cmd[0], cmd[1], { detached: true, stdio: "ignore" });
-      if (run.status === 0 || run.error == null) { toast(`已打开完整输出文件: ${path}`); return; }
-      toast(`打开失败（${run.error?.message ?? run.status}）；可用 Ctrl+R 复制路径`);
-      return;
-    }
-    toast(`完整输出路径: ${path}`);
+    // The path belongs to the HOST: ask it whether the entry exists, and only
+    // fall back to a local OS opener when this terminal really shares that disk.
+    const files = this.app?.files;
+    const host = files?.usable ? await files.stat(path) : { ok: false };
+    const onLocalDisk = files?.usable !== true && existsSync(path);
+    if (!host.ok && !onLocalDisk) { toast(`完整输出路径: ${path}`); return; }
+    const cmd = process.platform === "win32" ? ["cmd", ["/c", "start", "", path]] : process.platform === "darwin" ? ["open", [path]] : ["xdg-open", [path]];
+    const run = spawnSync(cmd[0], cmd[1], { detached: true, stdio: "ignore" });
+    if (run.status === 0 || run.error == null) { toast(`已打开完整输出文件: ${path}`); return; }
+    toast(`打开失败（${run.error?.message ?? run.status}）；可用 Ctrl+R 复制路径`);
   }
 
-  /** Read the spill file into a scrollable in-TUI viewer (local deployments:
-   *  the path is host-local, so a remote TUI simply lacks the entry). */
-  #openSpillPreview(path) {
-    let text;
-    try { text = readFileSync(path, "utf8"); } catch (error) { this.app.toast(`读取完整输出失败: ${error.message}`); return; }
+  /** Read the Host spill file into a scrollable in-TUI viewer. The truncation
+   *  notice the TUI renders comes from the HOST's report, so its full text must
+   *  be read through the Host too — a remote TUI has no such local file. */
+  async #openSpillPreview(path) {
     const MAX = 256 * 1024, MAX_LINES = 500;
+    let text = null;
+    const files = this.app?.files;
+    const host = files?.usable ? await files.readText(path, { offset: 1, limit: MAX_LINES + 1 }) : { ok: false };
+    if (host.ok) {
+      text = host.value?.text ?? "";
+    } else if (files?.usable !== true) {
+      // Legacy host: keep the old local read (same machine deployments).
+      try { text = readFileSync(path, "utf8"); } catch (error) { this.app.toast(`读取完整输出失败: ${error.message}`); return; }
+    } else if (host.missing) {
+      this.app.toast(`读取完整输出失败: Host 上没有 ${basename(path)}`);
+      return;
+    } else {
+      this.app.toast(`读取完整输出失败: ${host.error?.message ?? "Host 文件接口不可用"}`);
+      return;
+    }
     const truncated = text.length > MAX;
     if (truncated) text = text.slice(0, MAX);
     const rawLines = text.split("\n");
@@ -2914,18 +3007,29 @@ export class ChatView extends Widget {
     }
     // File mentions in tool args/results open directly in the workspace preview.
     const fileBlock = item.blockIdx != null ? node?.blocks?.[item.blockIdx] : null;
-    for (const p of this.#existingPathsIn(fileBlock?.args, fileBlock?.result)) {
+    const candidates = this.#pathCandidatesIn(fileBlock?.args, fileBlock?.result);
+    const shown = new Set();
+    for (const p of this.#existingPathsCached(candidates)) {
+      shown.add(p);
       entries.push({ label: `文件预览: ${basename(p)}`, action: () => this.app.openWorkspaceFile(p) });
     }
     // Host spill recovery: the truncated tool output names its full file.
     const spillBlock = item.blockIdx != null ? node?.blocks?.[item.blockIdx] : null;
     const spill = spillPathFromText(spillBlock?.result ?? spillBlock?.text ?? node?.text ?? "");
+    let spillShown = false;
     if (spill) {
       entries.push({ label: "打开完整输出文件", action: () => void this.#openSpillPath(spill) });
       entries.push({ label: "复制完整输出路径", action: () => this.app.copyText(spill) });
-      if (existsSync(spill)) entries.push({ label: "TUI 内预览完整输出", action: () => this.#openSpillPreview(spill) });
+      // The entry itself lives on the HOST: only the Host can say it exists.
+      const files = this.app?.files;
+      spillShown = Boolean(files?.peekStat(spill)) || (files?.usable !== true && existsSync(spill));
+      if (spillShown) entries.push({ label: "TUI 内预览完整输出", action: () => void this.#openSpillPreview(spill) });
     }
     this.app.openMenu(entries, { x: this.view.x + 2, y: this.view.y + Math.max(0, item.headerLine - this.view.scrollY) });
+    const menu = this.app.menu;
+    if (menu && (candidates.length > shown.size || (spill && !spillShown))) {
+      void this.#fillMenuPaths(menu, candidates, shown, spill && !spillShown ? spill : null);
+    }
     return true;
   }
 
@@ -3824,6 +3928,11 @@ export class App {
     this.term = term;
     this.api = api;
     this.log = log ?? (() => {});
+    // Host-backed file access (list/stat/read/readAll + @-mention candidates and
+    // the workspace change feed). Every file the UI shows is read from the HOST
+    // the TUI is attached to; the local disk is only a fallback for paths that
+    // are genuinely local (the $EDITOR draft, the tui config file).
+    this.files = new HostFiles(this);
     this.versionFetcher = versionFetcher;
     this.launcherAnime = launcherAnime; // opt-in boot animation (--launcher-anime)
     // Welcome logo mode: "preset" (bundled mascot), "custom" (JSON file) or
@@ -3983,6 +4092,7 @@ export class App {
     if (this.mainTab === "trajectory") return this.trajectoryPanel;
     if (this.mainTab === "subagent") return this.subagentPane;
     if (this.mainTab === "tasks") return this.tasksPane;
+    if (this.mainTab === "changes") return this.changesPane;
     return null;
   }
   ensureTrajectoryPane() {
@@ -3997,8 +4107,12 @@ export class App {
     if (!this.tasksPane) this.tasksPane = new TasksPage(this);
     return this.tasksPane;
   }
+  ensureChangesPane() {
+    if (!this.changesPane) this.changesPane = new ChangesPage(this);
+    return this.changesPane;
+  }
 
-  /** Set the main-area tab (chat | trajectory | subagent | tasks) and focus
+  /** Set the main-area tab (chat | trajectory | subagent | tasks | changes) and focus
    *  the main window. Non-chat panes are lazy-grown and seeded on first entry;
    *  re-entry (including a cycle back) keeps their live state. */
   setTab(which) {
@@ -4014,6 +4128,9 @@ export class App {
       pane.onActivate?.();
     } else if (which === "tasks") {
       pane = this.ensureTasksPane();
+      pane.onActivate?.();
+    } else if (which === "changes") {
+      pane = this.ensureChangesPane();
       pane.onActivate?.();
     }
     this.layout();
@@ -4064,10 +4181,11 @@ export class App {
     this.redraw();
   }
 
-  /** Cycle the main-window tab: chat → trajectory → subagent → tasks → chat.
+  /** Cycle the main-window tab:
+   *  chat → trajectory → subagent → tasks → changes → chat.
    *  Tabs are always reachable regardless of an open session. */
   cycleTab(delta) {
-    const tabs = ["chat", "trajectory", "subagent", "tasks"];
+    const tabs = ["chat", "trajectory", "subagent", "tasks", "changes"];
     const idx = tabs.indexOf(this.mainTab);
     const next = tabs[wrapIndex(Math.max(0, idx) + delta, tabs.length)];
     this.setTab(next);
@@ -5734,26 +5852,54 @@ export class App {
   showFilePicker() {
     const session = this.sessions.find((s) => s.sessionId === this.currentSession);
     this.overlay = new UploadPicker(this, { startPath: session?.cwd ?? process.cwd(), onUpload: (files) => {
-      let added = 0, meta = 0;
-      for (const file of files) {
-        if (!IMAGE_EXT.test(file.path)) {
-          // Host 协议没有通用二进制通道：非图片文件不发送，仅作为元数据条目
-          // （名称/大小/类型）出现在附件列表，绝不伪装成可发送附件。
-          try {
-            const st = statSync(file.path);
-            this.chat.attachments.push({ id: `file-${Date.now()}-${meta}`, path: file.path, local: true, name: file.name, binary: true, bytes: st.size });
-            meta++;
-          } catch (e) { this.toast(`无法读取文件信息: ${file.name}: ${e.message}`); }
-          continue;
-        }
-        try { const ext = IMAGE_EXT.exec(file.path)[1].toLowerCase(); const mediaType = MEDIA_TYPES[ext]; const data = readFileSync(file.path, "base64"); const item = { id: `file-${Date.now()}-${added}`, path:file.path, local:true, name:file.name, mediaType, data, bytes:Buffer.byteLength(data,"base64") }; this.chat.clipboardImages.push(item); this.chat.attachments.push(item); added++; } catch(e){ this.toast(`文件读取失败: ${file.name}: ${e.message}`); }
-      }
-      this.chat.inputChanged();
-      if (added && meta) this.toast(`已添加 ${added} 个图片附件；${meta} 个文件仅显示元数据（Host 不支持二进制附件）`);
-      else if (added) this.toast(`已添加 ${added} 个图片附件`);
-      else if (meta) this.toast(`${meta} 个文件仅显示元数据（Host 不支持二进制附件）`);
+      void this.#attachPickedFiles(files);
     }, onCancel: () => { this.overlay=null; this.focus(this.chat.input); this.redraw(); } });
     this.focus(this.overlay); this.redraw();
+  }
+
+  /** Turn picked files into attachments. Images ride the prompt inline; every
+   *  other file is stored on the HOST through `fileUploads/upload` and carried
+   *  by its receipt — a real attachment, not a metadata-only row. When the Host
+   *  cannot store it (legacy host, unavailable surface) the entry stays
+   *  metadata-only, exactly as before, and the toast says so. */
+  async #attachPickedFiles(picked) {
+    const files = this.app?.files ?? this.files;
+    let images = 0, hosted = 0, meta = 0;
+    for (const file of picked) {
+      if (IMAGE_EXT.test(file.path)) {
+        const mediaType = MEDIA_TYPES[IMAGE_EXT.exec(file.path)[1].toLowerCase()];
+        let data = null;
+        const bytes = await files.readAll(file.path);
+        if (bytes.ok) data = bytes.value.data.toString("base64");
+        else if (!files.usable) { try { data = readFileSync(file.path, "base64"); } catch { /* reported */ } }
+        if (data === null) { this.toast(`文件读取失败: ${file.name}${bytes.error?.message ? `: ${bytes.error.message}` : ""}`); continue; }
+        const item = { id: `file-${Date.now()}-${images}`, path: file.path, local: true, name: file.name, mediaType, data, bytes: Buffer.byteLength(data, "base64") };
+        this.chat.clipboardImages.push(item);
+        this.chat.attachments.push(item);
+        images++;
+        continue;
+      }
+      const upload = await files.uploadAttachment(file.path, file.name);
+      if (upload.ok) {
+        this.chat.attachments.push({
+          id: `file-${Date.now()}-${hosted}`, path: file.path, local: true, name: upload.value.name || file.name,
+          receiptId: upload.value.receiptId, attachmentId: upload.value.attachmentId, bytes: upload.value.bytes, hosted: true,
+        });
+        hosted++;
+        continue;
+      }
+      const st = await files.stat(file.path);
+      const size = st.ok ? st.value?.bytes : files.statLocal(file.path)?.bytes;
+      this.chat.attachments.push({ id: `file-${Date.now()}-${meta}`, path: file.path, local: true, name: file.name, binary: true, bytes: size ?? null });
+      meta++;
+    }
+    this.chat.inputChanged();
+    this.redraw();
+    const parts = [];
+    if (images) parts.push(`${images} 个图片附件`);
+    if (hosted) parts.push(`${hosted} 个 Host 附件（可发送）`);
+    if (meta) parts.push(`${meta} 个仅元数据（Host 附件接口不可用）`);
+    if (parts.length) this.toast(`已添加 ${parts.join("；")}`);
   }
 
   openImage(ref, opts = {}) {
@@ -5769,12 +5915,14 @@ export class App {
   }
 
   #modeTabs() {
-    // Main-window tab strip: 对话 | 轨迹 | 子代理 | 后台任务 (Shift+Tab cycles).
+    // Main-window tab strip: 对话 | 轨迹 | 子代理 | 后台任务 | 文件/改动
+    // (Shift+Tab / Ctrl+H / Ctrl+L cycle).
     return [
       ["chat", "对话"],
       ["trajectory", "轨迹"],
       ["subagent", "子代理"],
       ["tasks", "后台任务"],
+      ["changes", "文件/改动"],
     ];
   }
 

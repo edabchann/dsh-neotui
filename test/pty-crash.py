@@ -14,8 +14,13 @@
 #   local stub that requests a sandbox escalation. The Host therefore opens an
 #   approval waterfall, which can reach the TUI ONLY over the 0.1.5 Remote mux
 #   ($events). The phase asserts the approval popup renders (push works) and that
+#
+# Phase 5 (Host-sourced file access): the TUI runs inside a mount namespace
+#   where the session workspace path is bind-mounted onto a decoy directory
+#   (same names, different content, none of the Host-only entries). Completion,
+#   the file picker and the preview pane must still resolve the HOST files.
 #   pressing y makes the Host record the decision and run the tool ($events/result).
-import os, pty, time, signal, fcntl, termios, struct, json, socket, select, re, secrets
+import os, pty, time, signal, fcntl, termios, struct, json, socket, select, re, secrets, shutil
 import subprocess, urllib.request, urllib.error
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -325,7 +330,7 @@ STUB_TOOL_ARGS = {
 }
 
 
-def start_stub_llm(stream_deltas=None, stream_delay=1.0):
+def start_stub_llm(stream_deltas=None, stream_delay=1.0, tool_name="bash", tool_args=None):
     """Serve a deterministic streaming chat/completions stub; return (server, port).
 
     With `stream_deltas` (a list of strings) the stub streams exactly those
@@ -337,6 +342,7 @@ def start_stub_llm(stream_deltas=None, stream_delay=1.0):
 
     def chunks(payload):
         model = payload.get("model") or "stub-model"
+        call_args = STUB_TOOL_ARGS if tool_args is None else tool_args
         if stream_deltas is not None:
             out = [{"id": "stub", "object": "chat.completion.chunk", "created": 0, "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}]
             for part in stream_deltas:
@@ -350,7 +356,7 @@ def start_stub_llm(stream_deltas=None, stream_delay=1.0):
                 {"id": "stub", "object": "chat.completion.chunk", "created": 0, "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
             ]
         return [
-            {"id": "stub", "object": "chat.completion.chunk", "created": 0, "model": model, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0, "id": "call_stub_1", "type": "function", "function": {"name": "bash", "arguments": json.dumps(STUB_TOOL_ARGS)}}]}, "finish_reason": None}]},
+            {"id": "stub", "object": "chat.completion.chunk", "created": 0, "model": model, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0, "id": "call_stub_1", "type": "function", "function": {"name": tool_name, "arguments": json.dumps(call_args)}}]}, "finish_reason": None}]},
             {"id": "stub", "object": "chat.completion.chunk", "created": 0, "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
         ]
 
@@ -627,6 +633,211 @@ def stream_phase(env):
         server.server_close()
 
 
+# ---- phase 5: file access is Host-sourced, not terminal-local --------------
+
+"""
+The Host owns the session workspace. This phase makes the two views DISAGREE:
+the TUI process is attached inside a bubblewrap mount namespace where the
+session's workspace path is bind-mounted onto a decoy directory holding the same
+file NAME with different CONTENT (and none of the Host-only entries). That is
+precisely a remote deployment — the terminal's disk is not the Host's disk.
+
+The TUI must then render:
+  * an @-mention candidate that exists at NO local path (`sub/host-only-file.txt`);
+  * a Ctrl+O picker listing the Host-only entries (`attach-me.txt`);
+  * the Host file's CONTENT in the preview pane, never the decoy's text.
+
+Without the 0.1.5 `workspaceFiles/*` / `fileReferences/list` surface every one
+of those reads the decoy, which is what this phase fails on.
+"""
+
+HOST_MARKER = "HOST-SIDE-MARKER-VALUE 7f3a91"
+DECOY_MARKER = "LOCAL-DECOY-MARKER-VALUE deadbeef"
+
+
+def remote_correctness_phase(env):
+    """Phase 5: file preview/completion must resolve through the Host."""
+    if shutil.which("bwrap") is None:
+        print("NOTE: bubblewrap is unavailable; the remote-correctness phase was skipped")
+        return None, b""
+    real_ws = os.path.join(HOSTHOME, "remote-ws")
+    decoy_ws = os.path.join(HOSTHOME, "remote-decoy")
+    for path in (real_ws, decoy_ws):
+        shutil.rmtree(path, ignore_errors=True)
+        os.makedirs(path, exist_ok=True)
+    os.makedirs(os.path.join(real_ws, "sub"), exist_ok=True)
+    with open(os.path.join(real_ws, "host-only-marker.txt"), "w", encoding="utf-8") as stream:
+        stream.write(f"{HOST_MARKER}\nsecond host line\n")
+    with open(os.path.join(real_ws, "sub", "host-only-file.txt"), "w", encoding="utf-8") as stream:
+        stream.write("host-only nested content alpha\n")
+    with open(os.path.join(real_ws, "attach-me.txt"), "w", encoding="utf-8") as stream:
+        stream.write("attachment body\n")
+    # The decoy: same NAME, different CONTENT, none of the Host-only entries.
+    with open(os.path.join(decoy_ws, "host-only-marker.txt"), "w", encoding="utf-8") as stream:
+        stream.write(f"{DECOY_MARKER}\nlocal decoy line\n")
+
+    process, port, token, log = boot_private_host(log_name="web-remotefiles.log")
+    if process is None:
+        return None, b""
+    try:
+        session_id = api_session(port, token, "session/create", {"request": {"cwd": real_ws}})["sessionId"]
+        seen = {"mention": None, "picker": None, "preview": None}
+
+        def drive(fd, out, drain, set_size):
+            def frame():
+                return plain(b"".join(out))
+
+            set_size(60, 150)
+            drain(10, out)
+            # 1. @-mention completion: INSERT owns the input and the file picker.
+            os.write(fd, b"i")
+            drain(1, out)
+            os.write(fd, b"@sub/")
+            drain(0.5, out)
+            os.write(fd, b"\t")
+            drain(2.5, out)
+            seen["mention"] = frame()
+            # 2. Ctrl+O (INSERT) opens the Host-backed workspace picker.
+            os.write(fd, b"\x0f")
+            drain(4, out)
+            seen["picker"] = frame()
+            # 3. Walk the listing until the Host marker content is previewed:
+            #    the row index depends on the Host's own entry set.
+            seen["preview"] = frame()
+            for _ in range(12):
+                if HOST_MARKER in seen["preview"]:
+                    break
+                os.write(fd, b"\x1b[B")
+                drain(0.5, out)
+                seen["preview"] = frame()
+            drain(2, out)
+            seen["preview"] = frame()
+
+        argv = [
+            "bwrap", "--dev-bind", "/", "/", "--bind", decoy_ws, real_ws,
+            "dsh", "--profile", "tui", "--attach", f"http://127.0.0.1:{port}",
+            "--token", token, "--session", session_id,
+        ]
+        raw_bytes = run_pty(argv, env, 60, 150, drive, 5)
+        text = plain(raw_bytes)
+        raw = raw_bytes.decode("utf-8", "replace")
+        checks = {
+            "@-completion offers a Host-only path (fileReferences/list)": "host-only-file.txt" in (seen["mention"] or text),
+            "picker lists Host-only entries (workspaceFiles/list)": "attach-me.txt" in (seen["picker"] or text),
+            "preview shows the HOST content (workspaceFiles/read)": HOST_MARKER in (seen["preview"] or text),
+            "preview never shows the decoy content": DECOY_MARKER not in (seen["preview"] or text),
+            "alternate screen entered": "\x1b[?1049h" in raw,
+            "no runtime fatal": not any(term in raw for term in ("TypeError", "RangeError", "Cannot find package", "plugin(s) failed to load", "fatal:")),
+        }
+        return checks, raw_bytes
+    except Exception as error:  # noqa: BLE001 - any harness fault is a test failure
+        print(f"NOTE: remote-correctness phase aborted: {type(error).__name__}: {error}")
+        return {"remote-correctness phase completed": False}, b""
+    finally:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        if log is not None:
+            log.close()
+
+
+# ---- phase 6: the 文件/改动 tab renders the Host's change feed ------------
+
+"""
+`workspaceFiles/changes` relays instrumented filesystem operations only, so the
+frame this phase asserts cannot be faked from the test process: the private host
+is booted with a stub model that requests ONE `write` tool call, which the Host
+runs through its composed filesystem inside the session workspace. The TUI is
+attached and switched to the 文件/改动 tab BEFORE the prompt, because the feed
+reports observations from the moment its generation is opened — the row must
+appear live, from the Host stream.
+"""
+
+
+def changes_phase(env):
+    """Phase 6: a Host-instrumented write becomes a row in 文件/改动."""
+    workspace = os.path.join(HOSTHOME, "changes-ws")
+    shutil.rmtree(workspace, ignore_errors=True)
+    os.makedirs(workspace, exist_ok=True)
+    target = os.path.join(workspace, "written-by-agent.txt")
+    server, stub_port = start_stub_llm(tool_name="write", tool_args={"file_path": target, "content": "written by the host write tool\n"})
+    process, port, token, log = boot_private_host(
+        extra_env={"DEEPSEEK_BASE_URL": f"http://127.0.0.1:{stub_port}", "DEEPSEEK_API_KEY": "stub-key"},
+        log_name="web-changes.log",
+    )
+    if process is None:
+        server.shutdown()
+        return None, b""
+    import threading
+
+    def fire_prompt():
+        time.sleep(9)   # attach + tab switch first: the feed must open before the write
+        try:
+            api_session(port, token, "session/prompt", {"request": {
+                "requestId": f"pty-changes-{secrets.token_hex(6)}",
+                "sessionId": session_id,
+                "mode": "queue",
+                "content": [{"type": "text", "text": "write the file"}],
+            }})
+        except Exception as error:  # noqa: BLE001 - reported through the checks
+            print(f"NOTE: changes prompt failed: {type(error).__name__}: {error}")
+
+    try:
+        session_id = api_session(port, token, "session/create", {"request": {"cwd": workspace}})["sessionId"]
+
+        def drive(fd, out, drain, set_size):
+            set_size(60, 150)
+            drain(9, out)
+            # Shift+Tab x4: 对话 → 轨迹 → 子代理 → 后台任务 → 文件/改动
+            for _ in range(4):
+                os.write(fd, b"\x1b[Z")
+                drain(0.6, out)
+            drain(1, out)
+            threading.Thread(target=fire_prompt, daemon=True).start()
+            deadline = time.time() + 45
+            while time.time() < deadline:
+                drain(0.5, out)
+                if "written-by-agent.txt" in plain(b"".join(out)):
+                    break
+            drain(2, out)
+
+        raw_bytes = run_pty(
+            ["dsh", "--profile", "tui", "--attach", f"http://127.0.0.1:{port}", "--token", token, "--session", session_id],
+            env, 60, 150, drive, 5,
+        )
+        text = plain(raw_bytes)
+        raw = raw_bytes.decode("utf-8", "replace")
+        checks = {
+            "文件/改动 tab is on the strip and reachable": "文件/改动" in text,
+            "Host change frame rendered as a row (workspaceFiles/changes)": "written-by-agent.txt" in text,
+            "the Host really wrote the file": os.path.exists(target),
+            "alternate screen entered": "\x1b[?1049h" in raw,
+            "no runtime fatal": not any(term in raw for term in ("TypeError", "RangeError", "Cannot find package", "plugin(s) failed to load", "fatal:")),
+        }
+        return checks, raw_bytes
+    except Exception as error:  # noqa: BLE001 - any harness fault is a test failure
+        print(f"NOTE: changes phase aborted: {type(error).__name__}: {error}")
+        return {"changes phase completed": False}, b""
+    finally:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        if log is not None:
+            log.close()
+        server.shutdown()
+        server.server_close()
+
+
 def main():
     live = port_open(HOST, PORT)
     if not live:
@@ -680,12 +891,34 @@ def main():
             if not ok:
                 failed.append(name)
 
+    remote_checks, remote_capture = remote_correctness_phase(env)
+    if remote_checks is None:
+        print("NOTE: the private host did not boot; remote-correctness assertions were skipped")
+    else:
+        capture = remote_capture
+        print(f"captured {len(remote_capture)} bytes (remote file access)")
+        for name, ok in remote_checks.items():
+            print(f"{'PASS' if ok else 'FAIL'}: {name}")
+            if not ok:
+                failed.append(name)
+
+    changes_checks, changes_capture = changes_phase(env)
+    if changes_checks is None:
+        print("NOTE: the private host did not boot; changes-tab assertions were skipped")
+    else:
+        capture = changes_capture
+        print(f"captured {len(changes_capture)} bytes (文件/改动 tab)")
+        for name, ok in changes_checks.items():
+            print(f"{'PASS' if ok else 'FAIL'}: {name}")
+            if not ok:
+                failed.append(name)
+
     if failed:
         with open(FAIL_RAW, "wb") as stream:
             stream.write(capture)
         print(f"FAILED: {', '.join(failed)}; capture saved to {FAIL_RAW}")
         raise SystemExit(1)
-    print("PTY lifecycle + RPC data + approval push + live stream PASS")
+    print("PTY lifecycle + RPC data + approval push + live stream + remote file access + changes tab PASS")
 
 
 if __name__ == "__main__":

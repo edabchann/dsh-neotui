@@ -23,12 +23,20 @@
 - **轮询策略**：`session/follow` 健康时 `pollTail` 退化为 ~15s 安全网（只对账、不重复应用）；流不可用（旧协议 Host、mux 不可达、流出错）时恢复原有每 tick 节奏，行为不回归。
 - **会话列表自适应刷新**：0.1.5 无工作区推送，侧栏只能定时刷新——`会话列表` 窗口聚焦时 ~2s 并在进入该窗口时立即刷一次，其余情况保持原有 ~5s；本地变更（重命名/归档/新建/移动）后的立即刷新不变。README 明确写出「工作区无推送」这一限制。
 
+### Added
+
+- **Host 文件访问（文件内容一律来自 Host，而不是本机磁盘）**：新增 `src/host-files.js`，把文件列表/统计/读取/字节读取/补全候选/改动流/附件上传封装为带 TTL 异步缓存与请求去重的 Host 客户端（`workspaceFiles/list`、`stat`、`read`、`readBytes`、`readAll`、`fileReferences/list`、`fileUploads/upload`），并新增 `Api.subscribeRemote()`：UI 侧的长连流（`workspaceFiles/changes`）与 `session/follow` 共用同一个 `/api/remote.mux` socket，重连时自动重开。迁移的调用点：`@` 提及与 Tab 路径补全（`fileReferences/list`，Host 索引，缺失时回退本地扫描）、文件选择器三栏列表与预览（文本 `read`、图片 `readAll` 并以字节直接解析 PNG/JPEG/GIF/WebP 尺寸，Kitty 传输用 Host 字节）、工作区树列表与预览、溢出/截断输出预览（`[output truncated; full output: <path>]` 指向的 Host 文件）、发送时的 `@` 引用内联与图片字节读取。**not-found 由 Host 判定为权威**：Host 说没有就绝不回退本机同名文件；只有 Host 文件接口不可用（旧协议、未声明命名空间、传输失败）或调用点明确处理本机路径（`$EDITOR` 草稿、`tui-config.json`）时才读本地。
+- **「文件/改动」主窗口标签**：新增 `ChangesPage`（`对话 | 轨迹 | 子代理 | 后台任务 | 文件/改动`，`Shift+Tab` / `Ctrl+H` / `Ctrl+L` 循环或点击标签）。订阅 Host 的 `workspaceFiles/changes`（`ready` 后每帧 `{absolutePath, version|absent:true}`），按路径累积为 `M/A/D` 行（相对工作区路径、大小，payload 带 `±lines`/patch 时一并渲染）；`Enter` 用 `workspaceFiles/read` 分页读取内容（`PgDn` 续读），`h` 返回列表，`r` 重新订阅并重算每行状态，`q`/`Esc` 返回对话，Host 无改动时显示空状态；任何畸形帧都被忽略而不抛错。
+- **非图片附件成为真正的 Host 附件（Item C）**：`fileUploads/upload`（`{agentId, request:{data(base64), name}}` → `{receiptId, file}`）配合 `session/prompt` 的 `{type:"file", receiptId}` 内容块，使任意文件都能随消息上传；Host 缺少该接口时条目退化为原有的「仅元数据」并明确提示。README 的限制说明同步更新。
+
 ### Changed
 
 - `test/api.test.mjs`：按 0.1.5 线格式重写传输断言，新增适配表单测（名称翻译、args/结果包裹、协议探测与 legacy 回退、令牌交换、流式替代、`commands/execute` 的 0.1.2 `images` 兼容重试）；新增 Remote mux 单测（`$events`+`session/control` 订阅与 ready、转发事件/控制帧的翻译表、审批与提问的 `$events/result` 回答、重复事件去重、Host `cancel`、断线退避重连、退出时 `next` 释放、不可达降级、白名单覆盖）。
 - `test/pty-crash.py`：新增 RPC 数据阶段——起一个私有 `dsh --profile web` 实例、经公开 HTTP API 播种一个带唯一标题与消息标记的会话，再用该实例的令牌 attach TUI，断言渲染帧里出现 Host 返回的标题（`session/list`）与消息文本（`session/page`）；新增审批推送阶段——把模型路由指向本地 SSE 桩（`DEEPSEEK_BASE_URL`），桩请求一次 `danger-full-access` 沙箱提权，从而触发真实 `approval/request` waterfall，断言 TUI 渲染出审批弹窗（推送到位）、按下允许后 Host 记录 `allowed-once` 且提权命令真的执行（回答经 `$events/result` 生效）；新增实时流阶段——桩按 ~1s 间隔分 5 段流式输出（唯一头/尾哨兵 + 中间填充），TUI 在 prompt 之前就已 attach，断言**头哨兵出现在渲染帧时尾哨兵尚不存在**、且尾哨兵 ≥2s 之后才出现：0.1.5 不存在任何持久化的半截文本，轮询最早只能在回合提交后一次性画出整段回答，因此「两个分离时刻」只可能来自实时流。
 - `test/api.test.mjs`：新增 `session/follow` 单测（订阅 args、快照→`session/subscribed`+projection+记录、live 记录、assistant-stream 稠密下标去重、中途接入的累积流回放与 `nextIndex` 续接、紧凑流展开、断线重开、切换会话 cancel、restart 重发快照、流出错/不可达/旧协议的一次性降级）。
 - `test/click.test.mjs`：新增实时更新单测——「同一事件被流与轮询各投递一次只应用一次」（两种顺序都覆盖）、乱序/重复 seq 丢弃、`session/event` 帧孪生去重、进程内 chunk 的重投去重与跨尝试重置、follow 健康/不健康/他人会话三种情况下的轮询节奏、会话列表 2s/5s 自适应、`openSession` 订阅跟随与陈旧 epoch 不订阅。
+- `test/host-files.test.mjs`（新增，17 例）：Host 文件客户端与改动页单测——`workspaceFiles/list`/`read`/`readAll`/`fileUploads/upload` 的 args 与返回值映射、缓存与去重、`not-found` 的权威性与「命名空间未声明即停用」、`fileReferences/list` 候选与缓存、改动帧解析（含畸形载荷）、`parseUnifiedPatch`/`listingRows` 的健壮性、改动页空状态/累加/删除后重建/`Enter` 读内容/`r` 刷新、Host patch 的 diff 配色渲染、补全首按异步生效与二次 Tab 循环不再打 Host、以及旧协议下的本地回退与文件选择器本地预览。
+- `test/pty-crash.py`：新增「Host 源文件访问」阶段——TUI 在 bubblewrap 挂载命名空间里运行，把会话工作区路径 bind-mount 到诱饵目录（同名文件、不同内容、缺 Host 独有项），断言 `@` 补全给出本机不存在的 `sub/host-only-file.txt`、`Ctrl+O` 列表出现 Host 独有项、预览显示 Host 内容且从不显示诱饵内容；新增「文件/改动」阶段——桩模型请求一次 `write` 工具调用，Host 经组合文件系统落盘后，已切到该标签的 TUI 帧里出现该文件行（真实 `fs/observed` 帧）。
 
 ## 0.4.4 — 2026-08-26
 

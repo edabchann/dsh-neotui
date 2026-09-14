@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join, basename, extname, dirname } from "node:path";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 
+import { parseChangeFrame, parseUnifiedPatch } from "./host-files.js";
 import { T, THEMES, setTheme, setThemePreview, clearThemePreview, themeName, renderedThemeName } from "./theme.js";
 import { loadTuiConfig, saveTuiConfig, userPrefix, userName, foldDefaults, keyBindings, setKeyBinding, resetKeyBinding } from "./config.js";
 import { validateKeySpec, describeSpec } from "./keybindings.js";
@@ -617,20 +618,36 @@ export class WorkspacePanel extends Widget {
     this.treeScroll.setLines(this.treeLines);
     this.app.redraw();
   }
+  /** List one tree node's children. The workspace lives on the HOST, so this
+   *  asks the Host first and only scans locally for a host without the file
+   *  API (a local read would list this terminal's disk, not the session's). */
   async fillChildren(node) {
-    try {
-      const entries = readdirSync(node.path, { withFileTypes: true })
-        .filter((d) => !d.name.startsWith(".") && d.name !== "node_modules")
-        .sort((a, b) => (a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1));
-      node.children = entries.map((d) => ({
+    const files = this.app?.files;
+    let rows = null;
+    if (files?.usable) {
+      // The Host resolves the session scope from the node path itself, so a
+      // workspace with its own session lists through THAT session's root.
+      const result = await files.list(node.path);
+      if (result.ok) rows = result.value;
+      else rows = [];   // not-found or refused: never a local look-alike
+    }
+    if (rows === null) {
+      try {
+        rows = readdirSync(node.path, { withFileTypes: true })
+          .map((d) => ({ name: d.name, path: join(node.path, d.name), dir: d.isDirectory() }));
+      } catch { rows = []; }
+    }
+    node.children = rows
+      .filter((row) => !row.name.startsWith(".") && row.name !== "node_modules")
+      .sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1))
+      .map((row) => ({
         depth: node.depth + 1,
-        name: d.name,
-        path: join(node.path, d.name),
-        isDir: d.isDirectory(),
+        name: row.name,
+        path: row.path,
+        isDir: row.dir,
         open: false,
-        children: d.isDirectory() ? [] : null,
+        children: row.dir ? [] : null,
       }));
-    } catch { node.children = []; }
   }
   onMouse(ev) {
     if (ev.kind === "press" && ev.button === 2) {
@@ -658,9 +675,9 @@ export class WorkspacePanel extends Widget {
       if (node) {
         if (ev.kind === "press" && ev.button === 0) {
           if (node.isDir) {
-            if (!node.open && (!node.children || node.children.length === 0)) { this.fillChildren(node); }
+            if (!node.open && (!node.children || node.children.length === 0)) { void this.fillChildren(node); }
             this.expand(node);
-          } else if (!node.ws) this.previewFile(node.path);
+          } else if (!node.ws) void this.previewFile(node.path);
           return true;
         }
         if (ev.kind === "wheel-up" || ev.kind === "wheel-down") return this.treeScroll.onMouse(ev);
@@ -684,8 +701,29 @@ export class WorkspacePanel extends Widget {
     };
     return find(this.tree);
   }
-  previewFile(path) {
+  /** Read one file into the right-hand preview pane. The bytes come from the
+   *  HOST when it owns the path; a remote TUI has nothing at that path locally. */
+  async previewFile(path) {
     this.previewPath = path;
+    const files = this.app?.files;
+    if (files?.usable) {
+      const stat = await files.stat(path);
+      const size = stat.ok ? stat.value?.bytes : null;
+      if (Number.isFinite(size) && size > 256 * 1024) {
+        this.preview.setLines([[{ t: `文件过大（${Math.round(size / 1024)}KB），仅预览前 256KB`, fg: K.WARN }]]);
+        this.app.redraw();
+        return;
+      }
+      const page = await files.readText(path, { offset: 1, limit: 300 });
+      if (!page.ok) {
+        const reason = page.missing ? "Host 上没有该文件" : (page.error?.message ?? "Host 文件接口不可用");
+        this.preview.setLines([[{ t: `读取失败: ${reason}`, fg: K.ERR }]]);
+        this.app.redraw();
+        return;
+      }
+      this.#renderPreviewText(path, page.value.text);
+      return;
+    }
     try {
       const st = statSync(path);
       if (st.size > 256 * 1024) {
@@ -697,18 +735,25 @@ export class WorkspacePanel extends Widget {
       const lines = [];
       lines.push([{ t: basename(path), fg: K.ACCENT, bold: true, underline: true }]);
       lines.push([{ t: "" }]);
-      const codeLines = text.split("\n").slice(0, 300);
-      let inFence = false;
-      for (const cl of codeLines) {
-        if (cl.trim().startsWith("```")) { inFence = !inFence; lines.push([{ t: cl, fg: K.FAINT }]); continue; }
-        if (inFence) lines.push([{ t: truncate(cl, this.preview.w - 2), fg: K.DIM, code: true }]);
-        else lines.push([{ t: truncate(cl, this.preview.w - 2), fg: K.TXT }]);
-      }
-      this.preview.setLines(lines);
-      this.app.redraw();
+      this.#renderPreviewText(path, text);
     } catch (e) {
       this.preview.setLines([[{ t: `读取失败: ${e.message}`, fg: K.ERR }]]);
     }
+  }
+  /** Shared markdown-ish preview body (same styling for host and local reads). */
+  #renderPreviewText(path, text) {
+    const lines = [];
+    lines.push([{ t: basename(path), fg: K.ACCENT, bold: true, underline: true }]);
+    lines.push([{ t: "" }]);
+    const codeLines = String(text ?? "").split("\n").slice(0, 300);
+    let inFence = false;
+    for (const cl of codeLines) {
+      if (cl.trim().startsWith("```")) { inFence = !inFence; lines.push([{ t: cl, fg: K.FAINT }]); continue; }
+      if (inFence) lines.push([{ t: truncate(cl, this.preview.w - 2), fg: K.DIM, code: true }]);
+      else lines.push([{ t: truncate(cl, this.preview.w - 2), fg: K.TXT }]);
+    }
+    this.preview.setLines(lines);
+    this.app.redraw();
   }
   render(screen) {
     screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.BG2 });
@@ -754,7 +799,7 @@ export class WorkspacePanel extends Widget {
     if (ev.name === "backspace") { this.query = this.query.slice(0, -1); this.app.redraw(); return true; }
     if (ev.name === "down" && this.query) { this.searchSel = wrapIndex((this.searchSel ?? 0) + 1, this.searchResults?.length ?? 0); this.app.redraw(); return true; }
     if (ev.name === "up" && this.query) { this.searchSel = wrapIndex((this.searchSel ?? 0) - 1, this.searchResults?.length ?? 0); this.app.redraw(); return true; }
-    if (ev.name === "enter" && this.query && this.searchResults?.length) { this.previewFile(this.searchResults[this.searchSel ?? 0]); return true; }
+    if (ev.name === "enter" && this.query && this.searchResults?.length) { void this.previewFile(this.searchResults[this.searchSel ?? 0]); return true; }
     if (ev.name === "up" || ev.name === "down" || ev.name === "pgup" || ev.name === "pgdn") return this.treeScroll.onKey?.(ev) ?? false;
     return false;
   }
@@ -869,9 +914,9 @@ export class AttachmentPanel extends Widget {
   constructor(app) { const w=Math.min(76,app.screen.w-4),h=Math.min(22,app.screen.h-4);super({x:Math.floor((app.screen.w-w)/2),y:Math.floor((app.screen.h-h)/2),w,h});this.app=app;this.sel=0;this.dArmed=false; }
   items(){return this.app.chat?.attachments??[];}
   close(){this.app.overlay=null;this.app.focus(this.app.chat.input);this.app.chat.inputChanged();this.app.redraw();}
-  openItem(external=false){const a=this.items()[this.sel];if(!a)return;if(external){if(!a.path){this.app.toast("这不是本地文件，无法用默认程序定位");return;}try{const cmd=process.platform==="darwin"?"open":"xdg-open";spawn(cmd,[a.path],{detached:true,stdio:"ignore"}).unref();}catch(e){this.app.toast(`打开失败: ${e.message}`);}return;}if(a.mediaType?.startsWith("image/"))this.app.openImage(a,{all:this.items(),index:this.sel,returnTo:this});else if(a.binary)this.app.toast(`仅元数据: ${a.name}${bytesLabel(a.bytes)?` · ${bytesLabel(a.bytes)}`:""} · Host 不支持二进制附件`);else this.app.toast(a.path?`文件: ${a.path}`:"这不是本地文件");}
+  openItem(external=false){const a=this.items()[this.sel];if(!a)return;if(external){if(!a.path){this.app.toast("这不是本地文件，无法用默认程序定位");return;}try{const cmd=process.platform==="darwin"?"open":"xdg-open";spawn(cmd,[a.path],{detached:true,stdio:"ignore"}).unref();}catch(e){this.app.toast(`打开失败: ${e.message}`);}return;}if(a.mediaType?.startsWith("image/"))this.app.openImage(a,{all:this.items(),index:this.sel,returnTo:this});else if(a.receiptId)this.app.toast(`Host 附件: ${a.name}${bytesLabel(a.bytes)?` · ${bytesLabel(a.bytes)}`:""} · 发送时随消息上传`);else if(a.binary)this.app.toast(`仅元数据: ${a.name}${bytesLabel(a.bytes)?` · ${bytesLabel(a.bytes)}`:""} · Host 附件接口不可用`);else this.app.toast(a.path?`文件: ${a.path}`:"这不是本地文件");}
   remove(){const a=this.items()[this.sel];if(!a)return;this.app.chat.attachments.splice(this.sel,1);this.app.chat.clipboardImages=this.app.chat.clipboardImages.filter(x=>x.id!==a.id);this.sel=Math.max(0,Math.min(this.sel,this.items().length-1));this.app.chat.inputChanged();this.app.redraw();}
-  render(s){s.fillRect(this.x,this.y,this.x+this.w-1,this.y+this.h-1," ",{bg:T.BG2});s.box(this.x,this.y,this.x+this.w-1,this.y+this.h-1,{fg:K.ACCENT,bg:T.BG2},"附件管理器");const items=this.items();for(let i=0;i<Math.min(items.length,this.h-3);i++){const a=items[i],on=i===this.sel,y=this.y+1+i;s.fillRect(this.x+1,y,this.x+this.w-2,y," ",{bg:on?T.MENUSEL:T.BG2});const label=`${a.mediaType?.startsWith("image/")?"󰋩":"󰈔"} ${a.name}${a.binary?` · ${bytesLabel(a.bytes)||"?"} · 仅元数据`:""}`;s.text(this.x+2,y,truncate(label,this.w-6),{fg:on?T.SELFG:K.TXT,bg:on?T.MENUSEL:T.BG2});}if(!items.length)s.text(this.x+2,this.y+2,"暂无附件",{fg:K.FAINT,bg:T.BG2});s.text(this.x+2,this.y+this.h-1,"Enter 查看 · Shift+Enter/双击 默认程序 · dd 移除 · Esc 退出",{fg:K.FAINT,bg:T.BG2});}
+  render(s){s.fillRect(this.x,this.y,this.x+this.w-1,this.y+this.h-1," ",{bg:T.BG2});s.box(this.x,this.y,this.x+this.w-1,this.y+this.h-1,{fg:K.ACCENT,bg:T.BG2},"附件管理器");const items=this.items();for(let i=0;i<Math.min(items.length,this.h-3);i++){const a=items[i],on=i===this.sel,y=this.y+1+i;s.fillRect(this.x+1,y,this.x+this.w-2,y," ",{bg:on?T.MENUSEL:T.BG2});const label=`${a.mediaType?.startsWith("image/")?"󰋩":"󰈔"} ${a.name}${a.receiptId?` · ${bytesLabel(a.bytes)||"?"} · Host 附件`:a.binary?` · ${bytesLabel(a.bytes)||"?"} · 仅元数据`:""}`;s.text(this.x+2,y,truncate(label,this.w-6),{fg:on?T.SELFG:K.TXT,bg:on?T.MENUSEL:T.BG2});}if(!items.length)s.text(this.x+2,this.y+2,"暂无附件",{fg:K.FAINT,bg:T.BG2});s.text(this.x+2,this.y+this.h-1,"Enter 查看 · Shift+Enter/双击 默认程序 · dd 移除 · Esc 退出",{fg:K.FAINT,bg:T.BG2});}
   onKey(ev){const ch=ev.type==="text"?ev.text:ev.type==="key"&&ev.name==="char"?ev.key:null;if(ch==="d"){if(this.dArmed){this.dArmed=false;this.remove();}else{this.dArmed=true;this.app.toast("再按 d 删除附件");}return true;}if(ev.type!=="key"){this.dArmed=false;return false;}if(ev.name==="escape"){this.close();return true;}if(ev.name==="up"||(ev.name==="char"&&ev.key==="k")){this.dArmed=false;this.sel=wrapIndex(this.sel-1,this.items().length);return true;}if(ev.name==="down"||(ev.name==="char"&&ev.key==="j")){this.dArmed=false;this.sel=wrapIndex(this.sel+1,this.items().length);return true;}if(ev.name==="enter"){this.dArmed=false;this.openItem(!!ev.shift);return true;}this.dArmed=false;return false;}
   onMouse(ev){if(ev.kind==="press"&&ev.button===0){const i=ev.y-this.y-1;if(i>=0&&i<this.items().length){const now=Date.now();this.sel=i;if(this.lastClick&&now-this.lastClick<400)this.openItem(true);this.lastClick=now;}return true;}return false;}
 }
@@ -5147,6 +5192,310 @@ export class TasksPage extends Widget {
       const line = ev.y - this.view.y + this.view.scrollY;
       const row = this.groups[line];
       if (row?.kind === "item") { this.sel = this.selector.indexOf(row.index); this.openDetail(); }
+      return true;
+    }
+    return this.view.onMouse(ev);
+  }
+}
+
+// ---- 文件/改动 (workspace change feed) ----
+
+/** Status of one observed change, in the order the badge table below reads. */
+const CHANGE_BADGE = { changed: "M", modified: "M", created: "A", added: "A", deleted: "D", removed: "D" };
+const CHANGE_COLOR = { changed: "WARN", modified: "WARN", created: "OK", added: "OK", deleted: "ERR", removed: "ERR" };
+
+/** One relative display path for an absolute Host path (falls back to the
+ *  absolute path when the session workspace does not contain it). */
+function relativeTo(root, path) {
+  if (typeof root !== "string" || root === "" || typeof path !== "string") return path;
+  const base = root.endsWith("/") ? root : `${root}/`;
+  return path.startsWith(base) ? path.slice(base.length) : path;
+}
+
+/** Unified-diff / old-vs-new segments in the TUI's existing diff styling. */
+function diffSegs(width, { patch = null, oldText = null, newText = null } = {}) {
+  const out = [];
+  if (typeof patch === "string" && patch !== "") {
+    for (const line of parseUnifiedPatch(patch)) {
+      const text = truncate(line.text, width);
+      if (line.kind === "add") out.push([{ t: " + ", fg: K.OK }, { t: text, fg: T.GREENG }]);
+      else if (line.kind === "del") out.push([{ t: " - ", fg: K.ERR }, { t: text, fg: T.PINK }]);
+      else if (line.kind === "hunk") out.push([{ t: "   " }, { t: text, fg: K.ACCENT }]);
+      else if (line.kind === "meta") out.push([{ t: "   " }, { t: text, fg: K.FAINT }]);
+      else out.push([{ t: "   " }, { t: text, fg: K.DIM }]);
+    }
+    return out;
+  }
+  if (oldText == null && newText == null) return out;
+  const before = String(oldText ?? "").split("\n");
+  const after = String(newText ?? "").split("\n");
+  const max = Math.max(before.length, after.length);
+  for (let i = 0; i < Math.min(max, 400); i++) {
+    const o = before[i], n = after[i];
+    if (o === n) { out.push([{ t: "   " }, { t: truncate(o ?? "", width), fg: K.DIM }]); continue; }
+    if (o !== undefined) out.push([{ t: " - ", fg: K.ERR }, { t: truncate(o, width), fg: T.PINK }]);
+    if (n !== undefined) out.push([{ t: " + ", fg: K.OK }, { t: truncate(n, width), fg: T.GREENG }]);
+  }
+  return out;
+}
+
+/**
+ * 「文件/改动」: the main-window tab fed by the Host's `workspaceFiles/changes`
+ * Remote stream.
+ *
+ * The live contract (probed on 0.1.5-rc.2) is an OBSERVATION feed, not a diff:
+ * the Host reports `{kind:"ready"}` and then `{kind:"change",
+ * change:{absolutePath, version}|{absolutePath, absent:true}}` for every
+ * instrumented filesystem write inside the session workspace. So this page
+ * accumulates one row per touched path with the status the Host's own frames
+ * imply (first observation 改动, re-observation after an absent notice 新增,
+ * absent 删除) and keeps `insertions`/`deletions`/`patch` whenever a payload
+ * happens to carry them. Enter reads the file's content through
+ * `workspaceFiles/read` (paged), `r` re-subscribes and re-stats every row.
+ * A hostile frame never throws — it is ignored.
+ */
+export class ChangesPage extends Widget {
+  constructor(app) {
+    super({ x: 0, y: 1, w: app.screen.w, h: Math.max(2, app.screen.h - 1) });
+    this.app = app;
+    this.entries = new Map();   // absolute path -> record
+    this.order = [];            // absolute paths, most recent first
+    this.sel = 0;
+    this.watch = null;
+    this.watching = null;
+    this.notice = null;
+    this.detail = null;         // { path, segs, scroll, offset, eof, loading, error }
+    this.view = new ScrollView({ x: this.x, y: this.y, w: this.w, h: this.h, showScrollbar: true });
+  }
+  relayout(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.view.x = x; this.view.y = y; this.view.w = w; this.view.h = h;
+  }
+  /** Opening the tab subscribes the feed; leaving it keeps the rows. */
+  onActivate() { this.ensureWatch(); }
+  root() {
+    const id = this.app.currentSession;
+    return this.app.sessions?.find((s) => s.sessionId === id)?.cwd ?? null;
+  }
+  close() {
+    try { this.watch?.close?.(); } catch { /* already closed */ }
+    this.watch = null;
+    this.watching = null;
+  }
+  /** Subscribe (or re-subscribe) the Host change feed for the active session. */
+  ensureWatch(force = false) {
+    const id = this.app.currentSession ?? null;
+    if (!force && this.watch && this.watching === id) return;
+    this.close();
+    this.watching = id;
+    this.notice = null;
+    if (!id) { this.notice = "先打开一个会话：改动流按会话的工作区订阅"; return; }
+    const files = this.app.files;
+    if (files?.usable !== true) {
+      // Protocol detection may still be in flight at boot: wait for its answer
+      // instead of claiming the surface is missing.
+      const api = files?.app?.api ?? this.app.api;
+      if (api?.protocol == null && typeof api?.detectProtocol === "function") {
+        this.notice = "正在探测 Host 协议…";
+        void api.detectProtocol().then(() => { if (this.watching === id) this.ensureWatch(true); }).catch(() => {});
+        return;
+      }
+      this.notice = "Host 文件接口不可用（旧版 Host）：改动流需要 dsh 0.1.5";
+      return;
+    }
+    this.watch = files.watchChanges(id, {
+      onFrame: (frame) => this.onFrame(frame),
+      onError: (error) => { this.notice = `改动流中断: ${error?.message ?? "unknown"}`; this.watch = null; this.app.redraw(); },
+      onUnavailable: (reason) => { this.notice = `改动流不可用（${reason}）`; this.watch = null; this.app.redraw(); },
+    });
+  }
+  /** One raw `workspaceFiles/changes` frame -> one accumulated row. */
+  onFrame(frame) {
+    const change = parseChangeFrame(frame);
+    if (change === null) return;                    // `ready` or a hostile frame
+    const previous = this.entries.get(change.path);
+    const status = change.status
+      ?? (change.absent ? "deleted" : previous === undefined ? "changed" : previous.status === "deleted" ? "created" : "modified");
+    const record = {
+      path: change.path,
+      rel: relativeTo(this.root(), change.path),
+      status,
+      version: change.version,
+      insertions: change.insertions ?? previous?.insertions,
+      deletions: change.deletions ?? previous?.deletions,
+      patch: change.patch ?? previous?.patch,
+      bytes: previous?.bytes ?? null,
+      at: Date.now(),
+    };
+    this.entries.set(change.path, record);
+    this.order = [change.path, ...this.order.filter((p) => p !== change.path)];
+    if (this.sel >= this.order.length) this.sel = Math.max(0, this.order.length - 1);
+    this.app.redraw();
+    // Size/version refresh is a follow-up, never a render-path request.
+    if (!change.absent) {
+      void this.app.files.stat(change.path).then((result) => {
+        if (!result.ok) return;
+        const size = result.value?.bytes;
+        if (Number.isFinite(size)) { record.bytes = size; this.app.redraw(); }
+      }).catch(() => {});
+    }
+  }
+  /** `r`: re-subscribe the feed and re-stat every known path. */
+  async refresh() {
+    this.ensureWatch(true);
+    this.notice = null;
+    for (const path of [...this.order]) {
+      const record = this.entries.get(path);
+      if (!record) continue;
+      const result = await this.app.files.stat(path);
+      if (result.ok) {
+        record.status = record.status === "deleted" ? "created" : record.status;
+        record.version = result.value?.version ?? record.version;
+        record.bytes = Number.isFinite(result.value?.bytes) ? result.value.bytes : record.bytes;
+      } else if (result.missing) {
+        record.status = "deleted";
+      }
+    }
+    this.app.redraw();
+  }
+  /** Enter: read the file through the Host (paged) and render patch + content. */
+  async openDetail() {
+    const record = this.entry();
+    if (!record) return;
+    this.detail = { path: record.path, rel: record.rel, offset: 1, eof: false, loading: true, error: null, text: null, patch: record.patch ?? null };
+    this.app.redraw();
+    const page = await this.app.files.readText(record.path, { offset: 1, limit: 500 });
+    if (!this.detail || this.detail.path !== record.path) return;
+    this.detail.loading = false;
+    if (page.ok) {
+      this.detail.text = page.value.text;
+      this.detail.offset = (page.value.offset ?? 1) + (page.value.lines ?? 0);
+      this.detail.eof = page.value.eof !== false;
+    } else {
+      this.detail.error = page.missing ? "Host 上没有该文件（可能已删除）" : (page.error?.message ?? "Host 读取失败");
+    }
+    this.app.redraw();
+  }
+  /** Paged loading for a long file (detail view `PgDn`/`J` at the end). */
+  async loadMore() {
+    const detail = this.detail;
+    if (!detail || detail.loading || detail.eof || detail.error) return;
+    detail.loading = true;
+    this.app.redraw();
+    const page = await this.app.files.readText(detail.path, { offset: detail.offset, limit: 500 });
+    if (this.detail !== detail) return;
+    detail.loading = false;
+    if (page.ok) {
+      detail.text = `${detail.text ?? ""}${detail.text ? "\n" : ""}${page.value.text}`;
+      detail.offset = (page.value.offset ?? detail.offset) + (page.value.lines ?? 0);
+      detail.eof = page.value.eof !== false;
+    } else {
+      detail.eof = true;
+      detail.error = page.error?.message ?? "Host 读取失败";
+    }
+    this.app.redraw();
+  }
+  entry() { return this.entries.get(this.order[this.sel]) ?? null; }
+  #rows() {
+    const rows = [];
+    const width = Math.max(20, this.w - 6);
+    if (this.order.length === 0) {
+      rows.push([{ t: "  尚未观察到文件改动", fg: K.FAINT }]);
+      rows.push([{ t: "  Host 只上报会话工作区内的插入式文件操作（write/edit 工具等）；r 重新订阅", fg: K.FAINT }]);
+      return rows;
+    }
+    this.order.forEach((path, idx) => {
+      const record = this.entries.get(path);
+      if (!record) return;
+      const selected = idx === this.sel;
+      const fg = selected ? T.SELFG : K.TXT;
+      const bg = selected ? T.MENUSEL : -1;
+      const badge = CHANGE_BADGE[record.status] ?? "?";
+      const counts = Number.isFinite(record.insertions) || Number.isFinite(record.deletions)
+        ? ` +${record.insertions ?? 0}/-${record.deletions ?? 0}`
+        : "";
+      const size = Number.isFinite(record.bytes) ? ` · ${bytesLabel(record.bytes)}` : "";
+      rows.push([
+        { t: ` ${badge} `, fg: K[CHANGE_COLOR[record.status] ?? "WARN"], bg, bold: true },
+        { t: truncate(`${record.rel}${counts}${size}`, width - 4), fg, bg, bold: selected },
+      ]);
+    });
+    return rows;
+  }
+  #detailRows() {
+    const detail = this.detail;
+    const width = Math.max(20, this.w - 8);
+    const rows = [];
+    const badge = CHANGE_BADGE[this.entry()?.status] ?? "?";
+    rows.push([{ t: `${badge} ${detail.rel}`, fg: K.ACCENT, bold: true, underline: true }]);
+    rows.push([{ t: "" }]);
+    if (detail.loading && detail.text === null) rows.push([{ t: "  读取中…", fg: K.FAINT }]);
+    if (detail.error) rows.push([{ t: `  ${detail.error}`, fg: K.ERR }]);
+    if (detail.patch) {
+      rows.push([{ t: "  Host 提供的改动", fg: K.DIM }]);
+      rows.push(...diffSegs(width, { patch: detail.patch }));
+      rows.push([{ t: "" }]);
+    }
+    if (detail.text !== null) {
+      rows.push([{ t: "  文件内容（Host 读取）", fg: K.DIM }]);
+      const lines = detail.text.split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        rows.push([{ t: `${String(i + 1).padStart(4)} `, fg: K.FAINT }, { t: truncate(lines[i], width), fg: K.TXT }]);
+      }
+      rows.push([{ t: detail.eof ? "  （文件末尾）" : "  …PgDn 继续读取", fg: K.FAINT }]);
+    }
+    return rows;
+  }
+  render(screen) {
+    screen.fillRect(this.x, this.y, this.x + this.w - 1, this.y + this.h - 1, " ", { bg: T.BG });
+    const title = this.detail
+      ? ` 文件/改动 · ${this.detail.rel}`
+      : ` 文件/改动（${this.order.length}）${this.watching ? ` · 会话 ${String(this.watching).slice(0, 8)}` : ""}${this.watch ? " · 已订阅 Host 改动流" : ""}`;
+    screen.text(this.x + 1, this.y, truncate(title, Math.max(10, this.w - 2)), { fg: K.ACCENT, bold: true });
+    this.view.setLines(this.detail ? this.#detailRows() : this.#rows());
+    this.view.render(screen);
+    if (this.notice) screen.text(this.x + 1, this.y + this.h - 2, truncate(` ${this.notice}`, Math.max(10, this.w - 2)), { fg: K.WARN });
+    const foot = this.detail
+      ? " j/k 滚动 · PgDn 加载更多 · h 返回列表 · q/Esc 返回聊天"
+      : " ↑↓ 选择 · Enter 查看内容/diff · r 刷新 · q/Esc 返回聊天";
+    screen.text(this.x + 1, this.y + this.h - 1, foot, { fg: K.FAINT });
+  }
+  onKey(ev) {
+    if (ev.type !== "key") return false;
+    if (this.detail) {
+      // q/Esc are the App's "back to chat" keys for every pane; the detail view
+      // closes with h/Backspace so both levels stay reachable.
+      if (ev.name === "backspace" || (ev.name === "char" && ev.key === "h")) { this.detail = null; this.app.redraw(); return true; }
+      if (ev.name === "down" || (ev.name === "char" && ev.key === "j")) { this.view.scroll(1); this.app.redraw(); return true; }
+      if (ev.name === "up" || (ev.name === "char" && ev.key === "k")) { this.view.scroll(-1); this.app.redraw(); return true; }
+      if (ev.name === "pgdn") {
+        // Already at the last rendered line: pull the next Host page instead.
+        if (!this.view.scroll(this.view.h)) void this.loadMore();
+        this.app.redraw();
+        return true;
+      }
+      if (ev.name === "pgup") { this.view.scroll(-this.view.h); this.app.redraw(); return true; }
+      if (ev.name === "char" && ev.key === "g") { this.view.scroll(-this.view.lines.length); this.app.redraw(); return true; }
+      if (ev.name === "char" && ev.key === "G") { this.view.scroll(this.view.lines.length); this.app.redraw(); return true; }
+      return false;
+    }
+    if (ev.name === "up" || ev.name === "down") {
+      if (this.order.length === 0) return false;
+      this.sel = wrapIndex(this.sel + (ev.name === "up" ? -1 : 1), this.order.length);
+      this.app.redraw();
+      return true;
+    }
+    if (ev.name === "enter") { void this.openDetail(); return true; }
+    if (ev.name === "char" && ev.key === "r") { void this.refresh(); return true; }
+    if (ev.name === "pgup") { this.view.scroll(-this.view.h); this.app.redraw(); return true; }
+    if (ev.name === "pgdn") { this.view.scroll(this.view.h); this.app.redraw(); return true; }
+    return false;
+  }
+  onMouse(ev) {
+    if (ev.type === "mouse" && ev.kind === "press" && ev.button === 0) {
+      if (this.detail) return true;
+      const line = ev.y - this.view.y + this.view.scrollY;
+      if (line >= 0 && line < this.order.length) { this.sel = line; void this.openDetail(); }
       return true;
     }
     return this.view.onMouse(ev);

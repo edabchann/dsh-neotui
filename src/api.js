@@ -580,6 +580,11 @@ export class Api {
     // The ACTIVE session's `session/follow` subscription (null = none). It rides
     // the same mux socket, so it is re-opened per socket generation.
     this.follow = null;
+    // Extra logical Remote streams the UI subscribes to (workspaceFiles/changes
+    // and anything else opened through `subscribeRemote`). They ride the SAME
+    // mux socket, so they are re-opened with each socket generation.
+    this.remoteSubs = new Set();
+    this.remoteSubById = new Map();
     this.#cursorBySession = new Map();
     this.#selectionBySession = new Map();
     this.#degraded = new Set();
@@ -857,6 +862,96 @@ export class Api {
 
   /** Session the open follow stream belongs to (null when none). */
   get followSessionId() { return this.follow?.sessionId ?? null; }
+
+  /**
+   * Subscribe one extra logical Remote stream on the shared mux socket.
+   *
+   * `session/follow` is the transcript; the UI also needs side channels such as
+   * `workspaceFiles/changes` (a stream Remote: `{kind:"ready"}` first, then one
+   * frame per observed workspace write). Rather than give each one its own
+   * socket, every subscription rides the connection `connectMux()` maintains:
+   *
+   *   - registered before the socket is up: opened as soon as it connects;
+   *   - a reconnect re-opens it (the mux generation owns the streamIds);
+   *   - a host that never answers the mux reports `onUnavailable` once.
+   *
+   * `handlers` = `{onItem, onError, onEnd, onUnavailable}`; every callback is
+   * isolated so a consumer fault never kills the live socket.
+   * @returns {{streamId:string|null, close:()=>void}}
+   */
+  subscribeRemote(endpoint, args = {}, handlers = {}) {
+    const sub = { endpoint, args: args ?? {}, handlers: handlers ?? {}, streamId: null, closed: false };
+    this.remoteSubs.add(sub);
+    const handle = this.#subHandle(sub);
+    if (this.closed) return handle;
+    if (this.protocol === PROTOCOL_LEGACY) {
+      queueMicrotask(() => this.#subUnavailable(sub, "legacy host"));
+      return handle;
+    }
+    if (this.connectionState.mux.connected && this.muxWs !== null) this.#openSub(sub);
+    else if (this.connectionState.mux.unsupported) queueMicrotask(() => this.#subUnavailable(sub, "remote mux unavailable"));
+    else void this.#connectWhenReady("mux");
+    return handle;
+  }
+
+  /** Public handle of one subscription (closes through the owning instance). */
+  #subHandle(sub) {
+    return {
+      get streamId() { return sub.streamId; },
+      close: () => {
+        if (sub.closed) return;
+        sub.closed = true;
+        this.#closeSub(sub);
+        this.remoteSubs.delete(sub);
+      },
+    };
+  }
+
+  #subUnavailable(sub, reason) {
+    if (sub.closed || sub.unavailable === true) return;
+    sub.unavailable = true;
+    sub.streamId = null;
+    try { sub.handlers.onUnavailable?.(reason); } catch (error) { this.log(`[api] ${sub.endpoint} onUnavailable threw: ${error?.message ?? error}`); }
+  }
+
+  #openSub(sub) {
+    if (sub.closed || this.muxWs === null) return;
+    const streamId = mintId("stream");
+    try {
+      this.muxWs.send(JSON.stringify({ type: "open", streamId, endpoint: sub.endpoint, payload: { args: sub.args } }));
+    } catch (error) {
+      this.log(`[api] ${sub.endpoint} stream open failed: ${error.message}`);
+      this.#subUnavailable(sub, error.message);
+      return;
+    }
+    sub.streamId = streamId;
+    this.remoteSubById.set(streamId, sub);
+  }
+
+  #closeSub(sub) {
+    const streamId = sub.streamId;
+    if (streamId !== null) {
+      this.remoteSubById.delete(streamId);
+      try { this.muxWs?.send?.(JSON.stringify({ type: "cancel", streamId })); } catch { /* socket already gone */ }
+      sub.streamId = null;
+    }
+  }
+
+  #dropSubs() {
+    for (const sub of this.remoteSubs) sub.streamId = null;
+    this.remoteSubById.clear();
+  }
+
+  /** One frame for a UI-owned subscription (never throws into the socket). */
+  #onSubFrame(sub, frame) {
+    try {
+      if (frame.type === "item") sub.handlers.onItem?.(frame.value);
+      else if (frame.type === "error") sub.handlers.onError?.(frame.error ?? { message: `${sub.endpoint} failed` });
+      else if (frame.type === "end") sub.handlers.onEnd?.();
+    } catch (error) {
+      this.log(`[api] ${sub.endpoint} handler threw: ${error?.message ?? error}`);
+    }
+  }
 
   /**
    * Subscribe the ACTIVE session's live transcript.
@@ -1250,6 +1345,9 @@ export class Api {
         this.follow.broken = false;
         this.#openFollow();
       }
+      // UI-owned side streams (e.g. workspaceFiles/changes) belong to this
+      // socket generation too: reopen each one so a reconnect resumes the feed.
+      for (const sub of this.remoteSubs) this.#openSub(sub);
       this.log("[api] remote mux connected ($events + session/control)");
       this.#publishConnectionState();
     };
@@ -1272,6 +1370,7 @@ export class Api {
         this.follow.attemptId = null;
         this.follow.nextIndex = 0;
       }
+      this.#dropSubs();
       this.#publishConnectionState();
       if (this.closed || state.unsupported) return;
       if (!state.everOpened) {
@@ -1301,6 +1400,8 @@ export class Api {
       else if (frame.type === "end") this.#failFollow("流已结束");
       return;
     }
+    const sub = this.remoteSubById.get(streamId);
+    if (sub !== undefined) { this.#onSubFrame(sub, frame); return; }
     if (streamId === this.remoteState.events) {
       if (frame.type === "item") this.#onRemoteEvent(frame.value);
       else if (frame.type === "error") this.#onRemoteStreamError("$events", frame.error);
@@ -1390,6 +1491,8 @@ export class Api {
     // The Host-event channel rides the same socket on 0.1.5, so it is gone too.
     host.unsupported = true;
     this.degrade("live-streams", `实时事件流不可用（${reason}），改为轮询刷新`);
+    for (const sub of [...this.remoteSubs]) this.#subUnavailable(sub, reason);
+    this.remoteSubById.clear();
     if (this.follow !== null) {
       // The live transcript used the same socket: fall back to the poll cadence
       // the UI kept before the stream existed (one notice, never per tick).

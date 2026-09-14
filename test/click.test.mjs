@@ -1811,19 +1811,47 @@ test("prettyJson helpers reformat only parseable object/array dumps", async () =
   assert.equal(looksLikeJson("```json\n{}\n```"), false, "code fences are never reformatted");
 });
 
-test("non-image files attach as metadata-only entries instead of being skipped", () => {
+test("non-image files become real Host attachments, with metadata-only as the fallback", async () => {
   const dir = mkdtempSync(join(tmpdir(), "tui-file-"));
   const path = join(dir, "notes.txt");
   writeFileSync(path, "hello");
+  const tick = () => new Promise((r) => setTimeout(r, 10));
+
+  // A host without the upload surface (or a legacy one): metadata-only row.
   const app = headlessApp();
   app.showFilePicker();
   app.overlay.onUpload([{ path, name: "notes.txt", kind: "text" }]);
+  await tick();
   const meta = app.chat.attachments.find((a) => a.binary);
-  assert.ok(meta, "non-image file becomes a metadata entry");
+  assert.ok(meta, "non-image file becomes a metadata entry when the Host cannot store it");
   assert.equal(meta.bytes, 5);
   assert.equal(meta.data, undefined, "no payload is carried");
-  assert.equal(app.chat.clipboardImages.length, 0, "never queued for upload");
-  assert.ok(app.toastMsg?.includes("仅显示元数据"), app.toastMsg);
+  assert.equal(app.chat.clipboardImages.length, 0, "never queued as an inline image");
+  assert.ok(app.toastMsg?.includes("仅元数据"), app.toastMsg);
+
+  // A 0.1.5 host: the file is uploaded and carried by its receipt.
+  const hosted = headlessApp();
+  hosted.currentSession = "s1";   // uploads are Session-addressed on the Host
+  const uploads = [];
+  Object.defineProperty(hosted.api, "modern", { get: () => true });
+  hosted.api.callModern = async (wire, args) => {
+    if (wire === "workspaceFiles/readAll") return { absolutePath: path, offset: 0, eof: true, data: Buffer.from("hello").toString("base64") };
+    if (wire === "fileUploads/upload") {
+      uploads.push(args);
+      return { receiptId: "receipt-1", file: { attachmentId: "sha256:abc", name: args.request.name, bytes: 5 } };
+    }
+    throw Object.assign(new Error(`unexpected ${wire}`), { code: "gateway/lookup-not-found" });
+  };
+  hosted.showFilePicker();
+  hosted.overlay.onUpload([{ path, name: "notes.txt", kind: "text" }]);
+  await tick();
+  const entry = hosted.chat.attachments.find((a) => a.receiptId === "receipt-1");
+  assert.ok(entry, "the Host receipt is kept on the attachment");
+  assert.equal(entry.binary, undefined, "a stored attachment is not metadata-only");
+  assert.equal(uploads.length, 1, "one fileUploads/upload call");
+  assert.equal(uploads[0].request.name, "notes.txt");
+  assert.equal(Buffer.from(uploads[0].request.data, "base64").toString(), "hello", "bytes came from the Host read");
+  assert.ok(hosted.toastMsg?.includes("Host 附件"), hosted.toastMsg);
 });
 
 test("AttachmentPanel shows binary entries with metadata only", () => {
@@ -5045,6 +5073,8 @@ test("Ctrl+Left/Right toggles window focus; Tab toggles too while Shift+Tab cycl
   app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
   assert.equal(app.mainTab, "tasks", "Shift+Tab → 后台任务");
   app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "changes", "Shift+Tab → 文件/改动");
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
   assert.equal(app.mainTab, "chat", "tab cycle wraps to chat");
   // A full-screen buffer is modal: window/tab keys are owned by the buffer
   // until Esc, then window switching works again — buffers never fight it.
@@ -5082,6 +5112,8 @@ test("tab cycling reaches every tab and collapses the list window when the sideb
   app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
   assert.equal(app.mainTab, "tasks");
   app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "changes", "文件/改动 tab reached without a session");
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
   assert.equal(app.mainTab, "chat", "tab cycle wraps to chat");
   // Backtab from the list window focuses the main window first, then cycles a tab
   app.focusedWindow = "list"; app.focus(app.sidebar);
@@ -5096,13 +5128,13 @@ test("tab cycling reaches every tab and collapses the list window when the sideb
   assert.equal(app.focusedWindow, "main", "Ctrl+Left cannot reach a hidden list window");
 });
 
-test("the main-window tab strip renders all four tabs and the Shift+Tab key hint", () => {
+test("the main-window tab strip renders all five tabs and the Shift+Tab key hint", () => {
   const app = headlessApp(); app.currentSession = "s";
   app.layout();
   app.renderFrame();
   // toPlain() pads CJK wide glyphs with spaces, so compare space-agnostically.
   const row0 = (app.screen.toPlain().split("\n")[0] ?? "").replace(/\s+/g, "");
-  for (const label of ["对话", "轨迹", "子代理", "后台任务"]) {
+  for (const label of ["对话", "轨迹", "子代理", "后台任务", "文件/改动"]) {
     assert.ok(row0.includes(label), `tab strip renders ${label}`);
   }
   assert.ok(row0.includes("Shift+Tab"), "tab strip shows the Shift+Tab key hint");
@@ -5760,6 +5792,8 @@ test("Ctrl+T matches nothing; Ctrl+G opens the GoalPanel; Ctrl+Right toggles win
   assert.equal(app.mainTab, "subagent", "then subagent");
   app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
   assert.equal(app.mainTab, "tasks", "then 后台任务");
+  app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
+  assert.equal(app.mainTab, "changes", "then 文件/改动");
   app.onEvent({ type: "key", name: "backtab", ctrl: false, shift: true });
   assert.equal(app.mainTab, "chat", "then wraps to chat");
   // Each tab renders its own content in the main area

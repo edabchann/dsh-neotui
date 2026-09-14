@@ -377,6 +377,59 @@ export class Input extends Widget {
     }
     this.#edit(at, at, text);
   }
+  /**
+   * The workspace-relative query for a typed directory spelling, or null when
+   * the token addresses something the Host's workspace-root-relative file index
+   * cannot answer (`/abs`, `~`, `..`): those stay genuinely local.
+   */
+  #hostQuery(dirDisplay) {
+    let value = String(dirDisplay ?? "");
+    while (value.startsWith("./")) value = value.slice(2);
+    if (value === "." ) return "";
+    if (value.startsWith("/") || value.startsWith("~") || value.split("/").includes("..")) return null;
+    return value;
+  }
+
+  /**
+   * Candidate names for one directory, from the HOST when it can answer.
+   *
+   *  - `string[]`  candidates (directories keep a trailing "/")
+   *  - `"pending"` the Host query is in flight; `retry` runs the completion
+   *                again once it lands, so the first Tab press still completes
+   *  - `null`      the Host cannot answer here — the caller scans locally
+   *
+   * The Host owns the workspace, so a remote deployment never sees this
+   * machine's files; a host that answers "no candidates" is trusted (no local
+   * fallback) — only an unusable/failed host surface falls back.
+   */
+  #hostNames(dirDisplay, token, retry) {
+    const files = this.app?.files;
+    if (files?.usable !== true) return null;
+    if (this.#hostQuery(dirDisplay) === null) return null;   // /abs, ~, .. → local
+    const query = String(token ?? "");
+    const cached = files.peekRefs(query);
+    if (cached === null) {
+      // First Tab for this token: ask the Host, then complete from its answer.
+      const snapshot = this.value;
+      void files.references(query).then((result) => {
+        if (this.value !== snapshot) return;                 // the user kept typing
+        if (result.ok) retry();
+      }).catch(() => {});
+      return "pending";
+    }
+    // The Host echoes the typed directory prefix in every candidate path, so
+    // the name is what follows it — exactly what the insertion code expects.
+    const prefix = String(dirDisplay ?? "");
+    const names = [];
+    for (const item of cached) {
+      if (!item || typeof item.path !== "string") continue;
+      const relative = item.path.startsWith(prefix) ? item.path.slice(prefix.length) : item.path;
+      if (relative === "") continue;
+      names.push(item.dir === true ? `${relative}/` : relative);
+    }
+    return names;
+  }
+
   /** @-mention completion: the token after "@" is completed against the
    *  session cwd (dir scans stay bounded); Tab cycles the candidates. */
   #completeAtMention() {
@@ -391,17 +444,38 @@ export class Input extends Widget {
     const dirPart = slash < 0 ? root : (token.startsWith("/") || token.startsWith(".") || token.startsWith("~") ? token.slice(0, slash) : join(root, token.slice(0, slash)));
     const base = token.slice(slash + 1);
     const dirResolved = token.startsWith("~") ? join(homedir(), dirPart.slice(1)) : dirPart;
-    let names = [];
-    try {
-      names = readdirSync(dirResolved, { withFileTypes: true })
-        .filter((e) => e.name.startsWith(base) && (base.startsWith(".") ? e.name.startsWith(".") : !e.name.startsWith(".")))
-        .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
-        .slice(0, 12)
-        .map((e) => `${e.isDirectory() ? e.name + "/" : e.name}`);
-    } catch { names = []; }
-    if (!names.length) { this.atCands = []; return false; }
-    if (this.atLast === this.value && this.atCands.length > 1) this.atIdx = (this.atIdx + 1) % this.atCands.length;
-    else { this.atCands = names; this.atIdx = 0; }
+    // An unchanged line with a candidate list already in hand only CYCLEs: no
+    // Host round trip, exactly like the local scan used to behave.
+    const cycling = this.atLast === this.value && this.atCands.length > 1;
+    if (!cycling) {
+      // Host-indexed candidates first: `fileReferences/list` is the Host's own
+      // @-mention surface (`[{path, kind}]`, workspace-root relative).
+      const hosted = this.#hostNames(token.slice(0, slash + 1), token, () => this.#completeAtMention());
+      if (hosted === "pending") return true;
+      let names;
+      if (hosted !== null) {
+        names = hosted.slice(0, 12);
+      } else {
+        names = [];
+        try {
+          names = readdirSync(dirResolved, { withFileTypes: true })
+            .filter((e) => e.name.startsWith(base) && (base.startsWith(".") ? e.name.startsWith(".") : !e.name.startsWith(".")))
+            .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
+            .slice(0, 12)
+            .map((e) => `${e.isDirectory() ? e.name + "/" : e.name}`);
+        } catch { names = []; }
+      }
+      // Falling back to the live value's own list when it is already complete.
+      if (!names.length) {
+        if (this.atCands.length === 1 && this.atCands[0] === (slash >= 0 ? token.slice(slash + 1) : token)) return false;
+        this.atCands = [];
+        return false;
+      }
+      this.atCands = names;
+      this.atIdx = 0;
+    } else {
+      this.atIdx = (this.atIdx + 1) % this.atCands.length;
+    }
     const name = this.atCands[this.atIdx];
     const dirDisplay = slash >= 0 ? token.slice(0, slash + 1) : "";
     const repl = `@${dirDisplay}${name}`;
@@ -443,18 +517,32 @@ export class Input extends Widget {
     }
     if (dirPart.startsWith("~")) dirPart = join(homedir(), dirPart.slice(1));
     if (!isAbsolute(dirPart)) dirPart = join(root, dirPart);
-    let names = [];
-    try {
-      names = readdirSync(dirPart, { withFileTypes: true })
-        .filter((e) => e.name.startsWith(base) && (base.startsWith(".") ? e.name.startsWith(".") : !e.name.startsWith(".")))
-        .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
-        .map((e) => e.isDirectory() ? e.name + "/" : e.name);
-    } catch { names = []; }
-    if (!names.length) { this.fileCands = []; this.fileLast = null; return false; }
+    // An unchanged line with candidates in hand only cycles (see the mention path).
     if (this.fileLast === this.value && this.fileCands.length > 1) {
-      // unedited: cycle through the already-listed candidates
       this.fileIdx = (this.fileIdx + 1) % this.fileCands.length;
     } else {
+      // The typed spelling's directory part doubles as the Host query; `/abs`
+      // and `~` tokens stay local (the Host index is workspace-root relative).
+      const typedDir = (() => {
+        const cut = token.lastIndexOf("/");
+        if (cut < 0) return "";
+        return token.slice(0, cut + 1);
+      })();
+      const hosted = this.#hostNames(typedDir, token, () => this.#completeFile());
+      if (hosted === "pending") return true;
+      let names;
+      if (hosted !== null) {
+        names = hosted;
+      } else {
+        names = [];
+        try {
+          names = readdirSync(dirPart, { withFileTypes: true })
+            .filter((e) => e.name.startsWith(base) && (base.startsWith(".") ? e.name.startsWith(".") : !e.name.startsWith(".")))
+            .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
+            .map((e) => e.isDirectory() ? e.name + "/" : e.name);
+        } catch { names = []; }
+      }
+      if (!names.length) { this.fileCands = []; this.fileLast = null; return false; }
       this.fileCands = names;
       this.fileIdx = 0;
     }

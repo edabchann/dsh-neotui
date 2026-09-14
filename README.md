@@ -11,8 +11,9 @@
 
 ## 0.2.0 亮点
 
-- 三栏 Yazi 风格文件与工作区选择器：路径编辑、模糊筛选、隐藏项、Nerd Font 图标和 Kitty 图片预览；
-- 图片附件栏、附件管理器、`dd` 删除和等比例 Kitty 预览；
+- 三栏 Yazi 风格文件与工作区选择器：路径编辑、模糊筛选、隐藏项、Nerd Font 图标和 Kitty 图片预览；列表、预览与 `@` 补全全部通过 `workspaceFiles/*` / `fileReferences/list` 走 **Host**，远端 attach 时看到的就是 Host 的文件系统；
+- 「文件/改动」主窗口标签：订阅 Host `workspaceFiles/changes`，按路径列出 `M/A/D`，`Enter` 读取内容（长文件分页、带 patch 时按 diff 配色），`r` 重新订阅；
+- 图片附件栏、附件管理器、`dd` 删除和等比例 Kitty 预览；非图片文件经 `fileUploads/upload` 成为真正的 Host 附件（以 `receiptId` 随消息发送）；
 - 全屏跨会话全文搜索：工作区→会话→匹配块树、附近内容预览和精确跳转；
 - NORMAL / INSERT / VISUAL 只读模式、正文块选择与可编辑的快捷键目录；
 - 独立的命令、设置和插件目录，插件支持即时筛选；
@@ -136,7 +137,7 @@ node bin/dsh-tui.js --base http://127.0.0.1:3080
 | `Ctrl+.` | 显示/隐藏隐藏项 |
 | `Esc` | 关闭 |
 
-附件管理器支持 `Enter` 预览、`Shift+Enter` 或双击用默认程序打开、`dd` 删除。当前 Host 内容协议只接受文本和图片：非图片文件不会发送，选择后仅作为元数据条目（名称 / 大小 / 类型，标记「仅元数据」）显示在附件列表，绝不伪装成可发送附件。
+附件管理器支持 `Enter` 预览、`Shift+Enter` 或双击用默认程序打开、`dd` 删除。图片以 `{type:"image"}` 内联内容块随消息发送；**非图片文件在 dsh 0.1.5 Host 上会成为真正的 Host 附件**：TUI 通过 `fileUploads/upload`（`{agentId, request:{data, name}}`）把文件字节上传到 Host，拿到 `receiptId` 后以 `{type:"file", receiptId}` 随 `session/prompt` 发送，Host 在收件时校验该回执。只有 Host 缺少该接口（0.1.5 以前的旧 Host）时，条目才退化为「仅元数据」（名称 / 大小 / 类型），绝不伪装成可发送附件。
 
 Kitty graphics 可用时，图片在文件选择器和附件预览中等比例显示；否则回退到 MIME、尺寸和文件大小信息。
 
@@ -209,6 +210,14 @@ Kitty graphics 可用时，图片在文件选择器和附件预览中等比例�
 | `/goal` | Goal 面板 |
 
 Host 提供的 `/compact`、`/export`、`/feedback`、`/plan` 等命令会动态出现在命令页；实际清单以当前 Host 的 `commands/list` 为准。
+
+### 主窗口标签与「文件/改动」
+
+主窗口标签为 `对话 | 轨迹 | 子代理 | 后台任务 | 文件/改动`，由 `Shift+Tab`（结构键）、`Ctrl+H` / `Ctrl+L` 循环，也可直接点击标签行。
+
+「文件/改动」订阅 Host 的 `workspaceFiles/changes` 流（`{kind:"ready"}` 后每个被观测到的写入产生一帧 `{kind:"change", change:{absolutePath, version|absent:true}}`），按路径累积成一行：`M`/`A`/`D` 状态、相对工作区路径、大小（payload 带 `±lines` 或 patch 时一并显示）。`↑/↓` 选择，`Enter` 用 `workspaceFiles/read` 从 Host 分页读取该文件内容（`PgDn` 加载下一页；payload 带 patch 时按现有 diff 配色渲染），`h`/`Backspace` 返回列表，`r` 重新订阅并重新 `stat` 每一行，`q`/`Esc` 返回对话；Host 没有观测到任何改动时显示空状态。
+
+所有文件读取都走 Host：文件选择器的目录列表与预览（`workspaceFiles/list`、`workspaceFiles/read`、图片字节 `readAll`）、`@` 提及与路径补全（`fileReferences/list`，Host 索引）、工作区树、溢出输出预览、附件字节。因此 TUI 挂在远端 Host 上时看到的就是 Host 的文件系统，而不是本机磁盘上同名文件；只有 `$EDITOR` 草稿和 `tui-config.json` 这类**本机**文件仍直接读本地。列表/预览结果带 TTL 异步缓存与请求去重，渲染与按键不会每帧重打 Host。
 
 ## 面板与工具卡
 
@@ -302,9 +311,10 @@ node bin/dsh-tui.js --script test/smoke.script --plain
 - TUI 与 Host 必须使用兼容的事件、RPC 和内容块契约；
 - **工作区/归档没有推送**：Host 不广播工作区变更（`$events` 白名单只有 `api-session/*` 与 `commands/change`），其它客户端或守护进程改动分组/归档时，TUI 只能靠定时刷新感知（`会话列表` 聚焦 ~2s、其余 ~5s），本机操作则立即刷新；
 - **`session/follow` 的基线回放是进程内状态**：回合进行中接入会话时，已生成文本来自 Host 进程内的累积流；若此时 Host 进程重启，该回合剩余文本只能等 `assistant/message` 落地后才出现（Host 侧限制，TUI 无法补出已丢失的增量）；
-- 当前 Host 协议只接受文本与图片内容块，没有通用二进制附件通道：非图片文件一律不发送，仅在附件列表显示元数据（名称/大小/类型，标记「仅元数据」）；工具结果若含原始二进制字节（NUL/控制字符），工具卡同样只显示二进制数据元数据而不渲染字节（这是 Host 侧协议限制，TUI 无法单独扩展）；
+- **二进制附件依赖 dsh 0.1.5**：非图片文件通过 `fileUploads/upload` + `{type:"file", receiptId}` 成为真正的 Host 附件；旧 Host 没有该通道时，条目退化为「仅元数据」（名称/大小/类型）且不会发送；工具结果若含原始二进制字节（NUL/控制字符），工具卡同样只显示二进制数据元数据而不渲染字节（Host 侧协议限制，TUI 无法单独扩展）；
+- **文件改动流只覆盖 Host 插入式写入**：`workspaceFiles/changes` 转发的是 `fs/observed`（Host 组合文件系统上的写入/编辑工具等）。子进程、shell 命令或用户编辑器直接改文件不会产生任何帧（实测确认），因此「文件/改动」页只显示本会话内被 Host 观测到的改动；
 - Kitty 图片效果受终端实现、cell 尺寸和复用器支持影响；
-- 超长工具输出由 Host 截断并给出本地恢复路径：TUI 检测 `[output truncated; full output: <path>]` / `stored at: <path>` 类提示，在工具卡内显示完整输出文件，选中该块后 `Ctrl+R` 菜单可 `host.openPath` 打开、复制路径；本地部署（TUI 与 Host 同机）还可选择「TUI 内预览完整输出」直接滚动查看文件内容（上限 256 KB / 500 行）。恢复路径是 Host 本地的，远端 TUI 无法直接读取文件内容（需要 Host 新增结构化恢复字段/文件读取 RPC）；
+- 超长工具输出由 Host 截断并给出恢复路径：TUI 检测 `[output truncated; full output: <path>]` / `stored at: <path>` 类提示，在工具卡内显示完整输出文件，选中该块后 `Ctrl+R` 菜单可 `host.openPath` 打开、复制路径；「TUI 内预览完整输出」通过 `workspaceFiles/read` 从 **Host** 读取该文件（上限 500 行），因此远端部署同样可用，只有 Host 上没有该文件时才回退到本机同路径读取；
 - 可编辑快捷键覆盖配置已持久化并经过校验；输入/编辑/全局快捷键均已接入动态 dispatch，`Esc` 退出输入、`Ctrl+Q` 退出与审批弹窗 `y/n` 等安全键保持固定语义。
 
 ## 代码结构
@@ -319,7 +329,8 @@ src/keybindings.js  可编辑快捷键注册表（每个功能主/备两个槽�
 src/widgets.js      Input、Popup、ScrollView、Menu、StatusBar
 src/views.js        App、ChatView、会话树和主路由
 src/panels.js       Workspace、Trajectory、Queue、Jobs、Settings
-src/file-picker.js  三栏文件/目录选择器与图片预览
+src/file-picker.js  三栏文件/目录选择器与图片预览（列表/预览走 Host）
+src/host-files.js   Host 文件访问（workspaceFiles/*、fileReferences/*、改动流、附件上传）与异步缓存
 app/                DSH bundle 与 Cordis patch
 ```
 
