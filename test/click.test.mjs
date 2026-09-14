@@ -5546,6 +5546,37 @@ test("subagent/jobs/queue/trajectory keybindings are freed (main-area panes repl
   assert.equal(kb.goal.key, "Ctrl+G");
 });
 
+test("approval popup answers plain y/n text events (no CSI-u terminals)", () => {
+  const app = headlessApp();
+  app.currentSession = "s1";
+  app.sessions = [{ sessionId: "s1", agentPreset: "standard" }];
+  const answered = [];
+  app.api.respond = (rpcId, payload) => { answered.push({ rpcId, payload }); return Promise.resolve({ ok: true }); };
+  const popup = new ApprovalPopup({ app, frame: { sessionId: "s1", approvalId: "a1", rpcId: "r1", toolName: "bash", reason: "需要越权" } });
+  app.overlay = popup;
+  // plain "y" arrives as a text event in a non-kitty terminal
+  assert.equal(popup.onKey({ type: "text", text: "y" }), true, "text y handled");
+  assert.equal(answered.length, 1, "answer dispatched through api.respond");
+  assert.equal(answered[0].payload?.outcome, "allowed-once");
+  // and "n" rejects
+  const popup2 = new ApprovalPopup({ app, frame: { sessionId: "s1", approvalId: "a2", rpcId: "r2", toolName: "bash", reason: "需要越权" } });
+  app.overlay = popup2;
+  popup2.onKey({ type: "text", text: "n" });
+  assert.equal(answered.length, 2);
+  assert.equal(answered[1].payload?.outcome, "rejected");
+  app.overlay = null;
+});
+
+test("generic popup buttons accept (y)/(n) accelerator letters", () => {
+  const app = headlessApp();
+  const hits = [];
+  const popup = new Popup({ x: 0, y: 0, w: 30, h: 6, title: "确认", lines: [], buttons: [{ label: "是 (y)", action: "yes" }, { label: "否 (n)", action: "no" }], onAction: (b) => hits.push(b.action) });
+  assert.equal(popup.onKey({ type: "text", text: "y" }), true, "text accelerator");
+  assert.equal(popup.onKey({ type: "key", name: "char", key: "n", ctrl: false, alt: false }), true, "char accelerator");
+  assert.equal(popup.onKey({ type: "text", text: "z" }), false, "unknown letter ignored");
+  assert.deepEqual(hits, ["yes", "no"], "buttons activated in order");
+});
+
 test("Ctrl+W opens the small workspace picker and moves the current session", async () => {
   const app = headlessApp();
   app.currentSession = "s";

@@ -3716,6 +3716,13 @@ export class ApprovalPopup extends Popup {
     else this.app.closePopup();
   }
   onKey(ev) {
+    // Plain y/n arrive as text events in terminals without CSI-u/kitty support.
+    if (ev.type === "text") {
+      const ch = String(ev.text ?? "").trim().toLowerCase();
+      if (ch === "y") { this.#answer(this.buttons[0]); return true; }
+      if (ch === "n") { this.#answer(this.buttons[1]); return true; }
+      return false;
+    }
     if (ev.type !== "key") return false;
     if (ev.name === "char" && (ev.key === "y" || ev.key === "Y") && !ev.ctrl && !ev.alt) { this.#answer(this.buttons[0]); return true; }
     if (ev.name === "char" && (ev.key === "n" || ev.key === "N") && !ev.ctrl && !ev.alt) { this.#answer(this.buttons[1]); return true; }

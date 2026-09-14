@@ -988,7 +988,21 @@ export class Popup extends Widget {
     }
     return false;
   }
+  /** Activate a button whose label carries a "(y)"-style accelerator letter
+   *  from either a text event (non-CSI-u terminals) or a char key event. */
+  #accelerator(ev) {
+    const ch = ev.type === "text" ? String(ev.text ?? "").trim().toLowerCase()
+      : (ev.name === "char" && !ev.ctrl && !ev.alt ? String(ev.key ?? "").toLowerCase() : "");
+    if (ch.length !== 1) return false;
+    const idx = this.buttons.findIndex((b) => new RegExp(`\\(${ch}\\)`, "i").test(String(b?.label ?? "")));
+    if (idx < 0) return false;
+    this.btnIdx = idx;
+    this.onAction?.(this.buttons[idx], idx);
+    return true;
+  }
   onKey(ev) {
+    if (ev.type !== "key" && ev.type !== "text") return false;
+    if (this.#accelerator(ev)) return true;
     if (ev.type !== "key") return false;
     if (this.scrollable) {
       if (ev.name === "up") { this.scrollY = Math.max(0, this.scrollY - 1); return true; }
