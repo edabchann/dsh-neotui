@@ -21,10 +21,12 @@ function tuiCommand() {
     .option("--session <id>", "open this session on start")
     .option("--cwd <path>", "working directory for sessions created from the TUI")
     .option("--attach <url-or-port>", "attach to a RUNNING host instead of booting one (coexists with the web UI; e.g. --attach 3080)")
+    .option("--token <token>", "host launch token for --attach (0.1.5 fences /api; also DSH_TUI_TOKEN)")
     .addHelpText("after", `
 Examples:
   dsh --profile dsh-neotui                          open the TUI on its own host
   dsh --profile dsh-neotui --attach 3080            attach to the web UI's host (side-by-side debugging)
+  dsh --profile dsh-neotui --attach 3080 --token <t>  attach with the host's printed launch token
   dsh --profile dsh-neotui --session <id>           resume one session
   dsh --profile dsh-neotui --cwd ~/work             default directory for new sessions
 `);
@@ -46,6 +48,7 @@ export function apply(ctx) {
       ...(options.session !== undefined ? { session: options.session } : {}),
       ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
       ...(options.attach !== undefined ? { attach: options.attach } : {}),
+      ...(options.token !== undefined ? { token: options.token } : {}),
     });
   });
   parseCmdline(ctx, program);

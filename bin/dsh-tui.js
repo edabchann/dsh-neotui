@@ -3,6 +3,7 @@
 // Usage:
 //   dsh-tui                        interactive mode (needs a real terminal)
 //   dsh-tui --base http://host:port
+//   dsh-tui --base http://host:port --token <launch-token>   (0.1.5 hosts fence /api)
 //   dsh-tui --launcher-anime       opt-in white fade-in boot animation
 //   dsh-tui --script <file>        scripted mode: feed events from a file, dump frames
 //   dsh-tui --plain                with --script: dump plain text frames (no ANSI)
@@ -20,6 +21,9 @@ const opt = (name, dflt) => {
 const has = (name) => args.includes(name);
 
 const base = opt("--base", opt("--attach", process.env.DSH_URL || process.env.DSH_WEB_URL || "http://127.0.0.1:3080"));
+// A 0.1.5 host fences /api behind a launch token: --token / DSH_TUI_TOKEN, or
+// a `?token=` in the base URL, is exchanged for the browser-session cookie.
+const token = opt("--token", process.env.DSH_TUI_TOKEN || undefined);
 const log = (...a) => console.error("[dsh-tui]", ...a);
 let activeTerm = null;
 
@@ -34,8 +38,9 @@ async function main() {
   // (DSH_TUI_LAUNCHER_ANIME=1 works too); it stays OFF by default.
   const launcherAnime = has("--launcher-anime") || process.env.DSH_TUI_LAUNCHER_ANIME === "1";
   const screen = new Screen(process.stdout.columns || 80, process.stdout.rows || 24);
-  const api = new Api({ base, log, onFrame: () => {}, onHostFrame: () => {} });
+  const api = new Api({ base, token, log, onFrame: () => {}, onHostFrame: () => {} });
   const app = new App({ screen, term: null, api, log, launcherAnime });
+  api.onDegrade = (kind, message) => app.toast(message);
   const term = new Term({
     output: process.stdout,
     kitty: detectKitty(),
@@ -65,8 +70,9 @@ async function runScripted(scriptFile) {
   const plain = has("--plain");
   const out = new FakeOutput();
   const screen = new Screen(100, 30);
-  const api = new Api({ base, log, onFrame: () => {}, onHostFrame: () => {} });
+  const api = new Api({ base, token, log, onFrame: () => {}, onHostFrame: () => {} });
   const app = new App({ screen, term: { output: out, write: (s) => out.write(s) }, api, log });
+  api.onDegrade = (kind, message) => app.toast(message);
   const events = readFileSync(scriptFile, "utf8")
     .split("\n")
     .map((l) => l.trim())

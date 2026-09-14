@@ -4433,7 +4433,12 @@ export class App {
     try {
       const [list, workspaces] = await Promise.all([
         this.api.call("session.list"),
-        this.api.call("workspace.list").catch(() => ({ items: [], archivedSessionIds: [] })),
+        this.api.call("workspace.list").catch((error) => {
+          // 0.1.5 removed workspace/list; its replacement (workspace/follow) may
+          // still be missing on a stripped host. Sessions then render ungrouped.
+          this.api.degrade?.("workspace-list", `工作区分组不可用（${error?.message ?? error}），已按「未分组」显示`);
+          return { items: [], archivedSessionIds: [] };
+        }),
       ]);
       if (seq !== this.refreshSessionsSeq) return;
       this.sessions = [...list.items].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));

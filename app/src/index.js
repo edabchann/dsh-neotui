@@ -31,14 +31,28 @@ function normalizeAttach(raw) {
 
 export function apply(ctx) {
   const startup = ctx.tuiStartup;
+  const resolveBase = async () => {
+    if (startup.attach) return normalizeAttach(startup.attach);
+    const webServer = ctx.webServer;
+    if (webServer === undefined) throw new Error("tui-runtime: no embedded webserver and no --attach target");
+    return `http://127.0.0.1:${await waitForPort(webServer)}`;
+  };
   const dispose = launchTui({
     log: (...args) => ctx.logger.warn(...args),
     resume: startup.session,
-    getBase: async () => {
-      if (startup.attach) return normalizeAttach(startup.attach);
-      const webServer = ctx.webServer;
-      if (webServer === undefined) throw new Error("tui-runtime: no embedded webserver and no --attach target");
-      return `http://127.0.0.1:${await waitForPort(webServer)}`;
+    token: startup.token ?? process.env.DSH_TUI_TOKEN,
+    getBase: resolveBase,
+    // Self-host mode: the connection row mints this process's launch token, so
+    // the TUI can authenticate to its own /api exactly like a browser would.
+    // Attach mode has no local authority over the target host: --token /
+    // DSH_TUI_TOKEN is the only honest source.
+    getToken: async () => {
+      if (startup.token !== undefined) return startup.token;
+      if (startup.attach) return process.env.DSH_TUI_TOKEN;
+      const connection = ctx.get("connection");
+      const authenticated = connection?.authenticatedUrl?.(await resolveBase());
+      if (typeof authenticated !== "string") return undefined;
+      try { return new URL(authenticated).searchParams.get("token") ?? undefined; } catch { return undefined; }
     },
   });
   ctx.on("dispose", dispose);

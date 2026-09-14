@@ -11,6 +11,8 @@ import { mkdirSync, appendFileSync } from "node:fs";
  * @param {object} opts
  * @param {string} [opts.base]     fixed API base URL
  * @param {() => Promise<string>} [opts.getBase]  resolve the base before init (e.g. wait for the embedded webserver port)
+ * @param {string} [opts.token]    host launch token (0.1.5 fences /api behind one)
+ * @param {() => Promise<string>} [opts.getToken] resolve the token lazily (self-host mode mints it in-process)
  * @param {string} [opts.resume]   session id to open on start
  * @param {function} [opts.log]
  * @returns {() => void} disposer (restores the terminal and exits)
@@ -22,8 +24,11 @@ export function launchTui(opts = {}) {
     process.exit(1);
   }
   const screen = new Screen(process.stdout.columns || 80, process.stdout.rows || 24);
-  const api = new Api({ base: opts.base ?? "http://127.0.0.1:1", log, onFrame: () => {}, onHostFrame: () => {} });
+  const api = new Api({ base: opts.base ?? "http://127.0.0.1:1", token: opts.token, log, onFrame: () => {}, onHostFrame: () => {} });
   const app = new App({ screen, term: null, api, log, launcherAnime: opts.launcherAnime ?? process.env.DSH_TUI_LAUNCHER_ANIME === "1" });
+  // Protocol-level degradations (unavailable workspace list / live streams /
+  // missing token) surface once as a toast instead of a silent stall.
+  api.onDegrade = (kind, message) => app.toast(message);
   const term = new Term({
     output: process.stdout,
     kitty: detectKitty(),
@@ -48,6 +53,8 @@ export function launchTui(opts = {}) {
   (async () => {
     try {
       if (opts.getBase) api.base = await opts.getBase();
+      if (opts.getToken) api.token = (await opts.getToken()) ?? api.token;
+      if (opts.token) api.token = opts.token;
       await app.init();
       if (opts.resume) await app.openSession(opts.resume);
       app.redraw();

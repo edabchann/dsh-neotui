@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **dsh 0.1.5 协议适配（双协议）**：`src/api.js` 的 `call()`/`rpcCall()` 内新增 wire 级适配层——方法名翻译表（`session.history→session/page`、`agentPreset.*→agentPresets.*`、`skill.list→skills/list`、`subagent.*→subagents.*`、`host.listDirectory→directoryPicker/list`、`host.describe→session/modelCatalog`、`goal.*→goals/*` 等）、args 包裹（`payload:{args:{...}}`，含 `session/list` 的 `_request`、其余 `request` 包裹、`subagent.prompt` 补 `requestId`/`delivery`、`session.prompt` 补 `requestId`）与返回值还原（`records→events`、`{providers}`、`{models}`、`{ref}` 等）。连接后自动探测协议（先试 0.1.5 形式，404/未声明端点回退 legacy），`protocol` 缓存；legacy 路径保持 0.1.2 及更早的旧行为不变（点号方法名 + 平铺 payload）。
+- **`workspace.list` 替代**：0.1.5 移除了该端点，改由 `/api/remote.mux` 的 `workspace/follow` 流首帧 `baseline`（`{items, archivedSessionIds}`）还原；`session.history`（含 `subagent.history`）改由 `session/follow` 首帧快照 + `session/page` 游标分页实现（游标取自 `session/list` 的 `projections.asOfSeq` 或快照 cursor）。
+- **Host 访问令牌支持**：0.1.5 的 `/api` 需要浏览器会话 cookie，`--token` / `DSH_TUI_TOKEN` / base URL 的 `?token=` 会先做根路径令牌交换再携带 cookie（HTTP 与 WebSocket 均携带）；自托管模式下由 connection 行的 `authenticatedUrl` 自动注入。tui profile 新增 `--token` 选项。
+- **降级提示**：0.1.5 已移除 `/api/events.mux`、`/api/events.host` 事件下行，首次异常关闭后停止重连并一次性 toast 提示改为轮询刷新；工作区分组不可用时一次性提示并按「未分组」渲染；缺少令牌时提示 `--token`。
+
+### Changed
+
+- `test/api.test.mjs`：按 0.1.5 线格式重写传输断言，新增适配表单测（名称翻译、args/结果包裹、协议探测与 legacy 回退、令牌交换、流式替代、`commands/execute` 的 0.1.2 `images` 兼容重试）。
+- `test/pty-crash.py`：新增 RPC 数据阶段——起一个私有 `dsh --profile web` 实例、经公开 HTTP API 播种一个带唯一标题与消息标记的会话，再用该实例的令牌 attach TUI，断言渲染帧里出现 Host 返回的标题（`session/list`）与消息文本（`session/page`）。
+
 ## 0.4.4 — 2026-08-26
 
 ### Fixed

@@ -48,11 +48,20 @@ dsh --profile dsh-neotui --host 127.0.0.1 --port 3981
 dsh --profile dsh-neotui --attach 3080
 ```
 
+dsh 0.1.5 起 Host 的 `/api` 需要访问令牌（令牌随 `dsh web` 启动时打印的 URL 一起给出）。attach 到这类 Host 时补上 `--token`（或设 `DSH_TUI_TOKEN`，或把令牌写进 `--base` 的 `?token=`）：
+
+```bash
+dsh --profile dsh-neotui --attach 3080 --token <launch-token>
+```
+
+自托管模式（不带 `--attach`）由进程内的 connection 行自动注入令牌，无需手动指定。客户端在连接后会探测 Host 版本：旧版（≤0.1.2）走点号方法名 + 平铺 payload，0.1.5 走 `namespace/method` + `args`。
+
 也可以直接运行客户端：
 
 ```bash
 node bin/dsh-tui.js
 node bin/dsh-tui.js --base http://127.0.0.1:3080
+node bin/dsh-tui.js --base http://127.0.0.1:3080 --token <launch-token>
 ```
 
 默认连接 `http://127.0.0.1:3080`；可通过 `--base`、`DSH_URL` 或 `DSH_WEB_URL` 覆盖。`--attach` 不会启动或替换 WebUI。
