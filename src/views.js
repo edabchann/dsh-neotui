@@ -580,7 +580,10 @@ function applyEvent(nodes, event, view, log, state = null) {
           // TTFT anchor: the first streamed token of the step.
           if (st.firstTokenAt === undefined) st.firstTokenAt = event.time ?? Date.now();
           const b = node.blocks[ch.index ?? 0];
-          if (b) b.text = (b.text ?? "") + (ch.delta ?? "");
+          // 0.1.5's live StreamChunk names the fragment `text` (the legacy
+          // fixture vocabulary called it `delta`); accept both so the follow
+          // stream's assistant-stream chunks render unchanged.
+          if (b) b.text = (b.text ?? "") + (ch.delta ?? ch.text ?? "");
         } else if (ch.type === "usage") {
           st.lastUsage = ch.usage ?? null;
         } else if (ch.type === "reasoning-delta") {
@@ -808,6 +811,16 @@ export function nodeForEvents(events, log) {
 }
 
 const SEEN_TYPES = new Set();
+
+// Live-update cadences. The `session/follow` stream is the primary transcript
+// path; the tail poll stays as a slow reconciliation net while it is healthy and
+// keeps its original per-tick cadence when it is not (legacy host, dead mux).
+const FOLLOW_SAFETY_POLL_MS = 15000;
+// session.list costs ~100ms per call: refresh the sidebar fast while the user is
+// actually working in the 会话列表 window, and at the long-standing ~5s otherwise.
+// (0.1.5 forwards no workspace event, so there is no push to lean on.)
+const LIST_REFRESH_FOCUSED_MS = 2000;
+const LIST_REFRESH_MS = 5000;
 
 function partsToImages(content) {
   if (!Array.isArray(content)) return null;
@@ -1392,6 +1405,11 @@ export class ChatView extends Widget {
     this.running = false;
     this.hasMore = false;
     this.loadingOlder = false;
+    this.polling = false;      // one tail poll in flight at a time
+    this.pollSlow = false;     // >4000 fresh events: back the tick off to 2s
+    this.pollAt = 0;           // last tail-poll attempt (safety-net gate)
+    this.lastSeq = null;       // THE live cursor: highest applied durable seq
+    this.streamCursor = null;  // {attemptId, nextIndex}: applied assistant-stream chunks
     this.minSeq = null;
     this.earliestTime = null;  // earliest loaded event time ≈ session start
     this.view = new ScrollView({
@@ -1448,33 +1466,98 @@ export class ChatView extends Widget {
   }
 
   /** Queue a rebuild; flushed on the next frame render (throttles streaming). */
-  /** Merge freshly arrived events (mux frames) into the tail INCREMENTALLY —
-   *  each event mutates this.nodes directly via the same applyEvent the
-   *  full-window re-derivation uses, so a lone reasoning-delta appends to the
-   *  existing block instead of wiping it (the old "shows then deleted" bug). */
+  /**
+   * THE cursor guard shared by every live source.
+   *
+   * Both the `session/follow` stream and the polling safety net hand their
+   * records to this one function, which accepts a record only when its durable
+   * `event.seq` strictly advances `this.lastSeq`. An event delivered by both
+   * sources — or re-delivered after a reconnect — is therefore applied at most
+   * once, no matter which source wins the race, and an out-of-order seq can
+   * never rewind the transcript.
+   *
+   * Records WITHOUT a seq are process-local assistant-stream chunks: their
+   * identity is the attempt's dense `stream.index` (carried by the wire client),
+   * guarded here against re-delivery by a second cursor. `open()` resets that
+   * cursor with the transcript, because a rebuilt transcript needs the replayed
+   * baseline again.
+   * @returns {object[]} the accepted subset (empty when nothing is new)
+   */
+  acceptRecords(records) {
+    const accepted = [];
+    for (const record of records ?? []) {
+      const seq = record?.event?.seq;
+      if (Number.isFinite(seq)) {
+        if (seq <= (this.lastSeq ?? -1)) continue;
+        this.lastSeq = seq;
+        accepted.push(record);
+        continue;
+      }
+      const stream = record?.stream;
+      if (stream !== undefined && typeof stream.attemptId === "string" && Number.isFinite(stream.index)) {
+        const cursor = this.streamCursor;
+        if (cursor !== null && cursor.attemptId === stream.attemptId) {
+          if (stream.index < cursor.nextIndex) continue; // duplicate / stale chunk
+          cursor.nextIndex = stream.index + 1;
+        } else {
+          this.streamCursor = { attemptId: stream.attemptId, nextIndex: stream.index + 1 };
+        }
+      }
+      accepted.push(record);
+    }
+    return accepted;
+  }
+
+  /** Merge freshly arrived events (follow stream / mux frames) into the tail
+   *  INCREMENTALLY — each event mutates this.nodes directly via the same
+   *  applyEvent the full-window re-derivation uses, so a lone reasoning-delta
+   *  appends to the existing block instead of wiping it (the old "shows then
+   *  deleted" bug). Always routed through acceptRecords: this is the one place
+   *  a live record may touch the transcript.
+   *  @returns {number} how many records were accepted (0 = all duplicates). */
   mergeEvents(entries) {
+    const fresh = this.acceptRecords(entries);
+    if (fresh.length === 0) return 0;
     const beforeDiving = this.divingHeight();
-    for (const { event, view } of entries) {
+    for (const { event, view } of fresh) {
       applyEvent(this.nodes, event, view, this.app.log, this.stepState);
     }
     this.running = this.nodes.some((n) => (n.kind === "assistant" || n.kind === "turn-progress") && n.streaming);
     if (beforeDiving !== this.divingHeight()) this.inputChanged();
     this.queueRebuild();
+    return fresh.length;
   }
 
-  /** Poll the tail of the open session (mux live path is unreliable). */
+  /**
+   * Safety-net gate for the tail poll. While the `session/follow` stream is
+   * healthy for the open session it is the primary live path, so the poll only
+   * reconciles on a slow cadence; whenever the stream is unavailable
+   * (legacy host, unreachable mux, stream error) the ORIGINAL per-tick cadence
+   * is preserved untouched.
+   */
+  pollTailTick(now = Date.now()) {
+    if (!this.sessionId || this.polling) return;
+    const api = this.app.api;
+    const followed = api?.followActive === true && api?.followSessionId === this.sessionId;
+    if (followed && now - this.pollAt < FOLLOW_SAFETY_POLL_MS) return;
+    void this.pollTail();
+  }
+
+  /** Poll the tail of the open session (safety net under the follow stream). */
   async pollTail() {
     if (!this.sessionId || this.polling) return;
     const sessionId = this.sessionId;
     const epoch = this.app.sessionEpoch;
     this.polling = true;
+    this.pollAt = Date.now();
     try {
       const hist = await this.app.api.call("session.history", { sessionId, maxMessages: 1 });
       if (this.sessionId !== sessionId || this.app.sessionEpoch !== epoch) { this.polling = false; return; }
       const events = hist.events ?? [];
-      const fresh = events.filter((e) => e.event.seq > (this.lastSeq ?? -1));
+      // Same guard as the follow stream: an event already applied live is not
+      // "fresh" here, so the safety net can never double-apply one.
+      const fresh = this.acceptRecords(events);
       if (fresh.length === 0) { this.polling = false; return; }
-      this.lastSeq = fresh[fresh.length - 1].event.seq;
       if (fresh.length > 4000) this.pollSlow = true;
       this.syncTail(events);
     } catch {
@@ -1641,6 +1724,7 @@ export class ChatView extends Widget {
       this.minSeq = hist.events[0]?.event?.seq ?? null;
       this.lastSeq = hist.events[hist.events.length - 1]?.event?.seq ?? null;
       this.lastSyncedSeq = -1;
+      this.streamCursor = null; // a rebuilt transcript needs the baseline replay again
       this.pollSlow = false;
       this.hasMore = hist.hasMore;
       this.#noteEarliest(hist.events);
@@ -3781,6 +3865,8 @@ export class App {
     this.currentModel = null;   // session-scoped { provider, model, reasoningEffort }
     this.sessionEpoch = 0;
     this.refreshSessionsSeq = 0;
+    this.lastListRefresh = 0;   // pollTick: adaptive sidebar refresh clock
+    this.lastPollFocus = null;  // pollTick: focus-window transition detection
     this.searchSeq = 0;
     this.connState = "connecting";
     this.tokenUsage = null;
@@ -4382,16 +4468,36 @@ export class App {
   #startPolling() {
     // Self-rescheduling so the interval actually tracks run state (a fixed
     // setInterval would freeze at the idle 1500ms forever).
-    let ticks = 0;
     const tick = () => {
-      if (this.chat.sessionId) this.chat.pollTail();
-      // session.list is expensive (~100ms); refresh the sidebar every ~5s, not
-      // on every streaming poll.
-      if (ticks++ % 10 === 0) { this.refreshSessions(); this.refreshSubagentStats(); this.notifyPaneLive("subagent"); }
-      const delay = this.chat.pollSlow ? 2000 : (this.chat.running ? 500 : 1500);
+      const delay = this.pollTick();
       this.pollTimer = setTimeout(tick, delay);
     };
     this.pollTimer = setTimeout(tick, 500);
+  }
+
+  /** session.list is expensive (~100ms) and 0.1.5 forwards no workspace event,
+   *  so the list refreshes on a timer: fast while the 会话列表 window holds
+   *  focus, otherwise the long-standing ~5s. */
+  listRefreshMs() { return this.focusedWindow === "list" ? LIST_REFRESH_FOCUSED_MS : LIST_REFRESH_MS; }
+
+  /**
+   * One polling tick. The live transcript rides `session/follow`, so this only
+   * gates the tail-poll safety net (ChatView.pollTailTick) and drives the
+   * adaptive session-list refresh; entering the 会话列表 window refreshes at
+   * once, because that is the moment the user actually reads it.
+   * @returns {number} delay (ms) until the next tick.
+   */
+  pollTick(now = Date.now()) {
+    this.chat.pollTailTick(now);
+    const enteredList = this.focusedWindow === "list" && this.lastPollFocus !== "list";
+    this.lastPollFocus = this.focusedWindow;
+    if (enteredList || now - this.lastListRefresh >= this.listRefreshMs()) {
+      this.lastListRefresh = now;
+      this.refreshSessions();
+      this.refreshSubagentStats();
+      this.notifyPaneLive("subagent");
+    }
+    return this.chat.pollSlow ? 2000 : (this.chat.running ? 500 : 1500);
   }
 
   async init() {
@@ -5089,6 +5195,14 @@ export class App {
     }
     await this.chat.open(sessionId, epoch);
     if (epoch !== this.sessionEpoch || sessionId !== this.currentSession) return;
+    // Live transcript: the durable `session/follow` stream replaces the tail
+    // poll as the primary path. Every switch/resume/reload funnels through here,
+    // so an older subscription is always replaced — and a stale open (epoch
+    // already superseded) never reaches this line, so it can never re-point the
+    // stream at a session the UI has left. `restart` re-snapshots the same
+    // session: the fresh baseline replays an in-flight attempt into the
+    // transcript this open just rebuilt.
+    this.api.followSession?.(sessionId, { restart: true });
     this.chat.input?.setValue(this.draftsBySession.get(sessionId) ?? "");
     // A sidebar Enter intentionally preserves sidebar focus, but every
     // session-scoped panel must immediately follow the newly opened session.

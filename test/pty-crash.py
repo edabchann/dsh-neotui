@@ -325,13 +325,24 @@ STUB_TOOL_ARGS = {
 }
 
 
-def start_stub_llm():
-    """Serve a deterministic streaming chat/completions stub; return (server, port)."""
+def start_stub_llm(stream_deltas=None, stream_delay=1.0):
+    """Serve a deterministic streaming chat/completions stub; return (server, port).
+
+    With `stream_deltas` (a list of strings) the stub streams exactly those
+    content deltas `stream_delay` seconds apart — the slow stream phase 4 needs
+    to prove text is rendered BEFORE the turn commits.
+    """
     import http.server
     import threading
 
     def chunks(payload):
         model = payload.get("model") or "stub-model"
+        if stream_deltas is not None:
+            out = [{"id": "stub", "object": "chat.completion.chunk", "created": 0, "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}]
+            for part in stream_deltas:
+                out.append({"id": "stub", "object": "chat.completion.chunk", "created": 0, "model": model, "choices": [{"index": 0, "delta": {"content": part}, "finish_reason": None}]})
+            out.append({"id": "stub", "object": "chat.completion.chunk", "created": 0, "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+            return out
         saw_tool_result = any(message.get("role") == "tool" for message in payload.get("messages", []))
         if saw_tool_result:
             return [
@@ -372,6 +383,9 @@ def start_stub_llm():
             self.end_headers()
             for chunk in chunks(payload):
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                if stream_deltas is not None:
+                    time.sleep(stream_delay)
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
 
@@ -493,6 +507,126 @@ def approval_phase(env):
         server.server_close()
 
 
+# ---- phase 4: live assistant deltas must reach the rendered frame ----------
+
+"""
+dsh 0.1.5 persists NO `assistant/chunk` event: during a turn the durable log only
+gains the settlement event (`assistant/message`) after the model stream ends, so
+the tail-poll can render an answer only once the turn is already over. Text that
+appears in the frame WHILE the stub is still streaming therefore proves the
+`session/follow` Remote stream (mode:"stream", assistantStream:true) drives the
+transcript. Phase 4 asserts exactly that timeline:
+
+  * the stub streams a unique head sentinel, filler pieces, then a unique tail
+    sentinel, ~1.2s apart (a ~10s window, longer than the attach/settle time);
+  * the TUI is attached BEFORE the prompt, so the deltas arrive live;
+  * the head sentinel must be on screen while the tail sentinel is still absent,
+    and the tail must follow >= 2s later. A poll-only client could paint the
+    whole answer at commit time and nothing before it, so two separated moments
+    cannot come from the poll.
+
+The sentinels exist because the renderer is a cell diff: a delta's characters
+are written contiguously, but different rows/updates interleave in the raw byte
+stream, so a long contiguous marker would not survive a naive substring search.
+"""
+
+HEAD_SENTINEL = "ZQXJKV"
+TAIL_SENTINEL = "WMPZQK"
+STREAM_DELAY = 1.2
+
+
+def stream_phase(env):
+    """Phase 4: assistant deltas must render before the turn commits."""
+    filler = secrets.token_hex(6).upper()
+    # Head sentinel first, tail sentinel last: the streaming window (~10s) stays
+    # comfortably longer than the attach+settle time, so the head is always
+    # observed well before the tail.
+    deltas = [HEAD_SENTINEL, *[filler[index:index + 2] for index in range(0, len(filler), 2)], TAIL_SENTINEL]
+    server, stub_port = start_stub_llm(stream_deltas=deltas, stream_delay=STREAM_DELAY)
+    process, port, token, log = boot_private_host(
+        extra_env={"DEEPSEEK_BASE_URL": f"http://127.0.0.1:{stub_port}", "DEEPSEEK_API_KEY": "stub-key"},
+        log_name="web-stream.log",
+    )
+    if process is None:
+        server.shutdown()
+        return None, b""
+    import threading
+
+    try:
+        session_id = api_session(port, token, "session/create", {"request": {"cwd": REPO}})["sessionId"]
+        api_session(port, token, "session/rename", {"request": {"sessionId": session_id, "title": "PTYSTREAM"}})
+
+        def fire_prompt():
+            # Attach first, then prompt: the deltas must arrive live over the
+            # follow stream instead of being re-read from the durable log.
+            time.sleep(9)
+            try:
+                api_session(port, token, "session/prompt", {"request": {
+                    "requestId": f"pty-stream-{secrets.token_hex(6)}",
+                    "sessionId": session_id,
+                    "mode": "queue",
+                    "content": [{"type": "text", "text": "stream the marker"}],
+                }})
+            except Exception as error:  # noqa: BLE001 - reported through the checks
+                print(f"NOTE: stream prompt failed: {type(error).__name__}: {error}")
+
+        threading.Thread(target=fire_prompt, daemon=True).start()
+        seen = {"head_at": None, "head_had_tail": None, "tail_at": None}
+
+        def drive(fd, out, drain, set_size):
+            set_size(60, 150)
+            drain(6, out)
+            deadline = time.time() + 40
+            while time.time() < deadline:
+                drain(0.2, out)
+                text = plain(b"".join(out))
+                if seen["head_at"] is None and HEAD_SENTINEL in text:
+                    seen["head_at"] = time.time()
+                    seen["head_had_tail"] = TAIL_SENTINEL in text
+                if seen["tail_at"] is None and TAIL_SENTINEL in text:
+                    seen["tail_at"] = time.time()
+                    if seen["head_at"] is not None:
+                        break
+            drain(2, out)
+
+        raw_bytes = run_pty(
+            ["dsh", "--profile", "tui", "--attach", f"http://127.0.0.1:{port}", "--token", token, "--session", session_id],
+            env, 60, 150, drive, 5,
+        )
+        raw = raw_bytes.decode("utf-8", "replace")
+        text = plain(raw_bytes)
+        span = None if (seen["head_at"] is None or seen["tail_at"] is None) else seen["tail_at"] - seen["head_at"]
+        if span is not None:
+            print(f"NOTE: head sentinel rendered {span:.2f}s before the tail sentinel")
+        checks = {
+            "alternate screen entered": "\x1b[?1049h" in raw,
+            "no runtime fatal": not any(term in raw for term in ("TypeError", "RangeError", "Cannot find package", "plugin(s) failed to load", "fatal:")),
+            "no live-stream fallback toast": "实时事件流不可用" not in text and "会话实时流不可用" not in text,
+            # The head delta was on screen while the tail delta did not exist yet:
+            # only a live stream can paint a partial answer.
+            "streamed delta rendered mid-turn (follow stream)": seen["head_at"] is not None and seen["head_had_tail"] is False,
+            "later deltas completed the answer in-frame": seen["tail_at"] is not None,
+            "deltas rendered over time, not in one poll": span is not None and span >= 2.0,
+        }
+        return checks, raw_bytes
+    except Exception as error:  # noqa: BLE001 - any harness fault is a test failure
+        print(f"NOTE: stream phase aborted: {type(error).__name__}: {error}")
+        return {"stream phase completed": False}, b""
+    finally:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        if log is not None:
+            log.close()
+        server.shutdown()
+        server.server_close()
+
+
 def main():
     live = port_open(HOST, PORT)
     if not live:
@@ -535,12 +669,23 @@ def main():
             if not ok:
                 failed.append(name)
 
+    stream_checks, stream_capture = stream_phase(env)
+    if stream_checks is None:
+        print("NOTE: the private host did not boot; live-stream assertions were skipped")
+    else:
+        capture = stream_capture
+        print(f"captured {len(stream_capture)} bytes (live stream)")
+        for name, ok in stream_checks.items():
+            print(f"{'PASS' if ok else 'FAIL'}: {name}")
+            if not ok:
+                failed.append(name)
+
     if failed:
         with open(FAIL_RAW, "wb") as stream:
             stream.write(capture)
         print(f"FAILED: {', '.join(failed)}; capture saved to {FAIL_RAW}")
         raise SystemExit(1)
-    print("PTY lifecycle + RPC data + approval push PASS")
+    print("PTY lifecycle + RPC data + approval push + live stream PASS")
 
 
 if __name__ == "__main__":

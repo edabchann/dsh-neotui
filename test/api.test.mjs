@@ -3,7 +3,7 @@
 // table and the protocol detector that chooses between them.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Api, ApiError, METHODS_015, PROTOCOL_015, PROTOCOL_LEGACY, REMOTE_EVENTS_015, translateControlItem, translateRemoteItem } from "../src/api.js";
+import { Api, ApiError, METHODS_015, PROTOCOL_015, PROTOCOL_LEGACY, REMOTE_EVENTS_015, expandCompactAssistantStream, translateControlItem, translateRemoteItem } from "../src/api.js";
 
 /** Capture every unary POST and answer from a scripted result map. */
 function harness({ protocol = PROTOCOL_015, result = () => ({ ok: true }) } = {}) {
@@ -741,5 +741,285 @@ test("malformed forwarded emits produce no frame and never throw", async () => {
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.deepEqual(hostFrames, []);
   assert.deepEqual(frames, []);
+  api.close();
+});
+
+// ---- live transcript: the session/follow stream ----------------------------
+
+/** A connected 0.1.5 client with a follow subscription opened on `session-1`. */
+async function followClient(sessionId = "session-1", options = {}) {
+  const harness = muxHarness();
+  const client = await muxClient(harness);
+  const { api, socket } = client;
+  api.followSession(sessionId, options);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  return { ...client, harness, followId: socket.streamOf("session/follow"), stream: socket };
+}
+
+const RECORD = (seq, type = "user/message", data = { id: `m${seq}`, source: { kind: "user" }, content: [{ type: "text", text: `t${seq}` }] }) =>
+  ({ type: "event", event: { type, seq, time: 1000 + seq, data } });
+
+test("followSession opens session/follow on the shared mux socket with the exact args", async () => {
+  const { api, socket, followId } = await followClient("session-1");
+  const opens = socket.sent.filter((message) => message.type === "open");
+  assert.deepEqual(opens.map((open) => open.endpoint).sort(), ["$events", "session/control", "session/follow"]);
+  const follow = opens.find((open) => open.endpoint === "session/follow");
+  assert.equal(follow.streamId, followId);
+  assert.deepEqual(follow.payload, {
+    args: { request: { address: { kind: "session", sessionId: "session-1" }, maxMessages: 40, assistantStream: true } },
+  });
+  assert.equal(api.followActive, true);
+  assert.equal(api.followSessionId, "session-1");
+  api.close();
+});
+
+test("a follow snapshot becomes session/subscribed + projections + one frame per record", async () => {
+  const { api, frames, socket, followId } = await followClient();
+  socket.item(followId, {
+    type: "snapshot",
+    header: { id: "session-1", version: 3 },
+    cursor: 12,
+    hasMore: true,
+    projections: { asOfSeq: 12, values: { title: "Followed", todos: [] } },
+    records: [RECORD(10), RECORD(11)],
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(frames.map((frame) => frame.type), ["session/subscribed", "session/projection", "session/title", "session/projection", "session/event", "session/event"]);
+  assert.equal(frames[0].lastSeq, 12, "the baseline cursor is the subscribed position");
+  assert.deepEqual(frames[1], { type: "session/projection", sessionId: "session-1", key: "title", value: "Followed", seq: 12 });
+  assert.deepEqual(frames[4], { type: "session/event", sessionId: "session-1", event: RECORD(10).event, view: undefined });
+  assert.equal(api.followActive, true);
+  api.close();
+});
+
+test("live durable follow events surface as the TUI's session/event frames", async () => {
+  const { api, frames, socket, followId } = await followClient();
+  socket.item(followId, { type: "snapshot", header: {}, cursor: 12, hasMore: false, projections: { asOfSeq: 12, values: {} }, records: [] });
+  socket.item(followId, RECORD(13, "turn/start", {}));
+  socket.item(followId, RECORD(14, "assistant/message", { message: { id: "a1", content: [{ type: "text", text: "done" }] } }));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const events = frames.filter((frame) => frame.type === "session/event");
+  assert.deepEqual(events.map((frame) => frame.event.seq), [13, 14]);
+  assert.deepEqual(events.map((frame) => frame.sessionId), ["session-1", "session-1"]);
+  api.close();
+});
+
+test("assistant-stream chunks become assistant/chunk events, deduped by dense index", async () => {
+  const { api, frames, socket, followId } = await followClient();
+  const chunkFrame = (index, chunk) => ({ type: "assistant-stream", frame: { type: "chunk", attemptId: "session-1:1", revision: 1 + index, index, time: 2000 + index, chunk } });
+  socket.item(followId, { type: "snapshot", header: {}, cursor: 3, hasMore: false, projections: { asOfSeq: 3, values: {} }, records: [], assistantStream: { revision: 0 } });
+  socket.item(followId, { type: "assistant-stream", frame: { type: "start", attemptId: "session-1:1", revision: 1, startedAfterSeq: 3, turn: 1, step: 1 } });
+  socket.item(followId, chunkFrame(0, { type: "block-start", index: 0, blockType: "text" }));
+  socket.item(followId, chunkFrame(1, { type: "text-delta", index: 0, text: "FOLLO" }));
+  socket.item(followId, chunkFrame(2, { type: "text-delta", index: 0, text: "WSTREAM" }));
+  // Re-delivered + out-of-order frames after a reconnect must not double-apply.
+  socket.item(followId, chunkFrame(2, { type: "text-delta", index: 0, text: "WSTREAM" }));
+  socket.item(followId, chunkFrame(1, { type: "text-delta", index: 0, text: "FOLLO" }));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const chunks = frames.filter((frame) => frame.type === "session/event").map((frame) => frame.event);
+  assert.deepEqual(chunks.map((event) => event.type), ["assistant/chunk", "assistant/chunk", "assistant/chunk"]);
+  assert.deepEqual(chunks.map((event) => event.data.chunk.text ?? event.data.chunk.blockType), ["text", "FOLLO", "WSTREAM"]);
+  assert.equal(chunks.every((event) => event.seq === undefined), true, "process-local chunks carry no durable seq");
+  api.close();
+});
+
+test("a mid-attempt snapshot replays the accumulated stream, then continues at nextIndex", async () => {
+  const { api, frames, socket, followId } = await followClient();
+  socket.item(followId, {
+    type: "snapshot",
+    header: {},
+    cursor: 13,
+    hasMore: false,
+    projections: { asOfSeq: 13, values: {} },
+    records: [],
+    assistantStream: {
+      revision: 5,
+      activeAttempt: {
+        attemptId: "session-1:1",
+        startedAfterSeq: 13,
+        turn: 1,
+        step: 1,
+        nextIndex: 4,
+        // The exact shape a live 0.1.5 host sends (verified by probe).
+        stream: [
+          { type: "chunk", time: 100, chunk: { type: "block-start", index: 0, blockType: "text" } },
+          { type: "text-chunks", time0: 100, index: 0, dt: [400, 400], texts: ["FOLLO", "WSTRE", "AM"] },
+        ],
+      },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  let chunks = frames.filter((frame) => frame.type === "session/event").map((frame) => frame.event.data.chunk);
+  assert.deepEqual(chunks.map((chunk) => chunk.type), ["block-start", "text-delta", "text-delta", "text-delta"]);
+  assert.equal(chunks.filter((chunk) => chunk.type === "text-delta").map((chunk) => chunk.text).join(""), "FOLLOWSTREAM");
+  // The live continuation resumes exactly at nextIndex=4: a replayed index and a
+  // stale index are dropped, while the next real frame applies.
+  socket.item(followId, { type: "assistant-stream", frame: { type: "chunk", attemptId: "session-1:1", revision: 8, index: 3, time: 900, chunk: { type: "text-delta", index: 0, text: "AM" } } });
+  socket.item(followId, { type: "assistant-stream", frame: { type: "chunk", attemptId: "session-1:1", revision: 8, index: 2, time: 900, chunk: { type: "text-delta", index: 0, text: "WSTRE" } } });
+  socket.item(followId, { type: "assistant-stream", frame: { type: "chunk", attemptId: "session-1:1", revision: 9, index: 4, time: 950, chunk: { type: "block-end", index: 0, block: { type: "text", text: "FOLLOWSTREAM" } } } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  chunks = frames.filter((frame) => frame.type === "session/event").map((frame) => frame.event.data.chunk);
+  assert.deepEqual(chunks.slice(4).map((chunk) => chunk.type), ["block-end"], "the replayed index 3 and the stale index 2 are both dropped");
+  api.close();
+});
+
+test("expandCompactAssistantStream is lossless for every compact record kind", async () => {
+  const expanded = expandCompactAssistantStream([
+    { type: "chunk", time: 10, chunk: { type: "block-start", index: 0, blockType: "text" } },
+    { type: "text-chunks", time0: 10, index: 0, dt: [5, 5], texts: ["a", "b", "c"] },
+    { type: "reasoning-chunks", time0: 30, index: 1, dt: [7], texts: ["r1", "r2"] },
+    { type: "tool-call-chunks", time0: 50, index: 2, dt: [1], id: "call_1", name: "bash", args: ["{\"a\"", ":1}"] },
+    { type: "chunk", time: 60, chunk: { type: "finish", reason: { kind: "stop" } } },
+    null,
+  ]);
+  assert.deepEqual(expanded.map((entry) => entry.chunk.type), ["block-start", "text-delta", "text-delta", "text-delta", "reasoning-delta", "reasoning-delta", "tool-call-delta", "tool-call-delta", "finish"]);
+  assert.deepEqual(expanded.slice(1, 4).map((entry) => [entry.time, entry.chunk.text]), [[10, "a"], [15, "b"], [20, "c"]]);
+  assert.deepEqual(expanded[5].chunk, { type: "reasoning-delta", index: 1, text: "r2" });
+  assert.deepEqual(expanded[6].chunk, { type: "tool-call-delta", index: 2, id: "call_1", name: "bash", argumentsDelta: "{\"a\"" });
+  assert.deepEqual(expandCompactAssistantStream(undefined), []);
+});
+
+test("a dropped mux re-opens the follow stream on the next generation", async () => {
+  const harness = muxHarness();
+  const { api, frames, socket } = await muxClient(harness);
+  api.followSession("session-1");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(api.followActive, true);
+  socket.close();
+  assert.equal(api.followActive, false, "no live stream while the socket is down");
+  await new Promise((resolve) => setTimeout(resolve, 600)); // backoff 500ms
+  const next = harness.FakeSocket.instances.at(-1);
+  assert.notEqual(next, socket, "a new generation connected");
+  const reopened = next.streamOf("session/follow");
+  assert.notEqual(reopened, undefined, "the follow stream is re-opened with the new generation");
+  assert.equal(api.followActive, true);
+  next.item(reopened, { type: "snapshot", header: {}, cursor: 4, hasMore: false, projections: { asOfSeq: 4, values: {} }, records: [RECORD(4)] });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(frames.filter((frame) => frame.type === "session/subscribed").at(-1).lastSeq, 4, "the fresh baseline re-subscribes");
+  api.close();
+});
+
+test("switching sessions cancels the old follow stream and opens the new one", async () => {
+  const { api, socket } = await followClient("session-1");
+  const first = socket.streamOf("session/follow");
+  api.followSession("session-2");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const cancel = socket.sent.find((message) => message.type === "cancel");
+  assert.deepEqual(cancel, { type: "cancel", streamId: first });
+  const second = socket.sent.filter((message) => message.type === "open" && message.endpoint === "session/follow").at(-1);
+  assert.deepEqual(second.payload.args.request.address, { kind: "session", sessionId: "session-2" });
+  assert.equal(api.followSessionId, "session-2");
+  // Calling it again for the SAME session keeps the healthy stream (no churn).
+  const opens = socket.sent.filter((message) => message.type === "open" && message.endpoint === "session/follow").length;
+  api.followSession("session-2");
+  assert.equal(socket.sent.filter((message) => message.type === "open" && message.endpoint === "session/follow").length, opens);
+  api.stopFollow();
+  assert.equal(api.followActive, false);
+  assert.equal(api.followSessionId, null);
+  api.close();
+});
+
+test("a follow subscription made before protocol detection waits for it", async () => {
+  class FakeSocket {
+    constructor(url) { this.url = url; this.sent = []; FakeSocket.instances.push(this); queueMicrotask(() => this.onopen?.()); }
+    send(text) { this.sent.push(JSON.parse(text)); }
+    close() { this.onclose?.({ code: 1000 }); }
+  }
+  FakeSocket.instances = [];
+  const fetchImpl = async (url, init) => {
+    const body = init?.body === undefined ? undefined : JSON.parse(init.body);
+    if (init?.method === "GET") return { ok: true, status: 303, headers: { getSetCookie: () => [] } };
+    // The modern probe (session/list with the `_request` arg) answers; the
+    // legacy probe is never reached.
+    return { ok: true, status: 200, json: async () => ({ type: "server-response", rpcId: body?.rpcId, result: { ok: true, value: { items: [] } } }) };
+  };
+  const notices = [];
+  const api = new Api({ fetchImpl, webSocket: FakeSocket, onDegrade: (kind, message) => notices.push([kind, message]) });
+  const follow = api.followSession("session-1"); // before any detection happened
+  assert.equal(api.protocol, null);
+  api.connectMux();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(api.protocol, PROTOCOL_015);
+  assert.deepEqual(notices, [], "a 0.1.5 host is never mislabelled as legacy");
+  assert.equal(api.followActive, true);
+  assert.equal(follow.streamId, FakeSocket.instances.at(-1).sent.find((message) => message.endpoint === "session/follow").streamId);
+  api.close();
+});
+
+test("restart re-snapshots the session already followed (reload path)", async () => {
+  const { api, socket } = await followClient("session-1");
+  const first = socket.streamOf("session/follow");
+  api.followSession("session-1", { restart: true });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(socket.sent.find((message) => message.type === "cancel"), { type: "cancel", streamId: first });
+  const opens = socket.sent.filter((message) => message.type === "open" && message.endpoint === "session/follow");
+  assert.equal(opens.length, 2, "a fresh stream carries a fresh baseline");
+  assert.notEqual(opens[1].streamId, first);
+  api.close();
+});
+
+test("an errored follow stream degrades once and hands the transcript back to polling", async () => {
+  const { api, notices, frames, socket, followId } = await followClient();
+  socket.push({ type: "error", streamId: followId, error: { code: "session/not-found", message: "session gone" } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(api.followActive, false);
+  assert.deepEqual(notices.map(([kind]) => kind), ["session-follow"]);
+  assert.match(notices[0][1], /轮询刷新/);
+  // One notice only: a second failure must not toast again.
+  socket.push({ type: "error", streamId: followId, error: { code: "session/not-found", message: "session gone" } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(notices.length, 1);
+  assert.deepEqual(frames.filter((frame) => frame.type === "session/subscribed"), [], "no baseline ever arrived");
+  api.close();
+});
+
+test("a legacy host opens no follow stream and says so once", async () => {
+  const sockets = [];
+  class FakeSocket {
+    constructor(url) { this.url = url; this.sent = []; sockets.push(this); queueMicrotask(() => this.onopen?.()); }
+    send(text) { this.sent.push(JSON.parse(text)); }
+    close() { this.onclose?.({ code: 1000 }); }
+  }
+  const notices = [];
+  const api = new Api({
+    protocol: PROTOCOL_LEGACY,
+    webSocket: FakeSocket,
+    fetchImpl: async () => ({ ok: true, status: 303, headers: { getSetCookie: () => [] } }),
+    onDegrade: (kind, message) => notices.push([kind, message]),
+  });
+  api.connectMux();
+  api.followSession("session-1");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(api.followActive, false);
+  assert.deepEqual(sockets.flatMap((socket) => socket.sent), [], "the legacy downlink is untouched");
+  assert.deepEqual(notices.map(([kind]) => kind), ["session-follow"]);
+  assert.match(notices[0][1], /旧协议/);
+  api.followSession("session-2"); // switching must not toast again
+  assert.equal(notices.length, 1);
+  api.close();
+});
+
+test("an unreachable mux reports the follow stream unavailable exactly once", async () => {
+  const notices = [];
+  class DeadSocket {
+    // The socket never opens, then closes: #connectRemote marks the generation
+    // unsupported, and the follow subscription must fall back in the same breath.
+    constructor() { queueMicrotask(() => { this.onerror?.(new Error("boom")); this.onclose?.({ code: 1006 }); }); }
+    send() {}
+    close() {}
+  }
+  const api = new Api({
+    protocol: PROTOCOL_015,
+    webSocket: DeadSocket,
+    fetchImpl: async () => ({ ok: true, status: 303, headers: { getSetCookie: () => [] } }),
+    onDegrade: (kind, message) => notices.push([kind, message]),
+  });
+  api.connectMux();
+  api.followSession("session-1");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(api.followActive, false);
+  assert.equal(notices.filter(([kind]) => kind === "live-streams").length, 1);
+  assert.equal(notices.filter(([kind]) => kind === "session-follow").length, 1);
+  assert.match(notices.find(([kind]) => kind === "session-follow")[1], /轮询刷新/);
   api.close();
 });

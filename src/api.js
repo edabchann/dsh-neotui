@@ -498,6 +498,46 @@ export function translateControlItem(value) {
   }
 }
 
+/**
+ * Expand the compact accumulated assistant stream a `session/follow` snapshot
+ * carries for an in-flight attempt (`SessionAssistantStreamBaseline.activeAttempt.stream`)
+ * back into the exact ordered stream chunks. 0.1.5 does not persist
+ * `assistant/chunk` events, so this is the only way a client that joins
+ * mid-attempt can render the text already streamed; membership and order are
+ * lossless (runs pack consecutive deltas of one block, `dt` carries the gaps).
+ * @param {object[]} records compact `AssistantStreamRecord[]`.
+ * @returns {{time:number,chunk:object}[]} detached timed chunks.
+ */
+export function expandCompactAssistantStream(records) {
+  const out = [];
+  for (const record of records ?? []) {
+    if (record?.type === "chunk") { out.push({ time: record.time, chunk: record.chunk }); continue; }
+    if (record?.type === "text-chunks" || record?.type === "reasoning-chunks") {
+      const texts = record.texts ?? [];
+      let time = record.time0 ?? 0;
+      for (let i = 0; i < texts.length; i++) {
+        if (i > 0) time += record.dt?.[i - 1] ?? 0;
+        out.push({ time, chunk: { type: record.type === "text-chunks" ? "text-delta" : "reasoning-delta", index: record.index, text: texts[i] } });
+      }
+      continue;
+    }
+    if (record?.type === "tool-call-chunks") {
+      const args = record.args ?? [];
+      let time = record.time0 ?? 0;
+      for (let i = 0; i < args.length; i++) {
+        if (i > 0) time += record.dt?.[i - 1] ?? 0;
+        out.push({
+          time,
+          chunk: { type: "tool-call-delta", index: record.index, id: record.id, ...(record.name === undefined ? {} : { name: record.name }), argumentsDelta: args[i] },
+        });
+      }
+      continue;
+    }
+    // Unknown compact record: never invent a chunk from it.
+  }
+  return out;
+}
+
 export class Api {
   constructor({
     base = DEFAULT_BASE,
@@ -537,6 +577,9 @@ export class Api {
     // 0.1.5 remote-mux state: the `$events` generation identity plus the
     // blocking decisions this client currently holds (eventId -> descriptor).
     this.remoteState = { clientId: null, events: null, control: null, pending: new Map(), answered: new Set() };
+    // The ACTIVE session's `session/follow` subscription (null = none). It rides
+    // the same mux socket, so it is re-opened per socket generation.
+    this.follow = null;
     this.#cursorBySession = new Map();
     this.#selectionBySession = new Map();
     this.#degraded = new Set();
@@ -801,6 +844,240 @@ export class Api {
     });
   }
 
+  // ---- live transcript: the session/follow stream ------------------------
+  /** True while a `session/follow` stream for the followed session is open and
+   *  has not errored — the condition the UI uses to keep polling slow. */
+  get followActive() {
+    const follow = this.follow;
+    return follow !== null
+      && follow.streamId !== null
+      && follow.broken !== true
+      && this.connectionState.mux.connected;
+  }
+
+  /** Session the open follow stream belongs to (null when none). */
+  get followSessionId() { return this.follow?.sessionId ?? null; }
+
+  /**
+   * Subscribe the ACTIVE session's live transcript.
+   *
+   * 0.1.5 forwards no `session/event` on any channel, so this Remote stream is
+   * the durable live transcript (verified against a live 0.1.5 host):
+   *   first frame  `{type:"snapshot", header, cursor, records, hasMore,
+   *                  projections, assistantStream?}` — `cursor` is the last
+   *                  committed seq of the opening window;
+   *   then         `{type:"event", event}` records, gap-free and strictly
+   *                  increasing from `cursor + 1`;
+   *   and, when `assistantStream:true`, interleaved
+   *                `{type:"assistant-stream", frame}` frames whose dense
+   *                `index` counts the attempt's frames. 0.1.5 persists NO
+   *                `assistant/chunk` event, so these process-local frames are
+   *                the ONLY token-level live text path.
+   *
+   * Frames are translated back into the legacy TUI vocabulary and delivered
+   * through `onFrame`, so views.js keeps its existing `session/event` path:
+   *   snapshot -> session/subscribed (lastSeq = cursor) + session/projection*
+   *               + session/event per opening record + replayed stream chunks;
+   *   event    -> session/event;
+   *   assistant-stream -> session/event {event:{type:"assistant/chunk", …}}.
+   *
+   * The stream rides the shared mux socket, so it inherits that socket's
+   * reconnect/backoff: every fresh generation re-opens it and the Host answers
+   * with a new snapshot (whose records the UI's seq guard reconciles for free).
+   * The subscription follows one session at a time — calling this for another
+   * session cancels the previous stream.
+   *
+   * @param {string} sessionId durable session to follow.
+   * @param {{maxMessages?:number,assistantStream?:boolean,restart?:boolean}} [options]
+   *   `restart` forces a fresh snapshot even for the session already followed —
+   *   what a reload needs, because the re-sent baseline replays the in-flight
+   *   attempt's accumulated text into the rebuilt transcript.
+   * @returns {object|null} the subscription state (diagnostics/tests).
+   */
+  followSession(sessionId, { maxMessages = 40, assistantStream = true, restart = false } = {}) {
+    if (typeof sessionId !== "string" || sessionId === "") { this.stopFollow(); return null; }
+    const previous = this.follow;
+    // Same session, still healthy and no restart asked: keep it (switching back
+    // and forth must not churn streams).
+    if (previous !== null && previous.sessionId === sessionId && !previous.broken && previous.streamId !== null && !restart) return previous;
+    if (previous !== null) this.#closeFollow(previous);
+    const follow = {
+      sessionId,
+      maxMessages,
+      assistantStream,
+      streamId: null,
+      attemptId: null,
+      nextIndex: 0,
+      broken: false,
+    };
+    this.follow = follow;
+    if (!this.modern) {
+      if (this.protocol === null) {
+        // Protocol not detected yet (an early caller beat App.init's probe):
+        // decide once detection resolves instead of mislabelling a 0.1.5 host.
+        void this.detectProtocol().then(() => {
+          if (this.follow !== follow) return; // replaced/stopped meanwhile
+          if (this.modern) this.#openFollow();
+          else this.degrade("session-follow", "该 Host 不支持 session/follow 实时流（旧协议），对话保持轮询刷新");
+        });
+        return follow;
+      }
+      // Pre-0.1.5 hosts still forward `session/event` over /api/events.mux, so
+      // polling keeps its original cadence here — say so once, then carry on.
+      this.degrade("session-follow", "该 Host 不支持 session/follow 实时流（旧协议），对话保持轮询刷新");
+      return follow;
+    }
+    if (this.connectionState.mux.unsupported) {
+      this.degrade("session-follow", "会话实时流不可用（remote mux 未连接），对话保持轮询刷新");
+      return follow;
+    }
+    this.#openFollow();
+    return follow;
+  }
+
+  /** Cancel the live transcript subscription (session switch / teardown). */
+  stopFollow() {
+    if (this.follow !== null) this.#closeFollow(this.follow);
+    this.follow = null;
+  }
+
+  #closeFollow(follow) {
+    const streamId = follow.streamId;
+    follow.streamId = null;
+    follow.attemptId = null;
+    follow.nextIndex = 0;
+    if (streamId === null) return;
+    try { this.connectionState.mux.ws?.send?.(JSON.stringify({ type: "cancel", streamId })); }
+    catch { /* socket already gone */ }
+    this.log(`[api] session/follow closed (${streamId.slice(0, 8)})`);
+  }
+
+  /** Open the follow stream on the CURRENT mux socket generation. */
+  #openFollow() {
+    const follow = this.follow;
+    if (follow === null || this.closed || !this.modern) return;
+    const state = this.connectionState.mux;
+    if (state.unsupported || state.ws === null || !state.connected) return; // onopen retries
+    if (follow.streamId !== null) return;
+    const streamId = mintId("follow");
+    follow.streamId = streamId;
+    const args = {
+      request: dense({
+        address: { kind: "session", sessionId: follow.sessionId },
+        maxMessages: follow.maxMessages,
+        // 0.1.5 declares the literal `true`; omit it rather than sending false.
+        assistantStream: follow.assistantStream ? true : undefined,
+      }),
+    };
+    try {
+      state.ws.send(JSON.stringify({ type: "open", streamId, endpoint: "session/follow", payload: { args } }));
+    } catch (error) {
+      follow.streamId = null;
+      this.#failFollow(`session/follow 打开失败：${error.message}`);
+      return;
+    }
+    this.log(`[api] session/follow opened for ${follow.sessionId.slice(0, 8)} (${streamId.slice(0, 8)})`);
+  }
+
+  /** A follow stream that ended/errored: poll again, and say so once. */
+  #failFollow(reason) {
+    const follow = this.follow;
+    if (follow === null) return;
+    follow.streamId = null;
+    follow.attemptId = null;
+    follow.nextIndex = 0;
+    follow.broken = true;
+    this.log(`[api] session/follow unusable: ${reason}`);
+    this.degrade("session-follow", `会话实时流不可用（${reason}），对话恢复轮询刷新`);
+    this.#publishConnectionState();
+  }
+
+  /** One `session/follow` item -> the legacy TUI frame vocabulary. */
+  #onFollowItem(value) {
+    const follow = this.follow;
+    if (follow === null) return;
+    if (value?.type === "snapshot") {
+      follow.broken = false;
+      const baseline = value.assistantStream?.activeAttempt;
+      follow.attemptId = baseline?.attemptId ?? null;
+      follow.nextIndex = baseline?.nextIndex ?? 0;
+      // The opening window's cursor is exactly what the legacy channel called
+      // `session/subscribed`: the durable position the snapshot ends on.
+      if (typeof value.cursor === "number") {
+        this.#deliver({ type: "session/subscribed", sessionId: follow.sessionId, lastSeq: value.cursor });
+      }
+      for (const [key, projected] of Object.entries(value.projections?.values ?? {})) {
+        this.#deliver({ type: "session/projection", sessionId: follow.sessionId, key, value: projected, seq: value.projections?.asOfSeq });
+        if (key === "title") this.#deliver({ type: "session/title", sessionId: follow.sessionId });
+      }
+      this.log(`[api] session/follow baseline cursor=${value.cursor} records=${value.records?.length ?? 0}`
+        + ` activeAttempt=${baseline ? `${String(baseline.attemptId).slice(-12)}@${baseline.nextIndex}` : "none"}`);
+      // Opening-window records FIRST: they are the durable history the in-flight
+      // attempt started after, so the transcript must see them in seq order.
+      for (const record of value.records ?? []) {
+        this.#deliver({ type: "session/event", sessionId: follow.sessionId, event: record.event, view: record.view });
+      }
+      // A mid-attempt join must then render the text streamed so far: the Host
+      // ships the compact accumulated stream because the durable log has no
+      // chunks. The replayed chunks keep their dense position as their identity,
+      // so the transcript can drop them again if it already applied this attempt.
+      if (baseline) {
+        expandCompactAssistantStream(baseline.stream).forEach((entry, index) => {
+          this.#emitChunk(follow, baseline.attemptId, index, entry.time, entry.chunk);
+        });
+      }
+      return;
+    }
+    if (value?.type === "event") {
+      this.#deliver({ type: "session/event", sessionId: follow.sessionId, event: value.event, view: value.view });
+      return;
+    }
+    if (value?.type === "assistant-stream") { this.#onAssistantFrame(follow, value.frame); return; }
+    this.log(`[api] session/follow: unknown item ${JSON.stringify(value).slice(0, 120)}`);
+  }
+
+  /**
+   * One process-local assistant frame. The dense `index` is the frame identity
+   * (`revision` increments per frame and is NOT an attempt identity), so a
+   * re-delivered or out-of-order frame can never double-apply a delta.
+   */
+  #onAssistantFrame(follow, frame) {
+    switch (frame?.type) {
+      case "start":
+        if (follow.attemptId !== frame.attemptId) { follow.attemptId = frame.attemptId; follow.nextIndex = 0; }
+        return;
+      case "chunk": {
+        if (follow.attemptId !== frame.attemptId) { follow.attemptId = frame.attemptId; follow.nextIndex = 0; }
+        if (!Number.isFinite(frame.index) || frame.index < follow.nextIndex) return; // duplicate/stale
+        follow.nextIndex = frame.index + 1;
+        this.#emitChunk(follow, frame.attemptId, frame.index, frame.time, frame.chunk);
+        return;
+      }
+      case "end":
+        // The durable settlement event follows on the same stream; the frame
+        // only bounds the attempt's index space.
+        if (Number.isFinite(frame.index)) follow.nextIndex = Math.max(follow.nextIndex, frame.index + 1);
+        return;
+      default:
+        this.log(`[api] session/follow: unknown assistant frame ${JSON.stringify(frame).slice(0, 120)}`);
+    }
+  }
+
+  /**
+   * One raw stream chunk -> the TUI's assistant/chunk event (no durable seq).
+   * The frame carries the attempt's dense `index` alongside the event so the
+   * transcript can guard the SAME way it guards durable seqs (a reconnect
+   * re-sends this attempt's accumulated stream and must not re-append it).
+   */
+  #emitChunk(follow, attemptId, index, time, chunk) {
+    this.#deliver({
+      type: "session/event",
+      sessionId: follow.sessionId,
+      event: { type: "assistant/chunk", time, data: { chunk } },
+      stream: { attemptId, index },
+    });
+  }
+
   /**
    * Answer an approval/question frame successfully.
    *
@@ -964,6 +1241,15 @@ export class Api {
       state.retryDelay = 500;
       this.remoteState.events = openStream("$events");
       this.remoteState.control = openStream("session/control");
+      // A fresh generation re-opens the active session's follow stream; the Host
+      // answers with a new snapshot whose records the UI's seq guard reconciles.
+      if (this.follow !== null) {
+        this.follow.streamId = null;
+        this.follow.attemptId = null;
+        this.follow.nextIndex = 0;
+        this.follow.broken = false;
+        this.#openFollow();
+      }
       this.log("[api] remote mux connected ($events + session/control)");
       this.#publishConnectionState();
     };
@@ -980,6 +1266,12 @@ export class Api {
       this.remoteState.clientId = null;
       this.remoteState.events = null;
       this.remoteState.control = null;
+      // The follow stream died with the socket: the next generation re-opens it.
+      if (this.follow !== null) {
+        this.follow.streamId = null;
+        this.follow.attemptId = null;
+        this.follow.nextIndex = 0;
+      }
       this.#publishConnectionState();
       if (this.closed || state.unsupported) return;
       if (!state.everOpened) {
@@ -1003,6 +1295,12 @@ export class Api {
   #onRemoteFrame(frame) {
     const { streamId } = frame ?? {};
     if (streamId === undefined) return;
+    if (this.follow !== null && streamId === this.follow.streamId) {
+      if (frame.type === "item") this.#onFollowItem(frame.value);
+      else if (frame.type === "error") this.#failFollow(new ApiError(frame.error).message);
+      else if (frame.type === "end") this.#failFollow("流已结束");
+      return;
+    }
     if (streamId === this.remoteState.events) {
       if (frame.type === "item") this.#onRemoteEvent(frame.value);
       else if (frame.type === "error") this.#onRemoteStreamError("$events", frame.error);
@@ -1092,6 +1390,15 @@ export class Api {
     // The Host-event channel rides the same socket on 0.1.5, so it is gone too.
     host.unsupported = true;
     this.degrade("live-streams", `实时事件流不可用（${reason}），改为轮询刷新`);
+    if (this.follow !== null) {
+      // The live transcript used the same socket: fall back to the poll cadence
+      // the UI kept before the stream existed (one notice, never per tick).
+      this.follow.streamId = null;
+      this.follow.attemptId = null;
+      this.follow.nextIndex = 0;
+      this.follow.broken = true;
+      this.degrade("session-follow", `会话实时流不可用（${reason}），对话改为轮询刷新`);
+    }
     this.#publishConnectionState();
   }
 
@@ -1194,6 +1501,7 @@ export class Api {
 
   close() {
     this.closed = true;
+    this.stopFollow();
     // A pending Host waterfall blocks the agent until somebody answers. On exit
     // nobody will: delegate each one (`next`) so the Host fails closed with
     // "no approval channel available" instead of hanging the turn forever.

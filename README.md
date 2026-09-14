@@ -242,6 +242,29 @@ TUI 支持：
 
 不同终端、tmux 和 SSH 环境对 Kitty graphics、keyboard、OSC 52 的支持不同。WezTerm 和 Kitty 是图片预览的推荐终端。
 
+## 实时更新（0.1.5 Host）
+
+dsh 0.1.5 不再转发 `session/event`，也不落库 `assistant/chunk`：一次回合里持久化日志只在
+模型流结束后写入 `assistant/message`，因此单靠轮询只能在回合结束后看到整段回答。对话主通道
+因此改为 Remote 流 `session/follow`（`mode:"stream"`，`request:{address, maxMessages,
+assistantStream:true}`）：
+
+- 打开/切换会话时对当前会话开流；切换、恢复、`/reload` 与退出都会换流/关流；socket 断开按
+  退避重连并在新连接上重开（Host 会重发快照）。
+- 首帧 `snapshot` 给出开场窗口与游标 `cursor`（开场窗口最后一个已提交 seq），TUI 据此发出
+  `session/subscribed`；随后是 `cursor+1` 起严格递增的 `{type:"event", event}` 记录。
+- `assistant-stream` 增量帧是 0.1.5 唯一的分词级实时文本来源；中途接入会话时用快照里的
+  累积流回放已生成文本。
+- 同一事件可能同时被流和轮询看到：两条路径共用一个 `seq` 游标（`ChatView.acceptRecords`），
+  只有严格递增的记录会被应用，重复/乱序一律丢弃。
+
+轮询仍在：`session/follow` 健康时它退化为约 15 秒一次的安全网（只做对账）；流不可用
+（旧协议 Host、mux 不可达、流出错）时恢复原有节奏，并一次性 toast 提示。
+
+工作区/归档**没有推送**：Host 不广播工作区事件，侧栏只能定时刷新——`会话列表` 窗口聚焦时
+约 2 秒（进入该窗口时立即刷一次），其余情况约 5 秒；本机的重命名/归档/新建等操作仍会立即
+刷新。
+
 ## 配置
 
 TUI 设置：
@@ -266,7 +289,7 @@ npm run test:pty  # 真实 PTY 生命周期
 npm run test:rc   # 完整发布候选验证
 ```
 
-PTY 测试会验证 alternate screen、SGR mouse、界面渲染、退出恢复和常见运行时错误。需要可用的 DSH Host；Host 不可用时测试会明确输出 `SKIP`。
+PTY 测试会验证 alternate screen、SGR mouse、界面渲染、退出恢复和常见运行时错误；有私有 Host 可用时还会播种会话并断言 `session/list`/`session/page` 数据到达界面、审批推送（`$events` waterfall + `$events/result`）以及实时增量渲染（`session/follow`：回合仍在流式输出时增量文本已出现在渲染帧里，轮询在该时刻不可能提供这段文本）。需要可用的 DSH Host；Host 不可用时测试会明确输出 `SKIP`。
 
 脚本化 smoke：
 
@@ -277,6 +300,8 @@ node bin/dsh-tui.js --script test/smoke.script --plain
 ## 当前限制
 
 - TUI 与 Host 必须使用兼容的事件、RPC 和内容块契约；
+- **工作区/归档没有推送**：Host 不广播工作区变更（`$events` 白名单只有 `api-session/*` 与 `commands/change`），其它客户端或守护进程改动分组/归档时，TUI 只能靠定时刷新感知（`会话列表` 聚焦 ~2s、其余 ~5s），本机操作则立即刷新；
+- **`session/follow` 的基线回放是进程内状态**：回合进行中接入会话时，已生成文本来自 Host 进程内的累积流；若此时 Host 进程重启，该回合剩余文本只能等 `assistant/message` 落地后才出现（Host 侧限制，TUI 无法补出已丢失的增量）；
 - 当前 Host 协议只接受文本与图片内容块，没有通用二进制附件通道：非图片文件一律不发送，仅在附件列表显示元数据（名称/大小/类型，标记「仅元数据」）；工具结果若含原始二进制字节（NUL/控制字符），工具卡同样只显示二进制数据元数据而不渲染字节（这是 Host 侧协议限制，TUI 无法单独扩展）；
 - Kitty 图片效果受终端实现、cell 尺寸和复用器支持影响；
 - 超长工具输出由 Host 截断并给出本地恢复路径：TUI 检测 `[output truncated; full output: <path>]` / `stored at: <path>` 类提示，在工具卡内显示完整输出文件，选中该块后 `Ctrl+R` 菜单可 `host.openPath` 打开、复制路径；本地部署（TUI 与 Host 同机）还可选择「TUI 内预览完整输出」直接滚动查看文件内容（上限 256 KB / 500 行）。恢复路径是 Host 本地的，远端 TUI 无法直接读取文件内容（需要 Host 新增结构化恢复字段/文件读取 RPC）；

@@ -943,7 +943,9 @@ export class TrajectoryPanel extends Widget {
     if (e.type === "assistant/message") return `◉ ${String(d.message?.content?.find((c) => c.type === "text")?.text ?? "").slice(0, 40)}`;
     if (e.type === "assistant/chunk") {
       const ch = d.chunk ?? {};
-      return ch.type === "text-delta" ? String(ch.delta ?? "").slice(0, 40) : `[${ch.blockType ?? ch.type}]`;
+      // `text` is the 0.1.5 StreamChunk field (follow-stream frames); `delta`
+      // is the legacy fixture vocabulary — accept both.
+      return ch.type === "text-delta" ? String(ch.delta ?? ch.text ?? "").slice(0, 40) : `[${ch.blockType ?? ch.type}]`;
     }
     return e.type;
   }
@@ -4595,7 +4597,7 @@ export class SubagentPanel extends Widget {
           case "assistant/message": summary = "◉ " + String(partsText(d.message?.content)).slice(0, 90); break;
           case "assistant/chunk": {
             const ch = d.chunk ?? {};
-            if (ch.type === "text-delta") summary = "▸ " + String(ch.delta ?? "").slice(0, 90);
+            if (ch.type === "text-delta") summary = "▸ " + String(ch.delta ?? ch.text ?? "").slice(0, 90);
             else if (ch.type === "block-start") summary = `▸ [${ch.blockType}]`;
             else summary = "▸ …";
             break;

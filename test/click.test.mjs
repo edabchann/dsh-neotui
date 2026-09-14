@@ -5837,3 +5837,193 @@ test("tasks panel groups user/plugin/goal source kinds with badges and flags unk
   page.onKey({ type: "key", name: "enter", ctrl: false, shift: false });
   assert.ok(app.overlay instanceof Popup, "Enter opens a detail popup");
 });
+
+// ---- live-update gaps: ONE seq-guarded merge for follow + poll --------------
+
+/** A chat view with a stub app whose session.history is scripted per call. */
+function liveChat(history = () => ({ events: [], hasMore: false })) {
+  const app = fakeApp();
+  app.sessionEpoch = 1;
+  app.redraw = () => {};
+  app.sessions = [];
+  app.api = { call: async (method, payload) => history(method, payload) };
+  const chat = new ChatView({ app, x: 0, y: 1, w: 80, h: 24 });
+  chat.sessionId = "s1";
+  return { app, chat };
+}
+
+const userRecord = (seq, text = `m${seq}`) => ({
+  event: { type: "user/message", seq, time: 1000 + seq, data: { id: `u${seq}`, source: { kind: "user" }, content: [{ type: "text", text }] } },
+});
+
+test("an event delivered by BOTH the follow stream and the tail poll is applied exactly once", async () => {
+  const record = userRecord(7, "once");
+  const { chat } = liveChat(() => ({ events: [record], hasMore: false }));
+  const users = () => chat.nodes.filter((node) => node.kind === "user");
+
+  // 1. the follow stream wins the race…
+  assert.equal(chat.mergeEvents([record]), 1);
+  assert.equal(chat.lastSeq, 7, "the follow stream advanced the shared cursor");
+  assert.equal(users().length, 1);
+  // …then the poll sees the very same durable event.
+  await chat.pollTail();
+  assert.equal(users().length, 1, "the poll must not apply the event a second time");
+  assert.equal(chat.lastSyncedSeq, undefined, "no fresh record reached the tail re-derivation");
+  assert.equal(chat.nodes.find((node) => node.kind === "user").text, "once", "text applied exactly once");
+
+  // 2. the reverse order: the poll applies it, the follow stream's copy is dropped.
+  const other = liveChat(() => ({ events: [record], hasMore: false }));
+  await other.chat.pollTail();
+  assert.equal(other.chat.nodes.filter((node) => node.kind === "user").length, 1);
+  assert.equal(other.chat.mergeEvents([record]), 0, "the follow stream's duplicate is refused");
+  assert.equal(other.chat.nodes.filter((node) => node.kind === "user").length, 1);
+});
+
+test("out-of-order and duplicate seqs are dropped by the shared cursor", async () => {
+  const { chat } = liveChat();
+  // 9 then 8 (out of order) then 9 again (duplicate): only 9 and 10 apply.
+  assert.equal(chat.mergeEvents([userRecord(9), userRecord(8), userRecord(9)]), 1);
+  assert.equal(chat.lastSeq, 9);
+  assert.equal(chat.mergeEvents([userRecord(10), userRecord(10)]), 1);
+  assert.equal(chat.lastSeq, 10);
+  assert.equal(chat.mergeEvents([userRecord(7), userRecord(11), userRecord(11), userRecord(12)]), 2);
+  assert.equal(chat.lastSeq, 12);
+  assert.deepEqual(chat.nodes.filter((node) => node.kind === "user").map((node) => node.text), ["m9", "m10", "m11", "m12"]);
+  assert.equal(chat.mergeEvents([]), 0);
+});
+
+test("the follow frame handler routes through the same guard (session/event twins apply once)", () => {
+  const { chat } = liveChat();
+  const frame = { type: "session/event", sessionId: "s1", event: userRecord(5).event };
+  chat.onFrame(frame);
+  chat.onFrame(frame);
+  chat.onFrame({ type: "session/event", sessionId: "s1", event: userRecord(4).event });
+  assert.equal(chat.nodes.filter((node) => node.kind === "user").length, 1, "duplicate + stale frames dropped");
+  // A stale session's frames never touch this transcript either.
+  chat.onFrame({ type: "session/event", sessionId: "s2", event: userRecord(6).event });
+  assert.equal(chat.nodes.filter((node) => node.kind === "user").length, 1);
+});
+
+test("seq-less assistant-stream chunks still stream, accepting the 0.1.5 `text` field", () => {
+  const { chat } = liveChat();
+  chat.onFrame({ type: "session/event", sessionId: "s1", event: { type: "assistant/chunk", time: 10, data: { chunk: { type: "block-start", index: 0, blockType: "text" } } } });
+  chat.onFrame({ type: "session/event", sessionId: "s1", event: { type: "assistant/chunk", time: 11, data: { chunk: { type: "text-delta", index: 0, text: "FOLLO" } } } });
+  chat.onFrame({ type: "session/event", sessionId: "s1", event: { type: "assistant/chunk", time: 12, data: { chunk: { type: "text-delta", index: 0, text: "WSTREAM" } } } });
+  const assistant = chat.nodes.find((node) => node.kind === "assistant");
+  assert.equal(assistant.blocks[0].text, "FOLLOWSTREAM", "the raw 0.1.5 `text` deltas render");
+  assert.equal(assistant.streaming, true);
+  assert.equal(chat.lastSeq, null, "process-local chunks never move the durable cursor");
+});
+
+test("re-delivered stream chunks are dropped by the transcript's chunk cursor", () => {
+  const { chat } = liveChat();
+  const chunk = (index, text) => ({ type: "session/event", sessionId: "s1", stream: { attemptId: "s1:1", index }, event: { type: "assistant/chunk", time: 100 + index, data: { chunk: { type: "text-delta", index: 0, text } } } });
+  chat.onFrame({ type: "session/event", sessionId: "s1", stream: { attemptId: "s1:1", index: 0 }, event: { type: "assistant/chunk", time: 100, data: { chunk: { type: "block-start", index: 0, blockType: "text" } } } });
+  chat.onFrame(chunk(1, "FOLLO"));
+  chat.onFrame(chunk(2, "WSTREAM"));
+  const text = () => chat.nodes.filter((n) => n.kind === "assistant").map((n) => (n.blocks ?? []).map((b) => b.text ?? "").join("")).join("|");
+  assert.equal(text(), "FOLLOWSTREAM");
+  // A mux reconnect re-sends this attempt's frames: every one of them is stale.
+  chat.onFrame(chunk(1, "FOLLO"));
+  chat.onFrame(chunk(2, "WSTREAM"));
+  chat.onFrame(chunk(0, "FOLLO"));
+  assert.equal(text(), "FOLLOWSTREAM", "re-delivered chunks cannot re-append text");
+  // The live continuation still applies, and a NEW attempt resets the cursor.
+  chat.onFrame(chunk(3, "!"));
+  assert.equal(text(), "FOLLOWSTREAM!");
+  // The attempt commits (durable event), then a second attempt starts its own
+  // dense index space; its frames must not be mistaken for stale ones.
+  chat.onFrame({ type: "session/event", sessionId: "s1", event: { type: "assistant/message", seq: 20, time: 180, data: { message: { id: "a1", content: [{ type: "text", text: "FOLLOWSTREAM!" }] } } } });
+  chat.onFrame({ type: "session/event", sessionId: "s1", stream: { attemptId: "s1:2", index: 0 }, event: { type: "assistant/chunk", time: 200, data: { chunk: { type: "block-start", index: 0, blockType: "text" } } } });
+  chat.onFrame({ type: "session/event", sessionId: "s1", stream: { attemptId: "s1:2", index: 1 }, event: { type: "assistant/chunk", time: 201, data: { chunk: { type: "text-delta", index: 0, text: "second" } } } });
+  assert.equal(text(), "second", "the second attempt's own deltas apply (the tail node is reused across steps)");
+});
+
+test("the tail poll is a slow safety net while the follow stream is healthy", () => {
+  const { app, chat } = liveChat();
+  let polls = 0;
+  chat.pollTail = async () => { polls++; };
+
+  // No follow stream: the original every-tick cadence is untouched.
+  app.api.followActive = false;
+  chat.pollTailTick(1000);
+  chat.pollTailTick(1001);
+  assert.equal(polls, 2, "without the stream every tick polls, as before");
+
+  // Healthy follow stream for THIS session: slow reconciliation only.
+  app.api.followActive = true;
+  app.api.followSessionId = "s1";
+  chat.pollAt = 1000;
+  chat.pollTailTick(1000 + 14000);
+  assert.equal(polls, 2, "inside the safety-net window nothing polls");
+  chat.pollTailTick(1000 + 15000);
+  assert.equal(polls, 3, "the safety net fires once the window elapses");
+
+  // A follow stream for a DIFFERENT session must not slow this one down.
+  app.api.followSessionId = "other";
+  chat.pollTailTick(1000 + 15001);
+  assert.equal(polls, 4, "another session's stream is not this transcript's live path");
+
+  // A broken stream restores the fast cadence immediately.
+  app.api.followSessionId = "s1";
+  app.api.followActive = false;
+  chat.pollTailTick(1000 + 15002);
+  assert.equal(polls, 5);
+});
+
+test("the session list refreshes fast only while 会话列表 holds focus", () => {
+  const app = headlessApp();
+  let refreshes = 0;
+  app.refreshSessions = () => { refreshes++; };
+  app.refreshSubagentStats = () => {};
+  app.notifyPaneLive = () => {};
+  app.chat.sessionId = null; // isolate the list cadence from the transcript gate
+
+  assert.equal(app.listRefreshMs(), 5000, "unfocused windows keep the old ~5s cadence");
+  const t0 = 1_000_000; // realistic epoch-ms so the initial due-check behaves as in production
+  app.pollTick(t0);
+  assert.equal(refreshes, 1, "the first tick refreshes (lastListRefresh is unset)");
+  app.pollTick(t0 + 2000);
+  assert.equal(refreshes, 1, "2s since the last refresh is not yet due");
+  app.pollTick(t0 + 5001);
+  assert.equal(refreshes, 2);
+
+  app.focusedWindow = "list";
+  assert.equal(app.listRefreshMs(), 2000, "the focused 会话列表 window refreshes ~2s");
+  app.pollTick(t0 + 5100);
+  assert.equal(refreshes, 3, "entering the window refreshes at once");
+  app.pollTick(t0 + 6000);
+  assert.equal(refreshes, 3, "still inside the focused window");
+  app.pollTick(t0 + 7101);
+  assert.equal(refreshes, 4, "focused cadence is ~2s");
+  app.focusedWindow = "main";
+  app.pollTick(t0 + 7200);
+  assert.equal(refreshes, 4, "leaving the window returns to the slow cadence");
+});
+
+test("openSession subscribes the live transcript for the session it actually opened", async () => {
+  const app = headlessApp();
+  const followed = [];
+  app.api.followSession = (id) => { followed.push(id); };
+  app.api.call = async (method) => (method === "session.history" ? { events: [], hasMore: false } : {});
+  await app.openSession("s-open");
+  assert.deepEqual(followed, ["s-open"]);
+});
+
+test("a superseded session open never subscribes the follow stream", async () => {
+  const app = headlessApp();
+  const followed = [];
+  app.api.followSession = (id) => { followed.push(id); };
+  let release = () => {};
+  app.api.call = async (method, payload) => {
+    if (method === "session.history" && payload?.sessionId === "s-slow") await new Promise((resolve) => { release = resolve; });
+    if (method === "session.history") return { events: [], hasMore: false };
+    return {};
+  };
+  const slow = app.openSession("s-slow");
+  const fast = app.openSession("s-fast");
+  await fast;
+  release();
+  await slow;
+  assert.deepEqual(followed, ["s-fast"], "the epoch guard keeps the stale open from re-pointing the stream");
+});

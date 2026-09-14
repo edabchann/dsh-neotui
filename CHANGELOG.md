@@ -14,11 +14,21 @@
   - 同一 socket 另开 `session/control` 流，把 `baseline`/`jobs`/`queue`/`projection` 还原为 `session/jobs`、`session/queue`、`session/projection`（`title` 额外补 `session/title`），取代连接期快照轮询；
   - 重连退避 500ms→15s；重连后 Host 会重投同一 `eventId`，已决事件按 `eventId` 去重不再弹窗；mux 不可达时仍保持「一次性 toast + 轮询」降级。
 - **降级提示**：工作区分组不可用时一次性提示并按「未分组」渲染；缺少令牌时提示 `--token`；mux 不可达时一次性 toast 提示改为轮询刷新。
+- **实时对话流 `session/follow`**：0.1.5 不转发任何 `session/event`，也不落库 `assistant/chunk`（回合结束后才有 `assistant/message`），此前对话只能靠 `pollTail()` 刷新，因此流式回答只有收尾时才能看到。现在打开/切换/恢复/`/reload` 会话时对当前会话开流（`mode:"stream"`，`request:{address, maxMessages, assistantStream:true}`），并把帧还原成既有词汇交给 `views.js`：
+  - 首帧 `snapshot`：`cursor`（开场窗口最后一个已提交 seq）→ `session/subscribed`（`lastSeq=cursor`）+ `session/projection*`（含 `title` 的 `session/title`）+ 开场窗口逐条 `session/event`；其后是 `cursor+1` 起严格递增、无缺口的 `{type:"event", event}` 记录；
+  - `{type:"assistant-stream", frame}` 是 0.1.5 唯一的分词级实时文本来源，按 `assistant/chunk`（`block-start`/`text-delta`/`reasoning-delta`/`tool-call-delta`/`block-end`…）还原；帧身份是尝试内稠密 `index`（`revision` 逐帧递增，不是尝试身份）；
+  - 回合进行中接入会话时，用快照里的紧凑累积流（`assistantStream.activeAttempt.stream`，`text-chunks`/`reasoning-chunks`/`tool-call-chunks`/`chunk` 记录按 `dt` 还原时间）回放已生成文本，随后 live 帧从 `nextIndex` 续上；
+  - 流随共享 mux socket 重连：新连接重开流并重收快照（记录按 seq 游标对账）；流出错/结束一次性 toast 并回退轮询；切换会话会 `cancel` 旧流。
+- **单一 seq 游标合并路径（幂等）**：`session/follow` 与 `pollTail()` 共用 `ChatView.acceptRecords()`——只接受 `event.seq` 严格递增的记录，同一事件无论哪一路先到都只应用一次，乱序/重复 seq 直接丢弃；无 seq 的进程内 chunk 以帧上的 `stream:{attemptId,index}` 为身份在同一处按稠密下标去重（mux 重连重投累积流不会重复追加），`open()` 重建会话时重置该游标以便基线回放。
+- **轮询策略**：`session/follow` 健康时 `pollTail` 退化为 ~15s 安全网（只对账、不重复应用）；流不可用（旧协议 Host、mux 不可达、流出错）时恢复原有每 tick 节奏，行为不回归。
+- **会话列表自适应刷新**：0.1.5 无工作区推送，侧栏只能定时刷新——`会话列表` 窗口聚焦时 ~2s 并在进入该窗口时立即刷一次，其余情况保持原有 ~5s；本地变更（重命名/归档/新建/移动）后的立即刷新不变。README 明确写出「工作区无推送」这一限制。
 
 ### Changed
 
 - `test/api.test.mjs`：按 0.1.5 线格式重写传输断言，新增适配表单测（名称翻译、args/结果包裹、协议探测与 legacy 回退、令牌交换、流式替代、`commands/execute` 的 0.1.2 `images` 兼容重试）；新增 Remote mux 单测（`$events`+`session/control` 订阅与 ready、转发事件/控制帧的翻译表、审批与提问的 `$events/result` 回答、重复事件去重、Host `cancel`、断线退避重连、退出时 `next` 释放、不可达降级、白名单覆盖）。
-- `test/pty-crash.py`：新增 RPC 数据阶段——起一个私有 `dsh --profile web` 实例、经公开 HTTP API 播种一个带唯一标题与消息标记的会话，再用该实例的令牌 attach TUI，断言渲染帧里出现 Host 返回的标题（`session/list`）与消息文本（`session/page`）；新增审批推送阶段——把模型路由指向本地 SSE 桩（`DEEPSEEK_BASE_URL`），桩请求一次 `danger-full-access` 沙箱提权，从而触发真实 `approval/request` waterfall，断言 TUI 渲染出审批弹窗（推送到位）、按下允许后 Host 记录 `allowed-once` 且提权命令真的执行（回答经 `$events/result` 生效）。
+- `test/pty-crash.py`：新增 RPC 数据阶段——起一个私有 `dsh --profile web` 实例、经公开 HTTP API 播种一个带唯一标题与消息标记的会话，再用该实例的令牌 attach TUI，断言渲染帧里出现 Host 返回的标题（`session/list`）与消息文本（`session/page`）；新增审批推送阶段——把模型路由指向本地 SSE 桩（`DEEPSEEK_BASE_URL`），桩请求一次 `danger-full-access` 沙箱提权，从而触发真实 `approval/request` waterfall，断言 TUI 渲染出审批弹窗（推送到位）、按下允许后 Host 记录 `allowed-once` 且提权命令真的执行（回答经 `$events/result` 生效）；新增实时流阶段——桩按 ~1s 间隔分 5 段流式输出（唯一头/尾哨兵 + 中间填充），TUI 在 prompt 之前就已 attach，断言**头哨兵出现在渲染帧时尾哨兵尚不存在**、且尾哨兵 ≥2s 之后才出现：0.1.5 不存在任何持久化的半截文本，轮询最早只能在回合提交后一次性画出整段回答，因此「两个分离时刻」只可能来自实时流。
+- `test/api.test.mjs`：新增 `session/follow` 单测（订阅 args、快照→`session/subscribed`+projection+记录、live 记录、assistant-stream 稠密下标去重、中途接入的累积流回放与 `nextIndex` 续接、紧凑流展开、断线重开、切换会话 cancel、restart 重发快照、流出错/不可达/旧协议的一次性降级）。
+- `test/click.test.mjs`：新增实时更新单测——「同一事件被流与轮询各投递一次只应用一次」（两种顺序都覆盖）、乱序/重复 seq 丢弃、`session/event` 帧孪生去重、进程内 chunk 的重投去重与跨尝试重置、follow 健康/不健康/他人会话三种情况下的轮询节奏、会话列表 2s/5s 自适应、`openSession` 订阅跟随与陈旧 epoch 不订阅。
 
 ## 0.4.4 — 2026-08-26
 
