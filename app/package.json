@@ -1,6 +1,6 @@
 {
   "name": "dsh-neotui-app",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "description": "dsh-neotui bundle: keyboard-first terminal surface over dsh-base with embedded API access",
   "type": "module",
   "engines": {
@@ -25,7 +25,7 @@
     "@deepseek-ai/cordis": "*",
     "@deepseek-ai/dsh-cmdline": "*",
     "commander": "*",
-    "dsh-neotui": "0.3.0"
+    "dsh-neotui": "0.5.0"
   },
   "license": "MIT"
 }
